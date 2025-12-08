@@ -2461,7 +2461,7 @@ def megatron_rl_inference_mode(
 
         loop.run_until_complete(inference_interface.resume())
 
-        print(f"[{dist.get_rank()}:DP] Exited inference mode")
+        print(f"[{dist.get_rank()}:DP] Entering inference mode")
         yield inference_interface
 
         with nvtx_range("suspend-engine"):

@@ -1807,6 +1807,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Assign released blocks to paused requests.
         # todo: @shanmugamr, un-pause requests using FIFO, rather than LIFO.
         resume_request_count = 0
+        active_block_count_avail = None
+        paused_block_counts = None
         if self.paused_request_count > 0:
             active_block_count_avail = self.block_allocator.get_active_avail()
             paused_block_counts = self.request_kv_block_counts[: self.paused_request_count]
@@ -1820,6 +1822,42 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.paused_request_count -= resume_request_count
         active_request_count += resume_request_count
+
+        # Debug aid: log detailed state before asserting if we hit the zero-active corner case.
+        if active_request_count == 0:
+            # Only log the first time this happens to avoid log spam.
+            if not hasattr(self, "_logged_zero_active_once"):
+                self._logged_zero_active_once = True
+                active_used = self.block_allocator.get_active_used()
+                paused_used = self.block_allocator.get_paused_used()
+                logging.error(
+                    "DynamicInferenceContext.update_requests reached zero active requests "
+                    "after pause/resume step; this should not normally happen.\n"
+                    "Details: paused_request_count=%d, finished_request_count=%d, "
+                    "total_request_count=%d, active_block_avail=%s, "
+                    "block_allocator=%s, unified_memory_level=%s, "
+                    "chunked_prefill_request_id=%d, "
+                    "active_used=%d, paused_used=%d, total_avail=%d",
+                    self.paused_request_count,
+                    finished_request_count,
+                    self.total_request_count,
+                    active_block_count_avail,
+                    str(self.block_allocator),
+                    getattr(self, "unified_memory_level", None),
+                    getattr(self, "chunked_prefill_request_id", -1),
+                    active_used,
+                    paused_used,
+                    self.block_allocator.total_avail,
+                )
+                if paused_block_counts is not None:
+                    try:
+                        logging.error(
+                            "Paused block counts (last up to 16): %s",
+                            paused_block_counts[-16:].tolist(),
+                        )
+                    except Exception:  # pragma: no cover - best-effort debug logging
+                        pass
+
         assert active_request_count > 0, "active_request_count == %d." % active_request_count
 
         # finally, swap the chunked prefill to the end of the active requests to obey the invariance

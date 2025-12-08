@@ -8,7 +8,7 @@ High-level refit/reshard orchestration:
 """
 
 from typing import Any, Literal, Optional, Union
-
+import logging
 from megatron.core import parallel_state
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.utils import unwrap_model
@@ -17,10 +17,11 @@ from . import build_centralized_reshard_plan, execute_reshard_plan
 from .copy_services.base import CopyService
 from .copy_services.gloo_copy_service import GlooCopyService
 from .copy_services.nccl_copy_service import NCCLCopyService
-
+import torch
 # Supported refit backend names
 RefitBackendName = Literal["nccl", "gloo"]
 
+logger = logging.getLogger(__name__)
 
 def swap_model_weights(
     src_model: LanguageModule,
@@ -33,6 +34,7 @@ def swap_model_weights(
         * a string backend name (one of the supported refit backends), or
         * a CopyService instance.
     """
+    logger.info(f"[{torch.distributed.get_rank()}:DP] Swapping model weights with refit_method: {refit_method}")
     if isinstance(refit_method, CopyService):
         service = refit_method
         reshard_model_weights(src_model, target_model, service=service)
@@ -48,6 +50,7 @@ def swap_model_weights(
             raise ValueError(f"Unknown refit_method '{refit_method}'")
     else:
         raise TypeError("refit_method must be a str backend name or a CopyService instance")
+    logger.info(f"[{torch.distributed.get_rank()}:DP] Swapped model weights")
 
 
 def reshard_model_weights(
