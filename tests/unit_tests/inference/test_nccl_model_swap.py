@@ -114,7 +114,7 @@ def _set_pg_collection(module, tp_group, dp_group):
     module.pg_collection = types.SimpleNamespace(tp=tp_group, dp=dp_group, ep=None, pp=None)
     return module
 
-
+@pytest.mark.parametrize("refit_backend", ["nvshmem","nccl","gloo"])
 @pytest.mark.parametrize(
     "src_tp,src_pp,src_ep,dst_tp,dst_pp,dst_ep,num_experts",
     [
@@ -130,12 +130,13 @@ def _set_pg_collection(module, tp_group, dp_group):
         (2, 1, 1, 1, 2, 1, None),  # TP2,PP1 -> TP1,PP2
         (1, 2, 1, 2, 1, 1, None),  # TP1,PP2 -> TP2,PP1
         (1, 1, 2, 1, 1, 4, 4),  # EP2 -> EP4
-        (1, 1, 2, 1, 1, 1, 4),
+        (1, 1, 2, 1, 1, 1, 4),   # EP2 -> EP1
         (1, 1, 1, 1, 1, 2, 4),
         (1, 1, 2, 1, 2, 2, 4),
     ],
 )
 def test_nccl_swap_gpt_parametrized(
+    refit_backend: str,
     src_tp: int,
     src_pp: int,
     src_ep: int,
@@ -248,7 +249,7 @@ def test_nccl_swap_gpt_parametrized(
     dist.broadcast(ref_logits, src=src_last_pp_rank, group=src_pgs.pp)
 
     # Swap weights
-    swap_model_weights([src_model], [dst_model], refit_method="nccl")
+    swap_model_weights([src_model], [dst_model], refit_method=refit_backend)
 
     # Collect destination logits (parallel_output=False ensures full vocab on last PP stage)
     dst_logits = torch.empty(batch, seq_len, vocab_size, device=device, dtype=torch.float32)

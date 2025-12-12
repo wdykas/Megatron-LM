@@ -8,6 +8,7 @@ import torch
 import torch.distributed as dist
 
 from .copy_services.base import CopyService
+from .copy_services.nvshmem_copy_service import NVSHMEMCopyService
 from .utils import ReshardPlan
 
 logger = logging.getLogger(__name__)
@@ -27,26 +28,18 @@ def execute_reshard_plan(
 
     src_params = {name: p for name, p in src_module.named_parameters(recurse=True)}
     dst_params = {name: p for name, p in dst_module.named_parameters(recurse=True)}
-
-    # TODO(Peter) do this on like a separate stream?
-    # Execute local copies
-    for param_name, src_param, dst_param, src_slice, dst_slice in plan.local_copy_ops:
-        if src_param is None:
-            src_param = src_params.get(param_name)
-        if dst_param is None:
-            dst_param = dst_params.get(param_name)
-        if src_param is not None and dst_param is not None:
-            with torch.no_grad():
-                src_view = src_param.data[src_slice]
-                dst_view = dst_param.data[dst_slice]
-                dst_view.copy_(src_view)
+    submit_send_with_id = getattr(service, "submit_send_with_id", None)
+    submit_recv_with_id = getattr(service, "submit_recv_with_id", None)
 
     # Submit sends
     for op in plan.send_ops:
         src_param = src_params.get(op.param_name)
         if src_param is not None:
             src_view = src_param.data[op.my_slice].contiguous()
-            service.submit_send(src_view, op.peer_rank)
+            if submit_send_with_id is not None and op.task_id is not None:
+                submit_send_with_id(op.task_id, src_view, op.peer_rank)
+            else:
+                service.submit_send(src_view, op.peer_rank)
 
     # Submit recvs
     recv_writebacks: List[Tuple[torch.Tensor, torch.nn.Parameter, tuple[slice, ...]]] = []
@@ -55,7 +48,10 @@ def execute_reshard_plan(
         if dst_param is not None:
             dst_slice_view = dst_param.data[op.my_slice]
             recv_buffer = torch.empty_like(dst_slice_view.contiguous())
-            service.submit_recv(recv_buffer, op.peer_rank)
+            if submit_recv_with_id is not None and op.task_id is not None:
+                submit_recv_with_id(op.task_id, recv_buffer, op.peer_rank)
+            else:
+                service.submit_recv(recv_buffer, op.peer_rank)
             recv_writebacks.append((recv_buffer, dst_param, op.my_slice))
 
     # Execute

@@ -25,6 +25,11 @@ class TransferOp:
     my_slice: tuple[slice, ...]  # My tensor slice
     peer_slice: tuple[slice, ...]  # Peer's tensor slice (for reference)
 
+    # Optional global task identifier for advanced backends (e.g., NVSHMEM)
+    # When present, this ID is shared between the matching send/recv ops
+    # across ranks and can be used to build richer communication schedules.
+    task_id: int | None = None
+
 
 @dataclass
 class ParameterMetadata:
@@ -75,20 +80,10 @@ class ReshardPlan:
 
     send_ops: list[TransferOp]
     recv_ops: list[TransferOp]
-    local_copy_ops: list[
-        tuple[
-            str,
-            torch.nn.Parameter | None,
-            torch.nn.Parameter | None,
-            tuple[slice, ...],
-            tuple[slice, ...],
-        ]
-    ]  # (name, src_param, dst_param, src_slice, dst_slice)
 
     def __str__(self):
         return (
-            f"ReshardPlan(sends={len(self.send_ops)}, recvs={len(self.recv_ops)}, "
-            f"local_copies={len(self.local_copy_ops)})"
+            f"ReshardPlan(sends={len(self.send_ops)}, recvs={len(self.recv_ops)})"
         )
 
 
