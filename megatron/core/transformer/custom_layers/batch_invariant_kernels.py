@@ -15,6 +15,16 @@ import torch
 import triton
 import triton.language as tl
 
+# Optional cuTile (cuda.tile) backend for batch-invariant kernels.
+# We keep Triton as the default and add cuTile kernels side-by-side for experimentation.
+try:
+    import cuda.tile as ct  # type: ignore[import-not-found]
+
+    _CUTILE_AVAILABLE = True
+except ModuleNotFoundError:
+    ct = None
+    _CUTILE_AVAILABLE = False
+
 __all__ = [
     "set_batch_invariant_mode",
     "is_batch_invariant_mode_enabled",
@@ -464,6 +474,220 @@ def mean_dim(
 
     return output
 
+
+#
+# -----------------------------
+# cuTile experimental backends
+# -----------------------------
+#
+
+if _CUTILE_AVAILABLE:
+    ConstInt = ct.Constant[int]
+
+    def _cutile_swizzle_2d_from_bid(M, N, tm, tn, GROUP_SIZE_M, bid):
+        # Mirrors the swizzle logic from NVIDIA's cuTile matmul sample:
+        # https://raw.githubusercontent.com/NVIDIA/cutile-python/main/samples/MatMul.py
+        num_bid_m = ct.cdiv(M, tm)
+        num_bid_n = ct.cdiv(N, tn)
+        num_bid_in_group = GROUP_SIZE_M * num_bid_n
+        group_id = bid // num_bid_in_group
+        first_bid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_bid_m - first_bid_m, GROUP_SIZE_M)
+        bid_m = first_bid_m + (bid % group_size_m)
+        bid_n = (bid % num_bid_in_group) // group_size_m
+        return bid_m, bid_n
+
+    @ct.kernel
+    def _matmul_persistent_kernel_cutile(
+        A,
+        B,
+        C,
+        bias,
+        tm: ConstInt,
+        tn: ConstInt,
+        tk: ConstInt,
+        HAS_BIAS: ConstInt,
+    ):
+        """cuTile persistent matmul C = A @ B (+ bias), experimental.
+
+        - Launch is 1D: each CTA processes multiple (tm x tn) output tiles
+          in a persistent loop.
+        - Accumulates in fp32.
+        - Uses a 2D swizzle over a 1D CTA id similar to the cuTile sample.
+        """
+        GROUP_SIZE_M = 8
+
+        bid = ct.bid(0)
+        M = A.shape[0]
+        N = B.shape[1]
+
+        # Number of tiles along K for A's axis=1 (K dimension).
+        num_tiles_k = ct.num_tiles(A, axis=1, shape=(tm, tk))
+        zero_pad = ct.PaddingMode.ZERO
+
+        # Convert fp32 -> tf32 to use tensor cores (per cuTile sample).
+        dtype = ct.tfloat32 if A.dtype == ct.float32 else A.dtype
+
+        # Total output tiles (M-tiles * N-tiles)
+        num_bid_m = ct.cdiv(M, tm)
+        num_bid_n = ct.cdiv(N, tn)
+        upper_bound = num_bid_m * num_bid_n
+
+        # Persistent loop stride = number of CTAs launched.
+        num_tile_blocks = ct.num_blocks(0)
+        for current_bid in range(bid, upper_bound, num_tile_blocks):
+            accumulator = ct.full((tm, tn), 0, dtype=ct.float32)
+            bidx, bidy = _cutile_swizzle_2d_from_bid(M, N, tm, tn, GROUP_SIZE_M, current_bid)
+
+            for k in range(num_tiles_k):
+                a = ct.load(
+                    A, index=(bidx, k), shape=(tm, tk), padding_mode=zero_pad
+                ).astype(dtype)
+                b = ct.load(
+                    B, index=(k, bidy), shape=(tk, tn), padding_mode=zero_pad
+                ).astype(dtype)
+                accumulator = ct.mma(a, b, accumulator)
+
+            # Optional bias (assumed shape [N], broadcast over rows of tile)
+            if HAS_BIAS:
+                bvec = ct.load(bias, index=(bidy,), shape=(tn,), padding_mode=zero_pad).astype(
+                    ct.float32
+                )
+                accumulator = accumulator + bvec[None, :]
+
+            accumulator = ct.astype(accumulator, C.dtype)
+            ct.store(C, index=(bidx, bidy), tile=accumulator)
+
+
+    def matmul_persistent_cutile(
+        a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Experimental cuTile persistent matmul used by batch-invariant GEMM.
+
+        This is a drop-in alternative to `matmul_persistent` that you can call
+        explicitly for benchmarking. It is intentionally not wired into the
+        global `enable_batch_invariant_mode()` path by default.
+        """
+        if not _CUTILE_AVAILABLE:
+            raise RuntimeError("cuTile backend unavailable: `import cuda.tile as ct` failed.")
+        assert a.shape[1] == b.shape[0], "Incompatible dimensions"
+        assert a.is_cuda and b.is_cuda, "cuTile matmul requires CUDA tensors"
+        assert a.device == b.device, "Input tensors must be on the same device"
+        assert a.dtype == b.dtype, "Incompatible dtypes"
+        if bias is not None:
+            assert bias.dim() == 1, "bias must be 1D"
+            assert bias.numel() == b.shape[1], "bias length must equal output features (N)"
+            assert bias.device == a.device, "bias must be on the same device"
+
+        # Tile selection: start with values that match the cuTile sample defaults.
+        # You will likely want to tune these per shape/dtype/device.
+        if a.dtype.itemsize == 2:  # fp16/bf16
+            tm, tn, tk = 128, 256, 64
+        else:  # fp32 (uses tf32 internally)
+            tm, tn, tk = 128, 128, 32
+
+        M, _K = a.shape
+        _K2, N = b.shape
+        out = torch.empty((M, N), device=a.device, dtype=a.dtype)
+
+        # Launch a 1D persistent grid. Default heuristic: min(NUM_SMS, num_tiles).
+        props = torch.cuda.get_device_properties(a.device)
+        num_sms = props.multi_processor_count
+        grid_x = int(ct.cdiv(M, tm)) * int(ct.cdiv(N, tn))
+        grid_size = min(num_sms, grid_x)
+        grid = (grid_size, 1, 1)
+
+        ct.launch(
+            torch.cuda.current_stream(),
+            grid,
+            _matmul_persistent_kernel_cutile,
+            (a, b, out, bias if bias is not None else out, tm, tn, tk, int(bias is not None)),
+        )
+        return out
+
+
+    @ct.kernel
+    def _mean_lastdim_kernel_cutile(
+        X,
+        Y,
+        tm: ConstInt,
+        tn: ConstInt,
+    ):
+        """Compute mean over the last dimension of a 2D tensor.
+
+        X: [n_rows, n_cols]
+        Y: [n_rows]
+        """
+        bid_m = ct.bid(0)  # tile row id
+        n_cols = X.shape[1]
+
+        # Accumulate sums per row in fp32.
+        acc = ct.full((tm,), 0, dtype=ct.float32)
+        zero_pad = ct.PaddingMode.ZERO
+
+        # Number of tiles along the last dimension.
+        num_k_tiles = ct.num_tiles(X, axis=1, shape=(tm, tn))
+        for kt in range(num_k_tiles):
+            tile = ct.load(X, index=(bid_m, kt), shape=(tm, tn), padding_mode=zero_pad).astype(
+                ct.float32
+            )
+            # Reduce over columns of this tile.
+            acc = acc + ct.sum(tile, axis=1)
+
+        mean = acc / n_cols
+        ct.store(Y, index=(bid_m,), tile=ct.astype(mean, Y.dtype))
+
+
+    def mean_lastdim_cutile(
+        x: torch.Tensor, keepdim: bool = False, dtype: torch.dtype | None = None
+    ) -> torch.Tensor:
+        """Experimental cuTile mean over the last dimension (dim=-1).
+
+        This is a targeted replacement for the common RMSNorm usage pattern
+        (`mean_dim(..., dim=-1, keepdim=True)`).
+        """
+        if not _CUTILE_AVAILABLE:
+            raise RuntimeError("cuTile backend unavailable: `import cuda.tile as ct` failed.")
+        assert x.is_cuda, "Input must be a CUDA tensor"
+
+        if dtype is None:
+            dtype = x.dtype if x.dtype.is_floating_point else torch.float32
+        if x.dtype != dtype:
+            x = x.to(dtype)
+
+        # Flatten all leading dims into rows, reduce over last dim.
+        x2d = x.reshape(-1, x.shape[-1]).contiguous()
+        n_rows, n_cols = x2d.shape
+        y = torch.empty((n_rows,), device=x.device, dtype=dtype)
+
+        # Basic tiling. Tuneable.
+        tm, tn = 256, 1024
+        grid = (int(ct.cdiv(n_rows, tm)), 1, 1)
+
+        ct.launch(
+            torch.cuda.current_stream(),
+            grid,
+            _mean_lastdim_kernel_cutile,
+            (x2d, y, tm, tn),
+        )
+
+        if keepdim:
+            return y.reshape(*x.shape[:-1], 1)
+        return y.reshape(*x.shape[:-1])
+
+
+def mm_batch_invariant_cutile(a, b):
+    """Experimental batch-invariant replacement for `aten::mm` using cuTile."""
+    if not _CUTILE_AVAILABLE:
+        raise RuntimeError("cuTile backend unavailable: `import cuda.tile as ct` failed.")
+    return matmul_persistent_cutile(a, b)
+
+
+def addmm_batch_invariant_cutile(bias, a, b):
+    """Experimental batch-invariant replacement for `aten::addmm` using cuTile."""
+    if not _CUTILE_AVAILABLE:
+        raise RuntimeError("cuTile backend unavailable: `import cuda.tile as ct` failed.")
+    return matmul_persistent_cutile(a, b, bias=bias)
 
 def mm_batch_invariant(a, b):
     """Batch-invariant replacement for `aten::mm` using a persistent matmul kernel."""
