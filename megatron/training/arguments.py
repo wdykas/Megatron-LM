@@ -1399,6 +1399,8 @@ def core_transformer_config_from_args(args, config_class=None):
     if hasattr(args, "kitchen_attention_backend"):
         kw_args['kitchen_attention_backend'] = args.kitchen_attention_backend
 
+
+    kw_args['enable_routing_replay'] = True
     # Return config.
     return config_class(**kw_args)
 
