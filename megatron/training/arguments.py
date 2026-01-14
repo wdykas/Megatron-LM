@@ -2179,6 +2179,18 @@ def _add_rl_args(parser):
                         help='Number of parallel generation tasks for RL inference.')
     group.add_argument('--rl-skip-bos-token', action=argparse.BooleanOptionalAction, type=bool, default=False,
                         help='Skip BOS token at the beginning of the sequences. Default is False.')
+
+    # === Collaborative Reasoning ===
+    group.add_argument('--enable-collaborative-reasoning', action='store_true', default=False,
+                       help='Enable collaborative reasoning between parallel rollouts. '
+                            'Rollouts share hidden states within groups.')
+    group.add_argument('--collab-memory-dim', type=int, default=None,
+                       help='Dimension for collaborative memory storage. Default: hidden_size // 4')
+    group.add_argument('--collab-memory-lr-mult', type=float, default=10.0,
+                       help='Learning rate multiplier for collaborative memory parameters.')
+    group.add_argument('--collaboration-sync-interval', type=int, default=8,
+                       help='Sync collaboration every N tokens during decode.')
+
     return parser
 
 def _add_training_args(parser):
