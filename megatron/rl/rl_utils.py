@@ -1140,6 +1140,15 @@ def get_rollout_data_iterator(
     args = get_args()
     tokenizer = get_tokenizer()
 
+    # Initialize SOL hooks BEFORE rollout collection so we capture inference operations
+    # Note: Don't clear here - log_training_sol(clear=True) handles clearing at end of iteration
+    sol_model = model[0] if isinstance(model, (list, tuple)) else model
+    initialize_sol(sol_model, args)
+    
+    # Register optimizer for SOL tracking (tracks optimizer.step() time)
+    from megatron.rl.sol_integration import register_sol_optimizer
+    register_sol_optimizer(optimizer)
+
     buffered_rollouts = get_environment_rollouts(
         model, optimizer, args.grpo_prompts_per_step, args.grpo_group_size
     )

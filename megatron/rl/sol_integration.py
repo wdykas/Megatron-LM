@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """SOL (Speed of Light) integration for Megatron-RL."""
 
+import importlib
 import logging
 import sys
 from contextlib import contextmanager
@@ -12,11 +13,15 @@ from megatron.core.utils import log_single_rank
 from megatron.training.global_vars import get_args, get_tensorboard_writer, get_wandb_writer
 from megatron.training.utils import get_nvtx_range
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from sol_estimator.layer_hooks import LayerSOLHooks
 
+_SOL_IMPORT_ERROR = None
 try:
-    _sol_estimator_path = str(Path(__file__).parent.parent.parent.parent)
+    # sol_estimator is located at megatron-rl/sol_estimator/
+    _sol_estimator_path = str(Path(__file__).parent.parent.parent)
     if _sol_estimator_path not in sys.path:
         sys.path.insert(0, _sol_estimator_path)
     from sol_estimator.layer_hooks import LayerSOLHooks
@@ -25,14 +30,13 @@ try:
     from sol_estimator.phase_timer import PhaseTimer
     from sol_estimator import DataType
     SOL_ESTIMATOR_AVAILABLE = True
-except ImportError:
+except Exception as e:
     SOL_ESTIMATOR_AVAILABLE = False
+    _SOL_IMPORT_ERROR = e
     DataType = None
     CUDAGraphTracker = None
     OptimizerTracker = None
     PhaseTimer = None
-
-logger = logging.getLogger(__name__)
 
 
 class SOLTracker:
@@ -50,12 +54,21 @@ class SOLTracker:
         self.graph_tracker: "CUDAGraphTracker" = None
         self.optimizer_tracker: "OptimizerTracker" = None
         self.phase_timer: "PhaseTimer" = None
+        self._extra_patchers = []
+        self._phase_trackers = []
         self.initialized = False
     
     def initialize(self, model, args):
         """Initialize SOL tracking."""
         if not SOL_ESTIMATOR_AVAILABLE:
-            log_single_rank(logger, logging.WARNING, "SOL estimator not available")
+            if _SOL_IMPORT_ERROR:
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    f"SOL estimator not available: {_SOL_IMPORT_ERROR}",
+                )
+            else:
+                log_single_rank(logger, logging.WARNING, "SOL estimator not available")
             return False
         
         if not getattr(args, 'rl_enable_sol_tracking', False):
@@ -83,7 +96,36 @@ class SOLTracker:
             # OptimizerTracker
             if OptimizerTracker:
                 self.optimizer_tracker = OptimizerTracker(measure_time=True)
+
+            # Optional comm/sync tracking
+            if getattr(args, 'rl_enable_sol_comm_tracking', False):
+                self._setup_optional_patcher(
+                    module_name="sol_estimator.collective_patcher",
+                    class_candidates=("CollectivePatcher", "CollectiveTracker", "CollectiveHook"),
+                    label="collective",
+                )
+            if getattr(args, 'rl_enable_sol_sync_tracking', False):
+                self._setup_optional_patcher(
+                    module_name="sol_estimator.sync_tracker",
+                    class_candidates=("SyncTracker", "CudaSyncTracker", "SynchronizationTracker"),
+                    label="sync",
+                )
+                self._setup_optional_patcher(
+                    module_name="sol_estimator.functional_patcher",
+                    class_candidates=("FunctionalPatcher", "TorchFunctionalPatcher"),
+                    label="functional",
+                )
             
+            phase_candidates = [
+                self.layer_hooks,
+                self.graph_tracker,
+                self.phase_timer,
+                self.optimizer_tracker,
+            ] + [p for _, p, _ in self._extra_patchers]
+            self._phase_trackers = [
+                t for t in phase_candidates
+                if t is not None and hasattr(t, "push_phase") and hasattr(t, "pop_phase")
+            ]
             self.initialized = True
             log_single_rank(logger, logging.INFO, 
                 f"SOL tracking initialized: device={self.layer_hooks.device_spec.name}, dtype={dtype.value}")
@@ -99,6 +141,9 @@ class SOLTracker:
         for tracker in [self.layer_hooks, self.graph_tracker, self.phase_timer, self.optimizer_tracker]:
             if tracker is not None:
                 tracker.clear()
+        for _, patcher, _ in self._extra_patchers:
+            if patcher is not None and hasattr(patcher, "clear"):
+                patcher.clear()
     
     def cleanup(self):
         """Cleanup SOL tracking."""
@@ -106,24 +151,31 @@ class SOLTracker:
             self.layer_hooks.remove()
         if self.graph_tracker:
             self.graph_tracker.unpatch()
-        if self.phase_timer:
+        if self.phase_timer and hasattr(self.phase_timer, 'cleanup'):
             self.phase_timer.cleanup()
-        if self.optimizer_tracker:
+        if self.optimizer_tracker and hasattr(self.optimizer_tracker, 'cleanup'):
             self.optimizer_tracker.cleanup()
+        for _, patcher, unpatch_fn in self._extra_patchers:
+            if unpatch_fn is not None:
+                try:
+                    unpatch_fn()
+                except Exception:
+                    pass
+        self._extra_patchers = []
+        self._phase_trackers = []
         self.layer_hooks = self.graph_tracker = self.phase_timer = self.optimizer_tracker = None
         self.initialized = False
 
     @contextmanager
     def phase(self, name: str):
         """Context manager to mark operations as belonging to a phase."""
-        trackers = [self.layer_hooks, self.graph_tracker, self.phase_timer, self.optimizer_tracker]
-        for t in trackers:
+        for t in self._phase_trackers:
             if t is not None:
                 t.push_phase(name)
         try:
             yield
         finally:
-            for t in trackers:
+            for t in self._phase_trackers:
                 if t is not None:
                     t.pop_phase()
 
@@ -135,7 +187,74 @@ class SOLTracker:
 
     def get_captured_count(self) -> int:
         """Get total number of captured operations."""
-        return len(self.layer_hooks._captured_ops) if self.layer_hooks else 0
+        if not self.layer_hooks:
+            return 0
+        # Try public API first, fall back to private attribute
+        if hasattr(self.layer_hooks, 'get_captured_count'):
+            return self.layer_hooks.get_captured_count()
+        elif hasattr(self.layer_hooks, '_captured_ops'):
+            return len(self.layer_hooks._captured_ops)
+        return 0
+
+    def _setup_optional_patcher(
+        self,
+        module_name: str,
+        class_candidates: tuple[str, ...],
+        label: str,
+    ) -> None:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as e:
+            logger.debug(f"SOL {label} tracker import failed: {e}")
+            return
+
+        def _first_callable(obj, names):
+            for name in names:
+                candidate = getattr(obj, name, None)
+                if callable(candidate):
+                    return candidate
+            return None
+
+        # Try class-based patchers first
+        for class_name in class_candidates:
+            cls = getattr(module, class_name, None)
+            if cls is None:
+                continue
+            instance = None
+            for kwargs in ({"measure_time": True}, {}):
+                try:
+                    instance = cls(**kwargs)
+                    break
+                except TypeError:
+                    continue
+                except Exception as e:
+                    logger.debug(f"SOL {label} tracker init failed: {e}")
+                    return
+            if instance is None:
+                continue
+            patch_fn = _first_callable(instance, ("patch", "enable", "start"))
+            if patch_fn is None:
+                continue
+            try:
+                patch_fn()
+            except Exception as e:
+                logger.debug(f"SOL {label} tracker patch failed: {e}")
+                return
+            unpatch_fn = _first_callable(instance, ("unpatch", "disable", "stop"))
+            self._extra_patchers.append((label, instance, unpatch_fn))
+            return
+
+        # Fallback to module-level patchers
+        patch_fn = _first_callable(module, ("patch", "enable", "start"))
+        if patch_fn is None:
+            return
+        try:
+            patch_fn()
+        except Exception as e:
+            logger.debug(f"SOL {label} module patch failed: {e}")
+            return
+        unpatch_fn = _first_callable(module, ("unpatch", "disable", "stop"))
+        self._extra_patchers.append((label, module, unpatch_fn))
 
     def _print_report(self, summary: dict, phase_times: dict = None, optimizer_summary: dict = None):
         """Print SOL report."""
@@ -200,7 +319,7 @@ class SOLTracker:
         if not self.layer_hooks:
             return
         
-        num_ops = len(self.layer_hooks._captured_ops)
+        num_ops = self.get_captured_count()
         if num_ops == 0:
             return
             
@@ -271,10 +390,20 @@ def get_sol_tracker() -> SOLTracker:
 
 @contextmanager
 def sol_nvtx_range(name: str, log_level: int = 1):
+    """Context manager that combines NVTX range with SOL phase tracking.
+    
+    Args:
+        name: Name for the NVTX range and SOL phase
+        log_level: Log level (kept for API compatibility, not used by nvtx_range)
+    """
     nvtx_range = get_nvtx_range()
     sol_tracker = get_sol_tracker()
-    with nvtx_range(name, log_level=log_level):
-        with sol_tracker.phase(name):
+    if sol_tracker.initialized:
+        with nvtx_range(name):
+            with sol_tracker.phase(name):
+                yield
+    else:
+        with nvtx_range(name):
             yield
 
 def log_training_sol(iteration: int, clear: bool = True):

@@ -2474,6 +2474,10 @@ def train(
             forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func
         )
         ft_integration.on_training_step_end()
+        
+        # SOL (Speed of Light) logging for training operations
+        if has_rl_utils and getattr(args, 'rl_enable_sol_tracking', False):
+            rl_utils.log_training_sol(iteration, clear=True)
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,
