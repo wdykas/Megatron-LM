@@ -8,7 +8,7 @@ import socket
 import struct
 import time
 import warnings
-from collections import deque
+from collections import defaultdict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -242,6 +242,15 @@ class DynamicInferenceEngine(AbstractEngine):
         self.stop_word_finished_request_ids: set[int] = set()
         # Track requests currently being finished due to stop words (to skip extra token)
         self.stop_word_being_finished_ids: set[int] = set()
+
+        # Group tracking for collaborative reasoning
+        self.request_groups: Dict[int, set[int]] = defaultdict(set)  # group_id -> set of request_ids
+        self.group_reasoning_state: Dict[int, bool] = {}  # group_id -> is any request reasoning
+
+        # Collaboration settings - get once from args (will error if args not available)
+        from megatron.training.global_vars import get_args
+        args = get_args()
+        self.collaboration_method = getattr(args, 'rl_collaboration_method', 'none')
 
         # Timing and logging variables.
         self.rank = torch.distributed.get_rank()
@@ -745,6 +754,7 @@ class DynamicInferenceEngine(AbstractEngine):
         request_id: int,
         prompt: Union[str, List[int], Tensor],
         sampling_params: Optional[SamplingParams] = None,
+        group_id: Optional[int] = None,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add request to inference context.
 
@@ -752,6 +762,7 @@ class DynamicInferenceEngine(AbstractEngine):
             request_id (int): Unique ID of request.
             prompt (Union[str, Tensor]): Prompt as either a text string or token IDs.
             sampling_params (Optional[SamplingParams]): Sampling parameters for the request.
+            group_id (Optional[int]): Group ID for collaborative reasoning.
 
         Return:
             Returns an asyncio `Future[DynamicInferenceRequest]` for the user to wait on.
@@ -788,6 +799,7 @@ class DynamicInferenceEngine(AbstractEngine):
             prompt=prompt_str,
             prompt_tokens=tokens,
             sampling_params=sampling_params,
+            group_id=group_id,
         )
 
         # Add request.
@@ -839,6 +851,17 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.tpot = []
                     request.tpot.append(step_time)
 
+                    # Check for reasoning tokens (after token is appended)
+                    if request.sampling_params.reasoning_start_tokens and token in request.sampling_params.reasoning_start_tokens:
+                        request.is_reasoning = True
+                        if request.group_id is not None:
+                            self.group_reasoning_state[request.group_id] = True
+                    elif request.sampling_params.reasoning_end_tokens and token in request.sampling_params.reasoning_end_tokens:
+                        request.is_reasoning = False
+                        # Check if any other request in group is still reasoning
+                        if request.group_id is not None:
+                            self._update_group_reasoning_state(request.group_id)
+
                 # Check for stop words (after token is appended)
                 stop_word_hit = self._check_stop_words_for_request_post_append(request)
 
@@ -851,6 +874,15 @@ class DynamicInferenceEngine(AbstractEngine):
                     finished_request.generated_length = len(finished_request.generated_tokens)
                     finished_request_records.append(finished_entry.record)
                     finished_entry.future.set_result(finished_entry.record)
+
+                    # Clean up group tracking if request was part of a group
+                    if request.group_id is not None:
+                        self.request_groups[request.group_id].discard(request_id)
+                        # If group is now empty, clean up group state
+                        if len(self.request_groups[request.group_id]) == 0:
+                            del self.request_groups[request.group_id]
+                            if request.group_id in self.group_reasoning_state:
+                                del self.group_reasoning_state[request.group_id]
                 elif stop_word_hit:
                     # Stop word detected - mark for removal in next step's bookkeeping
                     # Don't pop yet; let the next step handle it properly via callback
@@ -1017,6 +1049,23 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return False
 
+    def _update_group_reasoning_state(self, group_id: int) -> None:
+        """Update the reasoning state for a group based on its active requests.
+
+        Args:
+            group_id: The group ID to update
+        """
+        # Check if any request in the group is still reasoning
+        any_reasoning = False
+        for request_id in self.request_groups[group_id]:
+            if request_id in self.requests:
+                request = self.get_request(request_id)
+                if request.is_reasoning:
+                    any_reasoning = True
+                    break
+
+        self.group_reasoning_state[group_id] = any_reasoning
+
     def schedule_waiting_requests(self):
         """Tries to schedule any requests in the waiting pool."""
         if self.enable_chunked_prefill:
@@ -1026,23 +1075,63 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def schedule_non_chunked_prefill(self):
         """
-        Perform the same original scheduling logic for non-chunked runs
+        Perform the same original scheduling logic for non-chunked runs.
+        Group-aware: requests in reasoning groups are scheduled together.
         """
         while self.waiting_request_ids:
             req = self.get_request(self.waiting_request_ids[0])
-            request_can_be_added, request_tokens_can_be_added, kv_cache_available = (
-                self.context.check_availability(req)
-            )
-            if request_can_be_added and request_tokens_can_be_added and kv_cache_available:
-                self.context.add_request(req)
-                self._loop.call_soon_threadsafe(
-                    self._loop.create_task, self._notify_cond_for_new_request()
-                )
-                req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
-                req.add_event_add()
-                self.waiting_request_ids.popleft()
+
+            # If request has a group_id and group is reasoning, schedule entire group
+            if req.group_id is not None and self.group_reasoning_state.get(req.group_id, False):
+                # Collect all waiting requests from this group
+                group_request_ids = [
+                    rid for rid in self.waiting_request_ids
+                    if self.get_request(rid).group_id == req.group_id
+                ]
+
+                # Check if we can add all requests in the group
+                can_add_all = True
+                for rid in group_request_ids:
+                    group_req = self.get_request(rid)
+                    request_can_be_added, request_tokens_can_be_added, kv_cache_available = (
+                        self.context.check_availability(group_req)
+                    )
+                    if not (request_can_be_added and request_tokens_can_be_added and kv_cache_available):
+                        can_add_all = False
+                        break
+
+                if can_add_all:
+                    # Schedule all group requests together
+                    for rid in group_request_ids:
+                        group_req = self.get_request(rid)
+                        self.context.add_request(group_req)
+                        self._loop.call_soon_threadsafe(
+                            self._loop.create_task, self._notify_cond_for_new_request()
+                        )
+                        group_req.remaining_prompt_tokens = group_req.remaining_prompt_tokens.new_empty(0)
+                        group_req.add_event_add()
+                        self.waiting_request_ids.remove(rid)
+                        self.request_groups[req.group_id].add(rid)
+                else:
+                    # Can't fit entire group, wait for space
+                    break
             else:
-                break
+                # Independent request or non-reasoning group, schedule normally
+                request_can_be_added, request_tokens_can_be_added, kv_cache_available = (
+                    self.context.check_availability(req)
+                )
+                if request_can_be_added and request_tokens_can_be_added and kv_cache_available:
+                    self.context.add_request(req)
+                    self._loop.call_soon_threadsafe(
+                        self._loop.create_task, self._notify_cond_for_new_request()
+                    )
+                    req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
+                    req.add_event_add()
+                    self.waiting_request_ids.popleft()
+                    if req.group_id is not None:
+                        self.request_groups[req.group_id].add(req.request_id)
+                else:
+                    break
 
     def schedule_chunked_prefill(self):
         """
@@ -1088,6 +1177,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     req.add_event_add()
                     # Fully scheduled, so we remove from waiting pool
                     self.waiting_request_ids.popleft()
+                    # Track group membership if applicable
+                    if req.group_id is not None:
+                        self.request_groups[req.group_id].add(req.request_id)
                     # Only this case we keep checking the rest of the waiting queue
                     can_schedule = True
                 elif token_partially_can_be_added:
@@ -1102,6 +1194,322 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Still have tokens to prefill, so we break and keep the
                     # chunked prefill request at the head of the waiting queue
                     # Note that we do not need to continue check the queue, as the tokens are full
+
+    def apply_collaboration_pre(
+        self,
+        group_id: int,
+        request_ids: List[int],
+    ) -> None:
+        """Hook for collaboration BEFORE token generation.
+
+        Called before generating tokens to allow traces to coordinate their generation strategy.
+
+        Behavior controlled by --rl-collaboration-method:
+        - 'none': No collaboration (skip)
+        - 'kv_mixing': Average KV cache across traces (default)
+        - 'temperature_diversity': Assign different temperatures
+        - 'early_termination': No pre-generation action
+
+        Args:
+            group_id: The group identifier
+            request_ids: List of request IDs in this group that are reasoning
+        """
+        if len(request_ids) < 2:
+            return
+
+        # Skip if collaboration disabled
+        if self.collaboration_method == 'none':
+            return
+
+        # Initialize collaboration metrics if first time
+        if not hasattr(self, '_collab_metrics'):
+            self._collab_metrics = {
+                'method': self.collaboration_method,
+                'total_ops': 0,
+                'total_mixed_blocks': 0,
+                'groups_mixed': set(),
+            }
+
+        self._collab_metrics['total_ops'] += 1
+
+        # Apply the selected collaboration method
+        if self.collaboration_method == 'kv_mixing':
+            self._apply_kv_mixing(group_id, request_ids)
+        elif self.collaboration_method == 'temperature_diversity':
+            self._apply_temperature_diversity(group_id, request_ids)
+        # early_termination has no pre-generation action
+
+    def _apply_kv_mixing(self, group_id: int, request_ids: List[int]) -> None:
+        """Apply KV cache mixing across traces."""
+        try:
+            import torch
+
+            # Get all requests in the group
+            requests = [self.get_request(rid) for rid in request_ids]
+
+            # Check if all requests have blocks allocated
+            if not all(hasattr(req, 'allocated_blocks') and req.allocated_blocks for req in requests):
+                return
+
+            # Get the memory buffer (KV cache)
+            memory_buffer = self.context.memory_buffer
+            if memory_buffer is None:
+                return
+
+            # Find common block positions across all requests
+            min_blocks = min(len(req.allocated_blocks) for req in requests)
+            if min_blocks == 0:
+                return
+
+            # Get mixing parameters from args
+            from megatron.training.global_vars import get_args
+            args = get_args()
+            mixing_coef = getattr(args, 'rl_collaboration_kv_mixing_coef', 1.0)
+            num_blocks_to_mix = getattr(args, 'rl_collaboration_kv_mixing_num_blocks', 1)
+
+            # Collect block indices to mix (last N blocks)
+            all_block_indices_per_trace = []
+            for req in requests:
+                # Get last N blocks for this trace
+                num_blocks = len(req.allocated_blocks)
+                start_idx = max(0, num_blocks - num_blocks_to_mix)
+                block_indices = req.allocated_blocks[start_idx:]
+                all_block_indices_per_trace.append(block_indices)
+
+            # Mix each block position
+            for block_pos in range(num_blocks_to_mix):
+                # Collect blocks at this position from all traces
+                block_indices_at_pos = []
+                for trace_blocks in all_block_indices_per_trace:
+                    if block_pos < len(trace_blocks):
+                        block_indices_at_pos.append(trace_blocks[-(block_pos + 1)])
+
+                if len(block_indices_at_pos) < 2:
+                    continue
+
+                # Extract KV data
+                block_data_list = []
+                original_data_list = []
+                for block_idx in block_indices_at_pos:
+                    if block_idx < memory_buffer.shape[0]:
+                        data = memory_buffer[block_idx].clone()
+                        block_data_list.append(data)
+                        original_data_list.append(data.clone())
+
+                if not block_data_list:
+                    continue
+
+                # Average across traces
+                averaged_block = torch.stack(block_data_list, dim=0).mean(dim=0)
+
+                # Apply mixing coefficient: mixed = coef * avg + (1-coef) * original
+                for idx, block_idx in enumerate(block_indices_at_pos):
+                    if block_idx < memory_buffer.shape[0]:
+                        if mixing_coef < 1.0:
+                            mixed = mixing_coef * averaged_block + (1 - mixing_coef) * original_data_list[idx]
+                            memory_buffer[block_idx] = mixed
+                        else:
+                            memory_buffer[block_idx] = averaged_block
+
+                self._collab_metrics['total_mixed_blocks'] += len(block_indices_at_pos)
+
+            self._collab_metrics['groups_mixed'].add(group_id)
+
+            # Log first time for this group
+            if not hasattr(self, '_collab_mixed_logged'):
+                self._collab_mixed_logged = set()
+            if group_id not in self._collab_mixed_logged:
+                print(f"[COLLAB] Group {group_id}: KV mixing across {len(request_ids)} traces "
+                      f"(coef={mixing_coef:.2f}, num_blocks={num_blocks_to_mix})")
+                self._collab_mixed_logged.add(group_id)
+
+        except Exception as e:
+            # Don't crash if mixing fails - just skip it
+            import logging
+            logging.warning(f"[COLLAB] KV cache mixing failed: {e}")
+
+    def _apply_temperature_diversity(self, group_id: int, request_ids: List[int]) -> None:
+        """Apply temperature diversity across traces."""
+        try:
+            # Assign different temperatures for diversity
+            base_temps = [0.3, 0.6, 0.9, 1.2]
+
+            for idx, rid in enumerate(request_ids):
+                request = self.get_request(rid)
+                temp_idx = idx % len(base_temps)
+                original_temp = request.sampling_params.temperature
+                request.sampling_params.temperature = base_temps[temp_idx]
+
+            # Log first time for this group
+            if not hasattr(self, '_collab_temp_logged'):
+                self._collab_temp_logged = set()
+            if group_id not in self._collab_temp_logged:
+                print(f"[COLLAB] Group {group_id}: Temperature diversity across {len(request_ids)} traces "
+                      f"(temps={base_temps[:len(request_ids)]})")
+                self._collab_temp_logged.add(group_id)
+
+        except Exception as e:
+            import logging
+            logging.warning(f"[COLLAB] Temperature diversity failed: {e}")
+
+    def apply_collaboration_post(
+        self,
+        group_id: int,
+        request_ids: List[int],
+        generated_tokens: Optional[Dict[int, List[int]]] = None,
+    ) -> None:
+        """Hook for collaboration AFTER token generation.
+
+        Called after generating tokens to allow traces to react to what was generated.
+
+        Behavior controlled by --rl-collaboration-method:
+        - 'none': No collaboration (skip)
+        - 'kv_mixing': Track diversity to measure effectiveness
+        - 'temperature_diversity': Track diversity
+        - 'early_termination': Terminate all traces when one finishes
+
+        Args:
+            group_id: The group identifier
+            request_ids: List of request IDs in this group that are reasoning
+            generated_tokens: Optional dict mapping request_id -> list of generated token IDs
+        """
+        if len(request_ids) < 2 or not generated_tokens:
+            return
+
+        # Skip if collaboration disabled
+        if self.collaboration_method == 'none':
+            return
+
+        # Initialize metrics if needed
+        if not hasattr(self, '_collab_metrics'):
+            self._collab_metrics = {
+                'method': self.collaboration_method,
+                'total_ops': 0,
+                'total_mixed_blocks': 0,
+                'groups_mixed': set(),
+                'diversity_scores': [],
+                'early_terminations': 0,
+            }
+
+        # Track token diversity for all methods (useful metric)
+        self._track_diversity(request_ids, generated_tokens)
+
+        # Apply method-specific post-generation logic
+        if self.collaboration_method == 'early_termination':
+            self._apply_early_termination(group_id, request_ids, generated_tokens)
+
+    def _track_diversity(self, request_ids: List[int], generated_tokens: Dict[int, List[int]]) -> None:
+        """Track token diversity across traces."""
+        last_tokens = []
+        for rid in request_ids:
+            tokens = generated_tokens.get(rid, [])
+            if tokens:
+                last_tokens.append(tokens[-1])
+
+        if len(last_tokens) >= 2:
+            # Calculate diversity as ratio of unique tokens
+            unique_count = len(set(last_tokens))
+            diversity = unique_count / len(last_tokens)
+            self._collab_metrics['diversity_scores'].append(diversity)
+
+    def _apply_early_termination(self, group_id: int, request_ids: List[int],
+                                  generated_tokens: Dict[int, List[int]]) -> None:
+        """Terminate all traces when one finishes reasoning."""
+        try:
+            # Check if any trace finished reasoning
+            sample_request = self.get_request(request_ids[0])
+            reasoning_end_tokens = set()
+            if sample_request.sampling_params.reasoning_end_tokens:
+                reasoning_end_tokens = set(sample_request.sampling_params.reasoning_end_tokens)
+
+            if not reasoning_end_tokens:
+                return
+
+            for rid, tokens in generated_tokens.items():
+                if tokens and tokens[-1] in reasoning_end_tokens:
+                    # One trace finished - terminate others
+                    print(f"[COLLAB] Group {group_id}: Early termination triggered by request {rid}")
+
+                    for other_rid in request_ids:
+                        if other_rid != rid:
+                            other_request = self.get_request(other_rid)
+                            other_request.is_reasoning = False
+                            # Inject end token to force termination
+                            end_token = list(reasoning_end_tokens)[0]
+                            other_request.generated_tokens.append(end_token)
+
+                    self._collab_metrics['early_terminations'] += 1
+                    break
+
+        except Exception as e:
+            import logging
+            logging.warning(f"[COLLAB] Early termination failed: {e}")
+
+    # Backward compatibility: apply_collaboration calls apply_collaboration_post
+    def apply_collaboration(
+        self,
+        group_id: int,
+        request_ids: List[int],
+        hidden_states: Optional[Tensor] = None,
+        generated_tokens: Optional[Dict[int, List[int]]] = None,
+    ) -> Optional[Tensor]:
+        """Legacy hook - calls apply_collaboration_post for backward compatibility."""
+        self.apply_collaboration_post(group_id, request_ids, generated_tokens)
+        return None
+
+    def get_collaboration_metrics(self) -> Dict[str, float]:
+        """Get collaboration metrics for logging.
+
+        Returns:
+            Dictionary of collaboration metrics including:
+            - collab_method: The collaboration method used
+            - collab_total_ops: Number of collaboration operations
+            - collab_total_mixed_blocks: Total number of KV cache blocks mixed (kv_mixing only)
+            - collab_groups_mixed: Number of unique groups with collaboration
+            - collab_mean_diversity: Mean token diversity (lower = more consensus)
+            - collab_early_terminations: Number of early terminations (early_termination only)
+        """
+        if not hasattr(self, '_collab_metrics'):
+            return {}
+
+        metrics = {
+            'collab_method': self._collab_metrics.get('method', 'unknown'),
+            'collab_total_ops': self._collab_metrics.get('total_ops', 0),
+            'collab_groups_mixed': len(self._collab_metrics.get('groups_mixed', set())),
+        }
+
+        # Method-specific metrics
+        if self._collab_metrics.get('method') == 'kv_mixing':
+            metrics['collab_total_mixed_blocks'] = self._collab_metrics.get('total_mixed_blocks', 0)
+        elif self._collab_metrics.get('method') == 'early_termination':
+            metrics['collab_early_terminations'] = self._collab_metrics.get('early_terminations', 0)
+
+        # Calculate mean diversity if we have scores (all methods)
+        diversity_scores = self._collab_metrics.get('diversity_scores', [])
+        if diversity_scores:
+            import statistics
+            metrics['collab_mean_diversity'] = statistics.mean(diversity_scores)
+            metrics['collab_min_diversity'] = min(diversity_scores)
+            metrics['collab_max_diversity'] = max(diversity_scores)
+
+        return metrics
+
+    def reset_collaboration_metrics(self) -> None:
+        """Reset collaboration metrics for next iteration."""
+        if hasattr(self, '_collab_metrics'):
+            method = self._collab_metrics.get('method', 'kv_mixing')
+            self._collab_metrics = {
+                'method': method,
+                'total_ops': 0,
+                'total_mixed_blocks': 0,
+                'groups_mixed': set(),
+                'diversity_scores': [],
+                'early_terminations': 0,
+            }
+        if hasattr(self, '_collab_mixed_logged'):
+            self._collab_mixed_logged = set()
+        if hasattr(self, '_collab_temp_logged'):
+            self._collab_temp_logged = set()
 
     async def async_forward(self) -> Tuple[Dict, Dict, float, int]:
         """Uses `asyncio` for continuous generation.
@@ -1132,6 +1540,22 @@ class DynamicInferenceEngine(AbstractEngine):
             "active_token_count": self.context.active_token_count,
         }
 
+        # Apply pre-generation collaboration for reasoning groups
+        # Only if groups exist and collaboration is enabled
+        if self.group_reasoning_state:
+            for group_id, is_reasoning in self.group_reasoning_state.items():
+                if is_reasoning:
+                    reasoning_request_ids = [
+                        rid for rid in self.request_groups.get(group_id, set())
+                        if rid in self.requests and self.get_request(rid).is_reasoning
+                    ]
+                    if len(reasoning_request_ids) > 1:  # Only collaborate if multiple traces
+                        # Call pre-generation collaboration hook
+                        self.apply_collaboration_pre(
+                            group_id=group_id,
+                            request_ids=reasoning_request_ids,
+                        )
+
         # Generate tokens.
         range_push("Prefill" if not is_decode_only else "Decode")
         # TODO @TDE: Account for this line when overlapping forward and bookkeep.
@@ -1143,6 +1567,28 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
         self.step_count += 1
+
+        # Apply post-generation collaboration for reasoning groups
+        # Only if groups exist and collaboration is enabled
+        if self.group_reasoning_state:
+            for group_id, is_reasoning in self.group_reasoning_state.items():
+                if is_reasoning:
+                    reasoning_request_ids = [
+                        rid for rid in self.request_groups.get(group_id, set())
+                        if rid in self.requests and self.get_request(rid).is_reasoning
+                    ]
+                    if len(reasoning_request_ids) > 1:  # Only collaborate if multiple traces
+                        # Extract tokens for collaboration
+                        generated_tokens = {
+                            rid: self.get_request(rid).generated_tokens
+                            for rid in reasoning_request_ids
+                        }
+                        # Call post-generation collaboration hook
+                        self.apply_collaboration_post(
+                            group_id=group_id,
+                            request_ids=reasoning_request_ids,
+                            generated_tokens=generated_tokens,
+                        )
 
         range_pop()
 
@@ -1514,9 +1960,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 ), "Engine is shutting down. No other messages allowed except STOP_ACK."
 
             if header == Headers.SUBMIT_REQUEST:
-                request_id, prompt, sampling_params = data[1:]
+                request_id, prompt, sampling_params, group_id = data[1:]
                 sampling_params = SamplingParams.deserialize(sampling_params)
-                self.add_request(request_id, prompt, sampling_params)
+                self.add_request(request_id, prompt, sampling_params, group_id)
             elif header == Headers.PAUSE:
                 # Pause thyself.
                 self.received_pause = True

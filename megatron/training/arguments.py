@@ -2133,6 +2133,24 @@ def _add_rl_args(parser):
                        help='Enable SOL tracking of CUDA graph captures and replays. '
                             'Tracks graph.capture_begin/end, graph.replay() with timing. '
                             'Essential for accurate estimation when using CUDA graphs for inference.')
+
+    # Grouped reasoning collaboration arguments
+    group.add_argument('--rl-collaboration-method', type=str, default='none',
+                       choices=['none', 'kv_mixing', 'temperature_diversity', 'early_termination'],
+                       help='Collaboration method for grouped reasoning traces. '
+                            'none: No collaboration (independent traces, default). '
+                            'kv_mixing: Average KV cache across traces. '
+                            'temperature_diversity: Assign different temperatures to traces. '
+                            'early_termination: Terminate all traces when one finishes.')
+    group.add_argument('--rl-collaboration-kv-mixing-coef', type=float, default=1.0,
+                       help='Mixing coefficient for KV cache mixing (0.0 = no mixing, 1.0 = full average). '
+                            'Controls how strongly traces influence each other. Only used when '
+                            '--rl-collaboration-method=kv_mixing.')
+    group.add_argument('--rl-collaboration-kv-mixing-num-blocks', type=int, default=1,
+                       help='Number of recent KV cache blocks to mix (default: 1 = only last block). '
+                            'Larger values mix more history but increase overhead. Only used when '
+                            '--rl-collaboration-method=kv_mixing.')
+
     return parser
 
 def _add_training_args(parser):

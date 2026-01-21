@@ -220,11 +220,13 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             add_BOS=(not args.rl_skip_bos_token and tokenizer.bos is not None),
         )
         requests = [
-            self._client.add_request(prompt=prompt, sampling_params=sampling_params)
+            self._client.add_request(prompt=prompt, sampling_params=sampling_params, group_id=None)
             for prompt in request.prompt
         ]
+
         records = await asyncio.gather(*requests)
         responses = [record[-1] for record in records]
+
         return [
             InferenceResponse(
                 response=r.generated_text,

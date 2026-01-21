@@ -103,9 +103,10 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
                 True if (x >= response.prompt_length) else False
                 for x in range(len(response.token_ids))
             ]
+            reward = await self.get_reward(response_text, golden)
             rollout = TokenRollout(
                 trajectory=response.token_ids,
-                reward=await self.get_reward(response_text, golden),
+                reward=reward,
                 logprobs=logprobs,
                 generation_mask=generation_mask,
                 env_id=self.env_id,

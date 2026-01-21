@@ -248,6 +248,8 @@ class DynamicInferenceRequest(InferenceRequest):
     latency: Optional[float] = None
     finished_chunk_token_count = 0
     stop_word_ids: Optional[List[List[int]]] = None  # Tokenized stop words (populated internally)
+    group_id: Optional[int] = None  # Group ID for collaborative reasoning
+    is_reasoning: bool = False  # Whether currently generating reasoning tokens
 
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)

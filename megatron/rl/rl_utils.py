@@ -131,6 +131,7 @@ class RLRuntimeState:
         self.global_batches_per_collection = 0
         self.sequences_this_iteration_on_rank = 0
         self.latest_batch_num_sequences = 0
+        self.collaboration_metrics = {}
 
     def reset_iteration_counters(self, iteration):
         """Reset per-iteration counters."""
@@ -340,7 +341,9 @@ def get_environment_rollouts(
         samples_per_group: Amount of trajectories per prompt.
 
     Returns:
-        GroupedRollouts object which is a nested list with each element being a list of rollouts of a group.
+        Tuple of (rollouts, collaboration_metrics):
+        - GroupedRollouts object which is a nested list with each element being a list of rollouts of a group.
+        - Dict of collaboration metrics from the inference engine
     """
     args = get_args()
     nvtx_range = get_nvtx_range()
@@ -348,6 +351,8 @@ def get_environment_rollouts(
     assert (
         n_prompts % mpu.get_data_parallel_world_size() == 0
     ), "n_prompts must be divisible by data_parallel_world_size"
+
+    collaboration_metrics = {}
 
     with nvtx_range("rollout-collection"):
         loop = get_asyncio_loop()
@@ -390,11 +395,40 @@ def get_environment_rollouts(
                     # Just set up space to collect the rollouts
                     rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
 
+            # Collect collaboration metrics from the inference engine
+            with nvtx_range("collect-collab-metrics"):
+                if rank == 0:
+                    try:
+                        # Access the dynamic inference engine to get collaboration metrics
+                        if hasattr(inference_interface, '_inference_engine'):
+                            engine = inference_interface._inference_engine
+                            if hasattr(engine, 'get_collaboration_metrics'):
+                                collaboration_metrics = engine.get_collaboration_metrics()
+                                log_single_rank(
+                                    logger,
+                                    logging.INFO,
+                                    f"Collaboration metrics: {collaboration_metrics}",
+                                )
+                                # Reset metrics for next iteration
+                                engine.reset_collaboration_metrics()
+                    except Exception as e:
+                        log_single_rank(
+                            logger,
+                            logging.WARNING,
+                            f"Failed to collect collaboration metrics: {e}",
+                        )
+
         with nvtx_range("sync-rollouts"):
             # Wait for Rollouts to be collected
             # TODO(jbarker): double check why this isn't causing rank 0 memory allocations
             torch.distributed.broadcast_object_list(rollouts, src=0)
         logger.debug(f"Got rollouts on rank {rank}")
+
+        # Broadcast collaboration metrics to all ranks
+        with nvtx_range("sync-collab-metrics"):
+            metrics_list = [collaboration_metrics]
+            torch.distributed.broadcast_object_list(metrics_list, src=0)
+            collaboration_metrics = metrics_list[0]
 
     if lang_rl_log_dir and rank == get_tensor_model_parallel_src_rank():
         with open(
@@ -405,7 +439,7 @@ def get_environment_rollouts(
         ) as f:
             pickle.dump(rollouts, f)
 
-    return rollouts
+    return rollouts, collaboration_metrics
 
 
 def selective_log_softmax(logits, index):
@@ -607,6 +641,7 @@ def maybe_log_training_metrics(
     example_group: list[TokenRollout | Rollout],
     wandb_writer: wandb_run.Run | None = None,
     tb_writer: SummaryWriter | None = None,
+    collaboration_metrics: Dict[str, float] | None = None,
 ):
     """Log training metrics if writers are available.
 
@@ -617,6 +652,7 @@ def maybe_log_training_metrics(
         example_group: A list of rollouts of one group to log examples of trajectories.
         wandb_writer: W&B writer object.
         tb_writer:  Tensorboard writer object.
+        collaboration_metrics: Optional dict of collaboration metrics from inference engine.
     """
     if wandb_writer:
         group_table = wandb_writer.Table(
@@ -683,11 +719,16 @@ def maybe_log_training_metrics(
                     if group_stats.mean_sim
                     else {}
                 ),
+                **(collaboration_metrics if collaboration_metrics else {}),
             },
             step=current_iteration,
         )
     if tb_writer:
         tb_writer.add_scalar('mean_reward', group_stats.mean_reward, current_iteration)
+        # Log collaboration metrics to tensorboard
+        if collaboration_metrics:
+            for key, value in collaboration_metrics.items():
+                tb_writer.add_scalar(key, value, current_iteration)
 
 
 def prepare_trajectories(
@@ -836,6 +877,7 @@ def prepare_data_for_update(
     ref_state_dict: Dict[str, Any],
     rollouts: GroupedRollouts,
     tokenizer: MegatronLegacyTokenizer,
+    collaboration_metrics: Dict[str, float] | None = None,
 ) -> RerunDataIterator:
     """Extract data for the update from raw rollouts.
 
@@ -844,6 +886,7 @@ def prepare_data_for_update(
         ref_state_dict: Reference policy state dict.
         rollouts: Rollouts to extract the data from.
         tokenizer: Tokenizer to pad/tokenize data.
+        collaboration_metrics: Optional collaboration metrics from inference engine.
 
     Returns:
         Cycled iterator over dataset batches. In GRPO we might want to go over the same data multiple times.
@@ -1125,6 +1168,7 @@ def prepare_data_for_update(
                 example_group=rollouts[0],
                 wandb_writer=wandb_writer,
                 tb_writer=tb_writer,
+                collaboration_metrics=collaboration_metrics,
             )
 
     return RerunDataIterator(itertools.cycle(loader))
@@ -1135,7 +1179,7 @@ def get_rollout_data_iterator(
     optimizer: MegatronOptimizer,
     iteration: int,
     ref_state_dict: Dict[str, torch.Tensor],
-) -> RerunDataIterator:
+) -> Tuple[RerunDataIterator, Dict[str, float]]:
 
     args = get_args()
     tokenizer = get_tokenizer()
@@ -1144,17 +1188,19 @@ def get_rollout_data_iterator(
     # Note: Don't clear here - log_training_sol(clear=True) handles clearing at end of iteration
     sol_model = model[0] if isinstance(model, (list, tuple)) else model
     initialize_sol(sol_model, args)
-    
+
     # Register optimizer for SOL tracking (tracks optimizer.step() time)
     from megatron.rl.sol_integration import register_sol_optimizer
     register_sol_optimizer(optimizer)
 
-    buffered_rollouts = get_environment_rollouts(
+    buffered_rollouts, collaboration_metrics = get_environment_rollouts(
         model, optimizer, args.grpo_prompts_per_step, args.grpo_group_size
     )
-    buffered_rollouts = prepare_data_for_update(model, ref_state_dict, buffered_rollouts, tokenizer)
+    buffered_rollouts = prepare_data_for_update(
+        model, ref_state_dict, buffered_rollouts, tokenizer, collaboration_metrics
+    )
 
-    return buffered_rollouts
+    return buffered_rollouts, collaboration_metrics
 
 
 def setup_grpo_data_iterator(
@@ -1183,11 +1229,15 @@ def setup_grpo_data_iterator(
     # We collect new rollouts when we've gone over the collected data 'grpo_iterations' times.
     if (
         buffered_rollouts is None or
-        iteration == runtime_state.last_collection_iteration + 
+        iteration == runtime_state.last_collection_iteration +
         (args.grpo_iterations * runtime_state.global_batches_per_collection)
     ):
-        train_data_iterator = get_rollout_data_iterator(model, optimizer, iteration, ref_state_dict)
+        train_data_iterator, collaboration_metrics = get_rollout_data_iterator(
+            model, optimizer, iteration, ref_state_dict
+        )
         runtime_state.reset_iteration_counters(iteration)
+        # Store collaboration metrics for logging
+        runtime_state.collaboration_metrics = collaboration_metrics
     else:
         train_data_iterator = buffered_rollouts
 
