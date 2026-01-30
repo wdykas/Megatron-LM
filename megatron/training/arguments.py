@@ -1920,8 +1920,6 @@ def _add_rl_args(parser):
                        help='If set, use inference logprobs in importance sampling correction of the loss.')
     group.add_argument('--rl-importance-sampling-truncation-coef', type=float, default=None,
                        help="If --inference-logprobs-is-correction is on and this coefficient is set, apply truncation for the IS correction at GRPO loss.")
-    group.add_argument('--rl-calculate-intra-group-similarity', action=argparse.BooleanOptionalAction, default=False,
-                       help='If set, calculate the intra-group similarity of rollouts.')
     group.add_argument('--rl-use-sequence-packing', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='Enable sequence packing')
     group.add_argument('--rl-sequence-packing-max-sequences-per-bin', type=int, default=50,
@@ -1979,12 +1977,12 @@ def _add_rl_args(parser):
             'Requires --rl-inference-model-unified-memory-level=1.'
         ),
     )
-    group.add_argument('--refit-method', type=str, default='gloo',
-                       choices=['nccl', 'gloo'],
+    group.add_argument('--refit-method', type=str, default='nvshmem',
+                       choices=['nccl', 'gloo', 'nvshmem'],
                        help=('Method to refit the model weights between training and inference models during RL. '
                              'nccl: use NCCLCopyService to refit using NCCL; '
                              'gloo: use GlooCopyService over CPU; '
-                             ))
+                             'nvshmem: use NVSHMEMCopyService to refit using the NVSHMEM.'))
     group.add_argument('--rl-verify-model-weights-swap', action=argparse.BooleanOptionalAction, default=False,
                        help='If set, verify that the model weights were correctly transferred by comparing forward pass outputs on'
                        'the first swap of model weights.')
