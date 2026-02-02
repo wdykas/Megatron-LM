@@ -12,7 +12,7 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
-from megatron.core.pipeline_parallel.utils import is_pp_last_stage
+from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -668,20 +668,26 @@ class TestRLUtils:
 
         This can be useful for quick benchmarking/analyzing regressions too.
         """
+        from megatron.core.pipeline_parallel import get_forward_backward_func
 
-        world_size, dp, tp, pp = initialize_model_parallel
+        world_size, dp, tp, pp_size = initialize_model_parallel
         self.create_test_args(
-            tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp, bf16=True
+            tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp_size,
+            pipeline_dtype=torch.bfloat16, bf16=True
         )
         model_parallel_cuda_manual_seed(123)
 
+        # Use num_layers divisible by pp_size
+        num_layers = 8
         transformer_config = TransformerConfig(
-            num_layers=10,
+            num_layers=num_layers,
             hidden_size=128,
             num_attention_heads=16,
             use_cpu_initialization=True,
             embedding_init_method_std=1.0,
             bf16=True,
+            pipeline_model_parallel_size=pp_size,
+            pipeline_dtype=torch.bfloat16,
         )
         vocab_size = 10_000
         pp = ProcessGroupCollection.use_mpu_process_groups().pp
@@ -690,7 +696,7 @@ class TestRLUtils:
             transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
             vocab_size=vocab_size,
             max_sequence_length=4192,
-            pre_process=True,
+            pre_process=is_pp_first_stage(pp),
             post_process=is_pp_last_stage(pp),
         ).cuda()
         sequence_length = gpt_model.max_sequence_length
@@ -703,9 +709,30 @@ class TestRLUtils:
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
         position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
 
-        logprobs = rl_utils.get_logprobs(
-            gpt_model, input_ids, position_ids=position_ids, no_grad=True
+        # Define a forward step function for the pipeline schedule
+        def forward_step_func(data_iterator, model):
+            tokens, pos_ids = next(data_iterator)
+            logprobs = rl_utils.get_logprobs(
+                model, tokens, position_ids=pos_ids, no_grad=True
+            )
+            return logprobs, lambda x, non_loss_data=False: x
+
+        data_iter = iter([(input_ids, position_ids)])
+
+        forward_backward_func = get_forward_backward_func()
+
+        output = forward_backward_func(
+            forward_step_func=forward_step_func,
+            data_iterator=data_iter,
+            model=gpt_model,
+            num_microbatches=1,
+            seq_length=sequence_length,
+            micro_batch_size=micro_batch_size,
+            decoder_seq_length=sequence_length,
+            forward_only=True,
+            collect_non_loss_data=True,
         )
 
-        if is_pp_last_stage(gpt_model.pg_collection.pp):
-            assert logprobs.shape == (2, sequence_length - 1)
+        if is_pp_last_stage(pp):
+            logprobs = output[0]
+            assert logprobs.shape == (micro_batch_size, sequence_length - 1)
