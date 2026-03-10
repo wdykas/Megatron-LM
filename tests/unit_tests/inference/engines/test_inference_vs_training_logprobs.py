@@ -1,4 +1,26 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+"""Test that dynamic inference and training forward passes produce consistent log probs.
+
+This test is critical for RL training loops where the policy's log probs during
+inference must closely match the log probs computed during the training forward pass.
+Significant discrepancies would destabilize policy gradient updates.
+
+We use the ``token_mult_prob_error`` metric from NeMo-RL as the acceptance criterion:
+
+    lp_error = |inference_logprobs - training_logprobs|          # per-token
+    token_mult_prob_error = mean(exp(lp_error))                  # over valid tokens
+
+A perfect match gives 1.0.  The RL training loop flags runs where this exceeds 1.05,
+so we use that as our pass/fail threshold.
+
+The test:
+  1. Runs dynamic inference (inference_optimized) to generate tokens + log probs.
+  2. Concatenates prompt + generated tokens into a full sequence.
+  3. Runs a standard (training-style) forward pass on the full sequence.
+  4. Computes token_mult_prob_error and asserts it is < 1.05.
+"""
+
 import random
 import types
 
@@ -22,9 +44,8 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_inference_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import is_fa_min_version, is_te_min_version
+from megatron.core.utils import is_fa_min_version, is_te_min_version, unwrap_model
 from tests.unit_tests.test_utilities import Utils
 
 try:
@@ -37,16 +58,10 @@ except ImportError:
 
 
 RANDOM_SEED = 42
-VOCAB_SIZE = 100
+VOCAB_SIZE = 32000
 
 # NeMo-RL threshold: token_mult_prob_error must be below 1.05 for stable RL.
 TOKEN_MULT_PROB_ERROR_THRESHOLD = 1.05
-
-
-def _set_rounder(value):
-    DynamicInferenceContext.ROUNDER = value
-    DynamicInferenceContext.TOKEN_ROUNDER = value
-    DynamicInferenceContext.REQUEST_ROUNDER = value
 
 
 def _compute_token_mult_prob_error(inference_lps, training_lps):
@@ -100,20 +115,22 @@ def _quantize_model_to_mxfp8(model):
 
 
 class TestInferenceVsTrainingLogProbs:
-    """Verify that MXFP8 inference log probs match training forward pass log probs."""
+    """Verify that inference log probs match training forward pass log probs."""
 
     def teardown_method(self, method):
-        _set_rounder(64)
         Utils.destroy_model_parallel()
 
     @staticmethod
-    def _build_model_and_engine(max_sequence_length):
-        """Build an MXFP8 inference-optimized GPT model + dynamic engine."""
+    def _build_model_and_engine(max_sequence_length, model_format="mxfp8"):
+        """Build an inference-optimized GPT model + dynamic engine.
+
+        Args:
+            model_format: "bf16" for standard bf16, "mxfp8" for MXFP8 quantized.
+        """
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=1,
         )
-        _set_rounder(4)
 
         random.seed(RANDOM_SEED)
         torch.manual_seed(RANDOM_SEED)
@@ -124,11 +141,13 @@ class TestInferenceVsTrainingLogProbs:
             force_reset_rng=True,
         )
 
+        is_mxfp8 = model_format == "mxfp8"
+
         transformer_config = TransformerConfig(
             params_dtype=torch.bfloat16,
-            num_layers=4,
-            hidden_size=128,
-            num_attention_heads=4,
+            num_layers=16,
+            hidden_size=2048,
+            num_attention_heads=16,
             use_cpu_initialization=True,
             inference_rng_tracker=True,
             tensor_model_parallel_size=1,
@@ -138,8 +157,8 @@ class TestInferenceVsTrainingLogProbs:
             inference_sampling_seed=RANDOM_SEED,
             transformer_impl="inference_optimized",
             normalization="RMSNorm",
-            fp8="hybrid",
-            fp8_recipe="mxfp8",
+            fp8="hybrid" if is_mxfp8 else None,
+            fp8_recipe="mxfp8" if is_mxfp8 else None,
         )
 
         model = GPTModel(
@@ -156,16 +175,15 @@ class TestInferenceVsTrainingLogProbs:
             param.data = param.data.to(transformer_config.params_dtype)
         model.eval()
 
-        from megatron.core.utils import unwrap_model
-
-        _quantize_model_to_mxfp8(unwrap_model(model))
+        if is_mxfp8:
+            _quantize_model_to_mxfp8(unwrap_model(model))
 
         inference_context = DynamicInferenceContext(
             model_config=transformer_config,
             inference_config=InferenceConfig(
                 max_sequence_length=max_sequence_length,
-                buffer_size_gb=0.1,
-                paused_buffer_size_gb=0.02,
+                buffer_size_gb=8.0,
+                paused_buffer_size_gb=2.0,
                 block_size_tokens=256,
                 materialize_only_last_token_logits=False,
                 use_flashinfer_fused_rope=None,
@@ -187,33 +205,8 @@ class TestInferenceVsTrainingLogProbs:
             ),
         )
 
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
-        CudaGraphManager.global_mempool = None
-
         engine = DynamicInferenceEngine(controller, inference_context)
         return model, engine
-
-    @staticmethod
-    @torch.inference_mode()
-    def _run_inference(engine, prompt_tokens, sampling_params):
-        """Run dynamic inference to completion and return the finished request."""
-        request = DynamicInferenceRequest(
-            request_id=0,
-            prompt_tokens=prompt_tokens.clone(),
-            sampling_params=sampling_params,
-        )
-        engine._add_request(request)
-
-        all_finished_records = []
-        while engine.has_unfinished_requests():
-            result = engine.step_modern()
-            all_finished_records.extend(result["finished_request_records"])
-
-        assert len(all_finished_records) == 1, (
-            f"Expected 1 finished request, got {len(all_finished_records)}"
-        )
-        return all_finished_records[0].merge()
 
     @staticmethod
     def _training_forward_log_probs(model, full_sequence):
@@ -234,82 +227,12 @@ class TestInferenceVsTrainingLogProbs:
         return per_token_log_probs.cpu().tolist()
 
     # =========================================================================
-    # Parametrized test
+    # Helper to run inference, training forward, and assert metric
     # =========================================================================
 
-    @pytest.mark.internal
-    @pytest.mark.skipif(
-        not is_fa_min_version("2.7.3"),
-        reason="need latest flash attn for dynamic batching",
-    )
-    @pytest.mark.parametrize(
-        "prompt_length",
-        [8, 16, 32, 64, 128],
-        ids=["prompt_8", "prompt_16", "prompt_32", "prompt_64", "prompt_128"],
-    )
-    @pytest.mark.parametrize(
-        "num_tokens_to_generate",
-        [16, 32, 64, 128],
-        ids=["gen_16", "gen_32", "gen_64", "gen_128"],
-    )
-    @pytest.mark.parametrize(
-        "sampling_config",
-        [
-            {"temperature": 1.0, "top_k": 1, "top_p": 0.0},
-            {"temperature": 0.7, "top_k": 0, "top_p": 0.0},
-            {"temperature": 1.0, "top_k": 10, "top_p": 0.0},
-            {"temperature": 1.0, "top_k": 0, "top_p": 0.9},
-            {"temperature": 1.5, "top_k": 0, "top_p": 0.0},
-            {"temperature": 0.3, "top_k": 0, "top_p": 0.0},
-        ],
-        ids=["greedy", "temp_0.7", "top_k_10", "top_p_0.9", "temp_1.5", "temp_0.3"],
-    )
-    @pytest.mark.parametrize(
-        "num_concurrent_requests", [1, 3], ids=["single_req", "batched_3"]
-    )
-    @torch.inference_mode()
-    def test_inference_vs_training_log_probs(
-        self,
-        prompt_length,
-        num_tokens_to_generate,
-        sampling_config,
-        num_concurrent_requests,
-    ):
-        _skip_if_mxfp8_unsupported()
-
-        max_sequence_length = prompt_length + num_tokens_to_generate
-        model, engine = self._build_model_and_engine(
-            max_sequence_length=max_sequence_length,
-        )
-
-        # Build requests — each gets a unique but deterministic prompt.
-        request_data = []
-        for i in range(num_concurrent_requests):
-            torch.manual_seed(RANDOM_SEED + i)
-            prompt_tokens = torch.randint(
-                0,
-                VOCAB_SIZE - 1,
-                (prompt_length,),
-                dtype=torch.int64,
-                device=torch.cuda.current_device(),
-            )
-            sampling_params = SamplingParams(
-                temperature=sampling_config["temperature"],
-                top_k=sampling_config["top_k"],
-                top_p=sampling_config["top_p"],
-                return_log_probs=True,
-                skip_prompt_log_probs=False,
-                num_tokens_to_generate=num_tokens_to_generate,
-                termination_id=-1,
-            )
-            req = DynamicInferenceRequest(
-                request_id=i,
-                prompt_tokens=prompt_tokens.clone(),
-                sampling_params=sampling_params,
-            )
-            request_data.append((req, prompt_tokens))
-
-        for req, _ in request_data:
+    def _run_and_check(self, model, engine, request_data):
+        """Add requests, run to completion, compare log probs for every request."""
+        for req, _, _ in request_data:
             engine._add_request(req)
 
         all_finished = {}
@@ -319,19 +242,19 @@ class TestInferenceVsTrainingLogProbs:
                 finished = record.merge()
                 all_finished[finished.request_id] = finished
 
-        assert len(all_finished) == num_concurrent_requests
+        assert len(all_finished) == len(request_data)
 
-        # Compare each request using the NeMo-RL token_mult_prob_error metric.
-        for req, prompt_tokens in request_data:
+        for req, prompt_tokens, num_gen in request_data:
             finished = all_finished[req.request_id]
             assert finished.status == Status.COMPLETED
+            plen = len(prompt_tokens)
 
             inf_prompt_lps = finished.prompt_log_probs or []
             inf_gen_lps = finished.generated_log_probs or []
             generated_tokens = finished.generated_tokens
 
-            assert len(generated_tokens) == num_tokens_to_generate, (
-                f"Request {req.request_id}: expected {num_tokens_to_generate} "
+            assert len(generated_tokens) == num_gen, (
+                f"Request {req.request_id}: expected {num_gen} "
                 f"tokens, got {len(generated_tokens)}"
             )
 
@@ -342,35 +265,281 @@ class TestInferenceVsTrainingLogProbs:
             training_lps = self._training_forward_log_probs(model, full_sequence)
             assert len(training_lps) == len(full_sequence) - 1
 
-            # Check prompt log probs.
-            expected_prompt_count = prompt_length - 1
-            assert len(inf_prompt_lps) == expected_prompt_count, (
-                f"Request {req.request_id}: expected {expected_prompt_count} "
+            assert len(inf_prompt_lps) == plen - 1, (
+                f"Request {req.request_id}: expected {plen - 1} "
                 f"prompt log probs, got {len(inf_prompt_lps)}"
             )
-
-            prompt_error = _compute_token_mult_prob_error(
-                inf_prompt_lps, training_lps[: prompt_length - 1]
-            )
-
-            # Check generated log probs.
-            assert len(inf_gen_lps) == num_tokens_to_generate, (
-                f"Request {req.request_id}: expected {num_tokens_to_generate} "
+            assert len(inf_gen_lps) == num_gen, (
+                f"Request {req.request_id}: expected {num_gen} "
                 f"generated log probs, got {len(inf_gen_lps)}"
             )
 
-            gen_error = _compute_token_mult_prob_error(
-                inf_gen_lps, training_lps[prompt_length - 1:]
+            prompt_error = _compute_token_mult_prob_error(
+                inf_prompt_lps, training_lps[: plen - 1]
             )
-
-            # Combined over all tokens (prompt + generated), same as NeMo-RL.
-            all_inf_lps = inf_prompt_lps + inf_gen_lps
-            all_train_lps = training_lps
-            total_error = _compute_token_mult_prob_error(all_inf_lps, all_train_lps)
+            gen_error = _compute_token_mult_prob_error(
+                inf_gen_lps, training_lps[plen - 1:]
+            )
+            total_error = _compute_token_mult_prob_error(
+                inf_prompt_lps + inf_gen_lps, training_lps
+            )
 
             assert total_error < TOKEN_MULT_PROB_ERROR_THRESHOLD, (
                 f"Request {req.request_id}: token_mult_prob_error {total_error:.6f} "
                 f">= {TOKEN_MULT_PROB_ERROR_THRESHOLD} "
                 f"(prompt_error={prompt_error:.6f}, gen_error={gen_error:.6f}, "
-                f"prompt_len={prompt_length}, gen_len={num_tokens_to_generate})"
+                f"prompt_len={plen}, gen_len={num_gen})"
+            )
+
+    # =========================================================================
+    # Helper to build greedy request data
+    # =========================================================================
+
+    @staticmethod
+    def _make_greedy_requests(num_requests, prompt_length, gen_length):
+        request_data = []
+        for i in range(num_requests):
+            torch.manual_seed(RANDOM_SEED + i)
+            prompt_tokens = torch.randint(
+                0, VOCAB_SIZE - 1, (prompt_length,),
+                dtype=torch.int64, device=torch.cuda.current_device(),
+            )
+            sampling_params = SamplingParams(
+                temperature=1.0, top_k=1, top_p=0.0,
+                return_log_probs=True,
+                skip_prompt_log_probs=False,
+                num_tokens_to_generate=gen_length,
+                termination_id=-1,
+            )
+            req = DynamicInferenceRequest(
+                request_id=i,
+                prompt_tokens=prompt_tokens.clone(),
+                sampling_params=sampling_params,
+            )
+            request_data.append((req, prompt_tokens, gen_length))
+        return request_data
+
+    # =========================================================================
+    # Core test: high concurrency, uniform prompts
+    # =========================================================================
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"),
+        reason="need latest flash attn for dynamic batching",
+    )
+    @pytest.mark.parametrize(
+        "prompt_length",
+        [128, 256, 512],
+        ids=["prompt_128", "prompt_256", "prompt_512"],
+    )
+    @pytest.mark.parametrize(
+        "num_tokens_to_generate",
+        [128, 256, 512],
+        ids=["gen_128", "gen_256", "gen_512"],
+    )
+    @pytest.mark.parametrize(
+        "num_concurrent_requests",
+        [1, 8, 32],
+        ids=["single_req", "batched_8", "batched_32"],
+    )
+    @pytest.mark.parametrize(
+        "model_format", ["bf16", "mxfp8"], ids=["bf16", "mxfp8"]
+    )
+    @torch.inference_mode()
+    def test_inference_vs_training_log_probs(
+        self,
+        prompt_length,
+        num_tokens_to_generate,
+        num_concurrent_requests,
+        model_format,
+    ):
+        if model_format == "mxfp8":
+            _skip_if_mxfp8_unsupported()
+
+        max_sequence_length = prompt_length + num_tokens_to_generate
+        model, engine = self._build_model_and_engine(
+            max_sequence_length=max_sequence_length,
+            model_format=model_format,
+        )
+
+        request_data = self._make_greedy_requests(
+            num_concurrent_requests, prompt_length, num_tokens_to_generate
+        )
+        self._run_and_check(model, engine, request_data)
+
+    # =========================================================================
+    # Stress test: mixed prompt lengths in the same batch
+    # =========================================================================
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"),
+        reason="need latest flash attn for dynamic batching",
+    )
+    @pytest.mark.parametrize(
+        "prompt_lengths,gen_length",
+        [
+            # Wildly different prompt lengths — stress variable-length packing
+            ([8, 64, 256, 512, 128, 32, 400, 16], 256),
+            ([1, 2, 4, 8, 16, 32, 64, 128, 256, 512], 128),
+            # Many short + one long — tests prefill/decode mix
+            ([16] * 15 + [512], 128),
+            # Many long — heavy KV cache pressure
+            ([512] * 8, 512),
+            # Extreme length disparity
+            ([4, 700], 256),
+            ([700, 4, 700, 4], 128),
+        ],
+        ids=[
+            "mixed_8_requests",
+            "staircase_1_to_512",
+            "15_short_1_long",
+            "8_long_512",
+            "extreme_disparity_2",
+            "alternating_long_short_4",
+        ],
+    )
+    @pytest.mark.parametrize(
+        "model_format", ["bf16", "mxfp8"], ids=["bf16", "mxfp8"]
+    )
+    @torch.inference_mode()
+    def test_mixed_prompt_lengths_stress(self, prompt_lengths, gen_length, model_format):
+        if model_format == "mxfp8":
+            _skip_if_mxfp8_unsupported()
+
+        max_sequence_length = max(prompt_lengths) + gen_length
+        model, engine = self._build_model_and_engine(
+            max_sequence_length=max_sequence_length,
+            model_format=model_format,
+        )
+
+        request_data = []
+        for i, plen in enumerate(prompt_lengths):
+            torch.manual_seed(RANDOM_SEED + i)
+            prompt_tokens = torch.randint(
+                0, VOCAB_SIZE - 1, (plen,),
+                dtype=torch.int64, device=torch.cuda.current_device(),
+            )
+            sampling_params = SamplingParams(
+                temperature=1.0, top_k=1, top_p=0.0,
+                return_log_probs=True,
+                skip_prompt_log_probs=False,
+                num_tokens_to_generate=gen_length,
+                termination_id=-1,
+            )
+            req = DynamicInferenceRequest(
+                request_id=i,
+                prompt_tokens=prompt_tokens.clone(),
+                sampling_params=sampling_params,
+            )
+            request_data.append((req, prompt_tokens, gen_length))
+
+        self._run_and_check(model, engine, request_data)
+
+    # =========================================================================
+    # Stress test: staggered request arrival
+    # =========================================================================
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"),
+        reason="need latest flash attn for dynamic batching",
+    )
+    @pytest.mark.parametrize(
+        "total_requests,stagger_steps",
+        [
+            (16, 4),   # add a new request every 4 decode steps
+            (16, 1),   # add a new request every step (maximum churn)
+            (32, 8),   # many requests, slower arrival
+        ],
+        ids=["16_reqs_stagger_4", "16_reqs_stagger_1", "32_reqs_stagger_8"],
+    )
+    @pytest.mark.parametrize(
+        "model_format", ["bf16", "mxfp8"], ids=["bf16", "mxfp8"]
+    )
+    @torch.inference_mode()
+    def test_staggered_arrival_stress(self, total_requests, stagger_steps, model_format):
+        """Requests arrive while others are mid-generation — stresses
+        the prefill/decode mixing path and KV cache block reallocation."""
+        if model_format == "mxfp8":
+            _skip_if_mxfp8_unsupported()
+
+        prompt_length = 128
+        gen_length = 128
+        max_sequence_length = prompt_length + gen_length
+        model, engine = self._build_model_and_engine(
+            max_sequence_length=max_sequence_length,
+            model_format=model_format,
+        )
+
+        request_data = self._make_greedy_requests(
+            total_requests, prompt_length, gen_length
+        )
+
+        # Stagger: add first request, then add one more every stagger_steps.
+        next_to_add = 0
+        engine._add_request(request_data[next_to_add][0])
+        next_to_add += 1
+        step_count = 0
+
+        all_finished = {}
+        while engine.has_unfinished_requests() or next_to_add < total_requests:
+            result = engine.step_modern()
+            step_count += 1
+            for record in result["finished_request_records"]:
+                finished = record.merge()
+                all_finished[finished.request_id] = finished
+
+            if next_to_add < total_requests and step_count % stagger_steps == 0:
+                engine._add_request(request_data[next_to_add][0])
+                next_to_add += 1
+
+        # Drain any remaining.
+        while next_to_add < total_requests:
+            engine._add_request(request_data[next_to_add][0])
+            next_to_add += 1
+        while engine.has_unfinished_requests():
+            result = engine.step_modern()
+            for record in result["finished_request_records"]:
+                finished = record.merge()
+                all_finished[finished.request_id] = finished
+
+        assert len(all_finished) == total_requests
+
+        for req, prompt_tokens, num_gen in request_data:
+            finished = all_finished[req.request_id]
+            assert finished.status == Status.COMPLETED
+            plen = len(prompt_tokens)
+
+            inf_prompt_lps = finished.prompt_log_probs or []
+            inf_gen_lps = finished.generated_log_probs or []
+            generated_tokens = finished.generated_tokens
+
+            assert len(generated_tokens) == num_gen
+            assert len(inf_prompt_lps) == plen - 1
+            assert len(inf_gen_lps) == num_gen
+
+            full_sequence = torch.cat([
+                prompt_tokens.cpu(),
+                torch.tensor(generated_tokens, dtype=torch.int64),
+            ])
+            training_lps = self._training_forward_log_probs(model, full_sequence)
+
+            prompt_error = _compute_token_mult_prob_error(
+                inf_prompt_lps, training_lps[: plen - 1]
+            )
+            gen_error = _compute_token_mult_prob_error(
+                inf_gen_lps, training_lps[plen - 1:]
+            )
+            total_error = _compute_token_mult_prob_error(
+                inf_prompt_lps + inf_gen_lps, training_lps
+            )
+
+            assert total_error < TOKEN_MULT_PROB_ERROR_THRESHOLD, (
+                f"Request {req.request_id}: token_mult_prob_error {total_error:.6f} "
+                f">= {TOKEN_MULT_PROB_ERROR_THRESHOLD} "
+                f"(prompt_error={prompt_error:.6f}, gen_error={gen_error:.6f}, "
+                f"prompt_len={plen}, gen_len={num_gen}, "
+                f"stagger_steps={stagger_steps})"
             )
