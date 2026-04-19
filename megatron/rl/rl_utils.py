@@ -1,20 +1,20 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
 import gc
 
-import copy
-from functools import partial
 # Keep this to make the env registered.
 import itertools
-import math
-import logging
 import json
+import logging
+import math
 import os
 from collections import Counter, defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional 
+from typing import Any, Dict, Iterator, List, Optional
 
 import numpy as np
 import torch
@@ -22,42 +22,39 @@ import torch.distributed as dist
 import yaml
 from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
+from wandb import wandb_run
 
 from megatron.core import mpu
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
-from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.num_microbatches_calculator import reconfigure_num_microbatches_calculator
-from megatron.core.optimizer import MegatronOptimizer
-from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.core.pipeline_parallel.utils import is_pp_last_stage, get_pp_last_rank
-from megatron.core.rerun_state_machine import RerunDataIterator
-from megatron.core.tokenizers import MegatronTokenizer
-from megatron.core.tokenizers.text.libraries.huggingface_tokenizer import HuggingFaceTokenizer
-from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
-from megatron.core.transformer.enums import CudaGraphScope
-from megatron.core.transformer.utils import (
-    toggle_cuda_graphs,
-    transition_moe_cudagraphs,
-)
-from megatron.core.inference.utils import set_decode_expert_padding
-from megatron.core.resharding.refit import swap_model_weights
+from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
 from megatron.core.inference.unified_memory import (
     advise_managed_module_parameters_preferred_location,
     prefetch_managed_module_parameters,
 )
-from megatron.core.inference.utils import device_memory_summary
-from megatron.core.utils import get_asyncio_loop, log_single_rank
-from megatron.rl.sequence_packing_utils import (
-    get_microbatch_dataloader,
-    pack_inference_logprobs,
-    compute_packed_inference_logprobs_stats,
-    pack_all_trajectories,
-    load_packed_data_by_index,
-    get_sequence_packing_tensorboard_metrics,
-    get_sequence_packing_log_info,
-    get_default_packed_seq_params,
-    update_microbatch_calculator,
+from megatron.core.inference.utils import device_memory_summary, set_decode_expert_padding
+from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.num_microbatches_calculator import reconfigure_num_microbatches_calculator
+from megatron.core.optimizer import MegatronOptimizer
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.pipeline_parallel.utils import get_pp_last_rank, is_pp_last_stage
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.rerun_state_machine import RerunDataIterator
+from megatron.core.resharding.refit import swap_model_weights
+from megatron.core.tokenizers import MegatronTokenizer
+from megatron.core.tokenizers.text.libraries.huggingface_tokenizer import HuggingFaceTokenizer
+from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    is_batch_invariant_mode_enabled,
+)
+from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.utils import toggle_cuda_graphs, transition_moe_cudagraphs
+from megatron.core.utils import (
+    get_asyncio_loop,
+    get_attr_wrapped_model,
+    get_pg_rank,
+    get_pg_size,
+    log_single_rank,
 )
 from megatron.rl.agent.api import (
     EvaluationRequest,
@@ -74,6 +71,17 @@ from megatron.rl.agent.weighted_multi_task import WeightedMultiTask
 from megatron.rl.inference.megatron import MegatronLocal
 from megatron.rl.logging import LOG_DIR as lang_rl_log_dir
 from megatron.rl.logging import log as lang_rl_log
+from megatron.rl.sequence_packing_utils import (
+    compute_packed_inference_logprobs_stats,
+    get_default_packed_seq_params,
+    get_microbatch_dataloader,
+    get_sequence_packing_log_info,
+    get_sequence_packing_tensorboard_metrics,
+    load_packed_data_by_index,
+    pack_all_trajectories,
+    pack_inference_logprobs,
+    update_microbatch_calculator,
+)
 from megatron.rl.server.inference.inference_interface_server import InferenceInterfaceServer
 from megatron.training.global_vars import (
     get_args,
@@ -87,14 +95,7 @@ from megatron.training.utils import (
     print_rank_0,
     unwrap_model,
 )
-from megatron.core.utils import get_pg_rank, get_pg_size, get_attr_wrapped_model
-from megatron.core.process_groups_config import ProcessGroupCollection
-from wandb import wandb_run
-from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-    is_batch_invariant_mode_enabled,
-)
 
-from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
 if HAVE_TORCH_MEMORY_SAVER:
     from torch_memory_saver import torch_memory_saver
 
@@ -442,13 +443,33 @@ _INFERENCE_INTERFACE = None
 def get_inference_interface(args, loop, model):
     global _INFERENCE_INTERFACE
     if _INFERENCE_INTERFACE is None:
-        _INFERENCE_INTERFACE = loop.run_until_complete(
-            MegatronLocal.launch(
-                model[0],
-                host='0.0.0.0',
-                port=8294,
-                verbose=args.inference_text_gen_server_logging)
-        )
+        from megatron.rl.parallel_utils import get_inference_shards
+
+        shards = get_inference_shards()
+        if shards is not None:
+            # Multi-shard path: one engine + coordinator + HTTP server per shard;
+            # resume/suspend/kill fan-out; base_generate round-robins across shards;
+            # every rank receives the full shard table so cross-shard reachability
+            # (ZMQ + HTTP + torch collectives) is available without further setup.
+            from megatron.rl.inference.multi_shard import MegatronLocalMulti
+
+            _INFERENCE_INTERFACE = loop.run_until_complete(
+                MegatronLocalMulti.launch(
+                    model[0] if model is not None else None,
+                    shards=shards,
+                    host='0.0.0.0',
+                    base_port=8294,
+                    verbose=args.inference_text_gen_server_logging,
+                )
+            )
+        else:
+            _INFERENCE_INTERFACE = loop.run_until_complete(
+                MegatronLocal.launch(
+                    model[0],
+                    host='0.0.0.0',
+                    port=8294,
+                    verbose=args.inference_text_gen_server_logging)
+            )
     return _INFERENCE_INTERFACE
 
 
@@ -513,7 +534,8 @@ def get_environment_rollouts(
         with nvtx_range("rl/prefetch-weights-to-gpu", time=True):
             inf_core = unwrap_model(inference_model[0])
             _maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
-        swap_model_weights(model, inference_model, args.refit_method)
+        from megatron.rl.parallel_utils import swap_weights_across_shards
+        swap_weights_across_shards(model, inference_model, args.refit_method)
         if args.rl_verify_model_weights_swap:
             verify_model_weights_swap(
                 train_model=model,

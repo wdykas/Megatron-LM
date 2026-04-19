@@ -2,6 +2,7 @@
 
 """Pretrain utilities."""
 import time
+
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
 
@@ -31,10 +32,8 @@ def set_startup_timestamps(program_start=None, main_entry=None):
         _STARTUP_TIMESTAMPS['main_entry'] = main_entry
 
 
-from collections import defaultdict
 import copy
 import dataclasses
-from datetime import datetime, timedelta
 import functools
 import gc
 import inspect
@@ -42,14 +41,17 @@ import logging
 import math
 import os
 import sys
+from collections import defaultdict
 from contextlib import nullcontext
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional, Dict
+from typing import Any, Dict, Optional
 
 import torch.distributed
 
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer_param_scheduler import get_canonical_lr_for_logging
+
 from .log_handler import CustomHandler
 
 # Make default logging level INFO, but filter out all log messages not from MCore.
@@ -116,9 +118,7 @@ RL_LOGGABLE_TIMER_NAMES = [
 ]
 
 try:
-    from modelopt.torch.distill.plugins.megatron import (
-        get_tensor_shapes_adjust_fn_for_distillation,
-    )
+    from modelopt.torch.distill.plugins.megatron import get_tensor_shapes_adjust_fn_for_distillation
 
     has_nvidia_modelopt = True
 except ImportError:
@@ -131,42 +131,49 @@ except ImportError:
 
 
 from megatron.core import mpu, tensor_parallel
+from megatron.core.distributed import DistributedDataParallel as DDP
+from megatron.core.distributed import (
+    DistributedDataParallelConfig,
+    TorchFullyShardedDataParallelConfig,
+)
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+    FullyShardedDataParallel as megatron_FSDP,
+)
+from megatron.core.fp8_utils import correct_amax_history_if_needed
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     is_linear_attention_variant,
 )
-from megatron.core.utils import (
-    check_param_hashes_across_dp_replicas,
-    configure_nvtx_profiling,
-    get_attr_wrapped_model,
-    get_model_config,
-    get_pg_size,
-    get_pg_rank,
-    StragglerDetector,
-)
-from megatron.core.fp8_utils import correct_amax_history_if_needed
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.optimizer import get_mup_config_overrides, get_standard_config_overrides
+from megatron.core.optimizer.optimizer import param_group_identifier_keys
+from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
+from megatron.core.optimizer.qk_clip import clip_qk
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
     is_vp_first_stage,
     is_vp_last_stage,
 )
-from megatron.core.optimizer import get_mup_config_overrides, get_standard_config_overrides
-from megatron.training.checkpointing import load_checkpoint
-from megatron.training.checkpointing import save_checkpoint, save_grads
-from megatron.training.checkpointing import checkpoint_exists
-from megatron.training.checkpointing import get_loaded_iteration
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper
-from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.module import Float16Module
-from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
-from megatron.core.distributed import DistributedDataParallel as DDP
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
-from megatron.core.optimizer.optimizer import param_group_identifier_keys
-
-from megatron.core.optimizer.qk_clip import clip_qk
+from megatron.core.utils import (
+    StragglerDetector,
+    check_param_hashes_across_dp_replicas,
+    configure_nvtx_profiling,
+    get_attr_wrapped_model,
+    get_model_config,
+    get_pg_rank,
+    get_pg_size,
+)
+from megatron.training.checkpointing import (
+    checkpoint_exists,
+    get_loaded_iteration,
+    load_checkpoint,
+    save_checkpoint,
+    save_grads,
+)
 
 try:
     from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
@@ -175,39 +182,42 @@ try:
 except ImportError:
     HAVE_FSDP2 = False
 
+from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
-from megatron.core.optimizer import (
-    get_megatron_optimizer,
-    OptimizerConfig,
-    ParamKey,
-)
-from megatron.core.rerun_state_machine import (
-    get_rerun_state_machine,
-    destroy_rerun_state_machine,
-    RerunDataIterator,
-    RerunMode,
-)
-from megatron.training.initialize import initialize_megatron
-from megatron.training.initialize import write_args_to_tensorboard
-from megatron.training.initialize import set_jit_fusion_options
-from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank, is_hybrid_model
-from megatron.training.datasets.data_samplers import build_pretraining_data_loader
-from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
+from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+from megatron.core.inference.unified_memory import create_unified_mempool
+from megatron.core.optimizer import OptimizerConfig, ParamKey, get_megatron_optimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
-from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
-from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
-from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
+    create_all_gather_groups,
     destroy_global_memory_buffer,
     destroy_model_parallel,
     update_pg_timeout,
-    create_all_gather_groups,
 )
-from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
-from megatron.core.inference.unified_memory import create_unified_mempool
+from megatron.core.rerun_state_machine import (
+    RerunDataIterator,
+    RerunMode,
+    destroy_rerun_state_machine,
+    get_rerun_state_machine,
+)
 from megatron.core.resharding.refit import swap_model_weights
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
+from megatron.core.transformer.moe import upcycling_utils
+from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker, track_moe_metrics
+from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+from megatron.rl.parallel_utils import swap_weights_across_shards
+from megatron.training.datasets.data_samplers import build_pretraining_data_loader
+from megatron.training.initialize import (
+    initialize_megatron,
+    set_jit_fusion_options,
+    write_args_to_tensorboard,
+)
+from megatron.training.utils import (
+    get_batch_on_this_cp_rank,
+    get_batch_on_this_tp_rank,
+    is_hybrid_model,
+)
 
 try:
     from torch_memory_saver import torch_memory_saver
@@ -216,45 +226,43 @@ try:
 except ImportError:
     HAVE_TORCH_MEMORY_SAVER = False
 
-from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     get_current_global_batch_size,
     get_current_running_global_batch_size,
     get_num_microbatches,
-    update_num_microbatches
+    update_num_microbatches,
 )
+from megatron.core.pipeline_parallel import get_forward_backward_func
 
+from . import ft_integration, one_logger_utils
 from .async_utils import maybe_finalize_async_save
+from .dgrad_logging import disable_dgrad_logging, enable_dgrad_logging, save_dgrads
+from .global_vars import (
+    destroy_global_vars,
+    get_args,
+    get_energy_monitor,
+    get_one_logger,
+    get_signal_handler,
+    get_tensorboard_writer,
+    get_timers,
+    get_tokenizer,
+    get_wandb_writer,
+)
 from .utils import (
     append_to_progress_log,
     calc_params_l2_norm,
     check_adlr_autoresume_termination,
-    logical_and_across_model_parallel_group,
-    reduce_max_stat_across_model_parallel_group,
     is_last_rank,
+    logical_and_across_model_parallel_group,
     print_rank_0,
     print_rank_last,
+    reduce_max_stat_across_model_parallel_group,
     report_memory,
+    to_empty_if_meta_device,
     unwrap_model,
     update_use_dist_ckpt,
-    to_empty_if_meta_device,
 )
-from .global_vars import (
-    destroy_global_vars,
-    get_args,
-    get_signal_handler,
-    get_timers,
-    get_tensorboard_writer,
-    get_wandb_writer,
-    get_one_logger,
-    get_tokenizer,
-    get_energy_monitor,
-)
-from . import one_logger_utils
-from .dgrad_logging import enable_dgrad_logging, disable_dgrad_logging, save_dgrads
-
-from . import ft_integration
 
 stimer = StragglerDetector()
 
@@ -903,9 +911,7 @@ def pretrain(
     timers = get_timers()
 
     if args.fine_grained_activation_offloading:
-        from megatron.core.pipeline_parallel.utils import (
-            set_ideal_affinity_for_current_gpu
-        )
+        from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
         set_ideal_affinity_for_current_gpu()
 
 
@@ -995,8 +1001,8 @@ def pretrain(
                 LocalCheckpointManager,
             )
             from nvidia_resiliency_ext.checkpointing.local.replication.group_utils import (
-                parse_group_sequence,
                 GroupWrapper,
+                parse_group_sequence,
             )
             from nvidia_resiliency_ext.checkpointing.local.replication.strategies import (
                 CliqueReplicationStrategy,
@@ -1035,46 +1041,54 @@ def pretrain(
     # Build a separate inference model for RL if requested.
     inference_model = None
     if args.perform_rl_step:
-        if (
+        use_shards = getattr(args, "rl_inference_shards_parsed", None) is not None
+        use_scalar = (
             args.rl_inference_tensor_model_parallel_size is not None
             or args.rl_inference_pipeline_model_parallel_size is not None
             or args.rl_inference_expert_model_parallel_size is not None
             or args.rl_inference_expert_tensor_model_parallel_size is not None
-        ):
-            from megatron.rl.parallel_utils import build_inference_pg_collection
-
-            print_rank_0(
-                "Building separate RL inference model with custom parallelism: "
-                f"TP={args.rl_inference_tensor_model_parallel_size}, "
-                f"PP={args.rl_inference_pipeline_model_parallel_size}, "
-                f"EP={args.rl_inference_expert_model_parallel_size}, "
-                f"ExptTP={args.rl_inference_expert_tensor_model_parallel_size}"
+        )
+        if use_shards or use_scalar:
+            from megatron.rl.parallel_utils import (
+                build_inference_pg_collection,
+                build_inference_pg_collections_for_shards,
+                set_inference_shards,
             )
-            inference_pg_collection = build_inference_pg_collection(
+
+            # Normalize to a list of shard specs so both paths share the build loop.
+            if use_shards:
+                shard_specs = args.rl_inference_shards_parsed
+                print_rank_0(
+                    f"Building {len(shard_specs)} heterogeneous RL inference shard(s):"
+                )
+                for i, s in enumerate(shard_specs):
+                    print_rank_0(
+                        f"  shard {i}: tp={s['tp']} pp={s['pp']} ep={s['ep']} "
+                        f"expt_tp={s['expt_tp']} dp={s['dp']} "
+                        f"(consumes {s['tp']*s['pp']*s['dp']} ranks)"
+                    )
+            else:
+                # Single-shard back-compat: scalar flags describe one shard that
+                # consumes the entire world.
+                tp = args.rl_inference_tensor_model_parallel_size or mpu.get_tensor_model_parallel_world_size()
+                pp = args.rl_inference_pipeline_model_parallel_size or mpu.get_pipeline_model_parallel_world_size()
+                ep = args.rl_inference_expert_model_parallel_size or mpu.get_expert_model_parallel_world_size()
+                expt_tp = args.rl_inference_expert_tensor_model_parallel_size or mpu.get_expert_tensor_parallel_world_size()
+                dp = args.world_size // (tp * pp)
+                shard_specs = [
+                    dict(tp=tp, pp=pp, ep=ep, expt_tp=expt_tp, dp=dp),
+                ]
+                print_rank_0(
+                    "Building separate RL inference model with custom parallelism: "
+                    f"TP={tp}, PP={pp}, EP={ep}, ExptTP={expt_tp}, DP={dp}"
+                )
+
+            shards = build_inference_pg_collections_for_shards(
                 args.world_size,
-                tp_size=args.rl_inference_tensor_model_parallel_size,
-                pp_size=args.rl_inference_pipeline_model_parallel_size,
-                ep_size=args.rl_inference_expert_model_parallel_size,
-                expt_tp_size=args.rl_inference_expert_tensor_model_parallel_size,
+                shard_specs,
                 use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
             )
-
-            # Build an isolated inference config so training config remains unchanged
-            inference_config = copy.deepcopy(config)
-            if args.rl_inference_tensor_model_parallel_size is not None:
-                inference_config.tensor_model_parallel_size = args.rl_inference_tensor_model_parallel_size
-            if args.rl_inference_pipeline_model_parallel_size is not None:
-                inference_config.pipeline_model_parallel_size = (
-                    args.rl_inference_pipeline_model_parallel_size
-                )
-            if args.rl_inference_expert_model_parallel_size is not None:
-                inference_config.expert_model_parallel_size = (
-                    args.rl_inference_expert_model_parallel_size
-                )
-            if args.rl_inference_expert_tensor_model_parallel_size is not None:
-                inference_config.expert_tensor_parallel_size = (
-                    args.rl_inference_expert_tensor_model_parallel_size
-                )
+            set_inference_shards(shards)
 
             # Optionally allocate the RL inference model weights from a unified virtual memory (UVM)
             # mempool so we can prefetch weights to CPU when idle while keeping CUDA-graph-safe pointers.
@@ -1101,15 +1115,26 @@ def pretrain(
             else:
                 model_alloc_ctx = nullcontext()
 
-            with model_alloc_ctx:
-                inference_model = get_model(
-                    model_provider,
-                    model_type,
-                    wrap_with_ddp=False,
-                    pg_collection=inference_pg_collection,
-                    config=inference_config,
-                )
-            inference_model[0].eval()
+            # Each rank builds at most one inference model — the one for the shard
+            # it belongs to. Ranks outside all shards get inference_model=None.
+            for shard in shards:
+                if shard.pg_collection is None:
+                    continue
+                inference_config = copy.deepcopy(config)
+                inference_config.tensor_model_parallel_size = shard.spec["tp"]
+                inference_config.pipeline_model_parallel_size = shard.spec["pp"]
+                inference_config.expert_model_parallel_size = shard.spec["ep"]
+                inference_config.expert_tensor_parallel_size = shard.spec["expt_tp"]
+                with model_alloc_ctx:
+                    inference_model = get_model(
+                        model_provider,
+                        model_type,
+                        wrap_with_ddp=False,
+                        pg_collection=shard.pg_collection,
+                        config=inference_config,
+                    )
+                inference_model[0].eval()
+                break  # a rank can only be a member of one shard
 
         # Validate: offloading flag requires a separate inference model
         if args.rl_offload_inference_model_weights_when_idle and inference_model is None:
@@ -1225,7 +1250,7 @@ def pretrain(
                 # If separate inference and training models, swap training weights
                 # back to the inference model for RL evaluation.
                 rl_utils._maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
-                swap_model_weights(model, inference_model, args.refit_method)
+                swap_weights_across_shards(model, inference_model, args.refit_method)
                 rl_eval_model = inference_model
                 rl_training_model = model
             rl_utils.evaluate_and_print_results_rl(
@@ -1334,6 +1359,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     if has_nvidia_modelopt:
         from megatron.post_training.checkpointing import has_modelopt_state
+
         # [ModelOpt]: Check if the checkpoint is a ModelOpt checkpoint and
         # set a flag to use our model provider if so.
         if args.load is not None and has_modelopt_state(args.load):
@@ -2139,7 +2165,8 @@ def training_log(
             from operator import itemgetter
 
             from megatron.core.ssm.mamba_hybrid_layer_allocation import (
-                Symbols, get_hybrid_layer_counts,
+                Symbols,
+                get_hybrid_layer_counts,
             )
             layers = itemgetter(Symbols.MOE)(get_hybrid_layer_counts(args.hybrid_layer_pattern))
         else:
@@ -2672,8 +2699,9 @@ def train(
         print_rank_0("> Reinitializing microbatch calculator for GRPO training...")
         from megatron.core.num_microbatches_calculator import (
             destroy_num_microbatches_calculator,
-            init_num_microbatches_calculator
+            init_num_microbatches_calculator,
         )
+
         # First destroy the existing calculator
         destroy_num_microbatches_calculator()
         # Then initialize with the correct perform_rl_step=True context
@@ -2695,8 +2723,9 @@ def train(
 
     if args.run_workload_inspector_server:
         try:
-            from workload_inspector.utils.webserver import run_server
             import threading
+
+            from workload_inspector.utils.webserver import run_server
 
             threading.Thread(
                 target=run_server, daemon=True, args=(torch.distributed.get_rank(),)
@@ -3167,7 +3196,7 @@ def train(
                     rl_utils._maybe_prefetch_separate_inference_model_weights(
                         inf_core, to_cpu=False
                     )
-                    swap_model_weights(model, inference_model, args.refit_method)
+                    swap_weights_across_shards(model, inference_model, args.refit_method)
                     rl_eval_model = inference_model
                     rl_training_model = model
                 rl_utils.evaluate_and_print_results_rl(

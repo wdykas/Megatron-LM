@@ -406,3 +406,41 @@ def reshard_model_weights(
     execute_reshard_plan(
         plan, src_core, tgt_core, service=service, group=group, transform=transform
     )
+
+
+def swap_model_weights_across_shards(
+    src_model,
+    target_model,
+    shards,
+    refit_method: Union[RefitBackendName, CopyService],
+) -> None:
+    """Refit weights from ``src_model`` into every registered inference shard.
+
+    Runs one :func:`swap_model_weights` call per shard as a world-collective
+    operation: the current rank passes ``target_model=target_model`` only for
+    the shard it belongs to and ``target_model=None`` for every other shard.
+    All ranks (including those outside every shard) participate in every call.
+
+    Args:
+        src_model: The training/source model. Passed unchanged on every call;
+            the rank's own membership in each shard determines whether it
+            acts as a real source or as an idle participant (via the ``None``
+            target).
+        target_model: The rank-local inference model (for the shard this rank
+            owns). ``None`` for ranks that do not own any shard.
+        shards: Full list of :class:`megatron.core.inference.shards.InferenceShard`
+            describing the heterogeneous layout. Typically produced by
+            :func:`megatron.core.inference.shards.build_inference_pg_collections_for_shards`.
+        refit_method: Backend name or ``CopyService`` instance; same semantics
+            as :func:`swap_model_weights`.
+    """
+    rank = torch.distributed.get_rank()
+    my_shard_index: Optional[int] = None
+    for s in shards:
+        if s.rank_offset <= rank < s.rank_offset + s.world_size:
+            my_shard_index = s.index
+            break
+
+    for s in shards:
+        target = target_model if my_shard_index == s.index else None
+        swap_model_weights(src_model, target, refit_method)

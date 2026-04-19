@@ -6,46 +6,45 @@ import argparse
 import dataclasses
 import json
 import os
-from pathlib import Path
 import re
 import types
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from packaging.version import Version as PkgVersion
 
+from megatron.core.activations import squared_relu
 from megatron.core.dist_checkpointing.validation import StrictHandling
+from megatron.core.fusions.fused_bias_geglu import quick_gelu
+from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.core.quantization.utils import (
+    kitchen_quantization_recipe_config,
+    load_quantization_recipe,
+)
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
-from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig,
     MLPConfig,
 )
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.utils import (
     get_torch_version,
     is_flashinfer_min_version,
     is_te_min_version,
     is_torch_min_version,
 )
-from megatron.core.activations import squared_relu
-from megatron.core.fusions.fused_bias_geglu import quick_gelu
+from megatron.training.argument_utils import ArgumentGroupFactory
 from megatron.training.global_vars import set_global_variables
 from megatron.training.utils import (
     get_device_arch_version,
-    update_use_dist_ckpt,
     print_rank_0,
+    update_use_dist_ckpt,
     warn_rank_0,
 )
-from megatron.core.msc_utils import MultiStorageClientFeature
 
-from megatron.core.quantization.utils import (
-    kitchen_quantization_recipe_config,
-    load_quantization_recipe,
-)
-
-from megatron.training.argument_utils import ArgumentGroupFactory
 
 def add_megatron_arguments(parser: argparse.ArgumentParser):
     """"Add Megatron-LM arguments to the given parser."""
@@ -334,8 +333,9 @@ def validate_args(args, defaults={}):
         'Currently only global and local checkpoints are supported'
     if args.non_persistent_ckpt_type == 'local':
         try:
-            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import \
-                LocalCheckpointManager
+            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
+                LocalCheckpointManager,
+            )
         except ModuleNotFoundError as e:
             raise RuntimeError('nvidia_resiliency_ext is required for local checkpointing') from e
 
@@ -428,6 +428,69 @@ def validate_args(args, defaults={}):
         assert not(
             not args.rl_persist_cuda_graphs and args.rl_kv_cache_management_mode == "offload"
         ), "Cannot recapture CUDA graphs while offloading KV cache."
+
+        # Parse and validate --rl-inference-shards (heterogeneous per-DP-replica parallelism).
+        if args.rl_inference_shards is not None:
+            if any(
+                getattr(args, f) is not None
+                for f in (
+                    "rl_inference_tensor_model_parallel_size",
+                    "rl_inference_pipeline_model_parallel_size",
+                    "rl_inference_expert_model_parallel_size",
+                    "rl_inference_expert_tensor_model_parallel_size",
+                )
+            ):
+                raise AssertionError(
+                    "--rl-inference-shards is mutually exclusive with the scalar "
+                    "--rl-inference-{tensor,pipeline,expert,expert-tensor}-model-parallel-size "
+                    "flags. Use one or the other."
+                )
+            parsed = []
+            total_ranks = 0
+            for shard_str in args.rl_inference_shards.split(";"):
+                shard_str = shard_str.strip()
+                if not shard_str:
+                    continue
+                spec = {}
+                for kv in shard_str.split(","):
+                    kv = kv.strip()
+                    if not kv:
+                        continue
+                    if "=" not in kv:
+                        raise AssertionError(
+                            f"Bad --rl-inference-shards spec entry {kv!r}: expected key=value."
+                        )
+                    k, v = kv.split("=", 1)
+                    k = k.strip(); v = v.strip()
+                    if k not in ("tp", "pp", "ep", "expt_tp", "dp"):
+                        raise AssertionError(
+                            f"Unknown key {k!r} in --rl-inference-shards (allowed: tp,pp,ep,expt_tp,dp)."
+                        )
+                    spec[k] = int(v)
+                # Defaults: everything else is 1; expt_tp defaults to tp.
+                spec.setdefault("tp", 1)
+                spec.setdefault("pp", 1)
+                spec.setdefault("ep", 1)
+                spec.setdefault("dp", 1)
+                spec.setdefault("expt_tp", spec["tp"])
+                # Validate expert decomposition is consistent on the shard's rank count.
+                shard_world = spec["tp"] * spec["pp"] * spec["dp"]
+                assert shard_world == spec["expt_tp"] * spec["ep"] * spec["pp"] * (
+                    shard_world // (spec["expt_tp"] * spec["ep"] * spec["pp"])
+                ), (
+                    f"Shard {spec} has tp*pp*dp={shard_world} but expt_tp*ep*pp does "
+                    f"not divide it; choose compatible sizes."
+                )
+                parsed.append(spec)
+                total_ranks += shard_world
+            assert parsed, "--rl-inference-shards was empty after parsing."
+            assert total_ranks <= args.world_size, (
+                f"--rl-inference-shards consumes {total_ranks} ranks but world size is "
+                f"{args.world_size}."
+            )
+            args.rl_inference_shards_parsed = parsed
+        else:
+            args.rl_inference_shards_parsed = None
 
         # Validate inference model offloading - requires either UVM or torch_memory_saver
         if args.rl_offload_inference_model_weights_when_idle:
@@ -658,8 +721,10 @@ def validate_args(args, defaults={}):
         )
 
     from megatron.core.ssm.mamba_hybrid_layer_allocation import (
-        Symbols, parse_hybrid_pattern, get_hybrid_total_layer_count,
+        Symbols,
+        get_hybrid_total_layer_count,
         get_hybrid_total_pipeline_segment_count,
+        parse_hybrid_pattern,
     )
     sep = Symbols.MTP_SEPARATOR
 
@@ -2446,6 +2511,22 @@ def _add_rl_args(parser):
              'Defaults to training expert_tensor_parallel_size if not specified.',
     )
     group.add_argument(
+        '--rl-inference-shards',
+        type=str,
+        default=None,
+        help=(
+            'Semicolon-separated list of heterogeneous inference shard specs. Each shard '
+            'spec is a comma-separated key=value list with keys '
+            'tp,pp,ep,expt_tp,dp (missing keys default to 1; expt_tp defaults to tp). '
+            'Ranks are partitioned contiguously across shards in the order given and each '
+            'shard consumes tp*pp*dp ranks. Example for a 16-rank world: '
+            '"tp=8,pp=1,ep=8,dp=1;tp=4,pp=1,ep=4,dp=2" allocates 8 ranks to the first '
+            'shard and 8 ranks to the second. Mutually exclusive with the scalar '
+            '--rl-inference-{tensor,pipeline,expert,expert-tensor}-model-parallel-size '
+            'flags.'
+        ),
+    )
+    group.add_argument(
         '--rl-inference-model-unified-memory-level',
         type=int,
         default=0,
@@ -2489,8 +2570,7 @@ def _add_rl_args(parser):
     return parser
 
 def _add_training_args(parser):
-    from megatron.training.config import TrainingConfig
-    from megatron.training.config import ProfilingConfig
+    from megatron.training.config import ProfilingConfig, TrainingConfig
 
     prof_factory = ArgumentGroupFactory(ProfilingConfig)
     prof_group = prof_factory.build_group(parser, "profiling")
@@ -3347,7 +3427,7 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
     If kitchen isn't available, nothing to do here, return unchanged parser
     """
     try:
-        from megatron.core.extensions.kitchen import KitchenSpecProvider, HAVE_KITCHEN
+        from megatron.core.extensions.kitchen import HAVE_KITCHEN, KitchenSpecProvider
 
     except (ImportError, ModuleNotFoundError):
         HAVE_KITCHEN = False
