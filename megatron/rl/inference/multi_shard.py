@@ -21,6 +21,7 @@ from collections import deque
 from typing import Deque, List, Optional
 
 import httpx
+import torch
 import torch.distributed as dist
 from openai import AsyncOpenAI, DefaultAioHttpClient
 from pydantic import PrivateAttr
@@ -254,6 +255,29 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         instance._route_lock = asyncio.Lock()
         instance._recent_latencies = [deque(maxlen=instance._latency_window) for _ in shards]
         instance._in_flight = [0 for _ in shards]
+
+        # Post-boot smoke tests, both opt-in via env. Run once per
+        # launch, before the caller starts driving real rollouts.
+        import os
+
+        if os.environ.get("MIGRATION_SMOKE_TEST", "") == "1" and len(shards) >= 2:
+            log_single_rank(
+                logger,
+                logging.INFO,
+                "[migration-smoke] MIGRATION_SMOKE_TEST=1 set; running "
+                "one-shot migration test across shards 0 → 1",
+            )
+            await instance.run_migration_smoke_test()
+
+        if os.environ.get("DISAGG_SMOKE_TEST", "") == "1" and len(shards) >= 2:
+            log_single_rank(
+                logger,
+                logging.INFO,
+                "[disagg-smoke] DISAGG_SMOKE_TEST=1 set; running one-shot "
+                "disaggregated (prefill on shard 0, decode on shard 1) test",
+            )
+            await instance.run_disaggregated_smoke_test()
+
         return instance
 
     # ---- Generation routing --------------------------------------------
@@ -399,6 +423,480 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             )
 
             stop_text_gen_server()
+
+    # ---- Request migration ---------------------------------------------
+
+    async def migrate_request(
+        self,
+        request_id: int,
+        src_shard_index: int,
+        dst_shard_index: int,
+        *,
+        request_id_dst: Optional[int] = None,
+    ) -> Optional[int]:
+        """Move an in-flight request from one shard's engine to another.
+
+        Collective: every rank calls this; rank 0 decides. The call
+        broadcasts the parameters to every rank, builds (or reuses) the
+        cross-shard process group spanning the two shards, quiesces both
+        engines, runs the KV-migration primitive, and resumes. The
+        returned dst-side request id (if this rank owns the dst shard)
+        lets the caller track the request's new identity.
+
+        Args:
+            request_id: Source-side request id on the src shard's engine.
+                Ignored on ranks that are not in the src shard.
+            src_shard_index: Index into ``_shards`` of the shard that
+                currently holds the request.
+            dst_shard_index: Index into ``_shards`` of the shard to move
+                to. Must differ from ``src_shard_index`` (same-shard
+                migration is a no-op at this API).
+            request_id_dst: Optional explicit id to register on the
+                destination. Defaults to ``request_id``. Useful when
+                the caller's id namespace overlaps between shards.
+
+        Returns:
+            The dst-side request id on ranks in the dst shard; ``None``
+            on other ranks.
+        """
+        from megatron.core.inference.engines.request_migration import (
+            KVLayout,
+            migrate_request_cross_shard,
+        )
+        from megatron.core.inference.shards import build_cross_shard_group
+
+        assert src_shard_index != dst_shard_index, (
+            f"src and dst shard indices must differ (got {src_shard_index})"
+        )
+        assert 0 <= src_shard_index < len(self._shards)
+        assert 0 <= dst_shard_index < len(self._shards)
+
+        src_shard = self._shards[src_shard_index]
+        dst_shard = self._shards[dst_shard_index]
+        rank = dist.get_rank()
+        in_src = src_shard.owns_rank(rank)
+        in_dst = dst_shard.owns_rank(rank)
+
+        # Cross-shard group spanning src + dst. The cache in
+        # ``build_cross_shard_group`` means subsequent migrations
+        # between the same pair reuse one group.
+        cross_shard_group = build_cross_shard_group(
+            self._shards, [src_shard_index, dst_shard_index]
+        )
+
+        if not (in_src or in_dst):
+            # Bystander rank — nothing to orchestrate, but the
+            # cross_shard_group construction above was world-collective.
+            return None
+
+        # Build KV layouts from the shard specs. MLA / head-dim config
+        # comes from the engine's model/context.
+        my_engine = self._my_engine
+        assert my_engine is not None, (
+            f"rank {rank} is in shard but has no engine — multi_shard.launch "
+            "wasn't run"
+        )
+        model_config = my_engine.controller.inference_wrapped_model.model.config
+        ctx = my_engine.context
+        num_kv_heads_total = (
+            model_config.num_query_groups or model_config.num_attention_heads
+        )
+        head_dim = ctx.hidden_size_per_attention_head
+        layout_kwargs = dict(
+            pp_size=1,
+            num_layers_total=model_config.num_layers,
+            num_kv_heads_total=num_kv_heads_total,
+            head_dim=head_dim,
+            block_size_tokens=ctx.block_size_tokens,
+            is_mla=getattr(ctx, "is_mla", False),
+            kv_reduced_dim=getattr(ctx, "kv_reduced_dim", None),
+        )
+        src_layout = KVLayout(tp_size=src_shard.spec["tp"], **layout_kwargs)
+        dst_layout = KVLayout(tp_size=dst_shard.spec["tp"], **layout_kwargs)
+
+        # Head offsets for this rank's shard-local buffer slice.
+        src_heads_per_tp = num_kv_heads_total // src_shard.spec["tp"]
+        dst_heads_per_tp = num_kv_heads_total // dst_shard.spec["tp"]
+        my_src_head_offset = (
+            (rank - src_shard.rank_offset) * src_heads_per_tp if in_src else 0
+        )
+        my_dst_head_offset = (
+            (rank - dst_shard.rank_offset) * dst_heads_per_tp if in_dst else 0
+        )
+
+        # Quiesce both engines so the migration collective can run at a
+        # safe step boundary. suspend() is idempotent.
+        await self.suspend()
+        try:
+            migrated_id = migrate_request_cross_shard(
+                role="src" if in_src else "dst",
+                engine=my_engine,
+                request_id_src=request_id if in_src else None,
+                src_layout=src_layout,
+                dst_layout=dst_layout,
+                src_ranks=src_shard.ranks(),
+                dst_ranks=dst_shard.ranks(),
+                cross_shard_group=cross_shard_group,
+                my_src_head_offset=my_src_head_offset,
+                my_dst_head_offset=my_dst_head_offset,
+                request_id_dst=request_id_dst,
+            )
+        finally:
+            await self.resume()
+
+        return migrated_id
+
+    # ---- Disaggregated inference ---------------------------------------
+
+    async def _submit_via_coord(
+        self,
+        prompt: str,
+        sampling_params: "SamplingParams",
+        shard_index: int,
+    ) -> int:
+        """Submit a request to one shard's coordinator and broadcast the
+        engine-visible request id to every rank.
+
+        Only rank 0 (which holds the lifecycle clients) actually sends;
+        every rank receives the id so subsequent collective operations
+        (e.g. migration) have a consistent target.
+        """
+        tokenizer = get_tokenizer()
+        rank = dist.get_rank()
+        submitted_request_id = -1
+        if rank == 0:
+            client = self._lifecycle_clients[shard_index]
+            assert client is not None, (
+                "submission requires rank 0 to hold a lifecycle client "
+                f"for shard {shard_index}"
+            )
+            prompt_tokens = tokenizer.tokenize(prompt)
+            submitted_request_id = client.next_request_id
+            client.add_request(prompt_tokens, sampling_params)
+
+        id_tensor = torch.tensor(
+            [submitted_request_id if rank == 0 else 0],
+            dtype=torch.int64,
+            device=torch.cuda.current_device(),
+        )
+        dist.broadcast(id_tensor, src=0)
+        return int(id_tensor.item())
+
+    async def _await_request_progress(
+        self,
+        request_id: int,
+        shard_index: int,
+        *,
+        min_generated_tokens: int = 1,
+        timeout_s: float = 30.0,
+        poll_interval_s: float = 0.1,
+    ) -> int:
+        """Block until ``request_id`` has ≥ ``min_generated_tokens`` on
+        the given shard's engine, or ``timeout_s`` elapses.
+
+        Called on every rank; only the shard's rank_offset actually
+        inspects the engine and broadcasts the observed token count so
+        the rest of the world agrees. Returns the observed count.
+        """
+        shard = self._shards[shard_index]
+        rank = dist.get_rank()
+        deadline = asyncio.get_event_loop().time() + timeout_s
+        observed = 0
+
+        while asyncio.get_event_loop().time() < deadline:
+            if rank == shard.rank_offset:
+                engine = self._my_engine
+                if request_id in engine.requests:
+                    observed = len(engine.get_request(request_id).generated_tokens)
+
+            count_tensor = torch.tensor(
+                [observed if rank == shard.rank_offset else 0],
+                dtype=torch.int64,
+                device=torch.cuda.current_device(),
+            )
+            dist.broadcast(count_tensor, src=shard.rank_offset)
+            observed = int(count_tensor.item())
+            if observed >= min_generated_tokens:
+                break
+            await asyncio.sleep(poll_interval_s)
+
+        return observed
+
+    async def submit_disaggregated_request(
+        self,
+        prompt: str,
+        sampling_params: "SamplingParams",
+        *,
+        prefill_shard_index: int = 0,
+        decode_shard_index: int = 1,
+        prefill_timeout_s: float = 30.0,
+        poll_interval_s: float = 0.1,
+    ) -> int:
+        """Run prefill on one shard and decode on another.
+
+        Collective: every rank must call. The flow:
+
+            1. rank 0 submits the prompt to the prefill shard's
+               coordinator (same ZMQ path HTTP would use).
+            2. All ranks poll the prefill shard's engine until the
+               request has produced at least one generated token — i.e.
+               prefill has completed and written KV for every prompt
+               position, and the first decode step has sampled the
+               initial output token.
+            3. The request is migrated to the decode shard using the
+               same KV-transport collective that powers mid-flight
+               migration. The decode shard continues generation from
+               the migrated KV.
+
+        Returns the request id (identical on both shards — no id
+        renaming by default).
+
+        Caveats (same as migrate_request):
+          - The prefill shard's coord loses visibility of the request
+            after migration; any originating HTTP future won't resolve
+            on it. Full HTTP-transparent disaggregation needs the
+            coord-mediated reply-forwarding work tracked alongside the
+            migration primitive.
+          - Call this *after* engines are RUNNING (post-``resume``);
+            the prefill shard must be able to pick up the submit.
+        """
+        assert prefill_shard_index != decode_shard_index, (
+            "prefill and decode shards must differ for disaggregation"
+        )
+
+        request_id = await self._submit_via_coord(
+            prompt, sampling_params, prefill_shard_index
+        )
+        observed_tokens = await self._await_request_progress(
+            request_id,
+            prefill_shard_index,
+            min_generated_tokens=1,
+            timeout_s=prefill_timeout_s,
+            poll_interval_s=poll_interval_s,
+        )
+        if observed_tokens < 1:
+            raise RuntimeError(
+                f"disaggregated submit: prefill did not complete within "
+                f"{prefill_timeout_s}s on shard {prefill_shard_index} "
+                f"(request {request_id} not seen on engine)"
+            )
+        await self.migrate_request(
+            request_id=request_id,
+            src_shard_index=prefill_shard_index,
+            dst_shard_index=decode_shard_index,
+        )
+        return request_id
+
+    # ---- Smoke tests ---------------------------------------------------
+
+    async def run_disaggregated_smoke_test(
+        self,
+        *,
+        prefill_shard_index: int = 0,
+        decode_shard_index: int = 1,
+        prompt: str = "The quick brown fox jumps over the lazy dog",
+        post_decode_sleep_s: float = 5.0,
+    ) -> None:
+        """One-shot self-test for :meth:`submit_disaggregated_request`.
+
+        Gated on ``DISAGG_SMOKE_TEST=1`` from :meth:`launch`. Logs the
+        prefill → migrate → decode hop and the decode-side token count
+        after a short grace period, so a human can eyeball that
+        disaggregation is actually running end-to-end.
+        """
+        from megatron.core.inference.sampling_params import SamplingParams
+
+        rank = dist.get_rank()
+        decode_shard = self._shards[decode_shard_index]
+
+        # Drive engines to RUNNING before the coord can see our submit.
+        await self.resume()
+
+        sampling = SamplingParams(
+            num_tokens_to_generate=2048,
+            termination_id=-1,
+            return_log_probs=False,
+            skip_prompt_log_probs=True,
+        )
+
+        if rank == 0:
+            logger.info(
+                "[disagg-smoke] prefill→decode shards = %d → %d (prompt=%r)",
+                prefill_shard_index,
+                decode_shard_index,
+                prompt,
+            )
+
+        request_id = await self.submit_disaggregated_request(
+            prompt,
+            sampling,
+            prefill_shard_index=prefill_shard_index,
+            decode_shard_index=decode_shard_index,
+        )
+
+        if rank == decode_shard.rank_offset:
+            engine = self._my_engine
+            if request_id in engine.requests:
+                n_at_handoff = len(engine.get_request(request_id).generated_tokens)
+                logger.info(
+                    "[disagg-smoke] at handoff: request %d landed on decode "
+                    "shard (%d) with %d generated tokens (should be ≥1 "
+                    "— the first-decode token produced during prefill)",
+                    request_id,
+                    decode_shard_index,
+                    n_at_handoff,
+                )
+            else:
+                logger.error(
+                    "[disagg-smoke] handoff FAILED: request %d not on "
+                    "decode shard %d",
+                    request_id,
+                    decode_shard_index,
+                )
+
+        await asyncio.sleep(post_decode_sleep_s)
+
+        if rank == decode_shard.rank_offset:
+            engine = self._my_engine
+            if request_id in engine.requests:
+                n_final = len(engine.get_request(request_id).generated_tokens)
+                logger.info(
+                    "[disagg-smoke] after %.1fs of decode on shard %d: "
+                    "request %d has %d generated tokens",
+                    post_decode_sleep_s,
+                    decode_shard_index,
+                    request_id,
+                    n_final,
+                )
+
+        if rank == 0:
+            logger.info("[disagg-smoke] smoke test completed")
+
+    async def run_migration_smoke_test(
+        self,
+        *,
+        src_shard_index: int = 0,
+        dst_shard_index: int = 1,
+        prompt: str = "The quick brown fox jumps over the lazy dog",
+        pre_migrate_sleep_s: float = 10.0,
+        post_migrate_sleep_s: float = 5.0,
+    ) -> None:
+        """Submit a dummy request to one shard, migrate it, verify.
+
+        A one-shot self-test that proves the migration primitive works
+        against the live engines launched by :meth:`launch`. Useful as a
+        post-boot assertion in RL runs to catch migration regressions
+        before they surface mid-rollout. Runs collectively: every rank
+        must call it.
+
+        The flow on a healthy system:
+
+            1. rank 0 of the src shard submits a short prompt via the
+               shard's :class:`InferenceClient` (same path HTTP takes).
+            2. After ``pre_migrate_sleep_s`` the engine has prefilled
+               and produced at least one decode token.
+            3. All ranks enter :meth:`migrate_request`; the primitive
+               pauses both engines, runs the collective transport, and
+               resumes.
+            4. After ``post_migrate_sleep_s`` the dst shard has
+               continued generation on the migrated KV.
+            5. rank 0 logs the before/after token counts.
+
+        The originating HTTP/coord future is deliberately abandoned —
+        coordinator-mediated migration plumbing (so the src coord
+        forwards the reply to the dst, or the caller learns where the
+        request went) is a separate follow-up. This test exercises the
+        engine-level + transport-level path only.
+        """
+        from megatron.core.inference.sampling_params import SamplingParams
+
+        rank = dist.get_rank()
+        src_shard = self._shards[src_shard_index]
+        dst_shard = self._shards[dst_shard_index]
+
+        # ``launch`` leaves engines in RESUMED but not RUNNING (the
+        # caller normally does that via ``resume`` right after). Drive
+        # both engines to RUNNING here so the coord can forward our
+        # dummy submit to the engine-side MP group before the sleep.
+        await self.resume()
+
+        # Generous token budget so the request is still mid-decode when
+        # the migration collective fires (a short request would finish
+        # and be cleaned out of engine.requests before we snapshot it).
+        smoke_sampling = SamplingParams(
+            num_tokens_to_generate=2048,
+            termination_id=-1,
+            return_log_probs=False,
+            skip_prompt_log_probs=True,
+        )
+        submitted_request_id = await self._submit_via_coord(
+            prompt, smoke_sampling, src_shard_index
+        )
+        if rank == 0:
+            logger.info(
+                "[migration-smoke] rank 0 submitted request %d via shard %d's "
+                "coordinator",
+                submitted_request_id,
+                src_shard_index,
+            )
+
+        # Let the coordinator push the request to the shard's MP group,
+        # then prefill + some decode steps.
+        await asyncio.sleep(pre_migrate_sleep_s)
+
+        if rank == src_shard.rank_offset:
+            engine = self._my_engine
+            n_before = len(engine.get_request(submitted_request_id).generated_tokens)
+            logger.info(
+                "[migration-smoke] pre-migration: request %d on src shard has "
+                "%d generated tokens — migrating to shard %d",
+                submitted_request_id,
+                n_before,
+                dst_shard_index,
+            )
+
+        # Collective migration. Every rank calls; primitive handles the
+        # role dispatch internally (src vs dst vs bystander).
+        await self.migrate_request(
+            request_id=submitted_request_id,
+            src_shard_index=src_shard_index,
+            dst_shard_index=dst_shard_index,
+        )
+
+        if rank == dst_shard.rank_offset:
+            engine = self._my_engine
+            if submitted_request_id in engine.requests:
+                n_after = len(engine.get_request(submitted_request_id).generated_tokens)
+                logger.info(
+                    "[migration-smoke] post-migration: dst shard has request "
+                    "%d with %d generated tokens (migration succeeded)",
+                    submitted_request_id,
+                    n_after,
+                )
+            else:
+                logger.error(
+                    "[migration-smoke] migration appears to have FAILED: "
+                    "dst shard engine does not have request %d",
+                    submitted_request_id,
+                )
+
+        # Give dst shard a moment to continue generating on the migrated KV.
+        await asyncio.sleep(post_migrate_sleep_s)
+
+        if rank == dst_shard.rank_offset:
+            engine = self._my_engine
+            if submitted_request_id in engine.requests:
+                n_final = len(engine.get_request(submitted_request_id).generated_tokens)
+                logger.info(
+                    "[migration-smoke] after %.1fs of continued decode on dst "
+                    "shard: request %d has %d generated tokens",
+                    post_migrate_sleep_s,
+                    submitted_request_id,
+                    n_final,
+                )
+
+        if rank == 0:
+            logger.info("[migration-smoke] smoke test completed")
 
     # ---- Reachability introspection ------------------------------------
 

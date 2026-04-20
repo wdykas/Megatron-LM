@@ -867,6 +867,424 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         return self.requests[request_id].record[-1]
 
+    @experimental_api
+    def snapshot_request(
+        self, request_id: int
+    ) -> Tuple["RequestMigrationBundle", Tensor]:
+        """Read-only extract of a request's current migration state.
+
+        Produces the metadata envelope + the physical KV block ids the
+        request currently occupies, without mutating engine/context state.
+        This is the first half of an inter-engine migration: a caller can
+        use the block-id tensor to drive a CopyService transport (reading
+        directly from ``self.context.memory_buffer``), then orchestrate
+        eviction and injection on the destination engine.
+
+        Must be called between engine steps. The returned block-id tensor
+        is a view of ``context.request_to_kv_block_ids`` and is valid
+        only until the next step reshuffles slot bookkeeping — clone if
+        you need to hold onto it across steps.
+
+        Args:
+            request_id: The request whose state to snapshot. Must
+                currently be in the active batch (not paused, not still
+                in ``waiting_request_ids``).
+
+        Returns:
+            (RequestMigrationBundle, block_ids): Bundle carries all the
+            non-tensor request state (tokens, sampling params, logprobs,
+            ``kv_cache_epoch``, block counts, source rank-ids assumed
+            filled by the caller). ``block_ids`` is a 1-D tensor of the
+            physical KV block ids in the engine's ``memory_buffer``, in
+            chronological order (block 0 = earliest tokens).
+        """
+        # Import here to avoid a cyclic dependency at module-load time.
+        from megatron.core.inference.engines.request_migration import (
+            KVLayout,
+            MambaLayout,
+            RequestMigrationBundle,
+        )
+
+        assert request_id in self.requests, (
+            f"request {request_id} is not tracked by this engine"
+        )
+        request = self.get_request(request_id)
+
+        # MoE router replay: the per-token per-layer routing decisions
+        # accumulated in ``request.routing_indices`` are *not* carried
+        # across shards yet, so a request that has recorded routing
+        # history would drop it on migration — breaking RL flows that
+        # rely on deterministic router replay. Refuse explicitly until
+        # the bundle gains a ``routing_indices`` field and
+        # inject_request hydrates it.
+        if getattr(request, "routing_indices", None) is not None and (
+            request.routing_indices.numel() > 0
+            if isinstance(request.routing_indices, torch.Tensor)
+            else len(request.routing_indices) > 0
+        ):
+            raise AssertionError(
+                f"request {request_id} has accumulated routing_indices "
+                f"(MoE router replay); migration does not yet carry "
+                f"routing history across shards. Disable router replay or "
+                f"wait for the follow-up that extends RequestMigrationBundle."
+            )
+
+        # Locate the request's current slot in the context. Slots are
+        # reshuffled across steps; a fresh lookup is required.
+        ctx = self.context
+        matches = (ctx.request_ids == request_id).nonzero(as_tuple=False).flatten()
+        assert matches.numel() == 1, (
+            f"request {request_id} has {matches.numel()} slots in the active batch "
+            f"(expected exactly one); cannot snapshot a paused or waiting request"
+        )
+        slot_idx = int(matches.item())
+        active_lo = ctx.paused_request_count
+        active_hi = ctx.total_request_count
+        assert active_lo <= slot_idx < active_hi, (
+            f"request {request_id} slot {slot_idx} is not in the active batch "
+            f"[{active_lo}, {active_hi}); snapshot requires active-batch residency"
+        )
+
+        block_count = int(ctx.request_kv_block_counts[slot_idx].item())
+        block_ids = ctx.request_to_kv_block_ids[slot_idx, :block_count].clone()
+        last_block_offset = int(ctx.request_last_kv_block_offset[slot_idx].item())
+
+        # Compose the KV layout descriptor from the context's own state.
+        # ``pg_collection`` isn't present in unit-test contexts; fall back
+        # to TP=PP=1 then.
+        model_config = self.controller.inference_wrapped_model.model.config
+        pg = getattr(ctx, "pg_collection", None)
+        tp_size = get_pg_size(pg.tp) if pg is not None else 1
+        pp_size = get_pg_size(pg.pp) if pg is not None else 1
+        mamba_layout: Optional[MambaLayout] = None
+        if ctx.is_hybrid_model:
+            mamba_layout = MambaLayout(
+                num_mamba_layers_pp=ctx.num_mamba_layers,
+                conv_states_shape=tuple(ctx.mamba_conv_states_shape),
+                ssm_states_shape=tuple(ctx.mamba_ssm_states_shape),
+                conv_states_dtype_name=str(ctx.mamba_conv_states_dtype).split(".")[-1],
+                ssm_states_dtype_name=str(ctx.mamba_ssm_states_dtype).split(".")[-1],
+            )
+
+        src_layout = KVLayout(
+            tp_size=tp_size,
+            pp_size=pp_size,
+            num_layers_total=model_config.num_layers,
+            num_kv_heads_total=(
+                model_config.num_query_groups or model_config.num_attention_heads
+            ),
+            head_dim=ctx.hidden_size_per_attention_head,
+            block_size_tokens=ctx.block_size_tokens,
+            is_mla=getattr(ctx, "is_mla", False),
+            kv_reduced_dim=getattr(ctx, "kv_reduced_dim", None),
+            mamba=mamba_layout,
+        )
+
+        def _as_list(x) -> list:
+            if x is None:
+                return []
+            return x.tolist() if isinstance(x, torch.Tensor) else list(x)
+
+        prompt_tokens = _as_list(request.prompt_tokens)
+        generated_tokens = _as_list(request.generated_tokens)
+        sampling_params = (
+            request.sampling_params.serialize() if request.sampling_params else {}
+        )
+        generated_log_probs = (
+            _as_list(request.generated_log_probs)
+            if request.generated_log_probs is not None
+            else None
+        )
+        kv_cache_epoch = [tuple(pair) for pair in (request.kv_cache_epoch or [])]
+
+        bundle = RequestMigrationBundle(
+            request_id=request_id,
+            prompt_tokens=prompt_tokens,
+            generated_tokens=generated_tokens,
+            sampling_params=sampling_params,
+            generated_log_probs=generated_log_probs,
+            generated_top_n_logprobs=None,
+            kv_cache_epoch=kv_cache_epoch,
+            num_kv_blocks=block_count,
+            last_block_offset=last_block_offset,
+            src_block_ids=block_ids.tolist(),
+            src_layout=src_layout,
+            dst_layout=None,
+        )
+        return bundle, block_ids
+
+    @experimental_api
+    def get_mamba_state_idx_for(self, request_id: int) -> Optional[int]:
+        """Return the index into ``mamba_conv_states`` / ``mamba_ssm_states``
+        that holds ``request_id``'s per-request Mamba state, or ``None``
+        if this engine isn't hybrid or the request has no mamba slot
+        assigned.
+
+        Complements :meth:`snapshot_request` / :meth:`inject_request`
+        for migrating Mamba / hybrid models. The returned index is a
+        rank-local handle — it is meaningful only for reading/writing
+        this rank's own ``mamba_conv_states`` / ``mamba_ssm_states``
+        tensors; the destination engine allocates its own fresh index
+        during :meth:`inject_request`.
+        """
+        ctx = self.context
+        if not ctx.is_hybrid_model:
+            return None
+        matches = (ctx.request_ids == request_id).nonzero(as_tuple=False).flatten()
+        if matches.numel() != 1:
+            return None
+        slot_idx = int(matches.item())
+        state_idx = int(ctx.mamba_metadata.request_to_mamba_state_idx[slot_idx].item())
+        return state_idx if state_idx >= 0 else None
+
+    @experimental_api
+    def detach_request(self, request_id: int, *, keep_blocks: bool = True) -> Tensor:
+        """Remove a request from the active batch without finishing it.
+
+        Undoes the slot bookkeeping for ``request_id`` — swaps it out to
+        the right edge of the active region, decrements
+        ``total_request_count``, and drops the engine-side
+        :attr:`requests` entry. When ``keep_blocks=True`` (the migration
+        use-case) the KV blocks the request occupied are **not** returned
+        to the allocator; the caller is handed a tensor of those block ids
+        and becomes responsible for eventually releasing them (typically
+        after a :class:`CopyService` send completes). When
+        ``keep_blocks=False`` the blocks are released immediately —
+        equivalent to a fire-and-forget abort.
+
+        Must be called between engine steps. Rejects Mamba / hybrid
+        models for now — their per-request mamba slot would also need
+        detachment and v0 only supports GPT-style attention.
+
+        Args:
+            request_id: Request to detach. Must be in the active batch.
+            keep_blocks: If True, the returned block ids remain allocated
+                in the KV block allocator; caller must free them later.
+
+        Returns:
+            1-D tensor of the physical KV block ids the request occupied.
+        """
+        assert request_id in self.requests, (
+            f"request {request_id} is not tracked by this engine"
+        )
+        ctx = self.context
+        assert ctx.chunked_prefill_request_id != request_id, (
+            f"cannot detach the chunked-prefill request {request_id}"
+        )
+
+        matches = (ctx.request_ids == request_id).nonzero(as_tuple=False).flatten()
+        assert matches.numel() == 1, (
+            f"request {request_id} has {matches.numel()} slots (expected 1); "
+            "only active-batch requests can be detached"
+        )
+        slot_idx = int(matches.item())
+        active_lo = ctx.paused_request_count
+        active_hi = ctx.total_request_count
+        assert active_lo <= slot_idx < active_hi, (
+            f"request {request_id} slot {slot_idx} is not in the active batch "
+            f"[{active_lo}, {active_hi}); detach requires active-batch residency"
+        )
+
+        block_count = int(ctx.request_kv_block_counts[slot_idx].item())
+        block_ids = ctx.request_to_kv_block_ids[slot_idx, :block_count].clone()
+
+        # Capture the mamba state slot (if any) before the swap below
+        # shuffles slot indices. The actual state-pool free happens
+        # after the swap + total_request_count bump.
+        mamba_state_to_free = None
+        if ctx.is_hybrid_model:
+            mamba_state_to_free = int(
+                ctx.mamba_metadata.request_to_mamba_state_idx[slot_idx].item()
+            )
+            if mamba_state_to_free < 0:
+                mamba_state_to_free = None
+
+        if keep_blocks:
+            # Hide the block ids from any future eviction path that might
+            # scan this slot before we overwrite it — blocks stay allocated
+            # in the allocator until the caller frees them via the returned
+            # tensor.
+            ctx.request_to_kv_block_ids[slot_idx, :] = -1
+
+        # Swap the detached slot with the last active slot, then drop the
+        # right edge. Use the context's own swap helper so every mirrored
+        # book-keeping tensor (metadata columns included, plus the hybrid
+        # model's ``request_to_mamba_state_idx``) stays consistent.
+        last_active = active_hi - 1
+        device = torch.cuda.current_device()
+        if slot_idx != last_active:
+            src_idxs = torch.tensor([slot_idx], device=device)
+            dst_idxs = torch.tensor([last_active], device=device)
+            ctx._swap_book_keeping_tensors(src_idxs=src_idxs, dst_idxs=dst_idxs)
+
+        ctx.total_request_count -= 1
+        # Reset the now-unused edge slot.
+        ctx.request_to_kv_block_ids[last_active, :] = -1
+        ctx.request_kv_block_counts[last_active] = 0
+        if ctx.is_hybrid_model:
+            # After the swap, the detached request's mamba state idx
+            # lives at the last_active slot. Free it through the
+            # allocator regardless of ``keep_blocks`` — the KV
+            # ``keep_blocks`` flag is specific to the KV allocator. The
+            # migration transport has already copied the mamba state
+            # by the time detach runs, so its storage is safe to release.
+            if mamba_state_to_free is not None:
+                # free_slots reads request_to_mamba_state_idx[last_active]
+                # (currently set to ``mamba_state_to_free`` after the
+                # swap), returns it to the free pool, and sets the slot
+                # back to ``-1``.
+                ctx.mamba_metadata.free_slots(
+                    torch.tensor([last_active], device=device)
+                )
+
+        del self.requests[request_id]
+
+        if not keep_blocks and block_count > 0:
+            ctx.kv_block_allocator.release_memory_blocks(block_ids)
+
+        return block_ids
+
+    @experimental_api
+    def inject_request(
+        self, bundle: "RequestMigrationBundle"
+    ) -> Tensor:
+        """Insert a request directly into the active batch in DECODE state.
+
+        Allocates ``bundle.num_kv_blocks`` fresh blocks from the KV
+        allocator, sets up a slot as if the request had already finished
+        prefill and accumulated ``len(prompt_tokens) + len(generated_tokens)``
+        tokens of KV cache (populated by the caller), and registers the
+        request in :attr:`requests`. Returns the new block ids so the
+        caller can write received KV tensors into them.
+
+        Contract for the caller:
+            1. Call :meth:`inject_request` to acquire block ids.
+            2. Write KV data into
+               ``engine.context.memory_buffer[..., block_id, ...]`` for
+               each returned block id (via the migration transport).
+            3. The next call to :meth:`step_modern` will resume generation.
+
+        Must be called between engine steps. Rejects Mamba / hybrid
+        models for v0.
+
+        Args:
+            bundle: Migration envelope produced by
+                :meth:`snapshot_request` on the source engine (optionally
+                transported through the coordinator wire format).
+
+        Returns:
+            1-D tensor of block ids the caller must fill.
+        """
+        from megatron.core.inference.engines.request_migration import (
+            RequestMigrationBundle,
+        )
+
+        assert isinstance(bundle, RequestMigrationBundle)
+        assert bundle.request_id not in self.requests, (
+            f"request {bundle.request_id} already tracked by this engine; "
+            "inject_request does not support re-injection"
+        )
+        ctx = self.context
+        assert ctx.total_request_count < ctx.max_requests, (
+            f"cannot inject: request slot table is full "
+            f"({ctx.total_request_count}/{ctx.max_requests})"
+        )
+
+        # Rehydrate the request object from its on-the-wire form.
+        sampling = SamplingParams.deserialize(bundle.sampling_params)
+        device = torch.cuda.current_device()
+        prompt_tokens = torch.tensor(
+            bundle.prompt_tokens, dtype=torch.int64, device=device
+        )
+        request = DynamicInferenceRequest(
+            request_id=bundle.request_id,
+            prompt_tokens=prompt_tokens,
+            sampling_params=sampling,
+        )
+        # The engine uses list-style mutation (`generated_tokens += tokens`)
+        # on the active request; tensorisation happens at serialisation
+        # time. Mirror that here so a subsequent step can append cleanly.
+        request.generated_tokens = list(bundle.generated_tokens)
+        if bundle.generated_log_probs is not None:
+            request.generated_log_probs = torch.tensor(
+                bundle.generated_log_probs, dtype=torch.float32, device=device
+            )
+        request.kv_cache_epoch = [tuple(p) for p in bundle.kv_cache_epoch]
+        request.status = Status.ACTIVE_AND_GENERATING_TOKENS
+
+        # Allocate KV blocks before touching context state so an
+        # allocator failure leaves the engine untouched.
+        block_ids = ctx.kv_block_allocator.allocate_memory_blocks(bundle.num_kv_blocks)
+        if block_ids is None:
+            raise BlockOverflowError(bundle.request_id)
+        assert block_ids.numel() == bundle.num_kv_blocks
+
+        # Register with the engine.
+        self.requests[bundle.request_id] = RequestEntry(
+            record=DynamicInferenceRequestRecord.from_request(request),
+            future=self._loop.create_future(),
+        )
+
+        # Install the slot at the right edge of the active region. Because
+        # we ensured the table isn't full, this write is safe.
+        slot_idx = ctx.total_request_count
+        prompt_len = len(bundle.prompt_tokens)
+        gen_len = len(bundle.generated_tokens)
+        total_len = prompt_len + gen_len
+        num_tokens_to_generate = sampling.num_tokens_to_generate or 0
+
+        ctx.request_ids[slot_idx] = bundle.request_id
+        ctx.request_in_prefill_status_tensor[slot_idx] = 0  # DECODE, not PREFILL
+        ctx.request_query_lengths[slot_idx] = 1
+        ctx.request_output_lengths[slot_idx] = total_len + num_tokens_to_generate
+
+        # Per-request sampling metadata (temperature, top_k, top_p,
+        # termination_id, etc.). Without this the slot inherits stale /
+        # zero values, causing the sampler to receive NaN probabilities.
+        # Mirror `add_dummy_requests_parallel`'s metadata population.
+        for (label, dtype, _), value in zip(
+            ctx.request_metadata_types, request.tracked_metadata
+        ):
+            metadata_tensor = ctx.request_metadata[label]
+            metadata_tensor[slot_idx] = torch.tensor(
+                value, dtype=dtype, device=metadata_tensor.device
+            )
+        # Post-decode-step invariant: KV for prompt + generated[:-1] is in
+        # cache; generated[-1] is the *pending query* whose KV will be
+        # written by the next forward pass. So kv_length_offsets counts
+        # ``total_len - 1`` tokens; adding query_lengths (=1) gives the
+        # post-step sequence length ``total_len``.
+        assert gen_len >= 1, (
+            "inject_request only supports requests past the prefill boundary "
+            "(need at least one generated token to derive the pending query)"
+        )
+        ctx.request_kv_length_offsets[slot_idx] = total_len - 1
+        ctx.request_kv_block_counts[slot_idx] = bundle.num_kv_blocks
+        ctx.request_last_kv_block_id[slot_idx] = int(block_ids[-1].item())
+        ctx.request_last_kv_block_offset[slot_idx] = bundle.last_block_offset
+        # Clear row first so any stale -1 sentinels in the tail are
+        # preserved after the valid prefix.
+        ctx.request_to_kv_block_ids[slot_idx, :] = -1
+        ctx.request_to_kv_block_ids[slot_idx, : bundle.num_kv_blocks] = block_ids
+
+        # Hybrid / Mamba models: allocate a fresh slot in the per-request
+        # Mamba state table and record its index. The caller will write
+        # the received ``mamba_conv_states`` / ``mamba_ssm_states`` at
+        # this index through the migration transport. If allocation
+        # fails, roll back the KV blocks we already allocated so the
+        # engine state is untouched.
+        if ctx.is_hybrid_model:
+            mamba_state_idx = ctx.mamba_metadata.allocate_slot()
+            if mamba_state_idx is None:
+                ctx.kv_block_allocator.release_memory_blocks(block_ids)
+                del self.requests[bundle.request_id]
+                raise BlockOverflowError(bundle.request_id)
+            ctx.mamba_metadata.request_to_mamba_state_idx[slot_idx] = mamba_state_idx
+
+        ctx.total_request_count += 1
+
+        return block_ids
+
     def _add_request(
         self, request: DynamicInferenceRequest
     ) -> asyncio.Future[DynamicInferenceRequest]:
