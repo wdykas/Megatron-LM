@@ -1,7 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.core import mpu
-from megatron.core.inference.communication_utils import broadcast_float_list
+from megatron.core.inference.communication_utils import (
+    broadcast_float_list,
+    is_pipeline_first_stage,
+)
 from megatron.core.inference.inference_request import InferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_server.tokenization import tokenize_prompts
@@ -81,8 +83,10 @@ def run_mcore_engine(
 
     result = engine.generate(inference_requests=requests)
 
-    # Only post-process on the server rank (first stage with prompts)
-    if mpu.is_pipeline_first_stage() and prompts is not None:
+    # Only post-process on the server rank (first stage with prompts). Use the
+    # engine's shard-local pp_group so heterogeneous inference shards (which
+    # differ from the training PP group) pick the right first stage.
+    if is_pipeline_first_stage(engine.controller.pp_group) and prompts is not None:
         response_dict = {
             # Send original prompts, not x.prompt, to circumvent tokenization artifacts
             "text": [p + x.generated_text for p, x in zip(prompts, result)],

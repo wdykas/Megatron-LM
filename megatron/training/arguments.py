@@ -447,7 +447,11 @@ def validate_args(args, defaults={}):
                 )
             parsed = []
             total_ranks = 0
-            for shard_str in args.rl_inference_shards.split(";"):
+            # Accept either ";" or "+" as the shard separator. "+" is
+            # convenient from shell recipes where quoting the semicolon is
+            # fiddly (it's a command terminator otherwise).
+            shards_raw = args.rl_inference_shards.replace("+", ";")
+            for shard_str in shards_raw.split(";"):
                 shard_str = shard_str.strip()
                 if not shard_str:
                     continue
@@ -473,20 +477,28 @@ def validate_args(args, defaults={}):
                 spec.setdefault("ep", 1)
                 spec.setdefault("dp", 1)
                 spec.setdefault("expt_tp", spec["tp"])
-                # Validate expert decomposition is consistent on the shard's rank count.
+                # Validate expert decomposition is consistent on the shard's rank count:
+                # expt_tp*ep*pp must divide shard_world so the expert grid tiles cleanly.
                 shard_world = spec["tp"] * spec["pp"] * spec["dp"]
-                assert shard_world == spec["expt_tp"] * spec["ep"] * spec["pp"] * (
-                    shard_world // (spec["expt_tp"] * spec["ep"] * spec["pp"])
-                ), (
-                    f"Shard {spec} has tp*pp*dp={shard_world} but expt_tp*ep*pp does "
-                    f"not divide it; choose compatible sizes."
+                expert_block = spec["expt_tp"] * spec["ep"] * spec["pp"]
+                assert shard_world % expert_block == 0, (
+                    f"Shard {spec} has tp*pp*dp={shard_world} but "
+                    f"expt_tp*ep*pp={expert_block} does not divide it; "
+                    f"choose compatible sizes."
                 )
                 parsed.append(spec)
                 total_ranks += shard_world
             assert parsed, "--rl-inference-shards was empty after parsing."
-            assert total_ranks <= args.world_size, (
+            # Enforce full coverage: every rank must belong to exactly one shard.
+            # Idle ranks would silently skip the world-collective refit loop
+            # (`swap_model_weights_across_shards` runs one swap call per shard on
+            # every rank) and deadlock the surviving ranks. Allowing idle ranks
+            # requires lifting the refit gate in training/rl_utils and routing
+            # None-targets through the collective on their behalf; until that
+            # lands, require equality.
+            assert total_ranks == args.world_size, (
                 f"--rl-inference-shards consumes {total_ranks} ranks but world size is "
-                f"{args.world_size}."
+                f"{args.world_size}; specs must partition the full world."
             )
             args.rl_inference_shards_parsed = parsed
         else:
@@ -2515,15 +2527,17 @@ def _add_rl_args(parser):
         type=str,
         default=None,
         help=(
-            'Semicolon-separated list of heterogeneous inference shard specs. Each shard '
-            'spec is a comma-separated key=value list with keys '
-            'tp,pp,ep,expt_tp,dp (missing keys default to 1; expt_tp defaults to tp). '
-            'Ranks are partitioned contiguously across shards in the order given and each '
-            'shard consumes tp*pp*dp ranks. Example for a 16-rank world: '
-            '"tp=8,pp=1,ep=8,dp=1;tp=4,pp=1,ep=4,dp=2" allocates 8 ranks to the first '
-            'shard and 8 ranks to the second. Mutually exclusive with the scalar '
-            '--rl-inference-{tensor,pipeline,expert,expert-tensor}-model-parallel-size '
-            'flags.'
+            'Semicolon- or "+"-separated list of heterogeneous inference shard specs '
+            '("+" is convenient from shells that otherwise treat ";" as a command '
+            'terminator). Each shard spec is a comma-separated key=value list with '
+            'keys tp,pp,ep,expt_tp,dp (missing keys default to 1; expt_tp defaults '
+            'to tp). Ranks are partitioned contiguously across shards in the order '
+            'given and each shard consumes tp*pp*dp ranks. Example for a 16-rank '
+            'world: "tp=8,pp=1,ep=8,dp=1;tp=4,pp=1,ep=4,dp=2" (equivalent: '
+            '"tp=8,pp=1,ep=8,dp=1+tp=4,pp=1,ep=4,dp=2") allocates 8 ranks to the '
+            'first shard and 8 ranks to the second. Mutually exclusive with the '
+            'scalar --rl-inference-{tensor,pipeline,expert,expert-tensor}-model-'
+            'parallel-size flags.'
         ),
     )
     group.add_argument(

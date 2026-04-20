@@ -32,6 +32,7 @@ from megatron.core.inference.shards import build_cross_shard_group as _core_buil
 from megatron.core.inference.shards import (
     build_inference_pg_collection,
     build_inference_pg_collections_for_shards,
+    clear_cross_shard_group_cache,
 )
 from megatron.core.resharding.refit import (
     swap_model_weights_across_shards as _core_swap_model_weights_across_shards,
@@ -42,6 +43,7 @@ __all__ = [
     "build_inference_pg_collection",
     "build_inference_pg_collections_for_shards",
     "build_cross_shard_group",
+    "clear_cross_shard_group_cache",
     "set_inference_shards",
     "get_inference_shards",
     "get_my_inference_shard",
@@ -59,9 +61,16 @@ _INFERENCE_SHARDS: Optional[List[InferenceShard]] = None
 
 
 def set_inference_shards(shards: Optional[List[InferenceShard]]) -> None:
-    """Register the inference-shard layout constructed during setup."""
+    """Register the inference-shard layout constructed during setup.
+
+    Passing ``None`` deregisters and also flushes the cross-shard group cache
+    — process groups from a prior distributed world are not valid once torch
+    distributed has been reinitialized.
+    """
     global _INFERENCE_SHARDS
     _INFERENCE_SHARDS = shards
+    if shards is None:
+        clear_cross_shard_group_cache()
 
 
 def get_inference_shards() -> Optional[List[InferenceShard]]:

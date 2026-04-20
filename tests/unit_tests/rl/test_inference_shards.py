@@ -8,13 +8,18 @@ Run with:
 """
 import copy
 import gc
+from collections import deque
 from typing import List, Optional
 
 import pytest
 import torch
 import torch.distributed as dist
 
-from megatron.core.inference.shards import InferenceShard, build_inference_pg_collections_for_shards
+from megatron.core.inference.shards import (
+    InferenceShard,
+    build_inference_pg_collections_for_shards,
+    clear_cross_shard_group_cache,
+)
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.resharding.refit import clear_all_caches, swap_model_weights
@@ -400,3 +405,93 @@ def test_heterogeneous_refit_end_to_end():
         Utils.destroy_model_parallel()
         gc.collect()
         torch.cuda.empty_cache()
+
+
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 4, reason="need >=4 GPUs for cross-shard group cache test"
+)
+def test_cross_shard_group_cache_reuses_groups():
+    """Repeated calls for the same union return the same ProcessGroup (and no
+    deadlock), while a call for a different union produces a distinct group."""
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+    )
+    try:
+        specs = [
+            dict(tp=2, pp=1, ep=1, expt_tp=2, dp=1),  # ranks 0,1
+            dict(tp=1, pp=1, ep=1, expt_tp=1, dp=2),  # ranks 2,3
+        ]
+        shards = build_inference_pg_collections_for_shards(
+            total_world_size=dist.get_world_size(), shards=specs
+        )
+        set_inference_shards(shards)
+
+        # Same union → same cached group on every rank.
+        g1 = build_cross_shard_group([0, 1])
+        g2 = build_cross_shard_group([0, 1])
+        assert g1 is g2
+
+        # Argument order doesn't matter — caching is set-based, not list-based.
+        g3 = build_cross_shard_group([1, 0])
+        assert g1 is g3
+
+        # A different union is a distinct group (even if the current rank is
+        # in both — we still expect a fresh entry).
+        g_other = build_cross_shard_group([0])
+        if dist.get_rank() in (0, 1):
+            assert g_other is not None
+            assert g_other is not g1
+
+        # After deregistering shards the cache is flushed; re-registering and
+        # building again must produce a *different* group instance.
+        set_inference_shards(None)
+        clear_cross_shard_group_cache()  # explicit — set_inference_shards(None) also clears
+        set_inference_shards(shards)
+        g4 = build_cross_shard_group([0, 1])
+        assert g4 is not g1, "cache should have been cleared"
+    finally:
+        set_inference_shards(None)
+        Utils.destroy_model_parallel()
+
+
+def test_multi_shard_routing_picks_fast_shard():
+    """Non-distributed unit test for MegatronLocalMulti._pick_shard.
+
+    Constructs a MegatronLocalMulti instance without launching an engine, seeds
+    per-shard latency windows, and confirms that the weighted picker selects
+    the faster shard once every shard has at least one sample.
+    """
+    from megatron.rl.inference.multi_shard import MegatronLocalMulti
+
+    # Cheap construction — pydantic still requires the public fields.
+    inst = MegatronLocalMulti(host="0.0.0.0", base_port=8294)
+
+    # Simulate two shards, both reachable. Before any latency is recorded the
+    # picker must round-robin.
+    inst._openai_clients = ["fake-0", "fake-1"]  # just needs to be non-None
+    inst._recent_latencies = [deque(maxlen=32), deque(maxlen=32)]
+    inst._in_flight = [0, 0]
+
+    reachable = [0, 1]
+    assert inst._pick_shard(reachable) == 0
+    assert inst._pick_shard(reachable) == 1
+    assert inst._pick_shard(reachable) == 0  # round-robin continues
+
+    # Seed shard 0 with 1s latencies and shard 1 with 0.1s — shard 1 is ~10×
+    # faster. After both shards have samples, every subsequent pick should go
+    # to shard 1 (deterministic max-weight selection).
+    for _ in range(5):
+        inst._recent_latencies[0].append(1.0)
+        inst._recent_latencies[1].append(0.1)
+    picks = [inst._pick_shard(reachable) for _ in range(10)]
+    assert picks == [1] * 10, f"expected fast shard to dominate, got {picks}"
+
+    # Raise in-flight for shard 1 so the picker down-weights it enough that
+    # shard 0 wins despite having worse latency.
+    inst._in_flight[1] = 20
+    assert inst._pick_shard(reachable) == 0
+
+    # If only one shard is reachable, the picker must return it regardless of
+    # latency state.
+    assert inst._pick_shard([0]) == 0
+    assert inst._pick_shard([1]) == 1

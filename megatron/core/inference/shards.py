@@ -27,7 +27,7 @@ explicitly.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, FrozenSet, List, Optional
 
 import torch.distributed as dist
 
@@ -289,15 +289,21 @@ def build_inference_pg_collections_for_shards(
     return results
 
 
+# Keyed by the set of global shard ranks so repeated calls for the same
+# cross-shard group don't spawn duplicate NCCL groups. Miss is world-collective
+# via ``dist.new_group``; hit is rank-local.
+_CROSS_SHARD_GROUP_CACHE: Dict[FrozenSet[int], Optional[dist.ProcessGroup]] = {}
+
+
 def build_cross_shard_group(
     shards: List[InferenceShard], shard_indices: List[int]
 ) -> Optional[dist.ProcessGroup]:
     """Create a process group spanning the union of the named shards' ranks.
 
     Lets DP replicas with different parallelism configurations exchange
-    tensors via ordinary torch collectives. Every rank must call this
-    simultaneously (``dist.new_group`` is world-collective); ranks outside the
-    union get ``None`` back.
+    tensors via ordinary torch collectives. On a cache miss every rank must
+    call this simultaneously (``dist.new_group`` is world-collective); cache
+    hits are rank-local.
 
     Args:
         shards: Full shard layout returned by
@@ -307,9 +313,18 @@ def build_cross_shard_group(
     Returns:
         A process group if the current rank is in the union, else ``None``.
     """
-    ranks: List[int] = []
-    for i in shard_indices:
-        ranks.extend(shards[i].ranks())
-    ranks = sorted(set(ranks))
-    group = dist.new_group(ranks=ranks)
-    return group if dist.get_rank() in ranks else None
+    rank_set = frozenset(r for i in shard_indices for r in shards[i].ranks())
+    if rank_set not in _CROSS_SHARD_GROUP_CACHE:
+        _CROSS_SHARD_GROUP_CACHE[rank_set] = dist.new_group(ranks=sorted(rank_set))
+    group = _CROSS_SHARD_GROUP_CACHE[rank_set]
+    return group if dist.get_rank() in rank_set else None
+
+
+def clear_cross_shard_group_cache() -> None:
+    """Drop all cached cross-shard groups.
+
+    Safe to call at teardown. Handy in tests that build shards, tear them
+    down, and re-build — stale process groups from a prior layout would
+    otherwise leak into the next one.
+    """
+    _CROSS_SHARD_GROUP_CACHE.clear()

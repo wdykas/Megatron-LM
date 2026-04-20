@@ -192,9 +192,17 @@ def verify_model_weights_swap(
     transfer was successful. It runs a forward pass on both models and asserts
     the outputs match.  This is meant for debugging purposes only.
 
+    Heterogeneous-shard semantics: each rank compares its own training forward
+    against its own (shard-local) inference forward. With
+    ``runtime_gather_output=True`` the full-vocab logits are gathered inside
+    each model's own TP group, so the comparison is intrinsically per-rank and
+    does not cross shard boundaries. Ranks that do not own any inference shard
+    (``inference_model is None``) simply skip — they have nothing to verify.
+
     Args:
         train_model: The training model (source of weights).
-        inference_model: The inference model (target of weights).
+        inference_model: The inference model (target of weights), or ``None``
+            on ranks that are not members of any inference shard.
         seq_len: Sequence length for test input.
         batch_size: Batch size for test input.
         atol: Absolute tolerance for comparing outputs.
@@ -203,6 +211,9 @@ def verify_model_weights_swap(
     Raises:
         AssertionError: If forward pass outputs do not match within tolerance.
     """
+    if inference_model is None:
+        return
+
     args = get_args()
 
     # Unwrap models to get the core module
@@ -447,15 +458,11 @@ def get_inference_interface(args, loop, model):
 
         shards = get_inference_shards()
         if shards is not None:
-            # Multi-shard path: one engine + coordinator + HTTP server per shard;
-            # resume/suspend/kill fan-out; base_generate round-robins across shards;
-            # every rank receives the full shard table so cross-shard reachability
-            # (ZMQ + HTTP + torch collectives) is available without further setup.
             from megatron.rl.inference.multi_shard import MegatronLocalMulti
 
             _INFERENCE_INTERFACE = loop.run_until_complete(
                 MegatronLocalMulti.launch(
-                    model[0] if model is not None else None,
+                    model[0],
                     shards=shards,
                     host='0.0.0.0',
                     base_port=8294,

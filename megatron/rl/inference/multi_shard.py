@@ -3,9 +3,9 @@
 
 Each registered ``InferenceShard`` runs its own ``DynamicInferenceEngine``,
 ``DataParallelInferenceCoordinator``, and text-generation HTTP server. A single
-``MegatronLocalMulti`` instance, returned on every rank from ``launch``, fans
-lifecycle calls (resume/suspend/kill/set_generation_epoch) out to every shard
-and routes ``base_generate`` requests round-robin across their HTTP front-ends.
+``MegatronLocalMulti`` instance, returned on every rank from ``launch``, drives
+lifecycle (resume/suspend/kill/set_generation_epoch) from rank 0 and routes
+``base_generate`` requests across shards with 1/latency weighting.
 
 Reachability:
 - Every rank learns every shard's coordinator ZMQ address and HTTP URL via
@@ -16,7 +16,9 @@ Reachability:
 """
 import asyncio
 import logging
-from typing import List, Optional
+import time
+from collections import deque
+from typing import Deque, List, Optional
 
 import httpx
 import torch.distributed as dist
@@ -70,14 +72,28 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
     # Rank-local state (only populated on ranks that belong to a shard).
     _my_shard_index: Optional[int] = PrivateAttr(default=None)
     _my_engine: Optional[DynamicInferenceEngine] = PrivateAttr(default=None)
-    _my_client: Optional[InferenceClient] = PrivateAttr(default=None)
+    # Lifecycle clients — one per shard, populated **only** on global rank 0
+    # (the rollout driver). Shard-local rank_offsets only launch the HTTP
+    # server; they do not drive pause/resume because the lifecycle calls run
+    # on every rank concurrently, and if each shard's rank_offset paused its
+    # own shard, non-driver shards would pause before rank 0 finished issuing
+    # requests to them.
+    _lifecycle_clients: List[Optional[InferenceClient]] = PrivateAttr(default_factory=list)
     _rl_kv_cache_management_mode: Optional[KVCacheManagementMode] = PrivateAttr(default=None)
 
     # Routing state for base_generate (lives on every rank but is only
     # exercised on the rollout-driver rank; per-rank lock is fine).
-    _openai_clients: List[AsyncOpenAI] = PrivateAttr(default_factory=list)
+    _openai_clients: List[Optional[AsyncOpenAI]] = PrivateAttr(default_factory=list)
     _next_shard: int = PrivateAttr(default=0)
     _route_lock: Optional[asyncio.Lock] = PrivateAttr(default=None)
+    # Sliding windows of recent per-shard response durations (seconds); used
+    # for 1/latency-weighted routing once each shard has some history.
+    # _in_flight counts pending requests per shard and biases the weighted
+    # pick against shards that are currently saturated, so a fast shard
+    # doesn't get piled on before a response lands in _recent_latencies.
+    _recent_latencies: List[Deque[float]] = PrivateAttr(default_factory=list)
+    _in_flight: List[int] = PrivateAttr(default_factory=list)
+    _latency_window: int = PrivateAttr(default=32)
 
     # ---- Public API -----------------------------------------------------
 
@@ -148,28 +164,26 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             )
 
         # --- Exchange coordinator addresses across all ranks --------------
-        #
-        # We all_gather_object by default, then pull the value reported by
-        # each shard's rank_offset rank (which is the shard's dp_coordinator
-        # and therefore the sole source of truth for its dp_addr).
+        # Only each shard's rank_offset (its dp_coordinator) knows the real
+        # dp_addr, so we all_gather and pluck by rank_offset.
         world_size = dist.get_world_size()
         all_dp_addrs: List[Optional[str]] = [None] * world_size
         dist.all_gather_object(all_dp_addrs, my_dp_addr or "")
         for s in shards:
-            addr = all_dp_addrs[s.rank_offset] or None
-            s.coordinator_addr = addr if addr else None
+            s.coordinator_addr = all_dp_addrs[s.rank_offset] or None
 
         # --- Start per-shard text-gen server on the shard's rank_offset ---
+        # The HTTP server's subprocesses create their own InferenceClient against
+        # `coordinator_addr`, so no outer client is needed here for HTTP. The
+        # lifecycle client (pause/resume/...) is created separately on rank 0
+        # below, independent of shard membership.
         my_http_port: int = -1
-        my_client: Optional[InferenceClient] = None
         if my_shard is not None and rank == my_shard.rank_offset:
             my_http_port = base_port + my_shard.index
             from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
                 start_text_gen_server,
             )
 
-            my_client = InferenceClient(inference_coordinator_address=my_dp_addr)
-            my_client.start()
             start_text_gen_server(
                 coordinator_addr=my_dp_addr,
                 tokenizer=my_engine.controller.tokenizer,
@@ -181,19 +195,26 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             )
 
         # --- Exchange HTTP ports so every rank knows every shard's URL ----
-        all_http_ports: List[Optional[int]] = [None] * world_size
+        all_http_ports: List[int] = [-1] * world_size
         dist.all_gather_object(all_http_ports, my_http_port)
         for s in shards:
             port = all_http_ports[s.rank_offset]
-            if port is not None and port >= 0:
-                s.http_url = f"http://{host}:{port}"
-            else:
-                s.http_url = None
+            s.http_url = f"http://{host}:{port}" if port >= 0 else None
+
+        # --- Build lifecycle InferenceClients (global rank 0 only) ---
+        # Only global rank 0 drives pause / resume / stop / shutdown so that
+        # these collective state transitions happen once per shard, not once
+        # per shard-rank_offset. rank 0 connects to every shard's coordinator.
+        lifecycle_clients: List[Optional[InferenceClient]] = [None] * len(shards)
+        if rank == 0:
+            for s in shards:
+                if s.coordinator_addr:
+                    c = InferenceClient(inference_coordinator_address=s.coordinator_addr)
+                    c.start()
+                    lifecycle_clients[s.index] = c
 
         # --- Build OpenAI clients pointing at every shard's HTTP server ---
-        # We build these on all ranks for symmetry; only the rollout-driver
-        # rank actually exercises them, but having them everywhere keeps the
-        # future cross-shard direct-call path trivial.
+        # Built on every rank so any rank can drive rollouts.
         concurrency_limit = (
             args.grpo_prompts_per_step
             * args.grpo_group_size
@@ -203,10 +224,10 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             max_connections=concurrency_limit,
             max_keepalive_connections=concurrency_limit,
         )
-        openai_clients: List[AsyncOpenAI] = []
+        openai_clients: List[Optional[AsyncOpenAI]] = []
         for s in shards:
             if s.http_url is None:
-                openai_clients.append(None)  # type: ignore[arg-type]
+                openai_clients.append(None)
                 continue
             http_client = DefaultAioHttpClient(
                 timeout=None,
@@ -225,18 +246,41 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         instance._shards = shards
         instance._my_shard_index = my_shard.index if my_shard is not None else None
         instance._my_engine = my_engine
-        instance._my_client = my_client
+        instance._lifecycle_clients = lifecycle_clients
         instance._openai_clients = openai_clients
         instance._rl_kv_cache_management_mode = KVCacheManagementMode(
             args.rl_kv_cache_management_mode
         )
         instance._route_lock = asyncio.Lock()
+        instance._recent_latencies = [deque(maxlen=instance._latency_window) for _ in shards]
+        instance._in_flight = [0 for _ in shards]
         return instance
 
     # ---- Generation routing --------------------------------------------
 
+    def _pick_shard(self, reachable: List[int]) -> int:
+        """Pick a reachable shard to route the next request to.
+
+        Falls back to round-robin until every reachable shard has at least one
+        recorded latency sample; after that, routes by 1/(latency * (1 +
+        in_flight)) — i.e. fast shards get more requests, and a shard that's
+        currently saturated (large in-flight queue) gets down-weighted so a
+        warm-up burst doesn't pile onto a single fast shard.
+        """
+        if not all(self._recent_latencies[i] for i in reachable):
+            idx = reachable[self._next_shard % len(reachable)]
+            self._next_shard += 1
+            return idx
+
+        def score(i: int) -> float:
+            samples = sorted(self._recent_latencies[i])
+            latency = max(samples[len(samples) // 2], 1e-6)
+            return 1.0 / (latency * (1 + self._in_flight[i]))
+
+        return max(reachable, key=score)
+
     async def base_generate(self, request: InferenceRequest) -> InferenceResponse:
-        """Round-robin request across shards that have an HTTP server up."""
+        """Route request across reachable shards using 1/latency weights."""
         tokenizer = get_tokenizer()
         args = get_args()
 
@@ -245,22 +289,29 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             raise RuntimeError("No inference shards are reachable for generation.")
 
         async with self._route_lock:
-            idx = reachable[self._next_shard % len(reachable)]
-            self._next_shard += 1
+            idx = self._pick_shard(reachable)
+            self._in_flight[idx] += 1
 
         client = self._openai_clients[idx]
-        response = await client.chat.completions.create(
-            model="",
-            messages=[message.model_dump() for message in request.prompt],
-            temperature=request.generation_args.temperature or 1.0,
-            top_p=request.generation_args.top_p or 0.0,
-            n=1,
-            logprobs=True,
-            extra_body={
-                "skip_prompt_log_probs": True,
-                "add_BOS": (not args.rl_skip_bos_token and tokenizer.bos is not None),
-            },
-        )
+        start = time.monotonic()
+        try:
+            response = await client.chat.completions.create(
+                model="",
+                messages=[message.model_dump() for message in request.prompt],
+                temperature=request.generation_args.temperature or 1.0,
+                top_p=request.generation_args.top_p or 0.0,
+                n=1,
+                logprobs=True,
+                extra_body={
+                    "skip_prompt_log_probs": True,
+                    "add_BOS": (not args.rl_skip_bos_token and tokenizer.bos is not None),
+                },
+            )
+        finally:
+            elapsed = time.monotonic() - start
+            async with self._route_lock:
+                self._in_flight[idx] -= 1
+                self._recent_latencies[idx].append(elapsed)
 
         choice = response.choices[0]
         return InferenceResponse(
@@ -277,32 +328,42 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         )
 
     # ---- Lifecycle (fanned out across shards) --------------------------
+    #
+    # Every rank calls these methods, but only rank 0 actually sends
+    # pause/resume/stop/shutdown commands — one per shard — through its
+    # `_lifecycle_clients`. Non-driver ranks just wait on their local engine
+    # state (``_my_engine.wait_until``) so the engine-side broadcast from the
+    # shard's coordinator brings them along. This matches the single-shard
+    # MegatronLocal pattern (rank 0 drives, others wait) but generalises it
+    # across N heterogeneous shards.
+
+    def _drive_all(self, fn_name: str, *args) -> None:
+        """Call `fn_name(*args)` on every shard's lifecycle client (rank 0 only)."""
+        if dist.get_rank() != 0:
+            return
+        for c in self._lifecycle_clients:
+            if c is not None:
+                getattr(c, fn_name)(*args)
 
     def set_generation_epoch(self, generation_epoch: int) -> None:
-        """Each shard's local client sets its own epoch."""
-        if self._my_client is not None:
-            self._my_client.set_generation_epoch(generation_epoch)
+        self._drive_all("set_generation_epoch", generation_epoch)
 
     async def resume(self) -> None:
         if self._my_engine is None:
             return
         if self._my_engine._state_events[EngineState.RUNNING].is_set():
             return
-        if self._my_client is not None:
-            self._my_client.resume_engines()
+        self._drive_all("resume_engines")
         await self._my_engine.wait_until(EngineState.RESUMED)
-        if self._my_client is not None:
-            self._my_client.unpause_engines()
+        self._drive_all("unpause_engines")
         await self._my_engine.wait_until(EngineState.RUNNING)
 
     async def suspend(self) -> None:
         if self._my_engine is None:
             return
-        if self._my_client is not None:
-            self._my_client.pause_engines()
+        self._drive_all("pause_engines")
         await self._my_engine.wait_until(EngineState.PAUSED)
-        if self._my_client is not None:
-            self._my_client.suspend_engines()
+        self._drive_all("suspend_engines")
         await self._my_engine.wait_until(EngineState.SUSPENDED)
 
     async def kill(self) -> None:
@@ -317,17 +378,17 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         if self._my_engine is None:
             return
 
-        if self._my_client is not None:
-            self._my_client.pause_engines()
+        self._drive_all("pause_engines")
         await self._my_engine.wait_until(EngineState.PAUSED)
 
-        if self._my_client is not None:
-            self._my_client.stop_engines()
+        self._drive_all("stop_engines")
         await self._my_engine.wait_until(EngineState.STOPPED)
 
-        if self._my_client is not None:
-            self._my_client.shutdown_coordinator()
-            self._my_client.stop()
+        if dist.get_rank() == 0:
+            for c in self._lifecycle_clients:
+                if c is not None:
+                    c.shutdown_coordinator()
+                    c.stop()
 
         # The text-gen server lives on the shard's first rank; only that rank
         # needs to stop it.
@@ -348,3 +409,23 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
     def shard_coordinator_addrs(self) -> List[Optional[str]]:
         """Full table of shard coordinator ZMQ addresses as seen by this rank."""
         return [s.coordinator_addr for s in self._shards]
+
+    def shard_routing_stats(self) -> List[dict]:
+        """Per-shard routing telemetry: median latency + in-flight count.
+
+        Useful for debugging load imbalance across heterogeneous shards. Values
+        are collected from the rank-local view, so on non-driver ranks they
+        are always zero/empty.
+        """
+        stats = []
+        for i, samples in enumerate(self._recent_latencies):
+            median = sorted(samples)[len(samples) // 2] if samples else None
+            stats.append(
+                {
+                    "shard": i,
+                    "samples": len(samples),
+                    "median_latency_s": median,
+                    "in_flight": self._in_flight[i],
+                }
+            )
+        return stats

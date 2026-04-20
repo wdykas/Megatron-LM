@@ -205,12 +205,16 @@ python3 -m torch.distributed.run --nproc-per-node=4 --master_port=29500 \
     -m pytest tests/unit_tests/rl/test_inference_shards.py -v
 ```
 
-Seven tests, all passing on 4× GB200:
+Nine tests covering parser, process-group construction, cross-shard
+reachability, refit, routing, and cache invariants:
 
 1. `test_parse_rl_inference_shards_string` — CLI parser invariants.
 2. `test_build_shards_basic` — pg_collection membership correct on 2 shards.
 3. `test_shard_rank_partition_explicit` — exact TP/DP rank lists per shard.
 4. `test_shards_with_idle_ranks` — ranks outside every shard see `pg_collection=None` on all shards.
+   *Note:* arg validation now rejects layouts that don't cover the full
+   world, so this test exercises the primitive directly — user-facing
+   configs still require full coverage.
 5. `test_cross_shard_group_broadcast` — NCCL broadcast across DP replicas
    via `build_cross_shard_group`.
 6. `test_shard_url_exchange_logic` — all-gather-object pattern for
@@ -218,6 +222,15 @@ Seven tests, all passing on 4× GB200:
 7. `test_heterogeneous_refit_end_to_end` — TP=4 training → shard 0 (TP=2)
    + shard 1 (TP=1); `swap_weights_across_shards` drives per-shard refit;
    verifies logits match the source model on every rank (atol=5e-4).
+8. `test_cross_shard_group_cache_reuses_groups` — repeated calls for the
+   same shard union return the *same* cached `ProcessGroup` object; order
+   of the argument list doesn't matter; deregistering shards flushes the
+   cache.
+9. `test_multi_shard_routing_picks_fast_shard` — non-distributed;
+   constructs a `MegatronLocalMulti` in isolation, seeds per-shard latency
+   samples, and asserts the weighted picker (a) round-robins during
+   cold-start, (b) prefers the fast shard once samples exist, and (c)
+   switches back when `in_flight` makes the fast shard saturated.
 
 A regression pass of `tests/unit_tests/resharding/test_model_swap.py`
 (~50 parametrizations) also passes with these changes in place.
@@ -278,44 +291,51 @@ ports 8294 and 8295. Watch for:
    each shard's HTTP server runs on that shard's rank 0 (distinct processes).
    If anyone refactors, preserve this invariant.
 
-2. **Arg validation of the `rl_inference_shards` string**: the assertion
-   ```python
-   shard_world == spec["expt_tp"] * spec["ep"] * spec["pp"] * (shard_world // (spec["expt_tp"] * spec["ep"] * spec["pp"]))
-   ```
-   in `validate_args` is a tautology if it doesn't also check
-   divisibility separately. The real intent is
-   `shard_world % (expt_tp * ep * pp) == 0`. Fix before shipping.
+2. ~~Arg validation tautology~~ — **resolved.** The expert-decomposition
+   check was rewritten as a plain `shard_world % (expt_tp * ep * pp) == 0`
+   divisibility assertion, and the world-coverage check was tightened from
+   `<= world_size` to `== world_size` so idle ranks can't silently skip the
+   collective refit loop (see §7.3).
 
-3. **Rollout code paths still assume single `inference_model`**:
-   `get_environment_rollouts` and `megatron_rl_inference_mode` take a single
-   `model` list. In multi-shard mode the rank-local `inference_model` is
-   still a single list, so these work, but any future code that iterates
-   over *all* shards' models (e.g. cross-shard weight verification) would
-   need access to shards via `get_inference_shards()`.
+3. **Idle ranks are currently rejected at arg validation time.** Allowing
+   them requires routing `target_model=None` through the refit for every
+   shard on ranks that own none — the collective needs every rank present.
+   Until the refit call-sites (`swap_weights_across_shards` in
+   `training.py` and `rl_utils.get_environment_rollouts`) unconditionally
+   run when shards are registered (instead of gating on `inference_model is
+   not None`), keep the equality assertion. The arg-validation error
+   message documents this.
 
-4. **`verify_model_weights_swap`**: runs a forward on both training and
-   inference models. Per shard, the inference model has different TP so the
-   comparison logic (which gathers logits across TP) needs to be
-   shard-scoped. Currently compares on WORLD — that's probably broken for
-   heterogeneous shards. Worth testing with `--rl-verify-model-weights-swap`
-   explicitly.
+4. ~~`verify_model_weights_swap` is shard-broken~~ — re-audited. The
+   comparison is intrinsically per-rank (no WORLD gather; each model's
+   `runtime_gather_output=True` gathers within its own TP group). The
+   function now no-ops when `inference_model is None` and documents the
+   heterogeneous-shard semantics in its docstring. If idle ranks are
+   re-enabled in the future (see §7.3) the no-op guard means it continues
+   to work without modification.
 
-5. **No weighted routing**: `base_generate` round-robins. If shards have
-   different throughput (likely — that's the point), requests will pile up
-   on slow shards. Low-effort follow-up: measure per-shard median latency
-   over a window, weight by 1/latency.
+5. ~~No weighted routing~~ — **resolved.** `MegatronLocalMulti.base_generate`
+   maintains a per-shard sliding window of recent response latencies and an
+   in-flight request counter; once every reachable shard has at least one
+   sample it picks the shard maximizing `1 / (median_latency * (1 +
+   in_flight))`. `shard_routing_stats()` returns the current per-shard
+   telemetry for debugging. The cold-start fallback is still round-robin.
 
-6. **Cross-shard collectives are single-use**: `build_cross_shard_group`
-   calls `dist.new_group` every time. Cache by `frozenset(indices)` if
-   this becomes hot.
+6. ~~Cross-shard collectives are single-use~~ — **resolved.**
+   `build_cross_shard_group` is now cached by `frozenset(ranks)`. Miss is
+   world-collective (unchanged); hit is rank-local.
+   `clear_cross_shard_group_cache()` flushes on teardown and is invoked
+   automatically by `set_inference_shards(None)`.
 
-7. **`pg_collection`-less model path**: gpt_builders.py's fallback for when
-   `pg_collection=None` uses mpu. In multi-shard mode each shard's
-   inference model has an explicit pg_collection, but cross-talk through
-   any code that still reads `mpu.get_tensor_model_parallel_group()` during
-   inference will see the **training** group, not the shard group. Search
-   for `mpu.get_tensor_model_parallel` under `megatron/core/inference/`
-   and audit anything not reading from `pg_collection`.
+7. ~~`mpu.get_*` leaks under `megatron/core/inference/`~~ — audited (see
+   commit). Only one forward/serving-path leak was found and fixed:
+   `run_mcore_engine.py` used `mpu.is_pipeline_first_stage()` for its
+   post-processing gate, which would read the training PP group on a
+   heterogeneous shard. Replaced with `is_pipeline_first_stage(engine.
+   controller.pp_group)`. Other `mpu.*` reads in `shards.py` are init-only
+   fallbacks (intentional, for callers that want training defaults) and
+   the wrappers under `model_inference_wrappers/` already plumb
+   `self.pp_group` from `pg_collection`.
 
 ## 8. Minimal reproducer for the serving path
 
@@ -367,10 +387,15 @@ loop.run_until_complete(interface.kill())
 - **Auto-port for coordinators**: fixed port 41521 (as in the single-shard
   path) cannot work here. `inference_coordinator_port=None` was a
   deliberate choice.
-- **Per-rank `MegatronLocalMulti` on idle ranks**: even ranks outside every
-  shard receive an instance so the rollout agent can reach any shard's HTTP
-  server. If you remove this, cross-shard orchestration from idle ranks
-  breaks.
+- **Global rank 0 drives lifecycle**: pause/resume/stop/shutdown are issued
+  through rank 0's `_lifecycle_clients` (one `InferenceClient` per shard).
+  Non-driver ranks only `wait_until` on their local engine state. Do not
+  re-introduce per-shard-rank_offset drive — shard 1's rank_offset would
+  then pause its shard before rank 0 finishes routing requests to it.
+- **Full world coverage required**: arg validation rejects shard layouts
+  that don't partition the full world. Supporting idle ranks requires
+  running the collective refit even on ranks outside every shard (see §7.3);
+  not supported today.
 - **Refit cache key**: relies on `(rank, src_config, dst_config,
   num_experts)` tuple uniqueness. The multi-shard driver loops over shards
   and each iteration's `dst_config` is either this rank's shard (one
