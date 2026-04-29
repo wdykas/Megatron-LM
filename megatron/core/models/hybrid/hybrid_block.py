@@ -5,6 +5,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 import os
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -196,8 +197,6 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
             ),
         )
         if self.segment_runtime.enabled:
-            import logging
-
             logging.getLogger(__name__).info(
                 "[attention-bounded-segments] pp_layer_offset=%d layers=%d -> %s",
                 pp_layer_offset,

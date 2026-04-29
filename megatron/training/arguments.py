@@ -2012,8 +2012,7 @@ def _add_inference_args(parser):
     # NOTE: --enable-attention-bounded-segments, --segment-owner-policy, and
     # --moe-combine-destination-policy are auto-generated from the
     # corresponding TransformerConfig fields by ArgumentGroupFactory in
-    # _add_network_size_args. See attention_bounded_segment_execution_plan.md
-    # for the design.
+    # _add_network_size_args.
     return parser
 
 

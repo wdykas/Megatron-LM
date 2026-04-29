@@ -4,6 +4,7 @@ import errno
 import faulthandler
 import json
 import logging
+import os
 import signal
 import socket
 from collections import deque
@@ -51,9 +52,7 @@ def _abs_replicate_requests_enabled() -> bool:
     Toggled by env ``MCORE_INFERENCE_REPLICATE_REQUESTS=1``. Default off
     keeps the existing sharded scheduling.
     """
-    import os as _os
-
-    return _os.environ.get("MCORE_INFERENCE_REPLICATE_REQUESTS", "0") == "1"
+    return os.environ.get("MCORE_INFERENCE_REPLICATE_REQUESTS", "0") == "1"
 
 
 class DataParallelInferenceCoordinator:

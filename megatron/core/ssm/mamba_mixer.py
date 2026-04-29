@@ -467,32 +467,19 @@ class MambaMixer(MegatronModule):
         """
         Executes dynamic inference by separating decode and prefill requests and
         running them independently.
+
+        Under Variant-B request replication, ``hidden_states`` arrives in
+        ``[G, hidden]`` form on every rank (the global view). The body
+        below operates on whatever shape it is given — only the
+        ``in_proj`` GEMM gets sliced via ``_maybe_in_proj_on_local_slice``
+        (Opt B-2), so the rest of the mamba path runs identically across
+        ranks given identical input and replicated state.
         """
         sequence_packing_available, reason_for_no_sequence_packing = (
             _check_mamba_sequence_packing_support(for_inference_not_training=True)
         )
         assert sequence_packing_available, reason_for_no_sequence_packing
 
-        # Variant-B segment-mode mamba. Upstream MoE's combine ran an
-        # all-reduce that left every rank with the full [global_tokens, ...]
-        # view; ``padded_batch_dimensions.token_count`` still describes
-        # this rank's local share L, so the standard mamba path can only
-        # process the first L of the G tokens. We mamba the slice as
-        # usual and then return [G, ...] by stitching the post-mamba
-        # output into a buffer with the rest of the global input
-        # passed through.
-        #
-        # All ranks get the same input post-AR, so the slice they mamba
-        # is identical across ranks — output is identical across ranks
-        # → state stays in sync across ranks (modulo the request-slot
-        # mapping issue, which is the same one synchronous-EP scheduling
-        # relies on for default decode).
-        #
-        # The other (G-L) rows are passed-through-stale and represent
-        # other ranks' work that those ranks have ALSO mamba'd. The next
-        # MoE's all-reduce will sum across ranks; because each rank only
-        # contributed to its own slice (via experts), the sum lands on
-        # the right rows.
         return self._dynamic_inference_local(hidden_states, context)
 
     def _maybe_in_proj_on_local_slice(self, hidden_states: torch.Tensor):

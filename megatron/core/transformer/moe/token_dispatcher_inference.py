@@ -14,6 +14,7 @@ on Hopper+ GPUs with BF16, with automatic fallback to NCCL.
 from typing import List, Optional
 
 import torch
+import torch.distributed as dist
 
 from megatron.core.inference.communication.torch_symm_triton import (
     are_tensors_nvls_eligible,
@@ -29,6 +30,7 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.moe.token_dispatcher import MoEAllGatherTokenDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import get_pg_rank
 
 
 class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
@@ -390,8 +392,6 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         2. NCCL ring all-reduce — fallback when symmetric memory or NVLS
            is unavailable. Same total bytes as RS+AG via ring algorithm.
         """
-        import torch.distributed as dist
-
         nvls_eligible = (
             self.triton_nvls_kernels_allowed
             and hidden_states.dtype in (torch.bfloat16, torch.float32)
@@ -457,15 +457,14 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
 
         Implementations, in priority order:
         1. ``torch.ops.symm_mem.multimem_all_reduce_`` — PyTorch's native
-           NVLS multimem all-reduce. Empirically ~2x faster than the
-           multimem reduce-scatter baseline on GB200 at p50 (66us vs
-           124us for 128x4096 bf16) — see ``inference-bench/bench_segment_combine.py``.
-           This is the fast path.
+           NVLS multimem all-reduce. Empirically ~2× faster than the
+           multimem reduce-scatter baseline on GB200 at small sizes
+           (e.g. ~66 µs vs ~124 µs for 128×4096 bf16). Fast path.
         2. NVLS multimem all-reduce via the Triton kernel in
-           ``torch_symm_triton.collectives`` — works alongside the rest of
-           the inference dispatcher's symmetric memory pool. Roughly
-           parity with NCCL ring AR; kept as a fallback if the native op
-           is unavailable.
+           ``torch_symm_triton.collectives`` — works alongside the rest
+           of the inference dispatcher's symmetric memory pool. Roughly
+           parity with NCCL ring AR; kept as a fallback if the native
+           op is unavailable.
         3. NCCL ring all-reduce + local slice — final fallback when no
            symmetric memory is available.
 
@@ -473,10 +472,6 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         reduce-scatter path) so callers don't need to know which
         collective ran.
         """
-        import torch.distributed as dist
-
-        from megatron.core.utils import get_pg_rank
-
         rank = get_pg_rank(self.tp_ep_group)
         local_tokens = hidden_states.size(0) // self.ep_size
         start = rank * local_tokens

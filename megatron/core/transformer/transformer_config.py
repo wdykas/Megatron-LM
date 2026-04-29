@@ -942,29 +942,32 @@ class TransformerConfig(ModelParallelConfig):
     launches (useful for debugging)."""
 
     enable_attention_bounded_segments: bool = False
-    """If True, enable attention-bounded segment execution for inference (Mamba+MoE
-    hybrids). With the flag off, behavior matches baseline exactly. With it on,
-    the runtime identifies maximal runs of non-attention layers between attention
-    boundaries and tracks per-request hidden-state ownership so that future stages
-    can redirect MoE combine and migrate Mamba state without round-tripping to
-    the KV owner after every MoE layer.
+    """If True, enable attention-bounded segment execution for inference
+    (Mamba+MoE hybrids). With the flag off, behavior matches baseline
+    exactly. With it on, the runtime identifies maximal runs of
+    non-attention layers between attention boundaries and exposes per-
+    segment metadata so MoE combine and Mamba state can be redirected
+    without round-tripping to the KV owner after every MoE layer.
 
-    See ``megatron/core/inference/attention_bounded_segments.py`` for the
-    runtime, and ``attention_bounded_segment_execution_plan.md`` for the design.
+    See ``megatron/core/inference/attention_bounded_segments.py`` for
+    the runtime.
     """
 
     segment_owner_policy: str = "original_owner"
     """Policy for choosing the segment owner rank when
     ``enable_attention_bounded_segments`` is set. Currently only
-    ``"original_owner"`` (baseline behavior) is implemented. Reserved values:
-    ``"fixed_rank"``, ``"same_node_as_attention_owner"``,
+    ``"original_owner"`` (baseline behavior) is implemented. Reserved
+    values: ``"fixed_rank"``, ``"same_node_as_attention_owner"``,
     ``"hottest_expert_affinity"``, ``"measured_cost_model"``."""
 
     moe_combine_destination_policy: str = "original_owner"
     """Policy for choosing the MoE combine destination rank when
-    ``enable_attention_bounded_segments`` is set. Currently only
-    ``"original_owner"`` (baseline behavior) is implemented. Reserved values:
-    ``"current_segment_owner"``, ``"next_mamba_owner"``, ``"cost_model"``."""
+    ``enable_attention_bounded_segments`` is set. Supported values:
+    ``"original_owner"`` (baseline behavior, the default) and
+    ``"current_segment_owner"`` (Variant B: returns the all-reduced
+    global view from MoE combine, letting the next MoE layer skip its
+    all-gather; pairs with ``MCORE_INFERENCE_REPLICATE_REQUESTS=1``).
+    Reserved values: ``"next_mamba_owner"``, ``"cost_model"``."""
 
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width

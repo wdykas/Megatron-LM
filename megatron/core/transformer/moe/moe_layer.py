@@ -30,7 +30,7 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
-from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import get_pg_rank, internal_api, nvtx_range_pop, nvtx_range_push
 
 try:
     import flashinfer  # pylint: disable=unused-import
@@ -488,8 +488,6 @@ class MoELayer(BaseMoELayer):
                 and global_tokens % ep_size == 0
             )
             if use_local_slice:
-                from megatron.core.utils import get_pg_rank
-
                 tp_ep_group = tok_disp.tp_ep_group
                 rank = get_pg_rank(tp_ep_group)
                 local_tokens = global_tokens // ep_size
@@ -563,17 +561,16 @@ class MoELayer(BaseMoELayer):
 
         When ``config.enable_attention_bounded_segments`` is set, the runtime
         consults the layer's ``segment_runtime`` (attached by ``HybridStack``)
-        to determine the combine destination policy. Only the
-        ``"original_owner"`` policy is implemented in the MVP, so the call is
-        a metadata pass-through; future stages will swap in a redirected
-        token_combine when the policy is non-baseline.
+        to validate the configured combine-destination policy.
+        ``"original_owner"`` (baseline) and ``"current_segment_owner"``
+        (Variant B AR + global return) are supported; other reserved policy
+        names raise ``NotImplementedError``.
         """
         # The token dispatcher reads ``config.enable_attention_bounded_segments``
         # and ``config.moe_combine_destination_policy`` directly to decide
-        # which collective to use; the segment runtime is consulted here only
-        # for assertions / future per-request dispatch decisions. The
-        # ``current_segment_owner`` policy is implemented as AllReduce + local
-        # slice in ``InferenceCUDAGraphTokenDispatcher._token_combine_via_all_reduce``.
+        # which collective to use; the segment runtime is consulted here
+        # only to validate the policy and (in future stages) to support
+        # per-request dispatch decisions.
         segment_runtime = getattr(self, "segment_runtime", None)
         if segment_runtime is not None and segment_runtime.enabled:
             combine_dest_policy = segment_runtime.combine_destination_for_layer(

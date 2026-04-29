@@ -5,17 +5,16 @@
 This module provides infrastructure for an exact (non-approximate) inference
 runtime optimization for hybrid Mamba+MoE models with sparse attention layers.
 
-The core idea is to canonicalize hidden state ownership only at attention layers,
-and between attention layers run Mamba+MoE blocks within a chosen execution
-"island" (segment owner rank). This avoids paying the MoE combine-back cost to
-the original KV owner after every MoE layer.
+The core idea is to canonicalize hidden state ownership only at attention
+layers, and between attention layers run Mamba+MoE blocks within a chosen
+execution "island" (segment owner rank). This avoids paying the MoE
+combine-back cost to the original KV owner after every MoE layer.
 
-For the MVP, the runtime tracks segments and ownership metadata but defaults to
-the baseline behavior (combine destination = original owner). The feature is
-guarded by ``TransformerConfig.enable_attention_bounded_segments``.
-
-References:
-    See ``attention_bounded_segment_execution_plan.md`` for the design doc.
+The runtime tracks segments and ownership metadata; the
+``moe_combine_destination_policy`` config field selects how MoE combine is
+redirected (default ``"original_owner"`` keeps baseline behavior;
+``"current_segment_owner"`` enables Variant B). The feature is guarded by
+``TransformerConfig.enable_attention_bounded_segments``.
 """
 
 from __future__ import annotations
@@ -214,14 +213,17 @@ class SegmentRuntime:
     ``HybridStack`` (one per pipeline stage) and lives for the lifetime of
     the model.
 
-    The MVP wires this into the model's forward path purely as metadata: with
-    ``enable_attention_bounded_segments=False`` (the default) every
+    With ``enable_attention_bounded_segments=False`` (the default) every
     ``combine_destination_for_layer`` call returns ``"original_owner"`` and
     the canonicalize / Mamba-state migration hooks are no-ops, so output
     matches baseline exactly.
 
-    Future stages will use this state to actually redirect MoE combine, move
-    Mamba state between ranks, and choose segment owners based on routing.
+    With the flag on and ``moe_combine_destination_policy="current_segment_owner"``,
+    callers (the dispatcher, the hybrid block) read the policy from this
+    runtime to decide whether to use the AR-instead-of-RS combine and skip
+    intra-segment all-gathers (Variant B). Future stages will additionally
+    move Mamba state between ranks and choose segment owners based on
+    routing.
 
     Attributes:
         layer_type_list: Layer types for this pipeline stage.
@@ -232,9 +234,11 @@ class SegmentRuntime:
         enabled: Master switch. When False, all hooks are no-ops and
             ``combine_destination_for_layer`` returns ``"original_owner"``.
         segment_owner_policy: Policy for choosing the segment owner rank.
-            Only ``"original_owner"`` is implemented in the MVP.
+            Only ``"original_owner"`` is implemented today.
         moe_combine_destination_policy: Policy for the MoE combine
-            destination. Only ``"original_owner"`` is implemented in the MVP.
+            destination. Today the dispatcher honors ``"original_owner"``
+            (baseline) and ``"current_segment_owner"`` (Variant B AR
+            return).
     """
 
     layer_type_list: List[str]
@@ -291,15 +295,14 @@ class SegmentRuntime:
     ) -> str:
         """Return the policy name for where MoE combine should send tokens.
 
-        For the MVP this always returns ``"original_owner"`` so behavior
-        matches baseline. The signature accepts a ``request_id`` so that
-        future cost-model policies can vary per-request without changing
-        callers.
+        Returns ``"original_owner"`` when the runtime is disabled (baseline
+        behavior). When enabled, returns the configured
+        ``moe_combine_destination_policy``. The signature accepts a
+        ``request_id`` so future cost-model policies can vary per-request
+        without changing callers.
         """
         if not self.enabled:
             return "original_owner"
-        # Only the baseline policy is implemented in the MVP. Future stages
-        # will branch on self.moe_combine_destination_policy and self.segments.
         return self.moe_combine_destination_policy
 
     # ------------------------------------------------------------------
