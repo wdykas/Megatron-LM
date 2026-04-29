@@ -18,6 +18,7 @@ import torch
 from megatron.core.inference.communication.torch_symm_triton import (
     are_tensors_nvls_eligible,
     multimem_all_gather_fused,
+    multimem_all_reduce,
     multimem_reduce_scatter,
 )
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
@@ -69,6 +70,22 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         self.topk = config.moe_router_topk
 
         self.triton_nvls_kernels_allowed = not self.config.inference_disable_triton_nvls_kernels
+
+        # Variant-B runtime flag. Set to True by HybridStack when this MoE
+        # layer sits inside an attention-bounded segment after another in-
+        # segment layer. Tells token_dispatch the input is already gathered
+        # ([global_tokens, hidden]) so it should skip the AG, and tells
+        # token_combine to return the full global view rather than the
+        # local slice.
+        self._segment_input_is_global = False
+        # Variant-B Opt-1: stash for the local-slice shared-experts output.
+        # The MoE layer sets these before combine; the combine path folds
+        # the slice into the AR input at [start:end] so the all-reduce
+        # naturally distributes shared additions across ranks. Cleared
+        # after use so subsequent layers don't pick up stale state.
+        self._shared_local_slice = None
+        self._shared_local_start = 0
+        self._shared_local_end = 0
 
     def _maybe_allocate_ag_buffers(
         self, routing_map: torch.Tensor, probs: torch.Tensor, hidden_states: torch.Tensor
@@ -180,6 +197,17 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
                 shape [global_tokens, topk].
         """
         if self.ep_size == 1:
+            return hidden_states, probs
+
+        # Variant-B fast path. The previous in-segment MoE's combine left
+        # ``hidden_states`` already in [global_tokens, hidden] form via
+        # multimem all-reduce, so the standard all-gather is redundant.
+        # We still need the routing-map and probs to be global. Since the
+        # router was just run on the global hidden_states by every rank
+        # (deterministically — same input → same router output), the
+        # routing_map and probs are already global on every rank too, so
+        # we can reuse them as-is.
+        if self._segment_input_is_global:
             return hidden_states, probs
 
         # 1. Check inputs only: if inputs are 16-byte divisible,
@@ -298,6 +326,20 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         if self.ep_size == 1:
             return hidden_states
 
+        # Variant-B combine: when ABS+current_segment_owner is set AND
+        # the dispatcher's _segment_input_is_global flag is set (managed
+        # by HybridStack at segment entry), return the full global view.
+        # Otherwise fall back to the AR-then-slice (bit-equivalent to
+        # default) path.
+        if (
+            getattr(self.config, "enable_attention_bounded_segments", False)
+            and getattr(self.config, "moe_combine_destination_policy", "original_owner")
+            == "current_segment_owner"
+        ):
+            if self._segment_input_is_global:
+                return self._token_combine_via_all_reduce_global(hidden_states)
+            return self._token_combine_via_all_reduce(hidden_states)
+
         # Compute output shape first — check NVLS eligibility on the output,
         # since if the smaller output is 16-byte divisible, the input is too.
         output_shape = list(hidden_states.size())
@@ -330,3 +372,143 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
                 hidden_states, group=self.tp_ep_group
             )
             return hidden_states.to(torch.bfloat16)
+
+    def _token_combine_via_all_reduce_global(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Variant-B combine: all-reduce, return the full **global** tensor.
+
+        The standard combine path does reduce-scatter so each rank ends up
+        with [local_tokens, hidden]. Variant B keeps the global view across
+        the entire segment so the next MoE's all-gather can be skipped:
+        we all-reduce in place and return [global_tokens, hidden] on every
+        rank.
+
+        Implementations, in priority order:
+        1. ``torch.ops.symm_mem.multimem_all_reduce_`` — PyTorch's NVLS
+           multimem all-reduce. ~2x faster than reduce-scatter at small
+           sizes on GB200 (microbench), and crucially is one collective
+           instead of the RS+AG pair used by the standard path.
+        2. NCCL ring all-reduce — fallback when symmetric memory or NVLS
+           is unavailable. Same total bytes as RS+AG via ring algorithm.
+        """
+        import torch.distributed as dist
+
+        nvls_eligible = (
+            self.triton_nvls_kernels_allowed
+            and hidden_states.dtype in (torch.bfloat16, torch.float32)
+            and are_tensors_nvls_eligible(hidden_states)
+        )
+
+        # Variant-B Opt-1: if a shared-experts local slice has been stashed
+        # by the upstream MoE layer, fold it into the AR input at this
+        # rank's slice range. The AR then sums each rank's contribution
+        # into the matching global row, so the combined output already
+        # includes shared without any extra collective. ``shared_local``
+        # is cleared after consumption.
+        shared_local = self._shared_local_slice
+        shared_start = self._shared_local_start
+        shared_end = self._shared_local_end
+        self._shared_local_slice = None
+
+        result = None
+        if nvls_eligible:
+            ar_buffer = self._maybe_allocate_rs_buffer(hidden_states)
+            if ar_buffer["handle"] is not None:
+                ar_buffer["tensor"].copy_(hidden_states)
+                if shared_local is not None:
+                    ar_buffer["tensor"][shared_start:shared_end].add_(shared_local)
+                native_op = getattr(
+                    getattr(torch.ops, "symm_mem", None), "multimem_all_reduce_", None
+                )
+                if native_op is not None:
+                    sm = ar_buffer["tensor"].view(hidden_states.shape)
+                    native_op(sm, "sum", self.tp_ep_group.group_name)
+                    result = sm.to(torch.bfloat16)
+                else:
+                    output = torch.empty_like(hidden_states)
+                    multimem_all_reduce(output, ar_buffer["tensor"], ar_buffer["handle"])
+                    result = output.to(torch.bfloat16)
+
+        if result is None:
+            reduced = hidden_states.contiguous().clone()
+            if shared_local is not None:
+                reduced[shared_start:shared_end].add_(shared_local)
+            dist.all_reduce(reduced, op=dist.ReduceOp.SUM, group=self.tp_ep_group)
+            result = reduced.to(torch.bfloat16)
+
+        # Variant-B: rewrite ``self.hidden_shape`` so that the upcoming
+        # ``combine_postprocess`` reshapes to the global view rather than
+        # the local pre-AG view captured by ``dispatch_preprocess``. The
+        # original first dim is local_tokens; replace it with global.
+        old_shape = list(self.hidden_shape)
+        if old_shape and old_shape[0] * self.ep_size == result.shape[0]:
+            old_shape[0] = result.shape[0]
+            self.hidden_shape = torch.Size(old_shape)
+        return result
+
+    def _token_combine_via_all_reduce(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Equivalent of token_combine but using AllReduce + local slice.
+
+        Same arithmetic as the reduce-scatter path (sum across EP ranks,
+        return this rank's slice) but reaches it via an all-reduce so the
+        global view is materialized intermediately. Used by the
+        attention-bounded-segments combine policy — the materialized
+        global view is what lets a follow-up MoE layer skip its
+        all-gather on this rank's slice.
+
+        Implementations, in priority order:
+        1. ``torch.ops.symm_mem.multimem_all_reduce_`` — PyTorch's native
+           NVLS multimem all-reduce. Empirically ~2x faster than the
+           multimem reduce-scatter baseline on GB200 at p50 (66us vs
+           124us for 128x4096 bf16) — see ``inference-bench/bench_segment_combine.py``.
+           This is the fast path.
+        2. NVLS multimem all-reduce via the Triton kernel in
+           ``torch_symm_triton.collectives`` — works alongside the rest of
+           the inference dispatcher's symmetric memory pool. Roughly
+           parity with NCCL ring AR; kept as a fallback if the native op
+           is unavailable.
+        3. NCCL ring all-reduce + local slice — final fallback when no
+           symmetric memory is available.
+
+        Returns the local slice (same shape and contract as the standard
+        reduce-scatter path) so callers don't need to know which
+        collective ran.
+        """
+        import torch.distributed as dist
+
+        from megatron.core.utils import get_pg_rank
+
+        rank = get_pg_rank(self.tp_ep_group)
+        local_tokens = hidden_states.size(0) // self.ep_size
+        start = rank * local_tokens
+        end = start + local_tokens
+
+        nvls_eligible = (
+            self.triton_nvls_kernels_allowed
+            and hidden_states.dtype in (torch.bfloat16, torch.float32)
+            and are_tensors_nvls_eligible(hidden_states)
+        )
+
+        if nvls_eligible:
+            ar_buffer = self._maybe_allocate_rs_buffer(hidden_states)
+            if ar_buffer["handle"] is not None:
+                # Stage in symmetric memory so the multicast load sees every
+                # rank's contribution.
+                ar_buffer["tensor"].copy_(hidden_states)
+                native_op = getattr(
+                    getattr(torch.ops, "symm_mem", None), "multimem_all_reduce_", None
+                )
+                if native_op is not None:
+                    # Fast path: PyTorch's native NVLS all-reduce. Operates
+                    # in-place on the symmetric memory buffer.
+                    sm = ar_buffer["tensor"].view(hidden_states.shape)
+                    native_op(sm, "sum", self.tp_ep_group.group_name)
+                    return sm[start:end].to(torch.bfloat16).clone()
+                # Fallback: our Triton multimem AR kernel (Stage 1 baseline).
+                output = torch.empty_like(hidden_states)
+                multimem_all_reduce(output, ar_buffer["tensor"], ar_buffer["handle"])
+                return output[start:end].to(torch.bfloat16)
+
+        # Final fallback: NCCL ring all-reduce.
+        reduced = hidden_states.contiguous().clone()
+        dist.all_reduce(reduced, op=dist.ReduceOp.SUM, group=self.tp_ep_group)
+        return reduced[start:end].to(torch.bfloat16)

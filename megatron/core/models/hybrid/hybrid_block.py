@@ -5,6 +5,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
@@ -18,6 +19,7 @@ from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.inference.attention_bounded_segments import SegmentRuntime, summarize_segments
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -178,6 +180,45 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
         # Required for activation recomputation
         self.num_layers_per_pipeline_rank = len(self.layers)
 
+        # Attention-bounded segment runtime. Lives on every pipeline stage
+        # whether or not the feature is enabled — when disabled, all hooks
+        # are no-ops and combine destinations resolve to "original_owner",
+        # so behavior matches baseline. See
+        # ``megatron/core/inference/attention_bounded_segments.py``.
+        self.segment_runtime = SegmentRuntime.from_layer_type_list(
+            self.layer_type_list,
+            enabled=getattr(self.config, "enable_attention_bounded_segments", False),
+            segment_owner_policy=getattr(
+                self.config, "segment_owner_policy", "original_owner"
+            ),
+            moe_combine_destination_policy=getattr(
+                self.config, "moe_combine_destination_policy", "original_owner"
+            ),
+        )
+        if self.segment_runtime.enabled:
+            import logging
+
+            logging.getLogger(__name__).info(
+                "[attention-bounded-segments] pp_layer_offset=%d layers=%d -> %s",
+                pp_layer_offset,
+                len(self.layer_type_list),
+                summarize_segments(self.segment_runtime.segments),
+            )
+
+        # Annotate each layer with the segment runtime + its local index so
+        # MoE layers (which are the layers that actually need to know about
+        # combine destinations) can resolve their own segment in O(1) without
+        # walking back up to HybridStack at forward time. MoE layers are
+        # wrapped in a TransformerLayer (``self.mlp`` is the MoELayer); also
+        # annotate the inner MoELayer when present.
+        for local_idx, layer in enumerate(self.layers):
+            layer.segment_runtime = self.segment_runtime
+            layer.segment_local_layer_idx = local_idx
+            inner_mlp = getattr(layer, "mlp", None)
+            if inner_mlp is not None:
+                inner_mlp.segment_runtime = self.segment_runtime
+                inner_mlp.segment_local_layer_idx = local_idx
+
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
             self.final_norm = TENorm(
@@ -331,10 +372,49 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
             def get_inner_quant_context(config, layer_number):
                 return nullcontext()
 
+        # Variant-B path is active when both the feature flag is on AND
+        # the inference coordinator is configured to replicate requests
+        # to every DP rank (env MCORE_INFERENCE_REPLICATE_REQUESTS=1).
+        # Under replication every rank schedules the same set of
+        # requests so the entire model already runs on the global view
+        # ([G, hidden] on every rank) and mamba state is consistent
+        # across ranks via deterministic recomputation. In that mode the
+        # AG/RS pair around each MoE layer is pure overhead — Variant B
+        # tells the dispatcher to skip the AG and to use AR (returning
+        # the full global view) instead of RS at combine.
+        abs_active = (
+            self.segment_runtime.enabled
+            and getattr(self.config, "moe_combine_destination_policy", "original_owner")
+            == "current_segment_owner"
+            and os.environ.get("MCORE_INFERENCE_REPLICATE_REQUESTS", "0") == "1"
+        )
+
+        def _set_segment_dispatch_flag(layer, flag_value):
+            inner_mlp = getattr(layer, "mlp", None)
+            if inner_mlp is None:
+                return
+            tok_disp = getattr(inner_mlp, "token_dispatcher", None)
+            if tok_disp is None:
+                return
+            if hasattr(tok_disp, "_segment_input_is_global"):
+                tok_disp._segment_input_is_global = bool(flag_value)
+
         with outer_fp8_context:
-            for layer in self.layers:
+            for local_idx, layer in enumerate(self.layers):
                 # Layers have 1-indexed layer numbers attribute.
                 inner_quant_context = get_inner_quant_context(self.config, layer.layer_number - 1)
+
+                if (
+                    self.segment_runtime.enabled
+                    and self.segment_runtime.is_attention_boundary(local_idx)
+                ):
+                    self.segment_runtime.canonicalize_to_attention_owner()
+
+                # Tell this layer's MoE dispatcher (if any) whether the
+                # input is already in [G, hidden] form. In replicated-
+                # request mode this is true for every layer.
+                if abs_active:
+                    _set_segment_dispatch_flag(layer, True)
                 with inner_quant_context:
                     if isinstance(layer, TransformerLayer):
                         hidden_states, _ = layer(

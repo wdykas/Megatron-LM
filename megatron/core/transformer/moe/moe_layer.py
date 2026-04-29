@@ -461,8 +461,51 @@ class MoELayer(BaseMoELayer):
         """
         shared_expert_output = None
         if self.use_shared_expert and not self.shared_expert_overlap:
-            # Compute the shared expert separately when not overlapped with communication.
-            if self.shared_experts_recompute:
+            # Variant-B Opt-1: when the dispatcher is in segment-input-is-
+            # global mode (every rank holds the full [G, hidden] view via
+            # request replication), compute shared experts on this rank's
+            # [G/N, hidden] slice and stash it on the dispatcher. The
+            # combine path will fold it into the AR input at this rank's
+            # slice positions; the AR sums each rank's contribution into
+            # the correct global row, so no extra collective is needed.
+            # Saves (N-1)/N of the redundant shared-expert compute on N
+            # ranks for free.
+            tok_disp = self.token_dispatcher
+            ep_size = getattr(tok_disp, "ep_size", 1) if tok_disp is not None else 1
+            global_tokens = hidden_states.shape[0]
+            use_local_slice = (
+                not self.shared_experts_recompute
+                and tok_disp is not None
+                and getattr(tok_disp, "_segment_input_is_global", False)
+                and ep_size > 1
+                # Decode-only path: hidden_states is already flat [G, H].
+                # Skip for prefill (3D [seq, batch, H]) — the AR buffer
+                # is 2D after preprocess flattens, and the slice math
+                # would need to handle the seq/batch product. Decode is
+                # where the optimization matters anyway.
+                and hidden_states.dim() == 2
+                and global_tokens >= ep_size
+                and global_tokens % ep_size == 0
+            )
+            if use_local_slice:
+                from megatron.core.utils import get_pg_rank
+
+                tp_ep_group = tok_disp.tp_ep_group
+                rank = get_pg_rank(tp_ep_group)
+                local_tokens = global_tokens // ep_size
+                start = rank * local_tokens
+                end = start + local_tokens
+
+                local_input = hidden_states[start:end].contiguous()
+                local_output = apply_module(self.shared_experts)(local_input)
+                # Stash for combine to fold into the AR input.
+                tok_disp._shared_local_slice = local_output
+                tok_disp._shared_local_start = start
+                tok_disp._shared_local_end = end
+                # Return None so postprocess doesn't add it again — the
+                # AR already includes shared via the fold.
+                return None
+            elif self.shared_experts_recompute:
                 if self.config.fp8 or self.config.fp4:
                     shared_expert_output = te_checkpoint(
                         apply_module(self.shared_experts),
@@ -517,7 +560,31 @@ class MoELayer(BaseMoELayer):
 
         This method uses the token dispatcher to combine the outputs from different
         experts (e.g., via an All-to-All communication).
+
+        When ``config.enable_attention_bounded_segments`` is set, the runtime
+        consults the layer's ``segment_runtime`` (attached by ``HybridStack``)
+        to determine the combine destination policy. Only the
+        ``"original_owner"`` policy is implemented in the MVP, so the call is
+        a metadata pass-through; future stages will swap in a redirected
+        token_combine when the policy is non-baseline.
         """
+        # The token dispatcher reads ``config.enable_attention_bounded_segments``
+        # and ``config.moe_combine_destination_policy`` directly to decide
+        # which collective to use; the segment runtime is consulted here only
+        # for assertions / future per-request dispatch decisions. The
+        # ``current_segment_owner`` policy is implemented as AllReduce + local
+        # slice in ``InferenceCUDAGraphTokenDispatcher._token_combine_via_all_reduce``.
+        segment_runtime = getattr(self, "segment_runtime", None)
+        if segment_runtime is not None and segment_runtime.enabled:
+            combine_dest_policy = segment_runtime.combine_destination_for_layer(
+                getattr(self, "segment_local_layer_idx", -1)
+            )
+            supported = {"original_owner", "current_segment_owner"}
+            if combine_dest_policy not in supported:
+                raise NotImplementedError(
+                    f"moe_combine_destination_policy={combine_dest_policy!r} is not "
+                    "implemented. Supported values: " + ", ".join(sorted(supported))
+                )
         output = self.token_dispatcher.token_combine(output)
         return output
 

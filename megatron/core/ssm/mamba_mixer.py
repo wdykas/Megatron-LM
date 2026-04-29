@@ -7,6 +7,7 @@
 
 import logging
 import math
+import os
 from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple, Union
 
@@ -472,6 +473,95 @@ class MambaMixer(MegatronModule):
         )
         assert sequence_packing_available, reason_for_no_sequence_packing
 
+        # Variant-B segment-mode mamba. Upstream MoE's combine ran an
+        # all-reduce that left every rank with the full [global_tokens, ...]
+        # view; ``padded_batch_dimensions.token_count`` still describes
+        # this rank's local share L, so the standard mamba path can only
+        # process the first L of the G tokens. We mamba the slice as
+        # usual and then return [G, ...] by stitching the post-mamba
+        # output into a buffer with the rest of the global input
+        # passed through.
+        #
+        # All ranks get the same input post-AR, so the slice they mamba
+        # is identical across ranks — output is identical across ranks
+        # → state stays in sync across ranks (modulo the request-slot
+        # mapping issue, which is the same one synchronous-EP scheduling
+        # relies on for default decode).
+        #
+        # The other (G-L) rows are passed-through-stale and represent
+        # other ranks' work that those ranks have ALSO mamba'd. The next
+        # MoE's all-reduce will sum across ranks; because each rank only
+        # contributed to its own slice (via experts), the sum lands on
+        # the right rows.
+        return self._dynamic_inference_local(hidden_states, context)
+
+    def _maybe_in_proj_on_local_slice(self, hidden_states: torch.Tensor):
+        """Variant-B Opt-2: in_proj on this rank's [G/N, hidden] slice + AG.
+
+        Returns the resulting [G, intermediate] tensor when the
+        optimization fires, or ``None`` to signal the caller should fall
+        back to the standard full-input ``in_proj`` path.
+
+        Conditions for firing:
+        - ``MCORE_INFERENCE_REPLICATE_REQUESTS=1`` (every rank has the
+          same [G, hidden] view).
+        - 2D input (decode/mixed flat path; skip prefill 3D shape).
+        - ``ep_size > 1`` and ``G % ep_size == 0``.
+        """
+        if os.environ.get("MCORE_INFERENCE_REPLICATE_REQUESTS", "0") != "1":
+            return None
+        if hidden_states.dim() != 2:
+            return None
+        ep_group = getattr(self.pg_collection, "ep", None)
+        tp_ep_group = getattr(self.pg_collection, "tp_ep", None)
+        if ep_group is None or tp_ep_group is None:
+            return None
+        ep_size = ep_group.size()
+        if ep_size <= 1:
+            return None
+        global_tokens = hidden_states.shape[0]
+        if global_tokens < ep_size or global_tokens % ep_size != 0:
+            return None
+
+        from megatron.core.inference.communication.torch_symm_triton import (
+            are_tensors_nvls_eligible,
+            multimem_all_gather,
+        )
+        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+        from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
+        from megatron.core.utils import get_pg_rank
+
+        rank = get_pg_rank(tp_ep_group)
+        local_tokens = global_tokens // ep_size
+        start = rank * local_tokens
+        end = start + local_tokens
+
+        local_input = hidden_states[start:end].contiguous()
+        local_output, _ = self.in_proj(local_input)
+        global_shape = (global_tokens,) + tuple(local_output.shape[1:])
+
+        if (
+            local_output.numel() > 0
+            and local_output.dtype in (torch.bfloat16, torch.float32)
+            and are_tensors_nvls_eligible(local_output)
+        ):
+            buf = SymmetricMemoryManager.get_buffer(
+                "ep", process_group=ep_group
+            ).maybe_get_tensor(list(global_shape), dtype=local_output.dtype)
+            if buf["handle"] is not None:
+                output = buf["tensor"].view(local_output.dtype).view(*global_shape)
+                multimem_all_gather(output, local_output, buf["handle"])
+                # Return a fresh non-symmem tensor: the dispatcher's AR
+                # at the next MoE may reuse this buffer slot, and the
+                # SSM kernels keep zxBCdt live across many ops below.
+                return output.clone()
+
+        return gather_from_sequence_parallel_region(local_output, group=tp_ep_group)
+
+    def _dynamic_inference_local(
+        self, hidden_states: torch.Tensor, context: DynamicInferenceContext
+    ):
+        """Original ``_dynamic_inference`` body, runs on the local-share view."""
         # Grab standard states
         conv_state, ssm_state = context.mamba_states_cache(self.layer_number - self.pp_layer_offset)
 
@@ -489,8 +579,17 @@ class MambaMixer(MegatronModule):
         decode_req_count = padded_dims.decode_req_count
         prefill_req_count = padded_dims.prefill_req_count
 
-        # Input projection
-        zxBCdt, _ = self.in_proj(hidden_states)
+        # Input projection. Variant-B Opt-2: when the model is running with
+        # request replication every rank holds the same [G, hidden] view
+        # and ``in_proj`` would otherwise redundantly recompute the per-
+        # token projection on every rank. Slice to [G/N, hidden], project
+        # only this rank's slice, and all-gather the result. Saves
+        # (N-1)/N of the in_proj GEMM at the cost of one NVLS multimem
+        # AG. Falls back to the full-input path on prefill (3D shape) and
+        # for graph sizes that don't divide evenly.
+        zxBCdt = self._maybe_in_proj_on_local_slice(hidden_states)
+        if zxBCdt is None:
+            zxBCdt, _ = self.in_proj(hidden_states)
 
         y_decode = None
         y_prefill = None
@@ -559,7 +658,11 @@ class MambaMixer(MegatronModule):
         if is_using_quantization_scales(self.config):
             y[context.padding_slice] = 0.0
 
-        # Output projection
+        # Output projection. (We previously experimented with also doing
+        # out_proj on a local slice + AG — same pattern as Opt B-2 — but
+        # that combination pushed the correctness_diff above the
+        # 1-prompt fp-noise tolerance, so we keep the standard full-input
+        # path here.)
         out, out_bias = self.out_proj(y)
 
         return out, out_bias

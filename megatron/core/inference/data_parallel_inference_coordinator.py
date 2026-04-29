@@ -41,6 +41,21 @@ faulthandler.register(signal.SIGTERM, all_threads=False, chain=True)
 faulthandler.register(signal.SIGINT, all_threads=False, chain=True)
 
 
+def _abs_replicate_requests_enabled() -> bool:
+    """Variant-B request replication: broadcast each new request to ALL
+    data-parallel ranks instead of load-balancing. This is required for
+    attention-bounded-segments execution because each rank's mamba state
+    must contain every request's recurrent state (for the in-segment
+    "mamba on global view" path to be correct).
+
+    Toggled by env ``MCORE_INFERENCE_REPLICATE_REQUESTS=1``. Default off
+    keeps the existing sharded scheduling.
+    """
+    import os as _os
+
+    return _os.environ.get("MCORE_INFERENCE_REPLICATE_REQUESTS", "0") == "1"
+
+
 class DataParallelInferenceCoordinator:
     """
     Coordinates inference requests between clients and distributed model engines.
@@ -452,17 +467,40 @@ class DataParallelInferenceCoordinator:
                 ):
                     request_hashes = request_hashes[:1]
 
-                # Account for the fact that some engines may have died.
-                for _ in range(len(self.identities_of_data_parallel_ranks)):
-                    next_identity = self.get_best_data_parallel_rank(request_hashes)
-                    if self._send_to_engine(next_identity, payload):
-                        break
+                if _abs_replicate_requests_enabled():
+                    # Variant-B: broadcast this request to ALL DP ranks so
+                    # every rank's mamba state can stay in sync. Each rank
+                    # adds the request to its local context and computes
+                    # mamba state for it; the AR-based combine in segment
+                    # mode lets each rank produce identical hidden_states,
+                    # so deterministic mamba updates produce identical
+                    # state on every rank. Track the request as "owned by
+                    # rank 0" for the response-dedup logic below.
+                    sent_to_any = False
+                    for ident in list(self.identities_of_data_parallel_ranks):
+                        if self._send_to_engine(ident, payload):
+                            sent_to_any = True
+                    if not sent_to_any:
+                        logging.error(
+                            "Coordinator: no reachable engines for request %d",
+                            request_id,
+                        )
+                        del self.request_id_to_client_id[request_id]
+                        del self.request_id_to_client_request_id[request_id]
+                        return
+                    next_identity = list(self.identities_of_data_parallel_ranks)[0]
                 else:
-                    # If all engines have died, we are in an abnormal state, and must exit cleanly.
-                    logging.error("Coordinator: no reachable engines for request %d", request_id)
-                    del self.request_id_to_client_id[request_id]
-                    del self.request_id_to_client_request_id[request_id]
-                    return
+                    # Account for the fact that some engines may have died.
+                    for _ in range(len(self.identities_of_data_parallel_ranks)):
+                        next_identity = self.get_best_data_parallel_rank(request_hashes)
+                        if self._send_to_engine(next_identity, payload):
+                            break
+                    else:
+                        # If all engines have died, we are in an abnormal state, and must exit cleanly.
+                        logging.error("Coordinator: no reachable engines for request %d", request_id)
+                        del self.request_id_to_client_id[request_id]
+                        del self.request_id_to_client_request_id[request_id]
+                        return
 
                 self.request_id_to_rank[request_id] = next_identity
                 self._pending_counts[self.identity_to_rank_index[next_identity]] += 1
@@ -539,8 +577,15 @@ class DataParallelInferenceCoordinator:
                 finished_requests = deserialized_payload[1]
 
                 for finished_request in finished_requests:
-                    self.detokenize(finished_request)
                     fid = finished_request["request_id"]
+                    # Variant-B replicated requests: every DP rank generates
+                    # an identical finished response for the same request.
+                    # The first one to arrive wins; subsequent duplicates
+                    # are silently ignored (the request_id_to_client_id
+                    # entry is already gone).
+                    if fid not in self.request_id_to_client_id:
+                        continue
+                    self.detokenize(finished_request)
                     client_identity = self.request_id_to_client_id[fid]
                     client_request_identity = self.request_id_to_client_request_id[fid]
                     del self.request_id_to_client_id[fid]

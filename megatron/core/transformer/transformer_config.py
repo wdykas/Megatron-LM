@@ -941,6 +941,31 @@ class TransformerConfig(ModelParallelConfig):
     fp8_recipe='mxfp8'. Set to True to disable fusion and use separate kernel
     launches (useful for debugging)."""
 
+    enable_attention_bounded_segments: bool = False
+    """If True, enable attention-bounded segment execution for inference (Mamba+MoE
+    hybrids). With the flag off, behavior matches baseline exactly. With it on,
+    the runtime identifies maximal runs of non-attention layers between attention
+    boundaries and tracks per-request hidden-state ownership so that future stages
+    can redirect MoE combine and migrate Mamba state without round-tripping to
+    the KV owner after every MoE layer.
+
+    See ``megatron/core/inference/attention_bounded_segments.py`` for the
+    runtime, and ``attention_bounded_segment_execution_plan.md`` for the design.
+    """
+
+    segment_owner_policy: str = "original_owner"
+    """Policy for choosing the segment owner rank when
+    ``enable_attention_bounded_segments`` is set. Currently only
+    ``"original_owner"`` (baseline behavior) is implemented. Reserved values:
+    ``"fixed_rank"``, ``"same_node_as_attention_owner"``,
+    ``"hottest_expert_affinity"``, ``"measured_cost_model"``."""
+
+    moe_combine_destination_policy: str = "original_owner"
+    """Policy for choosing the MoE combine destination rank when
+    ``enable_attention_bounded_segments`` is set. Currently only
+    ``"original_owner"`` (baseline behavior) is implemented. Reserved values:
+    ``"current_segment_owner"``, ``"next_mamba_owner"``, ``"cost_model"``."""
+
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
     in rope calculation. """
