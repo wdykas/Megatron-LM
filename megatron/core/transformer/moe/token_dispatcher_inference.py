@@ -461,11 +461,37 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # Variant B fast path: input is already in [G, hidden] global
         # form on every rank (replicated compute upstream — typically
         # because we're in decode and every rank shares the migrated
-        # mamba state). Skipping the AGV avoids the redundant gather
-        # and matching is_global propagation through routing_map and
-        # probs (every rank ran the same router on the same input, so
-        # those tensors are already global too).
+        # mamba state). Skip the AGV (we already have the global
+        # view), but copy into the symm-mem AGV buffers so downstream
+        # NVLS expert kernels see the same buffer layout/pointers
+        # they'd see after the real AGV. Every rank ran the same
+        # router on the same input, so probs and routing_map are
+        # already global, and the metadata all-reduce-max returns G
+        # (same on every rank).
         if self._segment_input_is_global:
+            if self._runs_metadata_sync:
+                self.update_metadata(hidden_states.shape[0])
+
+            agv_h = self.__class__._symm_agv_hidden
+            agv_r = self.__class__._symm_agv_routing
+            agv_p = self.__class__._symm_agv_probs
+            per_rank_max = self._per_rank_worst_case_token_count
+            global_max = per_rank_max * self.ep_size
+            G = hidden_states.shape[0]
+            topk = probs.shape[1]
+            hidden_dim = hidden_states.shape[1]
+
+            # Copy already-global tensors into the AGV symm-mem buffers
+            # at rows [0:G]. The remaining rows [G:global_max] can stay
+            # at whatever they were — downstream readers respect
+            # ``valid_tokens=G`` and don't read past it.
+            agv_h["tensor"][:G].copy_(hidden_states)
+            agv_p["tensor"][:G].copy_(probs)
+            agv_r["tensor"][:G].copy_(self.routing_map)
+
+            self.routing_map = agv_r["tensor"].view(global_max, topk)
+            probs = agv_p["tensor"].view(global_max, topk)
+            hidden_states = agv_h["tensor"].view(global_max, hidden_dim)
             return hidden_states, probs
 
         if self._runs_metadata_sync:
@@ -529,21 +555,21 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         rsv = self.__class__._symm_rsv
 
         # Variant B combine: instead of reduce-scattering back to per-
-        # rank slices, all-reduce the partials and keep the full global
-        # view. The expert output is written into the [global_max,
-        # hidden] symm-mem buffer; the meaningful data lives in the
-        # first ``self._local_tokens`` (== G in replicated mode) rows.
-        # We slice to the active region, AR across EP, and return the
-        # [G, hidden] result so the next MoE layer's token_dispatch
-        # sees a global-form input and skips its AGV.
-        #
-        # We use NCCL all_reduce here rather than the multimem variant
-        # because the active region shape is dynamic across steps (and
-        # is a slice of the underlying symm-mem buffer, not the buffer
-        # itself).
+        # rank slices, all-reduce only the active [0:G] rows of the
+        # RSV symm-mem buffer and keep that as the global view. The
+        # multimem AR kernel reads ``numel`` elements from the
+        # multicast pointer base — passing rsv[:G] as both input and
+        # output gets it to AR exactly the active region (G * hidden
+        # bytes per rank) instead of the full per-rank-worst-case
+        # buffer (global_max * hidden bytes), which is what was
+        # making the old version slower than baseline.
         if self._segment_input_is_global:
-            active = hidden_states[: self._local_tokens].contiguous()
-            torch.distributed.all_reduce(active, group=self.ep_group)
+            if hidden_states is not rsv["tensor"]:
+                rsv["tensor"][: self._local_tokens].copy_(
+                    hidden_states[: self._local_tokens]
+                )
+            active = rsv["tensor"][: self._local_tokens]
+            multimem_all_reduce(active, active, rsv["handle"])
             return active.to(torch.bfloat16)
 
         if hidden_states is not rsv["tensor"]:
