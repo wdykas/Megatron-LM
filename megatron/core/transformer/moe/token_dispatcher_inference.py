@@ -79,6 +79,14 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         # ([global_tokens, hidden]) so it should skip the AG, and tells
         # token_combine to return the full global view rather than the
         # local slice.
+        #
+        # MTP / speculative-decoding note: under
+        # ``num_speculative_tokens = K``, the leading dim of hidden_states
+        # is ``G × (K + 1)`` instead of ``G``. Both AR-then-slice (default
+        # combine) and AR-return-global (Variant B combine) operate on
+        # the leading dim and divide by ``ep_size``, which holds because
+        # ``(K + 1)`` cleanly divides each rank's slice when ``G %
+        # ep_size == 0``. See docs/user-guide/features/attention_bounded_segments.md.
         self._segment_input_is_global = False
         # Variant-B Opt-1: stash for the local-slice shared-experts output.
         # The MoE layer sets these before combine; the combine path folds

@@ -188,9 +188,6 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
         self.segment_runtime = SegmentRuntime.from_layer_type_list(
             self.layer_type_list,
             enabled=getattr(self.config, "enable_attention_bounded_segments", False),
-            segment_owner_policy=getattr(
-                self.config, "segment_owner_policy", "original_owner"
-            ),
             moe_combine_destination_policy=getattr(
                 self.config, "moe_combine_destination_policy", "original_owner"
             ),
@@ -406,15 +403,9 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
                 tok_disp._segment_input_is_global = bool(flag_value)
 
         with outer_fp8_context:
-            for local_idx, layer in enumerate(self.layers):
+            for layer in self.layers:
                 # Layers have 1-indexed layer numbers attribute.
                 inner_quant_context = get_inner_quant_context(self.config, layer.layer_number - 1)
-
-                if (
-                    self.segment_runtime.enabled
-                    and self.segment_runtime.is_attention_boundary(local_idx)
-                ):
-                    self.segment_runtime.canonicalize_to_attention_owner()
 
                 # Tell this layer's MoE dispatcher (if any) whether the
                 # input is already in [G, hidden] form. In replicated-

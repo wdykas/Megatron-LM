@@ -953,21 +953,13 @@ class TransformerConfig(ModelParallelConfig):
     the runtime.
     """
 
-    segment_owner_policy: str = "original_owner"
-    """Policy for choosing the segment owner rank when
-    ``enable_attention_bounded_segments`` is set. Currently only
-    ``"original_owner"`` (baseline behavior) is implemented. Reserved
-    values: ``"fixed_rank"``, ``"same_node_as_attention_owner"``,
-    ``"hottest_expert_affinity"``, ``"measured_cost_model"``."""
-
     moe_combine_destination_policy: str = "original_owner"
     """Policy for choosing the MoE combine destination rank when
     ``enable_attention_bounded_segments`` is set. Supported values:
     ``"original_owner"`` (baseline behavior, the default) and
     ``"current_segment_owner"`` (Variant B: returns the all-reduced
     global view from MoE combine, letting the next MoE layer skip its
-    all-gather; pairs with ``InferenceConfig.inference_replicate_requests``).
-    Reserved values: ``"next_mamba_owner"``, ``"cost_model"``."""
+    all-gather; pairs with ``InferenceConfig.inference_replicate_requests``)."""
 
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width

@@ -2,30 +2,27 @@
 
 """Attention-bounded segment execution for hybrid Mamba+MoE inference.
 
-This module provides infrastructure for an exact (non-approximate) inference
-runtime optimization for hybrid Mamba+MoE models with sparse attention layers.
+This module identifies "attention-bounded segments" — maximal runs of
+non-attention layers (Mamba/MoE/MLP/GDN) delimited by attention layers — and
+exposes a small runtime that callers (the hybrid block, the MoE dispatcher)
+read to decide whether to take the Variant B fast path.
 
-The core idea is to canonicalize hidden state ownership only at attention
-layers, and between attention layers run Mamba+MoE blocks within a chosen
-execution "island" (segment owner rank). This avoids paying the MoE
-combine-back cost to the original KV owner after every MoE layer.
-
-The runtime tracks segments and ownership metadata; the
-``moe_combine_destination_policy`` config field selects how MoE combine is
-redirected (default ``"original_owner"`` keeps baseline behavior;
-``"current_segment_owner"`` enables Variant B). The feature is guarded by
-``TransformerConfig.enable_attention_bounded_segments``.
+The Variant B fast path skips the AllGather before each MoE layer and replaces
+the ReduceScatter at combine with an AllReduce that returns the full global
+view. It is enabled by setting
+``TransformerConfig.enable_attention_bounded_segments=True`` together with
+``moe_combine_destination_policy="current_segment_owner"``. With either
+condition off, every hook is a no-op and behavior matches baseline exactly.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import List, Literal, Optional
 
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 
-# Layer type symbols that act as attention boundaries. Hidden state must be
-# canonicalized to the KV owner before these layers run.
+# Layer type symbols that act as attention boundaries.
 _ATTENTION_SYMBOLS = frozenset({LayerSymbols.ATTENTION, LayerSymbols.DS_ATTENTION})
 
 # Layer type symbols that participate in MoE-style routing.
@@ -36,17 +33,7 @@ _MOE_SYMBOLS = frozenset({LayerSymbols.MOE})
 _STATEFUL_SYMBOLS = frozenset({LayerSymbols.MAMBA, LayerSymbols.GDN})
 
 
-SegmentOwnerPolicy = Literal[
-    "original_owner",
-    "fixed_rank",
-    "same_node_as_attention_owner",
-    "hottest_expert_affinity",
-    "measured_cost_model",
-]
-
-CombineDestinationPolicy = Literal[
-    "original_owner", "current_segment_owner", "next_mamba_owner", "cost_model"
-]
+CombineDestinationPolicy = Literal["original_owner", "current_segment_owner"]
 
 
 @dataclass
@@ -54,9 +41,7 @@ class Segment:
     """An attention-bounded segment of layers.
 
     A segment is a maximal run of non-attention layers (Mamba/MoE/MLP/GDN)
-    delimited by attention layers (or the beginning/end of the model). Within
-    a segment, hidden state ownership may move freely; outside (i.e., at
-    attention layers), ownership is canonicalized to the KV owner.
+    delimited by attention layers (or the beginning/end of the model).
 
     Attributes:
         segment_id: Index of this segment within the layer sequence.
@@ -133,7 +118,6 @@ def compute_segments(layer_type_list: List[str]) -> List[Segment]:
         if layer_type_list[i] in _ATTENTION_SYMBOLS:
             i += 1
             continue
-        # Collect a run of non-attention layers.
         start = i
         while i < n and layer_type_list[i] not in _ATTENTION_SYMBOLS:
             i += 1
@@ -171,14 +155,6 @@ def build_layer_to_segment_map(
     """Build a lookup table from local layer index to segment id.
 
     Layers that are attention boundaries map to ``None``.
-
-    Args:
-        segments: Segments produced by ``compute_segments``.
-        num_layers: Total number of layers on this pipeline stage.
-
-    Returns:
-        A list of length ``num_layers`` where entry ``i`` is the segment id
-        containing layer ``i`` (or ``None`` for attention layers).
     """
     mapping: List[Optional[int]] = [None] * num_layers
     for seg in segments:
@@ -188,10 +164,7 @@ def build_layer_to_segment_map(
 
 
 def summarize_segments(segments: List[Segment]) -> str:
-    """Return a short human-readable summary of segment topology.
-
-    Useful to log once at startup so users can verify what the runtime sees.
-    """
+    """Return a short human-readable summary of segment topology."""
     if not segments:
         return "<no attention-bounded segments>"
     parts = []
@@ -208,22 +181,10 @@ def summarize_segments(segments: List[Segment]) -> str:
 class SegmentRuntime:
     """Per-pipeline-stage runtime state for attention-bounded segment execution.
 
-    This object holds the static segment topology and a small amount of
-    mutable per-request ownership state. It is constructed once per
-    ``HybridStack`` (one per pipeline stage) and lives for the lifetime of
-    the model.
-
-    With ``enable_attention_bounded_segments=False`` (the default) every
-    ``combine_destination_for_layer`` call returns ``"original_owner"`` and
-    the canonicalize / Mamba-state migration hooks are no-ops, so output
-    matches baseline exactly.
-
-    With the flag on and ``moe_combine_destination_policy="current_segment_owner"``,
-    callers (the dispatcher, the hybrid block) read the policy from this
-    runtime to decide whether to use the AR-instead-of-RS combine and skip
-    intra-segment all-gathers (Variant B). Future stages will additionally
-    move Mamba state between ranks and choose segment owners based on
-    routing.
+    Holds the static segment topology and the configured combine-destination
+    policy. With ``enabled=False`` (default) every
+    ``combine_destination_for_layer`` call returns ``"original_owner"`` so
+    output matches baseline exactly.
 
     Attributes:
         layer_type_list: Layer types for this pipeline stage.
@@ -231,29 +192,16 @@ class SegmentRuntime:
             ``layer_type_list``.
         layer_to_segment: ``layer_to_segment[i]`` is the segment id of layer
             ``i``, or ``None`` if layer ``i`` is an attention boundary.
-        enabled: Master switch. When False, all hooks are no-ops and
-            ``combine_destination_for_layer`` returns ``"original_owner"``.
-        segment_owner_policy: Policy for choosing the segment owner rank.
-            Only ``"original_owner"`` is implemented today.
-        moe_combine_destination_policy: Policy for the MoE combine
-            destination. Today the dispatcher honors ``"original_owner"``
-            (baseline) and ``"current_segment_owner"`` (Variant B AR
-            return).
+        enabled: Master switch.
+        moe_combine_destination_policy: Either ``"original_owner"`` (baseline)
+            or ``"current_segment_owner"`` (Variant B AR return).
     """
 
     layer_type_list: List[str]
     segments: List[Segment]
     layer_to_segment: List[Optional[int]]
     enabled: bool = False
-    segment_owner_policy: SegmentOwnerPolicy = "original_owner"
     moe_combine_destination_policy: CombineDestinationPolicy = "original_owner"
-
-    # Per-request bookkeeping. Populated lazily as requests appear. The
-    # initial implementation does not migrate state, so these are all
-    # initialized to and remain at the request's KV owner.
-    _attention_owner: Dict[int, int] = field(default_factory=dict)
-    _current_owner: Dict[int, int] = field(default_factory=dict)
-    _segment_owner: Dict[Tuple[int, int], int] = field(default_factory=dict)
 
     @classmethod
     def from_layer_type_list(
@@ -261,7 +209,6 @@ class SegmentRuntime:
         layer_type_list: List[str],
         *,
         enabled: bool = False,
-        segment_owner_policy: SegmentOwnerPolicy = "original_owner",
         moe_combine_destination_policy: CombineDestinationPolicy = "original_owner",
     ) -> "SegmentRuntime":
         """Build a runtime from a list of layer type characters."""
@@ -272,7 +219,6 @@ class SegmentRuntime:
             segments=segments,
             layer_to_segment=layer_to_segment,
             enabled=enabled,
-            segment_owner_policy=segment_owner_policy,
             moe_combine_destination_policy=moe_combine_destination_policy,
         )
 
@@ -290,51 +236,13 @@ class SegmentRuntime:
             return False
         return self.layer_type_list[local_layer_idx] in _ATTENTION_SYMBOLS
 
-    def combine_destination_for_layer(
-        self, local_layer_idx: int, request_id: Optional[int] = None
-    ) -> str:
+    def combine_destination_for_layer(self, local_layer_idx: int) -> str:
         """Return the policy name for where MoE combine should send tokens.
 
         Returns ``"original_owner"`` when the runtime is disabled (baseline
         behavior). When enabled, returns the configured
-        ``moe_combine_destination_policy``. The signature accepts a
-        ``request_id`` so future cost-model policies can vary per-request
-        without changing callers.
+        ``moe_combine_destination_policy``.
         """
         if not self.enabled:
             return "original_owner"
         return self.moe_combine_destination_policy
-
-    # ------------------------------------------------------------------
-    # Attention-boundary canonicalization. The MVP keeps current_owner ==
-    # attention_owner at all times, so this is a no-op. The hook exists so
-    # that later stages can drop in real send/recv code without touching
-    # the model forward path again.
-    # ------------------------------------------------------------------
-    def canonicalize_to_attention_owner(self, request_ids: Optional[List[int]] = None) -> None:
-        if not self.enabled:
-            return
-        if request_ids is None:
-            request_ids = list(self._current_owner.keys())
-        for req_id in request_ids:
-            owner = self._attention_owner.get(req_id)
-            if owner is not None:
-                self._current_owner[req_id] = owner
-
-    def set_attention_owner(self, request_id: int, rank: int) -> None:
-        """Record the (stable) KV owner rank for a request."""
-        self._attention_owner[request_id] = rank
-        # Until we actually redirect, current_owner tracks attention_owner.
-        self._current_owner.setdefault(request_id, rank)
-
-    def get_current_owner(self, request_id: int) -> Optional[int]:
-        return self._current_owner.get(request_id)
-
-    def forget_request(self, request_id: int) -> None:
-        """Drop bookkeeping for a finished request."""
-        self._attention_owner.pop(request_id, None)
-        self._current_owner.pop(request_id, None)
-        # Also drop segment_owner entries for this request.
-        stale = [k for k in self._segment_owner if k[0] == request_id]
-        for k in stale:
-            self._segment_owner.pop(k, None)

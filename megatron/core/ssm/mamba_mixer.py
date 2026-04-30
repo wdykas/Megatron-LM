@@ -495,6 +495,15 @@ class MambaMixer(MegatronModule):
           rank has the same [G, hidden] view).
         - 2D input (decode/mixed flat path; skip prefill 3D shape).
         - ``ep_size > 1`` and ``G % ep_size == 0``.
+
+        MTP / speculative-decoding note: under
+        ``num_speculative_tokens = K``, ``hidden_states.shape[0]`` is
+        ``G × (K + 1)``. The slicing below partitions along the leading
+        dim and inherits ``G % ep_size == 0``, so each rank's slice
+        contains exactly ``G/ep_size`` requests' worth of contiguous
+        ``(K + 1)``-token groups — the layout the SSM kernel expects
+        after the downstream reshape to ``[decode_req_count, K + 1,
+        intermediate]``. No spec-decode-specific path needed.
         """
         if not getattr(
             getattr(context, "config", None), "inference_replicate_requests", False
