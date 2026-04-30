@@ -100,6 +100,7 @@ class DataParallelInferenceCoordinator:
         schedule_output_path: str | None = None,
         hostname: str | None = None,
         replicate_requests: bool = False,
+        replication_group_size: int = 1,
     ):
         """
         Initializes the inference coordinator.
@@ -204,12 +205,30 @@ class DataParallelInferenceCoordinator:
         # Schedule recording.
         self.schedule_output_path = schedule_output_path
         self.schedule_records = [] if schedule_output_path else None
-        # When True, every newly-submitted request is broadcast to all DP
-        # ranks instead of load-balanced. Required by the Variant B
-        # attention-bounded-segments inference path so each rank's mamba
-        # state can stay in sync via deterministic recomputation. Sourced
-        # from ``InferenceConfig.inference_replicate_requests``.
+        # When True, every newly-submitted request is broadcast to the
+        # ranks of one *replication group* (== one model copy = one
+        # EP/TP/PP cluster) instead of load-balanced to a single rank.
+        # Required by the Variant B attention-bounded-segments inference
+        # path so each rank's mamba state stays in sync via deterministic
+        # recomputation. Sourced from
+        # ``InferenceConfig.inference_replicate_requests``.
+        #
+        # ``replication_group_size`` controls the broadcast scope. With
+        # group_size = data_parallel_size, every DP rank receives every
+        # request (full replication, kills cross-cluster DP scaling).
+        # With group_size = ep_size * tp_size * pp_size (the per-model-
+        # copy rank count, the usual Variant-B setting), only the ranks
+        # within one model copy share each request and the coordinator
+        # still load-balances across model copies — preserving DP
+        # throughput scaling for multi-cluster deployments.
         self.replicate_requests = replicate_requests
+        self.replication_group_size = max(1, int(replication_group_size))
+        if self.replicate_requests and self.data_parallel_size % self.replication_group_size != 0:
+            raise ValueError(
+                f"data_parallel_size ({self.data_parallel_size}) must be a "
+                f"multiple of replication_group_size ({self.replication_group_size}) "
+                f"when replicate_requests is enabled."
+            )
 
         # Deterministic rank index mapping (sorted identity -> 0-based index).
         sorted_identities = sorted(self.identities_of_data_parallel_ranks)
@@ -303,6 +322,24 @@ class DataParallelInferenceCoordinator:
             tokens = list(prompt)
         token_tensor = torch.tensor(tokens, dtype=torch.int64)
         return compute_block_hashes_batched(token_tensor, self.block_size_tokens)
+
+    def _identities_in_replication_group(self, primary_identity):
+        """Return all rank identities that share a replication group with ``primary_identity``.
+
+        Replication groups are contiguous in rank index: ranks
+        ``[k*G, (k+1)*G)`` form the k-th group, where ``G`` is
+        ``self.replication_group_size``. The "primary" is just the rank
+        whose identity was selected by the load balancer; any rank in
+        the group could equally serve that role.
+        """
+        primary_idx = self.identity_to_rank_index[primary_identity]
+        group_start = (primary_idx // self.replication_group_size) * self.replication_group_size
+        group_end = group_start + self.replication_group_size
+        return [
+            ident
+            for ident, ridx in self.identity_to_rank_index.items()
+            if group_start <= ridx < group_end
+        ]
 
     def get_best_data_parallel_rank(self, request_hashes):
         """Select the best DP rank based on prefix cache affinity and load.
@@ -460,19 +497,25 @@ class DataParallelInferenceCoordinator:
                     request_hashes = request_hashes[:1]
 
                 if self.replicate_requests:
-                    # Variant-B: broadcast this request to ALL DP ranks so
-                    # every rank's mamba state can stay in sync. Each rank
-                    # adds the request to its local context and computes
-                    # mamba state for it; the AR-based combine in segment
-                    # mode lets each rank produce identical hidden_states,
-                    # so deterministic mamba updates produce identical
-                    # state on every rank. Track the request as "owned by
-                    # rank 0" for the response-dedup logic below.
-                    sent_to_any = False
-                    for ident in list(self.identities_of_data_parallel_ranks):
-                        if self._send_to_engine(ident, payload):
-                            sent_to_any = True
-                    if not sent_to_any:
+                    # Variant-B: broadcast this request to all ranks
+                    # within one *replication group* (one model copy)
+                    # so every rank in the group keeps its mamba state
+                    # in sync via deterministic recomputation. The group
+                    # is picked by the standard load balancer (any rank
+                    # in the group serves equally well) and we expand
+                    # it to its peers for the broadcast. Across groups
+                    # the load balancer continues to spread requests so
+                    # multi-cluster deployments keep DP throughput
+                    # scaling.
+                    primary_identity = None
+                    for _ in range(len(self.identities_of_data_parallel_ranks)):
+                        candidate = self.get_best_data_parallel_rank(request_hashes)
+                        # Probe the primary first; only accept the group
+                        # if at least the primary itself is reachable.
+                        if self._send_to_engine(candidate, payload):
+                            primary_identity = candidate
+                            break
+                    if primary_identity is None:
                         logging.error(
                             "Coordinator: no reachable engines for request %d",
                             request_id,
@@ -480,7 +523,13 @@ class DataParallelInferenceCoordinator:
                         del self.request_id_to_client_id[request_id]
                         del self.request_id_to_client_request_id[request_id]
                         return
-                    next_identity = list(self.identities_of_data_parallel_ranks)[0]
+                    # Broadcast to the rest of the primary's replication
+                    # group (skipping the primary, already sent).
+                    for ident in self._identities_in_replication_group(primary_identity):
+                        if ident == primary_identity:
+                            continue
+                        self._send_to_engine(ident, payload)
+                    next_identity = primary_identity
                 else:
                     # Account for the fact that some engines may have died.
                     for _ in range(len(self.identities_of_data_parallel_ranks)):
@@ -655,6 +704,7 @@ class DataParallelInferenceCoordinator:
         schedule_output_path: str | None = None,
         hostname: str | None = None,
         replicate_requests: bool = False,
+        replication_group_size: int = 1,
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -690,6 +740,7 @@ class DataParallelInferenceCoordinator:
             schedule_output_path=schedule_output_path,
             hostname=hostname,
             replicate_requests=replicate_requests,
+            replication_group_size=replication_group_size,
         )
         ready_event.set()
         try:

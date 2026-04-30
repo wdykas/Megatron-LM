@@ -526,6 +526,17 @@ class DynamicInferenceEngine(AbstractEngine):
                     "replicate_requests": getattr(
                         self.context.config, "inference_replicate_requests", False
                     ),
+                    # Replication group size = the rank count for one
+                    # model copy (EP × TP × PP). Within a model copy the
+                    # ranks are already in lockstep via collectives, so
+                    # broadcasting a request to the whole group is the
+                    # cheap thing. Across model copies, requests still
+                    # load-balance and DP throughput scaling is preserved.
+                    "replication_group_size": (
+                        get_pg_size(self.pg_collection.ep)
+                        * get_pg_size(self.pg_collection.tp)
+                        * get_pg_size(self.pg_collection.pp)
+                    ),
                 },
             )
             self.inference_coordinator_process.start()
