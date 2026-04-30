@@ -309,6 +309,19 @@ class InferenceConfig:
     performance variability for MoEs.
     """
 
+    inference_replicate_requests: bool = False
+    """If True, the data-parallel inference coordinator broadcasts each new
+    request to every DP rank instead of load-balancing. This is required by
+    the attention-bounded-segments Variant B path so that each rank's Mamba
+    state stays in sync via deterministic recomputation on a shared global
+    view. Default off keeps the existing sharded scheduling.
+
+    Pairs with ``--enable-attention-bounded-segments`` and
+    ``--moe-combine-destination-policy current_segment_owner`` on
+    ``TransformerConfig``. See
+    ``docs/user-guide/features/attention_bounded_segments.md``.
+    """
+
     verbose: InitVar[bool] = False
     """Whether to log detailed context configuration at initialization.
     This is an InitVar and is not stored as a field on the config."""

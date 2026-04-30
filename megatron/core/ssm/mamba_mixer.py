@@ -7,7 +7,6 @@
 
 import logging
 import math
-import os
 from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple, Union
 
@@ -482,7 +481,9 @@ class MambaMixer(MegatronModule):
 
         return self._dynamic_inference_local(hidden_states, context)
 
-    def _maybe_in_proj_on_local_slice(self, hidden_states: torch.Tensor):
+    def _maybe_in_proj_on_local_slice(
+        self, hidden_states: torch.Tensor, context: DynamicInferenceContext
+    ):
         """Variant-B Opt-2: in_proj on this rank's [G/N, hidden] slice + AG.
 
         Returns the resulting [G, intermediate] tensor when the
@@ -490,12 +491,14 @@ class MambaMixer(MegatronModule):
         back to the standard full-input ``in_proj`` path.
 
         Conditions for firing:
-        - ``MCORE_INFERENCE_REPLICATE_REQUESTS=1`` (every rank has the
-          same [G, hidden] view).
+        - ``InferenceConfig.inference_replicate_requests`` is set (every
+          rank has the same [G, hidden] view).
         - 2D input (decode/mixed flat path; skip prefill 3D shape).
         - ``ep_size > 1`` and ``G % ep_size == 0``.
         """
-        if os.environ.get("MCORE_INFERENCE_REPLICATE_REQUESTS", "0") != "1":
+        if not getattr(
+            getattr(context, "config", None), "inference_replicate_requests", False
+        ):
             return None
         if hidden_states.dim() != 2:
             return None
@@ -574,7 +577,7 @@ class MambaMixer(MegatronModule):
         # (N-1)/N of the in_proj GEMM at the cost of one NVLS multimem
         # AG. Falls back to the full-input path on prefill (3D shape) and
         # for graph sizes that don't divide evenly.
-        zxBCdt = self._maybe_in_proj_on_local_slice(hidden_states)
+        zxBCdt = self._maybe_in_proj_on_local_slice(hidden_states, context)
         if zxBCdt is None:
             zxBCdt, _ = self.in_proj(hidden_states)
 

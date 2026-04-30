@@ -966,7 +966,7 @@ class TransformerConfig(ModelParallelConfig):
     ``"original_owner"`` (baseline behavior, the default) and
     ``"current_segment_owner"`` (Variant B: returns the all-reduced
     global view from MoE combine, letting the next MoE layer skip its
-    all-gather; pairs with ``MCORE_INFERENCE_REPLICATE_REQUESTS=1``).
+    all-gather; pairs with ``InferenceConfig.inference_replicate_requests``).
     Reserved values: ``"next_mamba_owner"``, ``"cost_model"``."""
 
     mrope_section: Optional[List[int]] = None

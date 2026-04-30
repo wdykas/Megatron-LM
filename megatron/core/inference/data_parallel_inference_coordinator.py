@@ -4,7 +4,6 @@ import errno
 import faulthandler
 import json
 import logging
-import os
 import signal
 import socket
 from collections import deque
@@ -40,19 +39,6 @@ except:
 faulthandler.enable()
 faulthandler.register(signal.SIGTERM, all_threads=False, chain=True)
 faulthandler.register(signal.SIGINT, all_threads=False, chain=True)
-
-
-def _abs_replicate_requests_enabled() -> bool:
-    """Variant-B request replication: broadcast each new request to ALL
-    data-parallel ranks instead of load-balancing. This is required for
-    attention-bounded-segments execution because each rank's mamba state
-    must contain every request's recurrent state (for the in-segment
-    "mamba on global view" path to be correct).
-
-    Toggled by env ``MCORE_INFERENCE_REPLICATE_REQUESTS=1``. Default off
-    keeps the existing sharded scheduling.
-    """
-    return os.environ.get("MCORE_INFERENCE_REPLICATE_REQUESTS", "0") == "1"
 
 
 class DataParallelInferenceCoordinator:
@@ -113,6 +99,7 @@ class DataParallelInferenceCoordinator:
         prefix_caching_routing_alpha: float = 0.5,
         schedule_output_path: str | None = None,
         hostname: str | None = None,
+        replicate_requests: bool = False,
     ):
         """
         Initializes the inference coordinator.
@@ -217,6 +204,12 @@ class DataParallelInferenceCoordinator:
         # Schedule recording.
         self.schedule_output_path = schedule_output_path
         self.schedule_records = [] if schedule_output_path else None
+        # When True, every newly-submitted request is broadcast to all DP
+        # ranks instead of load-balanced. Required by the Variant B
+        # attention-bounded-segments inference path so each rank's mamba
+        # state can stay in sync via deterministic recomputation. Sourced
+        # from ``InferenceConfig.inference_replicate_requests``.
+        self.replicate_requests = replicate_requests
 
         # Deterministic rank index mapping (sorted identity -> 0-based index).
         sorted_identities = sorted(self.identities_of_data_parallel_ranks)
@@ -466,7 +459,7 @@ class DataParallelInferenceCoordinator:
                 ):
                     request_hashes = request_hashes[:1]
 
-                if _abs_replicate_requests_enabled():
+                if self.replicate_requests:
                     # Variant-B: broadcast this request to ALL DP ranks so
                     # every rank's mamba state can stay in sync. Each rank
                     # adds the request to its local context and computes
@@ -661,6 +654,7 @@ class DataParallelInferenceCoordinator:
         prefix_caching_routing_alpha: float = 0.5,
         schedule_output_path: str | None = None,
         hostname: str | None = None,
+        replicate_requests: bool = False,
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -695,6 +689,7 @@ class DataParallelInferenceCoordinator:
             prefix_caching_routing_alpha=prefix_caching_routing_alpha,
             schedule_output_path=schedule_output_path,
             hostname=hostname,
+            replicate_requests=replicate_requests,
         )
         ready_event.set()
         try:

@@ -523,6 +523,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     "prefix_caching_routing_alpha": self.context.prefix_caching_routing_alpha,
                     "schedule_output_path": coordinator_schedule_output_path,
                     "hostname": hostname,
+                    "replicate_requests": getattr(
+                        self.context.config, "inference_replicate_requests", False
+                    ),
                 },
             )
             self.inference_coordinator_process.start()

@@ -2009,6 +2009,13 @@ def _add_inference_args(parser):
                        help='Dtype for the Mamba inference SSM states tensor')
     group.add_argument('--inference-use-synchronous-zmq-collectives', action=argparse.BooleanOptionalAction,
                        required=False, default=False, help='Use synchronous ZMQ collectives for inference. Helps in reducing performance variability for MoEs.')
+    group.add_argument('--inference-replicate-requests', action=argparse.BooleanOptionalAction,
+                       required=False, default=False,
+                       help='If set, the data-parallel inference coordinator broadcasts each '
+                            'new request to every DP rank instead of load-balancing. Required by '
+                            'the attention-bounded-segments Variant B path. Pairs with '
+                            '--enable-attention-bounded-segments and '
+                            '--moe-combine-destination-policy current_segment_owner.')
     # NOTE: --enable-attention-bounded-segments, --segment-owner-policy, and
     # --moe-combine-destination-policy are auto-generated from the
     # corresponding TransformerConfig fields by ArgumentGroupFactory in

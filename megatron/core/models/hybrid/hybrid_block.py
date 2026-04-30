@@ -6,7 +6,6 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
-import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
@@ -373,7 +372,7 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
 
         # Variant-B path is active when both the feature flag is on AND
         # the inference coordinator is configured to replicate requests
-        # to every DP rank (env MCORE_INFERENCE_REPLICATE_REQUESTS=1).
+        # to every DP rank (``InferenceConfig.inference_replicate_requests``).
         # Under replication every rank schedules the same set of
         # requests so the entire model already runs on the global view
         # ([G, hidden] on every rank) and mamba state is consistent
@@ -381,11 +380,19 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
         # AG/RS pair around each MoE layer is pure overhead — Variant B
         # tells the dispatcher to skip the AG and to use AR (returning
         # the full global view) instead of RS at combine.
+        replicate_requests = (
+            inference_context is not None
+            and getattr(
+                getattr(inference_context, "config", None),
+                "inference_replicate_requests",
+                False,
+            )
+        )
         abs_active = (
             self.segment_runtime.enabled
             and getattr(self.config, "moe_combine_destination_policy", "original_owner")
             == "current_segment_owner"
-            and os.environ.get("MCORE_INFERENCE_REPLICATE_REQUESTS", "0") == "1"
+            and replicate_requests
         )
 
         def _set_segment_dispatch_flag(layer, flag_value):
