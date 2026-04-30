@@ -278,6 +278,26 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Engine step counter (used for logging, metrics, and event tracking)
         self.step_count = 0
 
+        # Per-step gate for the attention-bounded-segments Variant B fast
+        # path (skip AG before MoE, AR-instead-of-RS at combine).
+        #
+        # ``inference_replicate_requests`` (legacy mode): the coordinator
+        # broadcasts every request to every rank and the model fast-paths
+        # on every step.
+        #
+        # ``inference_decode_only_variant_b``: implies replicate_requests
+        # (so every rank's mamba state stays in sync) but only takes the
+        # Variant B fast path on pure-decode steps. Prefill steps fall
+        # back to the baseline data path. The ``fast_path_active``
+        # getter encodes the per-step intersection.
+        self._inference_decode_only_variant_b = bool(
+            getattr(inference_config, "inference_decode_only_variant_b", False)
+        )
+        self._fast_path_active = bool(
+            getattr(inference_config, "inference_replicate_requests", False)
+            or self._inference_decode_only_variant_b
+        )
+
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
         )
@@ -1057,6 +1077,36 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Returns True if cuda graphs are being used for this step."""
         return self._using_cuda_graph_this_step
 
+    @property
+    def fast_path_active(self) -> bool:
+        """Whether the model should engage the Variant B fast path THIS step.
+
+        Variant B skips the AG before each MoE and replaces the RS at MoE
+        combine with an AR returning the full global view. This requires
+        every rank to hold a globally-replicated ``[G, hidden]`` view AND
+        every active request's mamba state.
+
+        Engine-driven: the engine sets this flag per step via
+        ``set_fast_path_active``. In always-replicate mode the engine
+        leaves it permanently on (initialized from
+        ``inference_replicate_requests``). In decode-only no-compute-
+        replication mode the engine flips it on only after every rank
+        has finished its owned prefills AND every active request has
+        had its mamba state migrated to all ranks via M2.
+        """
+        if not self._fast_path_active:
+            return False
+        if self._inference_decode_only_variant_b:
+            try:
+                return self.is_decode_only()
+            except Exception:
+                return False
+        return True
+
+    def set_fast_path_active(self, active: bool) -> None:
+        """Set the per-step fast-path gate. See ``fast_path_active``."""
+        self._fast_path_active = bool(active)
+
     def has_unfinished_requests(self) -> bool:
         """Test if any requests remain."""
         return self.total_request_count > 0
@@ -1200,6 +1250,124 @@ class DynamicInferenceContext(BaseInferenceContext):
             ssm_state = self.mamba_ssm_states[mamba_layer_number]
 
         return (conv_state, ssm_state)
+
+    def _mamba_state_slot_views(self, slot: int) -> List[Tensor]:
+        """Return per-layer state slices for a single slot.
+
+        The returned list contains one tensor per (layer, kind) pair where
+        kind is conv_state, ssm_state, and (when speculative decoding is
+        enabled) the intermediate variants. Each tensor is a strided view
+        into the underlying per-layer state cache, so writing into it
+        updates the cache in place.
+        """
+        views: List[Tensor] = [
+            self.mamba_conv_states[:, slot, ...],
+            self.mamba_ssm_states[:, slot, ...],
+        ]
+        if self.num_speculative_tokens > 0:
+            views.append(self.mamba_intermediate_conv_states[:, slot, ...])
+            views.append(self.mamba_intermediate_ssm_states[:, slot, ...])
+        return views
+
+    def migrate_mamba_state(
+        self,
+        slot: int,
+        src_rank_in_group: int,
+        replication_group,
+        stream: Optional["torch.cuda.Stream"] = None,
+    ) -> Optional["torch.cuda.Event"]:
+        """Broadcast a request's mamba state from owner to every rank in the group.
+
+        After this completes, every rank's per-layer ``mamba_conv_states``
+        and ``mamba_ssm_states`` (and the intermediate buffers under
+        speculative decoding) hold the same data at index ``slot`` as the
+        owner did before the call.
+
+        Implementation: pack all per-layer state slices for ``slot`` into
+        one contiguous byte buffer, broadcast once, then unpack in place.
+        A single collective minimizes kernel-launch overhead — important
+        when migration sits on the critical path between the request's
+        last prefill chunk and its first decode step.
+
+        Prefetch / overlap: when ``stream`` is given, the pack +
+        broadcast + unpack runs on that stream and an event is returned
+        so the caller can wait on it later (typically right before the
+        request's first decode step). The migration then overlaps with
+        the request's tail prefill compute on the default stream.
+
+        Args:
+            slot: Local slot id of the request to migrate. Must be the
+                same value on every rank in ``replication_group``.
+            src_rank_in_group: Group-local rank that currently holds
+                the authoritative state. Other ranks' bytes at ``slot``
+                are overwritten.
+            replication_group: Process group spanning the EP × TP × PP
+                cluster (one full model copy). Must include the source
+                rank.
+            stream: Optional CUDA stream to run the migration on. When
+                provided, the call returns a ``torch.cuda.Event``
+                recorded on ``stream`` after the unpack completes so the
+                consumer can ``event.wait()`` before reading the state.
+                When ``None``, the migration runs on the current stream
+                synchronously.
+
+        Returns:
+            ``None`` when the migration was a no-op (non-hybrid, single
+            rank, no distributed init) or ran synchronously. Otherwise
+            an event recorded on ``stream`` after unpack.
+        """
+        if not self.is_hybrid_model:
+            return None
+        # Single-rank groups (or no distributed init): nothing to do.
+        if not torch.distributed.is_initialized():
+            return None
+        if torch.distributed.get_world_size(group=replication_group) <= 1:
+            return None
+
+        if stream is not None:
+            # Make the side stream wait for the producer of the source
+            # state on the current stream before reading it. The unpack
+            # writes happen on ``stream`` so consumers must wait for the
+            # returned event.
+            stream.wait_stream(torch.cuda.current_stream())
+
+        ctx = (
+            torch.cuda.stream(stream)
+            if stream is not None
+            else nullcontext()
+        )
+        with ctx:
+            views = self._mamba_state_slot_views(slot)
+            # Pack: copy each view into a single byte buffer. Views are
+            # strided (slot is the second dim), so copying through a flat
+            # tensor of contiguous bytes is the cheapest correct path.
+            byte_sizes = [v.numel() * v.element_size() for v in views]
+            total_bytes = sum(byte_sizes)
+            device = views[0].device
+            flat = torch.empty(total_bytes, dtype=torch.uint8, device=device)
+
+            offset = 0
+            for v, sz in zip(views, byte_sizes):
+                flat.narrow(0, offset, sz).copy_(
+                    v.contiguous().view(torch.uint8).flatten()
+                )
+                offset += sz
+
+            torch.distributed.broadcast(
+                flat, src=src_rank_in_group, group=replication_group
+            )
+
+            offset = 0
+            for v, sz in zip(views, byte_sizes):
+                slab = flat.narrow(0, offset, sz).view(v.dtype).view(v.shape)
+                v.copy_(slab)
+                offset += sz
+
+            if stream is not None:
+                event = torch.cuda.Event()
+                event.record(stream)
+                return event
+        return None
 
     # =========================================================================
     # Mamba prefix cache infrastructure

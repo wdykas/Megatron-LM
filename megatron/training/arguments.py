@@ -2017,6 +2017,12 @@ def _add_inference_args(parser):
                             'the attention-bounded-segments Variant B path. Pairs with '
                             '--enable-attention-bounded-segments and '
                             '--moe-combine-destination-policy current_segment_owner.')
+    group.add_argument('--inference-decode-only-variant-b', action=argparse.BooleanOptionalAction,
+                       required=False, default=False,
+                       help='If set, engage the Variant B fast path only on pure-decode steps; '
+                            'prefill steps fall back to the baseline data path. Implies request '
+                            'replication. Pairs with --enable-attention-bounded-segments and '
+                            '--moe-combine-destination-policy current_segment_owner.')
     # NOTE: --enable-attention-bounded-segments and
     # --moe-combine-destination-policy are auto-generated from the
     # corresponding TransformerConfig fields by ArgumentGroupFactory in

@@ -334,29 +334,23 @@ class HybridStack(MegatronModule):
             def get_inner_quant_context(config, layer_number):
                 return nullcontext()
 
-        # Variant-B path is active when both the feature flag is on AND
-        # the inference coordinator is configured to replicate requests
-        # to every DP rank (``InferenceConfig.inference_replicate_requests``).
-        # Under replication every rank schedules the same set of
-        # requests so the entire model already runs on the global view
-        # ([G, hidden] on every rank) and mamba state is consistent
-        # across ranks via deterministic recomputation. In that mode the
-        # AG/RS pair around each MoE layer is pure overhead — Variant B
-        # tells the dispatcher to skip the AG and to use AR (returning
-        # the full global view) instead of RS at combine.
-        replicate_requests = (
-            inference_context is not None
-            and getattr(
-                getattr(inference_context, "config", None),
-                "inference_replicate_requests",
-                False,
-            )
-        )
+        # Variant-B path is active when (a) the segment runtime is on
+        # with ``current_segment_owner`` policy AND (b) the inference
+        # context's per-step ``fast_path_active`` flag is set. The engine
+        # owns the per-step gate: today it tracks
+        # ``InferenceConfig.inference_replicate_requests`` (the always-
+        # replicate path), and the decode-only mode will toggle it per
+        # step based on whether the batch is pure decode AND every
+        # active request's mamba state has been migrated to all ranks.
+        # When active, the dispatcher skips the AG before MoE and
+        # replaces RS at combine with an AR returning the full global
+        # view, so successive MoE layers chain in [G, hidden] form.
         abs_active = (
             self.segment_runtime.enabled
             and getattr(self.config, "moe_combine_destination_policy", "original_owner")
             == "current_segment_owner"
-            and replicate_requests
+            and inference_context is not None
+            and getattr(inference_context, "fast_path_active", False)
         )
 
         def _set_segment_dispatch_flag(layer, flag_value):

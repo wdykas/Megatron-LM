@@ -322,6 +322,21 @@ class InferenceConfig:
     ``docs/user-guide/features/attention_bounded_segments.md``.
     """
 
+    inference_decode_only_variant_b: bool = False
+    """If True, engage the Variant B fast path only during pure-decode
+    steps; prefill steps fall back to the baseline data path.
+
+    Implies ``inference_replicate_requests`` (the coordinator broadcasts
+    to every rank, so every rank holds every request's mamba state from
+    submission onward). The savings vs always-on Variant B come from
+    skipping the AG-instead-of-RS optimization on prefill steps where
+    collectives are a smaller fraction of step time.
+
+    Pairs with ``--enable-attention-bounded-segments`` and
+    ``--moe-combine-destination-policy current_segment_owner``.
+    """
+
+
     verbose: InitVar[bool] = False
     """Whether to log detailed context configuration at initialization.
     This is an InitVar and is not stored as a field on the config."""

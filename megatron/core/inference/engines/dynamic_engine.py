@@ -279,6 +279,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Track requests currently being finished due to stop words (to skip extra token)
         self.stop_word_being_finished_ids: set[int] = set()
 
+
         # Timing and logging variables.
         self.rank = torch.distributed.get_rank()
         self.step_start_event = torch.cuda.Event(enable_timing=True)
@@ -552,8 +553,18 @@ class DynamicInferenceEngine(AbstractEngine):
                     "prefix_caching_routing_alpha": self.context.prefix_caching_routing_alpha,
                     "schedule_output_path": coordinator_schedule_output_path,
                     "hostname": hostname,
-                    "replicate_requests": getattr(
-                        self.context.config, "inference_replicate_requests", False
+                    # Decode-only mode currently relies on coordinator
+                    # replication (every rank sees every request) so the
+                    # cooperative model forward across EP ranks stays
+                    # consistent. The follow-on engine work (per-rank
+                    # request partitioning + state migration via
+                    # ``migrate_mamba_state`` at the prefill→decode
+                    # boundary) can drop this and load-balance instead.
+                    "replicate_requests": (
+                        getattr(self.context.config, "inference_replicate_requests", False)
+                        or getattr(
+                            self.context.config, "inference_decode_only_variant_b", False
+                        )
                     ),
                     # Replication group size = the rank count for one
                     # model copy (EP × TP × PP). Within a model copy the

@@ -40,6 +40,16 @@ class MambaMetadata:
             (self.max_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
         )
 
+        # Owner rank for each active request, within the replication
+        # group (one model copy = EP × TP × PP). Populated at request
+        # submission as ``request_id % replication_group_size``. Read by
+        # mamba layers in decode-only no-compute-replication mode to
+        # filter SSM compute to owned positions and merge per-rank
+        # partial outputs via an all-reduce. ``-1`` = not yet assigned.
+        self.request_to_owner_rank = torch.full(
+            (self.max_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+
         # Map from requests to slots in the static Mamba state buffer for active decode requests.
         # int64 so selective_state_update can index directly without a per-layer upcast kernel;
         self._batch_indices_decode_buffer = torch.full(

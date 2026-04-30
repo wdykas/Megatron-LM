@@ -376,6 +376,9 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         num_speculative_tokens=args.num_speculative_tokens,
         use_synchronous_zmq_collectives=args.inference_use_synchronous_zmq_collectives,
         inference_replicate_requests=getattr(args, 'inference_replicate_requests', False),
+        inference_decode_only_variant_b=getattr(
+            args, 'inference_decode_only_variant_b', False
+        ),
     )
 
 

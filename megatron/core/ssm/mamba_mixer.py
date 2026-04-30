@@ -491,8 +491,8 @@ class MambaMixer(MegatronModule):
         back to the standard full-input ``in_proj`` path.
 
         Conditions for firing:
-        - ``InferenceConfig.inference_replicate_requests`` is set (every
-          rank has the same [G, hidden] view).
+        - ``inference_context.fast_path_active`` is set (every rank
+          holds the same ``[G, hidden]`` view this step).
         - 2D input (decode/mixed flat path; skip prefill 3D shape).
         - ``ep_size > 1`` and ``G % ep_size == 0``.
 
@@ -505,9 +505,7 @@ class MambaMixer(MegatronModule):
         after the downstream reshape to ``[decode_req_count, K + 1,
         intermediate]``. No spec-decode-specific path needed.
         """
-        if not getattr(
-            getattr(context, "config", None), "inference_replicate_requests", False
-        ):
+        if not getattr(context, "fast_path_active", False):
             return None
         if hidden_states.dim() != 2:
             return None

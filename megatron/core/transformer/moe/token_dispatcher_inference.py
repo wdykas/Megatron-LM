@@ -28,6 +28,7 @@ import torch.distributed as dist
 
 from megatron.core.inference.communication.torch_symm_triton import (
     multimem_all_gatherv_3tensor,
+    multimem_all_reduce,
     multimem_reduce_scatter_v,
 )
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
@@ -421,6 +422,17 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # Set in dispatch_preprocess; consumed by token_dispatch and token_combine.
         self._local_tokens: int = 0
 
+        # Variant B (attention-bounded segments): when True, the input
+        # to ``token_dispatch`` is already in ``[G, hidden]`` global
+        # form on every rank (replicated decode compute) and the AGV
+        # would just duplicate data. We skip it. ``token_combine``
+        # then uses an all-reduce (instead of reduce-scatter-V) so the
+        # output stays at ``[G, hidden]`` and chains into the next MoE
+        # layer's skipped AGV. Set per-step by HybridStack at segment
+        # entry, cleared at segment exit. See
+        # ``megatron/core/inference/attention_bounded_segments.py``.
+        self._segment_input_is_global: bool = False
+
     # ── Dispatch path ─────────────────────────────────────────────────────────────
 
     def dispatch_preprocess(self, hidden_states, routing_map, probs):
@@ -444,6 +456,16 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             Also updates self.routing_map to [global_max, topk] int64.
         """
         if self.ep_size == 1:
+            return hidden_states, probs
+
+        # Variant B fast path: input is already in [G, hidden] global
+        # form on every rank (replicated compute upstream — typically
+        # because we're in decode and every rank shares the migrated
+        # mamba state). Skipping the AGV avoids the redundant gather
+        # and matching is_global propagation through routing_map and
+        # probs (every rank ran the same router on the same input, so
+        # those tensors are already global too).
+        if self._segment_input_is_global:
             return hidden_states, probs
 
         if self._runs_metadata_sync:
@@ -497,12 +519,32 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             hidden_states: [global_max, hidden_size] bf16 expert outputs.
 
         Returns:
-            [local_tokens, hidden_size] bf16 local token outputs.
+            [local_tokens, hidden_size] bf16 local token outputs (or
+            [global_max, hidden_size] in Variant B mode where the
+            global view is preserved for the next layer).
         """
         if self.ep_size == 1:
             return hidden_states.to(torch.bfloat16)
 
         rsv = self.__class__._symm_rsv
+
+        # Variant B combine: instead of reduce-scattering back to per-
+        # rank slices, all-reduce the partials and keep the full global
+        # view. The expert output is written into the [global_max,
+        # hidden] symm-mem buffer; the meaningful data lives in the
+        # first ``self._local_tokens`` (== G in replicated mode) rows.
+        # We slice to the active region, AR across EP, and return the
+        # [G, hidden] result so the next MoE layer's token_dispatch
+        # sees a global-form input and skips its AGV.
+        #
+        # We use NCCL all_reduce here rather than the multimem variant
+        # because the active region shape is dynamic across steps (and
+        # is a slice of the underlying symm-mem buffer, not the buffer
+        # itself).
+        if self._segment_input_is_global:
+            active = hidden_states[: self._local_tokens].contiguous()
+            torch.distributed.all_reduce(active, group=self.ep_group)
+            return active.to(torch.bfloat16)
 
         if hidden_states is not rsv["tensor"]:
             rsv["tensor"].copy_(hidden_states)
