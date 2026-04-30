@@ -8,3 +8,8 @@ from .collectives import (
 )
 from .fused_collectives import fused_multimem_rs_add_norm_ag
 from .utils import are_tensors_nvls_eligible, is_device_nvls_capable
+from .variable_collectives import (
+    multimem_all_gather_v,
+    multimem_all_gatherv_3tensor,
+    multimem_reduce_scatter_v,
+)
