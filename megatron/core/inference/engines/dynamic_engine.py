@@ -553,18 +553,24 @@ class DynamicInferenceEngine(AbstractEngine):
                     "prefix_caching_routing_alpha": self.context.prefix_caching_routing_alpha,
                     "schedule_output_path": coordinator_schedule_output_path,
                     "hostname": hostname,
-                    # Decode-only mode currently relies on coordinator
-                    # replication (every rank sees every request) so the
-                    # cooperative model forward across EP ranks stays
-                    # consistent. The follow-on engine work (per-rank
-                    # request partitioning + state migration via
-                    # ``migrate_mamba_state`` at the prefill→decode
-                    # boundary) can drop this and load-balance instead.
+                    # ``replicate_requests``: broadcasts each new request to
+                    # every rank in a model copy. Required by the always-on
+                    # / decode-only Variant B flavor that uses replicated
+                    # mamba state.
+                    #
+                    # ``partitioned_state``: assigns each new request to
+                    # exactly one rank in the model copy (the prefix-cache
+                    # / load-balance winner). Required by the partitioned-
+                    # state Variant B flavor where mamba state lives only
+                    # on the owner. Mutually exclusive with replicate.
                     "replicate_requests": (
                         getattr(self.context.config, "inference_replicate_requests", False)
                         or getattr(
                             self.context.config, "inference_decode_only_variant_b", False
                         )
+                    ),
+                    "partitioned_state": getattr(
+                        self.context.config, "inference_partitioned_state", False
                     ),
                     # Replication group size = the rank count for one
                     # model copy (EP × TP × PP). Within a model copy the

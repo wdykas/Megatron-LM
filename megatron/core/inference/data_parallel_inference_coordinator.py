@@ -100,6 +100,7 @@ class DataParallelInferenceCoordinator:
         schedule_output_path: str | None = None,
         hostname: str | None = None,
         replicate_requests: bool = False,
+        partitioned_state: bool = False,
         replication_group_size: int = 1,
     ):
         """
@@ -222,12 +223,33 @@ class DataParallelInferenceCoordinator:
         # still load-balances across model copies — preserving DP
         # throughput scaling for multi-cluster deployments.
         self.replicate_requests = replicate_requests
+        # ``partitioned_state``: pick a single owner rank per request
+        # (using the existing prefix-cache + load-balancer score) and
+        # constrain that owner to lie within one replication group, so
+        # the request lives on exactly one model copy. Mutually
+        # exclusive with ``replicate_requests``. Sourced from
+        # ``InferenceConfig.inference_partitioned_state``. Used by the
+        # Variant-B partitioned-state path where mamba state lives only
+        # on the owner.
+        self.partitioned_state = partitioned_state
+        if self.replicate_requests and self.partitioned_state:
+            raise ValueError(
+                "replicate_requests and partitioned_state are mutually exclusive."
+            )
         self.replication_group_size = max(1, int(replication_group_size))
-        if self.replicate_requests and self.data_parallel_size % self.replication_group_size != 0:
+        # Both modes require data_parallel_size be a multiple of the
+        # replication group size: replication broadcasts within a group;
+        # partitioned routing still confines per-request ownership to a
+        # single group so the engine can rely on a model copy worth of
+        # consistent compute and state.
+        if (
+            (self.replicate_requests or self.partitioned_state)
+            and self.data_parallel_size % self.replication_group_size != 0
+        ):
             raise ValueError(
                 f"data_parallel_size ({self.data_parallel_size}) must be a "
                 f"multiple of replication_group_size ({self.replication_group_size}) "
-                f"when replicate_requests is enabled."
+                f"when replicate_requests or partitioned_state is enabled."
             )
 
         # Deterministic rank index mapping (sorted identity -> 0-based index).
@@ -704,6 +726,7 @@ class DataParallelInferenceCoordinator:
         schedule_output_path: str | None = None,
         hostname: str | None = None,
         replicate_requests: bool = False,
+        partitioned_state: bool = False,
         replication_group_size: int = 1,
     ):
         """
@@ -740,6 +763,7 @@ class DataParallelInferenceCoordinator:
             schedule_output_path=schedule_output_path,
             hostname=hostname,
             replicate_requests=replicate_requests,
+            partitioned_state=partitioned_state,
             replication_group_size=replication_group_size,
         )
         ready_event.set()

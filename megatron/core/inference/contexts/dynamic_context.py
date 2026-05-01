@@ -293,9 +293,43 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._inference_decode_only_variant_b = bool(
             getattr(inference_config, "inference_decode_only_variant_b", False)
         )
-        self._fast_path_active = bool(
+        # ``inference_partitioned_state``: per-rank request ownership +
+        # mamba state per-rank instead of replicated. Enables the
+        # Variant-B skip-AG MoE path by reconstructing the
+        # ``[G_total, H]`` global view at HybridStack entry (initial
+        # AG of the embedding output) and at every mamba layer's exit
+        # (AG of the per-rank mamba output). Mamba does its work on
+        # the rank's owned ``[G_local, H]`` slice; everything else
+        # in the model sees ``[G_total, H]`` consistently — that's
+        # what makes residual_add / norm / MoE skip-AG correct under
+        # this data flow.
+        #
+        # This is a *layer-level data-flow restructure* compared to
+        # default main, not just a coordinator/engine-level flag. The
+        # mamba mixer's forward changes; HybridStack adds an initial
+        # AG. Skip-AG fires across all MoE layers in segments because
+        # mamba's exit-AG keeps the global view alive between MoE
+        # layers.
+        #
+        # ``fast_path_active`` is True under partitioned just like
+        # under replication; the difference is *how* the global view
+        # is produced (per-rank-mamba+AG vs replicated mamba), not
+        # whether it exists.
+        self._inference_partitioned_state = bool(
+            getattr(inference_config, "inference_partitioned_state", False)
+        )
+        # Cache the replicate flag on the context so callers (e.g.,
+        # HybridStack's partitioned_active gate) can distinguish
+        # "data is global because every rank ran the same upstream
+        # compute" (replicated) from "data is per-rank, needs an
+        # initial AG to become global" (partitioned).
+        self._inference_replicate_requests = bool(
             getattr(inference_config, "inference_replicate_requests", False)
+        )
+        self._fast_path_active = bool(
+            self._inference_replicate_requests
             or self._inference_decode_only_variant_b
+            or self._inference_partitioned_state
         )
 
         self.cache_mla_latent = (
@@ -1853,12 +1887,32 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.batch_dimensions = batch_dimensions
 
+        # In partitioned-state mode each EP rank holds a different
+        # subset of requests (potentially with different prefill
+        # seqlens), so per-rank token counts diverge and the default
+        # NVLS-path "skip the EP sync" optimization picks different
+        # captured graphs on different ranks → asymmetric collective
+        # sequences → multimem barrier deadlock. Force the EP sync on
+        # under partitioned mode so all ranks select the same captured
+        # graph; AGV then handles per-rank padding internally. The sync
+        # is a single tiny all-reduce-max per step.
+        #
+        # Skipped during graph capture because
+        # ``adjust_batch_dims_for_expert_parallelism`` bails (returns
+        # None → eager) whenever any rank has prefill — which would
+        # break the capture-side assertion ``_using_cuda_graph_this_step``
+        # when capturing prefill graphs. The sync is only needed at
+        # inference time when ranks dispatch real requests.
+        sync_ep_token_counts = (
+            self._nccl_ep_dispatcher
+            or (self._inference_partitioned_state and not self.is_creating_cuda_graphs)
+        )
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
             batch_dimensions,
             self.cuda_graph_batch_dimensions_list,
             strict=self.is_hybrid_model,
             ep_group=self.expert_model_parallel_group,
-            match_ep_token_counts=self._nccl_ep_dispatcher,
+            match_ep_token_counts=sync_ep_token_counts,
         )
         self._using_cuda_graph_this_step = best_graph is not None
 

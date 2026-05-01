@@ -379,6 +379,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         inference_decode_only_variant_b=getattr(
             args, 'inference_decode_only_variant_b', False
         ),
+        inference_partitioned_state=getattr(args, 'inference_partitioned_state', False),
     )
 
 

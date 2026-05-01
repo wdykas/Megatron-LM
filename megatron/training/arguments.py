@@ -2023,6 +2023,14 @@ def _add_inference_args(parser):
                             'prefill steps fall back to the baseline data path. Implies request '
                             'replication. Pairs with --enable-attention-bounded-segments and '
                             '--moe-combine-destination-policy current_segment_owner.')
+    group.add_argument('--inference-partitioned-state', action=argparse.BooleanOptionalAction,
+                       required=False, default=False,
+                       help='If set, run Variant B with per-rank request ownership instead of '
+                            'request replication. Each request lives on exactly one EP-rank owner; '
+                            'mamba state is per-rank; the global view used by skip-AG MoE is produced '
+                            'by an NVLS all-gather of the owners\' mamba outputs. Mutually exclusive '
+                            'with --inference-replicate-requests. See '
+                            'docs/user-guide/features/state_migration_plan.md.')
     # NOTE: --enable-attention-bounded-segments and
     # --moe-combine-destination-policy are auto-generated from the
     # corresponding TransformerConfig fields by ArgumentGroupFactory in

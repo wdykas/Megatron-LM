@@ -336,6 +336,24 @@ class InferenceConfig:
     ``--moe-combine-destination-policy current_segment_owner``.
     """
 
+    inference_partitioned_state: bool = False
+    """If True, run Variant B with per-rank request ownership and
+    on-demand NVLS all-gather of mamba outputs (instead of replicating
+    every request to every rank). Each request has exactly one EP-rank
+    owner; mamba state lives only there; the global view used by the
+    skip-AG MoE path is produced by an AG of the owners' mamba outputs.
+
+    Mutually exclusive with ``inference_replicate_requests``. Cluster
+    state memory is O(total_requests) instead of O(EP × total_requests),
+    which lets the cluster hold ~EP× more concurrent requests at the
+    same per-GPU memory budget. Per-step latency at low batch matches
+    Variant-B-with-replication (same skip-AGV / AR savings).
+
+    Pairs with ``--enable-attention-bounded-segments`` and
+    ``--moe-combine-destination-policy current_segment_owner``. See
+    ``docs/user-guide/features/state_migration_plan.md``.
+    """
+
 
     verbose: InitVar[bool] = False
     """Whether to log detailed context configuration at initialization.
@@ -347,4 +365,11 @@ class InferenceConfig:
             raise ValueError(
                 f"prefix_caching_routing_alpha must be in [0, 1], "
                 f"got {self.prefix_caching_routing_alpha}"
+            )
+        if self.inference_replicate_requests and self.inference_partitioned_state:
+            raise ValueError(
+                "inference_replicate_requests and inference_partitioned_state are "
+                "mutually exclusive: replication broadcasts each request to every EP "
+                "rank, while partitioned state assigns each request to exactly one "
+                "owner. Pick one (or neither for default load-balanced inference)."
             )

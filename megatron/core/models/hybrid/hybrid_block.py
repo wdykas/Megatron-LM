@@ -368,9 +368,14 @@ class HybridStack(MegatronModule):
                 # Layers have 1-indexed layer numbers attribute.
                 inner_quant_context = get_inner_quant_context(self.config, layer.layer_number - 1)
 
-                # Tell this layer's MoE dispatcher (if any) whether the
-                # input is already in [G, hidden] form. In replicated-
-                # request mode this is true for every layer.
+                # Tell this layer's MoE dispatcher (if any) whether its
+                # input is already in [G_total, H] form. In replicated-
+                # request mode every rank holds the global view from the
+                # start, so this is True for every layer and the
+                # dispatcher takes its skip-AG path. Under default /
+                # partitioned-engine mode the input is per-rank and the
+                # dispatcher's normal AGV path runs (this branch is a
+                # no-op since the flag stays at its False default).
                 if abs_active:
                     _set_segment_dispatch_flag(layer, True)
                 with inner_quant_context:
