@@ -548,10 +548,13 @@ class MambaMixer(MegatronModule):
             if buf["handle"] is not None:
                 output = buf["tensor"].view(local_output.dtype).view(*global_shape)
                 multimem_all_gather(output, local_output, buf["handle"])
-                # Return a fresh non-symmem tensor: the dispatcher's AR
-                # at the next MoE may reuse this buffer slot, and the
-                # SSM kernels keep zxBCdt live across many ops below.
-                return output.clone()
+                # No clone: the "ep" symm-mem buffer is owned exclusively
+                # by mamba's in_proj path within a single layer, and the
+                # next mamba layer's in_proj write only happens after
+                # this layer's downstream SSM kernels have consumed
+                # zxBCdt (kernels run in-order on the default stream).
+                # Saves a per-layer copy of [G, intermediate] bytes.
+                return output
 
         return gather_from_sequence_parallel_region(local_output, group=tp_ep_group)
 
@@ -657,9 +660,10 @@ class MambaMixer(MegatronModule):
 
         # Output projection. (We previously experimented with also doing
         # out_proj on a local slice + AG — same pattern as Opt B-2 — but
-        # that combination pushed the correctness_diff above the
-        # 1-prompt fp-noise tolerance, so we keep the standard full-input
-        # path here.)
+        # at small batch sizes the AG overhead exceeds the GEMM
+        # savings; out_proj's intermediate→hidden ratio also makes the
+        # slice GEMM smaller and more launch-overhead-bound than
+        # in_proj's hidden→intermediate. Keeping the standard path.)
         out, out_bias = self.out_proj(y)
 
         return out, out_bias

@@ -433,6 +433,16 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # ``megatron/core/inference/attention_bounded_segments.py``.
         self._segment_input_is_global: bool = False
 
+        # Variant B Opt-1: shared experts on local slice. When the MoE
+        # layer's ``shared_experts_compute`` runs the shared-experts
+        # GEMM on this rank's [G/EP, hidden] slice (saving the
+        # redundant compute), it stashes the result here so the
+        # combine all-reduce folds it into the output at the slice's
+        # offset positions — no extra collective. Cleared after use.
+        self._shared_local_slice: Optional[torch.Tensor] = None
+        self._shared_local_start: int = 0
+        self._shared_local_end: int = 0
+
     # ── Dispatch path ─────────────────────────────────────────────────────────────
 
     def dispatch_preprocess(self, hidden_states, routing_map, probs):
@@ -469,29 +479,22 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # already global, and the metadata all-reduce-max returns G
         # (same on every rank).
         if self._segment_input_is_global:
-            if self._runs_metadata_sync:
-                self.update_metadata(hidden_states.shape[0])
-
-            agv_h = self.__class__._symm_agv_hidden
-            agv_r = self.__class__._symm_agv_routing
-            agv_p = self.__class__._symm_agv_probs
-            per_rank_max = self._per_rank_worst_case_token_count
-            global_max = per_rank_max * self.ep_size
+            # Under replication every rank already has the same [G, *]
+            # tensors and the AGV would just duplicate data we already
+            # have. Under CUDA graph capture, each decode batch size has
+            # its own captured graph; each graph sees a fixed G, so we
+            # can return the inputs at their native [G, *] shape (rather
+            # than copying into the [global_max, *] AGV symm-mem buffers)
+            # and let the experts kernel work directly on [G, *]. This
+            # eliminates 3 per-layer ``.copy_()`` kernel launches and the
+            # NVLS update_metadata collective.
             G = hidden_states.shape[0]
-            topk = probs.shape[1]
-            hidden_dim = hidden_states.shape[1]
 
-            # Copy already-global tensors into the AGV symm-mem buffers
-            # at rows [0:G]. The remaining rows [G:global_max] can stay
-            # at whatever they were — downstream readers respect
-            # ``valid_tokens=G`` and don't read past it.
-            agv_h["tensor"][:G].copy_(hidden_states)
-            agv_p["tensor"][:G].copy_(probs)
-            agv_r["tensor"][:G].copy_(self.routing_map)
+            if self._runs_metadata_sync:
+                self.__class__._step_metadata[0:1].fill_(G)
+                self.__class__._step_metadata[1:2].fill_(0)
+                self.__class__._step_metadata[2:3].fill_(G)
 
-            self.routing_map = agv_r["tensor"].view(global_max, topk)
-            probs = agv_p["tensor"].view(global_max, topk)
-            hidden_states = agv_h["tensor"].view(global_max, hidden_dim)
             return hidden_states, probs
 
         if self._runs_metadata_sync:
@@ -561,14 +564,40 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # multicast pointer base — passing rsv[:G] as both input and
         # output gets it to AR exactly the active region (G * hidden
         # bytes per rank) instead of the full per-rank-worst-case
-        # buffer (global_max * hidden bytes), which is what was
-        # making the old version slower than baseline.
+        # buffer (global_max * hidden bytes).
+        #
+        # Opt B-1: shared experts are computed per-rank on a slice of
+        # the global view (``_shared_local_slice`` / start / end set by
+        # ``moe_layer.shared_experts_compute``). We fold that slice
+        # into the AR input at its rank-specific offset so the AR sum
+        # naturally spreads the shared contribution across the global
+        # view — no extra collective, the shared output rides the
+        # combine AR for free.
         if self._segment_input_is_global:
             if hidden_states is not rsv["tensor"]:
                 rsv["tensor"][: self._local_tokens].copy_(
                     hidden_states[: self._local_tokens]
                 )
             active = rsv["tensor"][: self._local_tokens]
+            shared_slice = self._shared_local_slice
+            if shared_slice is not None:
+                start = self._shared_local_start
+                end = self._shared_local_end
+                # Add this rank's shared output into the AR input at
+                # [start:end]. Each rank covers a disjoint range, so
+                # AR-sum produces the full shared contribution at the
+                # right positions on every rank (other ranks' slices
+                # contribute zero at this rank's range and vice versa).
+                active[start:end].add_(shared_slice)
+                # Clear so subsequent layers don't re-fold stale data.
+                self._shared_local_slice = None
+            # Use the Triton multimem all-reduce kernel: it takes
+            # ``numel`` explicitly and ARs exactly the active slice
+            # (G * hidden bytes per rank). PyTorch's native
+            # ``torch.ops.symm_mem.multimem_all_reduce_`` operates on
+            # the full registered buffer (global_max * hidden) and
+            # measured slower in this configuration; the slice-aware
+            # Triton kernel wins by 5-10% at b=1..4 here.
             multimem_all_reduce(active, active, rsv["handle"])
             return active.to(torch.bfloat16)
 
