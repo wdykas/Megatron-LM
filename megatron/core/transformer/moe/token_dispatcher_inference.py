@@ -306,6 +306,13 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     _pending_residual: Optional[torch.Tensor] = None
     _residual_was_added_by_ar: bool = False
 
+    # Set True by ``HybridStack.forward`` when the partitioned-state path
+    # is active for the step. Indicates that ``_step_metadata`` was
+    # populated via ``fused_metadata_update`` with per-rank prefix-sum
+    # offsets, so the skip-AG dispatch path should NOT overwrite those
+    # values with replicated-mode defaults.
+    _partitioned_metadata_set: bool = False
+
     # v34 fused AR + residual_add + RMSNorm. ``_pending_next_norm_weights``
     # is set by transformer_layer pre-combine using the pre-linked
     # next-layer norm weights stashed on the MoE layer. The fused
@@ -509,9 +516,16 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             G = hidden_states.shape[0]
 
             if self._runs_metadata_sync:
-                self.__class__._step_metadata[0:1].fill_(G)
-                self.__class__._step_metadata[1:2].fill_(0)
-                self.__class__._step_metadata[2:3].fill_(G)
+                # In partitioned mode hybrid_block already populated
+                # ``_step_metadata`` via ``fused_metadata_update`` with
+                # actual per-rank counts (g_total, prefix-sum offset,
+                # ep_max). Don't overwrite. In replicated mode no such
+                # call ran, so override with the [G, 0, G] values
+                # appropriate for replicated semantics.
+                if not NVLSAllGatherVDispatcher._partitioned_metadata_set:
+                    self.__class__._step_metadata[0:1].fill_(G)
+                    self.__class__._step_metadata[1:2].fill_(0)
+                    self.__class__._step_metadata[2:3].fill_(G)
 
             return hidden_states, probs
 

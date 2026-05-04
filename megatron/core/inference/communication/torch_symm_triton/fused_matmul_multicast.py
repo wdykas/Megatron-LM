@@ -1,18 +1,18 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Constexpr-specialized NVLS multicast publish kernel for the
-partitioned-state inference path.
+"""NVLS multicast publish kernel for the partitioned-state inference path.
 
 In partitioned mode each rank computes mamba locally and then publishes
 its ``[local_tokens, hidden]`` output to all peers' copies of the
-global symmetric-memory buffer at row offset ``rank * local_tokens``.
-The standard ``multimem_all_gather_v`` kernel handles this via runtime
-``ep_max_tokens`` / ``rank_token_offset`` pointer loads to support
-variable per-rank counts; under EP-token-count sync those values are
-identical across ranks at every step, so we can specialize them as
-constexpr — saving a few microseconds of pointer-load + dispatcher
-metadata work and producing a kernel that is sized for exactly
-``local_tokens`` CTAs (no per-rank-max wasted CTAs).
+global symmetric-memory buffer at a per-rank prefix-sum offset.
+
+This kernel supports **asymmetric per-rank counts** without an
+EP-token-count sync. Each rank passes its own runtime ``local_tokens``
+and ``rank_token_offset_ptr`` (filled with the prefix-sum across
+ranks). The grid size is fixed to ``per_rank_max_tokens`` (a static
+config max), so every rank's captured graph has the same grid; CTAs
+with ``pid >= local_tokens`` skip the data work but still participate
+in the cross-rank barrier so the barrier slots align across ranks.
 """
 
 from __future__ import annotations
@@ -44,50 +44,57 @@ def _publish_multicast_kernel(
     local_ptr,
     multicast_ptr,
     signal_pad_ptrs,
-    LOCAL_TOKENS: tl.constexpr,
+    local_tokens,             # runtime: this rank's actual count this step
+    rank_token_offset_ptr,    # runtime: this rank's prefix-sum offset
     HIDDEN_SIZE: tl.constexpr,
-    RANK_TOKEN_OFFSET: tl.constexpr,
+    PER_RANK_MAX: tl.constexpr,    # static grid size; same across all ranks
     BLOCK_SIZE: tl.constexpr,
     NUMEL_PER_THREAD: tl.constexpr,
     BITS: tl.constexpr,
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
 ):
-    """Publish ``local_ptr[0:LOCAL_TOKENS, :HIDDEN_SIZE]`` to all peers'
-    copies of ``multicast_ptr`` starting at row ``RANK_TOKEN_OFFSET``.
+    """Publish per-rank rows to all peers at this rank's prefix-sum offset.
 
-    All counts are constexpr so the kernel is fully specialized per
-    shape. Mirrors ``_multimem_all_gather_v_kernel`` but with a fixed
-    grid of ``LOCAL_TOKENS`` CTAs (one per token row) and constexpr
-    rank-offset.
+    Fixed grid of ``PER_RANK_MAX`` CTAs (same across all ranks).
+    CTAs with ``pid >= local_tokens`` skip the load+store but still
+    participate in the cross-rank barrier — that is what makes the
+    barrier symmetric when peers have different ``local_tokens``.
+
+    Each CTA handles one token row. ``rank_token_offset_ptr`` is read
+    at runtime from a tensor populated by the dispatcher's per-step
+    metadata pass (prefix-sum of all preceding ranks' local_tokens).
     """
     pid = tl.program_id(axis=0)
-    if pid >= LOCAL_TOKENS:
-        return
+    do_work = pid < local_tokens
 
     tid = tl.arange(0, BLOCK_SIZE)
     numel_per_token = tl.cdiv(HIDDEN_SIZE, NUMEL_PER_THREAD)
     channel_mask = tid < numel_per_token
 
-    for channel_offset in range(0, numel_per_token, BLOCK_SIZE):
-        local_offsets = pid * numel_per_token + channel_offset + tid
-        token_mask = local_offsets < LOCAL_TOKENS * numel_per_token
-        mask = token_mask & channel_mask
+    if do_work:
+        rank_token_offset = tl.load(rank_token_offset_ptr)
+        for channel_offset in range(0, numel_per_token, BLOCK_SIZE):
+            local_offsets = pid * numel_per_token + channel_offset + tid
+            token_mask = local_offsets < local_tokens * numel_per_token
+            mask = token_mask & channel_mask
 
-        global_offsets = RANK_TOKEN_OFFSET * numel_per_token + local_offsets
+            global_offsets = rank_token_offset * numel_per_token + local_offsets
 
-        if BITS == 128:
-            multicast_ptrs = multicast_ptr.to(tl.pointer_type(tl.uint64)) + global_offsets * 2
-            local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + local_offsets * 2
-            (x, y, z, w) = ld_128(local_ptrs, mask=mask, multicast_op=False)
-            st_128(multicast_ptrs, x, y, z, w, mask=mask, multicast_op=True)
-        else:
-            from .multimem_asm import ld_64, st_64
-            multicast_ptrs = multicast_ptr.to(tl.pointer_type(tl.uint64)) + global_offsets
-            local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + local_offsets
-            (x, y) = ld_64(local_ptrs, mask=mask)
-            st_64(multicast_ptrs, x, y, mask=mask, multicast_op=True)
+            if BITS == 128:
+                multicast_ptrs = multicast_ptr.to(tl.pointer_type(tl.uint64)) + global_offsets * 2
+                local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + local_offsets * 2
+                (x, y, z, w) = ld_128(local_ptrs, mask=mask, multicast_op=False)
+                st_128(multicast_ptrs, x, y, z, w, mask=mask, multicast_op=True)
+            else:
+                from .multimem_asm import ld_64, st_64
+                multicast_ptrs = multicast_ptr.to(tl.pointer_type(tl.uint64)) + global_offsets
+                local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + local_offsets
+                (x, y) = ld_64(local_ptrs, mask=mask)
+                st_64(multicast_ptrs, x, y, mask=mask, multicast_op=True)
 
+    # All CTAs (including those that skipped data work) participate in
+    # the barrier so signal-pad slots align across asymmetric ranks.
     sync_threads()
     symm_mem_sync(
         signal_pad_ptrs,
@@ -99,29 +106,26 @@ def _publish_multicast_kernel(
     )
 
 
-def multicast_publish_constexpr(
+def multicast_publish(
     local_tensor: torch.Tensor,
     output_global_buffer: torch.Tensor,
     output_symm_mem_handle,
     rank: int,
-    rank_token_offset: int,
+    rank_token_offset_tensor: torch.Tensor,
+    per_rank_max: int,
 ) -> torch.Tensor:
-    """Publish ``local_tensor`` (already-computed per-rank output) to all
-    peers' copies of ``output_global_buffer`` at row ``rank_token_offset``.
-
-    Equivalent to ``multimem_all_gather_v`` but with a constexpr-specialized
-    Triton kernel sized exactly for ``local_tensor.shape[0]`` CTAs.
+    """Publish per-rank rows to all peers' copies of the global buffer.
 
     Args:
-        local_tensor: ``[local_tokens, hidden]`` per-rank tensor to publish.
-        output_global_buffer: ``[ep_size * local_tokens, hidden]`` symm-mem
-            buffer (registered with NVLS).
-        output_symm_mem_handle: ``_SymmetricMemory`` handle for the buffer.
-        rank: this rank's index in the EP group.
-        rank_token_offset: row offset for this rank's contribution.
-
-    Returns: ``output_global_buffer`` (unchanged ref) populated with all
-    ranks' contributions after the end-of-kernel ``symm_mem_sync`` barrier.
+        local_tensor: ``[local_tokens, hidden]`` per-rank tensor.
+        output_global_buffer: ``[per_rank_max * ep_size, hidden]`` symm-mem.
+        output_symm_mem_handle: ``_SymmetricMemory`` handle.
+        rank: this rank's EP index.
+        rank_token_offset_tensor: 0-d int32 CUDA tensor holding this rank's
+            prefix-sum offset (sum of preceding ranks' local_tokens).
+            Populated by the dispatcher each step.
+        per_rank_max: the static config max-per-rank token count. Grid
+            size; same on every rank so barriers align.
     """
     assert HAVE_TRITON
     assert local_tensor.dim() == 2 and output_global_buffer.dim() == 2
@@ -135,13 +139,14 @@ def multicast_publish_constexpr(
     block_size = min(triton.next_power_of_2(numel_per_token), 1024)
     num_warps = max(1, block_size // 32)
 
-    _publish_multicast_kernel[(local_tokens, 1, 1)](
+    _publish_multicast_kernel[(per_rank_max, 1, 1)](
         local_tensor.contiguous(),
         output_symm_mem_handle.multicast_ptr,
         output_symm_mem_handle.signal_pad_ptrs_dev,
-        LOCAL_TOKENS=local_tokens,
+        local_tokens=local_tokens,
+        rank_token_offset_ptr=rank_token_offset_tensor,
         HIDDEN_SIZE=hidden_size,
-        RANK_TOKEN_OFFSET=rank_token_offset,
+        PER_RANK_MAX=per_rank_max,
         BLOCK_SIZE=block_size,
         NUMEL_PER_THREAD=numel_per_thread,
         BITS=bits,

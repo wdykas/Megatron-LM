@@ -427,6 +427,38 @@ class HybridStack(MegatronModule):
             and decode_req_count > 0
             and prefill_req_count == 0
         )
+
+        # Populate ``_step_metadata`` once per step BEFORE any layer
+        # runs. The publish kernels in ``_partitioned_pre_moe_agv``
+        # read the prefix-sum offset and ep_max_tokens from this
+        # tensor, so it must be ready before the first publish (which
+        # runs before any MoE dispatcher's ``token_dispatch`` would
+        # otherwise compute it).
+        if partitioned_active:
+            from megatron.core.inference.moe.metadata import fused_metadata_update
+            from megatron.core.transformer.moe.token_dispatcher_inference import (
+                NVLSAllGatherVDispatcher as _NVLSDisp,
+            )
+            seq_len = 1 + getattr(inference_context, "num_speculative_tokens", 0)
+            local_tokens_for_step = decode_req_count * seq_len
+            if (
+                _NVLSDisp._symm_metadata is not None
+                and _NVLSDisp._symm_metadata.get("handle") is not None
+                and _NVLSDisp._step_metadata is not None
+            ):
+                fused_metadata_update(
+                    local_tokens=local_tokens_for_step,
+                    local_buf=_NVLSDisp._symm_metadata["tensor"],
+                    symm_mem_hdl=_NVLSDisp._symm_metadata["handle"],
+                    step_metadata=_NVLSDisp._step_metadata,
+                )
+                _NVLSDisp._partitioned_metadata_set = True
+        else:
+            from megatron.core.transformer.moe.token_dispatcher_inference import (
+                NVLSAllGatherVDispatcher as _NVLSDisp,
+            )
+            _NVLSDisp._partitioned_metadata_set = False
+
         in_global_view = False
 
         with outer_fp8_context:
@@ -508,21 +540,27 @@ class HybridStack(MegatronModule):
         hidden_states: torch.Tensor,
         inference_context: BaseInferenceContext,
     ) -> torch.Tensor:
-        """Variable-count NVLS multimem all-gather right before each MoE.
+        """Variable-count NVLS multimem publish before each MoE.
+
+        Supports asymmetric per-rank token counts: each rank passes its
+        own ``local_tokens`` and reads its prefix-sum offset from the
+        shared ``_step_metadata`` tensor populated once per step by
+        ``fused_metadata_update`` (called from ``forward`` before the
+        layer loop). The publish kernel uses a fixed grid of
+        ``per_rank_max`` CTAs so cross-rank barriers align even when
+        peers process different numbers of valid tokens; CTAs with
+        ``pid >= local_tokens`` skip the data work but still
+        participate in the barrier.
 
         Caller passes 3-D ``[local_tokens, 1, hidden]`` (the dynamic
         engine's decode-step layout). We squeeze the seq dim to 2-D
-        for AGV, run the kernel, then unsqueeze back. AGV writes at
-        compact prefix-sum offsets (``rank * local_tokens``) since EP
-        sync makes every rank's ``local_tokens`` the same.
-
-        Returns ``[per_rank_max * ep_size, 1, hidden]`` on every rank;
-        valid contributions are at offsets ``[rank * local_tokens,
-        (rank+1) * local_tokens)`` for each rank.
+        for the kernel, run it, then unsqueeze back. The output is
+        sliced to ``g_total`` rows (sum of all peers' local_tokens)
+        for the MoE dispatcher.
         """
         from megatron.core.inference.communication.torch_symm_triton import (
             are_tensors_nvls_eligible,
-            multicast_publish_constexpr,
+            multicast_publish,
         )
         from megatron.core.transformer.moe.token_dispatcher_inference import (
             NVLSAllGatherVDispatcher,
@@ -556,24 +594,26 @@ class HybridStack(MegatronModule):
         rank = ep_group.rank()
         global_max = per_rank_max * ep_size
 
-        # Use the constexpr-specialized multicast-publish kernel:
-        # launches exactly local_tokens CTAs (no per-rank-max padding,
-        # no ep_max_tokens runtime load). Saves the fused_metadata_update
-        # collective AND ~115 wasted CTAs from the variable AGV-V kernel.
+        # _step_metadata holds [g_total, rank_token_offset, ep_max_tokens]
+        # populated by ``fused_metadata_update`` at the start of each
+        # partitioned-active step (see ``forward`` below).
+        step_metadata = NVLSAllGatherVDispatcher._step_metadata
+        rank_token_offset_tensor = step_metadata[1:2]
+
         output_2d_full = agv_h["tensor"].view(global_max, hidden_size)
-        multicast_publish_constexpr(
+        multicast_publish(
             local_tensor=hidden_states_2d.contiguous(),
             output_global_buffer=output_2d_full,
             output_symm_mem_handle=agv_h["handle"],
             rank=rank,
-            rank_token_offset=rank * local_tokens,
+            rank_token_offset_tensor=rank_token_offset_tensor,
+            per_rank_max=per_rank_max,
         )
-        # Compact prefix-sum layout: valid rows are at [0, ep_size *
-        # local_tokens). Slice to that exact extent so the downstream
-        # MoE dispatcher sees ``_local_tokens = ep_size * local_tokens``
-        # (≈52 in our bench) instead of ``per_rank_max * ep_size``
-        # (=8192) — otherwise the combine AR runs over the entire
-        # registered buffer and costs 100× more than needed.
+        # G_total = ep_size * local_tokens by symmetry under EP-token-count
+        # sync. The runtime ``rank_token_offset`` from step_metadata still
+        # equals ``rank * local_tokens`` in that case — using the runtime
+        # path here costs nothing and lets us drop the sync in a future
+        # change without touching this code.
         g_total = ep_size * local_tokens
         output_2d = output_2d_full[:g_total]
         if was_3d:

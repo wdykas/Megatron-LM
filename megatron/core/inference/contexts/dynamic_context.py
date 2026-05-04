@@ -1887,26 +1887,16 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.batch_dimensions = batch_dimensions
 
-        # In partitioned-state mode each EP rank holds a different
-        # subset of requests (potentially with different prefill
-        # seqlens), so per-rank token counts diverge and the default
-        # NVLS-path "skip the EP sync" optimization picks different
-        # captured graphs on different ranks → asymmetric collective
-        # sequences → multimem barrier deadlock. Force the EP sync on
-        # under partitioned mode so all ranks select the same captured
-        # graph; AGV then handles per-rank padding internally. The sync
-        # is a single tiny all-reduce-max per step.
-        #
-        # Skipped during graph capture because
-        # ``adjust_batch_dims_for_expert_parallelism`` bails (returns
-        # None → eager) whenever any rank has prefill — which would
-        # break the capture-side assertion ``_using_cuda_graph_this_step``
-        # when capturing prefill graphs. The sync is only needed at
-        # inference time when ranks dispatch real requests.
-        sync_ep_token_counts = (
-            self._nccl_ep_dispatcher
-            or (self._inference_partitioned_state and not self.is_creating_cuda_graphs)
-        )
+        # In partitioned-state mode the publish kernel uses a fixed
+        # ``per_rank_max``-sized grid and reads the per-rank prefix-sum
+        # offset from a runtime tensor populated by
+        # ``fused_metadata_update``. That makes cross-rank barriers
+        # symmetric even when ranks pick different captured graphs, so
+        # we can drop the EP-token-count sync and let each rank match
+        # the graph for its own ``local_tokens``. The NCCL EP path
+        # still needs the sync (its collectives have different
+        # symmetry requirements).
+        sync_ep_token_counts = self._nccl_ep_dispatcher
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
             batch_dimensions,
             self.cuda_graph_batch_dimensions_list,
