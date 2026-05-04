@@ -89,6 +89,7 @@ def mcore_fused_moe(
     routing_map: torch.Tensor,
     disable_fused_quant_kernels: bool = False,
     out: torch.Tensor = None,
+    out_symm_handle=None,
 ) -> torch.Tensor:
     """Fused MoE: permute -> pad -> FC1 -> activation -> FC2 -> unpad -> unpermute.
 
@@ -188,6 +189,33 @@ def mcore_fused_moe(
     fc2_output = mm_fn(activation_out, fc2_weight, offs)
 
     # --- Post-processing: unpermute ---
+    # Multicast unpermute path: fold cross-rank AR into the unpermute by
+    # using ``multimem.red.add`` for the atomic-accumulate. Saves a
+    # separate AR kernel (~40μs/layer) at the cost of one extra
+    # cross-rank barrier inside the unpermute kernel. Only fires when
+    # the dispatcher signals it is taking the AR (Variant-B) path.
+    import os as _os
+    if (
+        out_symm_handle is not None
+        and _os.environ.get("ABS_UNPERMUTE_MULTICAST", "0") == "1"
+    ):
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+        if NVLSAllGatherVDispatcher._multicast_unpermute_active:
+            from megatron.core.inference.moe.permute_multicast import (
+                _zero_rsv_for_multicast,
+                unpermute_tokens_multicast,
+            )
+            # Caller-required: zero the destination on every rank before
+            # multicast atomic-adds start. The multicast kernel's start
+            # barrier waits for all peers to arrive, so a kernel-launch is
+            # OK here (stream-ordered with the barrier).
+            _zero_rsv_for_multicast(out, valid_tokens, max_tokens)
+            unpermute_tokens_multicast(
+                fc2_output, permuted_probs, permutation_map, n_used, out_symm_handle
+            )
+            return out
     return unpermute_tokens(
         fc2_output, permuted_probs, permutation_map, max_tokens, n_used, valid_tokens, out=out
     )

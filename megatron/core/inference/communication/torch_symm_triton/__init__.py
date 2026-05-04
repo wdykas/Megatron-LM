@@ -13,3 +13,7 @@ from .variable_collectives import (
     multimem_all_gatherv_3tensor,
     multimem_reduce_scatter_v,
 )
+from .fused_matmul_multicast import (
+    fused_linear_multicast_publish,
+    multicast_publish_constexpr,
+)

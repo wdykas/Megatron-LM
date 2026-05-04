@@ -298,6 +298,38 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         return cls._symm_rsv["tensor"] if cls._symm_rsv is not None else None
 
     @classmethod
+    def _get_rsv_handle(cls):
+        """Return the RSV ``_SymmetricMemory`` handle for multicast atomic-add."""
+        return cls._symm_rsv["handle"] if cls._symm_rsv is not None else None
+
+    # Class-level flag: True when the current step is using the
+    # Variant-B / segment-input-is-global path (where the AR combine
+    # runs and could be folded into a multicast unpermute). Set by
+    # ``token_dispatch`` at the start of each combine pair, cleared by
+    # ``token_combine`` after the AR. Read by ``mcore_fused_moe`` so
+    # the multicast-unpermute optimization only fires on the right
+    # path; prefill / RSV-scatter path keeps the standard unpermute.
+    _multicast_unpermute_active: bool = False
+
+    # Class-level "pending residual" slot for fused AR + residual_add
+    # (v33). Set by transformer_layer pre-combine when the toggle is
+    # active; consumed by ``token_combine`` which runs the fused kernel
+    # and clears the slot. When this is set, transformer_layer must
+    # skip the post-mlp bias_dropout_add (the residual is already added
+    # inside the AR kernel).
+    _pending_residual: Optional[torch.Tensor] = None
+    _residual_was_added_by_ar: bool = False
+
+    # v34 fused AR + residual_add + RMSNorm. ``_pending_next_norm_weights``
+    # is set by transformer_layer pre-combine using the pre-linked
+    # next-layer norm weights stashed on the MoE layer. The fused
+    # kernel applies the norm in the same pass, and
+    # ``_norm_was_applied_by_ar`` signals to the next layer's input
+    # norm to skip itself.
+    _pending_next_norm_weights: Optional[torch.Tensor] = None
+    _norm_was_applied_by_ar: bool = False
+
+    @classmethod
     def _rank_token_offset(cls) -> torch.Tensor:
         return cls._step_metadata[1:2]
 
@@ -495,7 +527,12 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
                 self.__class__._step_metadata[1:2].fill_(0)
                 self.__class__._step_metadata[2:3].fill_(G)
 
+            # Signal mcore_fused_moe that the AR combine is the path
+            # we'll take below — opt-in to multicast-unpermute fusion.
+            NVLSAllGatherVDispatcher._multicast_unpermute_active = True
             return hidden_states, probs
+
+        NVLSAllGatherVDispatcher._multicast_unpermute_active = False
 
         if self._runs_metadata_sync:
             self.update_metadata(hidden_states.shape[0])
@@ -591,6 +628,16 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
                 active[start:end].add_(shared_slice)
                 # Clear so subsequent layers don't re-fold stale data.
                 self._shared_local_slice = None
+            # Multicast-unpermute path: the AR has already been folded
+            # into the unpermute kernel via ``multimem.red.add``, so the
+            # rsv tensor already holds the cross-rank sum. Skip the
+            # explicit AR (would double the contributions). Note: the
+            # ``add_(shared_slice)`` above is only valid when shared
+            # experts aren't used in this configuration; otherwise we
+            # need a separate multicast add for the shared slice.
+            import os as _os
+            if _os.environ.get("ABS_UNPERMUTE_MULTICAST", "0") == "1":
+                return active.to(torch.bfloat16)
             # Use the Triton multimem all-reduce kernel: it takes
             # ``numel`` explicitly and ARs exactly the active slice
             # (G * hidden bytes per rank). PyTorch's native
@@ -598,7 +645,77 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             # the full registered buffer (global_max * hidden) and
             # measured slower in this configuration; the slice-aware
             # Triton kernel wins by 5-10% at b=1..4 here.
-            multimem_all_reduce(active, active, rsv["handle"])
+            #
+            # Tuning toggle: ABS_AR_BLOCK_SIZE/ABS_AR_MAX_BLOCKS lets us
+            # pick a config better suited to this small numel
+            # (213K elements at nano b=4) than the default
+            # (BLOCK_SIZE=1024, max_num_blocks=128). Microbench sweep
+            # showed nb=128 bs=256 wins by ~0.3μs/call.
+            import os as _os
+            _ar_kwargs = {}
+            _bs_env = _os.environ.get("ABS_AR_BLOCK_SIZE")
+            _mb_env = _os.environ.get("ABS_AR_MAX_BLOCKS")
+            if _bs_env:
+                _ar_kwargs["BLOCK_SIZE"] = int(_bs_env)
+            if _mb_env:
+                _ar_kwargs["max_num_blocks"] = int(_mb_env)
+
+            # v33 fused AR + residual_add: if a residual was stashed by
+            # the transformer layer pre-combine and the toggle is on,
+            # use the fused kernel that does AR + add in one pass.
+            pending = NVLSAllGatherVDispatcher._pending_residual
+            pending_norm = NVLSAllGatherVDispatcher._pending_next_norm_weights
+            if (
+                pending is not None
+                and _os.environ.get("ABS_FUSED_AR_RESIDUAL", "0") == "1"
+                and pending.numel() == active.numel()
+                and pending.dtype == active.dtype
+            ):
+                # Residual comes in as [seq, batch, hidden]; active is
+                # [G, hidden]. ``view`` requires contiguous.
+                pending_2d = (
+                    pending if pending.shape == active.shape
+                    else pending.contiguous().view(active.shape)
+                )
+
+                # v34 fused AR + residual + RMSNorm: also fold the next
+                # layer's input norm in. Requires:
+                #   1. ABS_FUSED_AR_RESIDUAL_NORM=1
+                #   2. pending_norm pre-linked at hybrid_block init
+                #   3. shape match (norm weight len == hidden)
+                use_norm = (
+                    _os.environ.get("ABS_FUSED_AR_RESIDUAL_NORM", "0") == "1"
+                    and pending_norm is not None
+                    and pending_norm.numel() == active.shape[-1]
+                    and pending_norm.dtype == torch.bfloat16
+                )
+
+                if use_norm:
+                    from megatron.core.inference.communication.torch_symm_triton.fused_ar_residual import (
+                        fused_multimem_ar_residual_norm,
+                    )
+                    fused_multimem_ar_residual_norm(
+                        active, active, pending_2d.contiguous(),
+                        pending_norm.contiguous(),
+                        rsv["handle"], eps=1e-5, **_ar_kwargs,
+                    )
+                    NVLSAllGatherVDispatcher._pending_residual = None
+                    NVLSAllGatherVDispatcher._pending_next_norm_weights = None
+                    NVLSAllGatherVDispatcher._residual_was_added_by_ar = True
+                    NVLSAllGatherVDispatcher._norm_was_applied_by_ar = True
+                    return active.to(torch.bfloat16)
+
+                from megatron.core.inference.communication.torch_symm_triton.fused_ar_residual import (
+                    fused_multimem_ar_residual_add,
+                )
+                fused_multimem_ar_residual_add(
+                    active, active, pending_2d, rsv["handle"], **_ar_kwargs
+                )
+                NVLSAllGatherVDispatcher._pending_residual = None
+                NVLSAllGatherVDispatcher._residual_was_added_by_ar = True
+                return active.to(torch.bfloat16)
+
+            multimem_all_reduce(active, active, rsv["handle"], **_ar_kwargs)
             return active.to(torch.bfloat16)
 
         if hidden_states is not rsv["tensor"]:

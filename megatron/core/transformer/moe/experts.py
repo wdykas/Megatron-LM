@@ -632,6 +632,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
         """Torch grouped_mm fused MoE forward via mcore_fused_moe."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
+        out_handle = (
+            NVLSAllGatherVDispatcher._get_rsv_handle()
+            if self._nvls_dispatcher
+            else None
+        )
         output = mcore_fused_moe(
             hidden_states,
             probs,
@@ -644,6 +649,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             routing_map=routing_map,
             disable_fused_quant_kernels=self.config.inference_moe_disable_fused_quant_kernels,
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
+            out_symm_handle=out_handle,
         )
         return output, None
 

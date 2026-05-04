@@ -388,6 +388,115 @@ def st_32(ptr, x, mask, multicast_op: tl.constexpr):
 
 
 @triton.jit
+def red_v4_bf16x2(ptr, x, y, z, w, mask):
+    """Atomic-add 8 bf16 values (packed in 4 uint32) to ``ptr`` across all peers.
+
+    Issues ``multimem.red.relaxed.sys.global.add.acc::f32.v4.bf16x2 [addr],
+    {x, y, z, w};`` — a single hardware atomic that updates the value at
+    ``ptr`` simultaneously on every peer in the multicast group, with f32
+    accumulation semantics. This is the ``add`` analogue of ``ld_reduce``
+    and lets a producer fold its contribution into all peers' local copies
+    without a separate AR pass.
+
+    Memory ordering is ``relaxed``; pair with a release fence (e.g.
+    ``symm_mem_sync`` with ``hasPreviousMemAccess=True``) before any
+    consumer reads the result.
+
+    Args:
+        ptr: destination pointer typed as uint64 (16-byte aligned).
+        x, y, z, w: four uint32 registers holding 8 packed bf16 values.
+        mask: predicate; if False the operation is skipped.
+    """
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %p0;
+            setp.ne.s32 %p0, $6, 1;
+            @%p0 bra end;
+            multimem.red.relaxed.sys.global.add.acc::f32.v4.bf16x2 [$1], {$2, $3, $4, $5};
+            end:
+        }
+        """,
+        "=r,l,r,r,r,r,r",
+        args=[ptr, x, y, z, w, mask.to(tl.int32)],
+        dtype=(tl.uint32),
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def red_add_u32_release(ptr, mask):
+    """Atomic-add 1 to a u32 multicast counter, with release semantics.
+
+    Issues ``multimem.red.release.sys.global.add.u32 [addr], 1;`` —
+    increments the counter at ``ptr`` simultaneously on every peer's
+    local copy. The release scope ensures all preceding writes from
+    this rank are flushed before the increment is observed by peers.
+    """
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %p0;
+            setp.ne.s32 %p0, $2, 1;
+            @%p0 bra end;
+            multimem.red.release.sys.global.add.u32 [$1], 1;
+            end:
+        }
+        """,
+        "=r,l,r",
+        args=[ptr, mask.to(tl.int32)],
+        dtype=(tl.uint32),
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def ld_acquire_u32(ptr, mask):
+    """Acquire-load a u32 from local memory; pairs with a remote release."""
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %p0;
+            mov.u32 $0, 0;
+            setp.ne.s32 %p0, $2, 1;
+            @%p0 bra end;
+            ld.acquire.sys.global.u32 $0, [$1];
+            end:
+        }
+        """,
+        "=r,l,r",
+        args=[ptr, mask.to(tl.int32)],
+        dtype=(tl.uint32),
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def cas_u32(ptr, expected, desired, mask):
+    """Atomic CAS u32. Returns the previous value at ptr."""
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %p0;
+            mov.u32 $0, 0;
+            setp.ne.s32 %p0, $4, 1;
+            @%p0 bra end;
+            atom.global.relaxed.sys.cas.b32 $0, [$1], $2, $3;
+            end:
+        }
+        """,
+        "=r,l,r,r,r",
+        args=[ptr, expected, desired, mask.to(tl.int32)],
+        dtype=(tl.uint32),
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
 def asm_rsqrt(x, eps):
     """
     Computes the reciprocal square root of a float32 number using inline assembly.

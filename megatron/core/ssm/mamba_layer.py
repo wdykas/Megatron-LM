@@ -138,7 +138,20 @@ class MambaLayer(GraphableMegatronModule):
             residual = residual.float()
 
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
-        hidden_states = apply_module(self.norm)(hidden_states)
+        # v34 fused AR + residual_add + RMSNorm: skip our input norm if
+        # the previous MoE's AR kernel already applied it.
+        _norm_already_applied = False
+        try:
+            from megatron.core.transformer.moe.token_dispatcher_inference import (
+                NVLSAllGatherVDispatcher,
+            )
+            if NVLSAllGatherVDispatcher._norm_was_applied_by_ar:
+                NVLSAllGatherVDispatcher._norm_was_applied_by_ar = False
+                _norm_already_applied = True
+        except ImportError:
+            pass
+        if not _norm_already_applied:
+            hidden_states = apply_module(self.norm)(hidden_states)
 
         mixer_out_with_bias = self.mixer(
             hidden_states, inference_context=inference_context, packed_seq_params=packed_seq_params
