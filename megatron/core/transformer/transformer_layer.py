@@ -577,7 +577,24 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # Optional Input Layer norm
-        if self.recompute_input_layernorm:
+        # v34 fused AR + residual_add + RMSNorm: when the previous MoE
+        # layer's AR kernel already applied this layer's input norm,
+        # skip the kernel here to avoid norm-of-norm. The flag is
+        # cleared after this read so it only applies once.
+        _norm_already_applied = False
+        try:
+            from megatron.core.transformer.moe.token_dispatcher_inference import (
+                NVLSAllGatherVDispatcher,
+            )
+            if NVLSAllGatherVDispatcher._norm_was_applied_by_ar:
+                NVLSAllGatherVDispatcher._norm_was_applied_by_ar = False
+                _norm_already_applied = True
+        except ImportError:
+            pass
+
+        if _norm_already_applied:
+            input_layernorm_output = hidden_states
+        elif self.recompute_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
                 input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
@@ -815,6 +832,32 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
                 # operation in MLP's fc2.
                 self._set_fc2_residual(residual)
+
+            # v33 fused AR + residual_add: when partitioned + Variant-B
+            # path is active (set by token_dispatch) and the toggle is
+            # on, stash the residual so ``token_combine`` can fold it
+            # into the AR kernel; bias_dropout_add is skipped below
+            # because ``_residual_was_added_by_ar`` will be set.
+            #
+            # v34 extends this: also stash next-layer's input-norm
+            # weights (pre-linked at hybrid_block init) so the fused
+            # kernel can apply the next layer's RMSNorm and we can
+            # skip the next layer's input norm entirely.
+            import os as _os
+            if (
+                self.is_moe_layer
+                and _os.environ.get("ABS_FUSED_AR_RESIDUAL", "0") == "1"
+            ):
+                from megatron.core.transformer.moe.token_dispatcher_inference import (
+                    NVLSAllGatherVDispatcher,
+                )
+                NVLSAllGatherVDispatcher._pending_residual = residual
+                if _os.environ.get("ABS_FUSED_AR_RESIDUAL_NORM", "0") == "1":
+                    _ref = getattr(self, "_next_input_norm_weights_ref", None)
+                    NVLSAllGatherVDispatcher._pending_next_norm_weights = (
+                        _ref[0] if _ref is not None else None
+                    )
+
             mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask)
 
         nvtx_range_pop(suffix="mlp")
@@ -868,10 +911,21 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="mlp_bda")
-        if using_fused_tp_inference_kernel:
+        # v33 fused AR + residual: token_combine has already folded the
+        # residual into the AR kernel's local store, so skip the
+        # bias_dropout_add here (would double-add). Clear the flag.
+        _residual_already_added = False
+        if self.is_moe_layer:
+            from megatron.core.transformer.moe.token_dispatcher_inference import (
+                NVLSAllGatherVDispatcher,
+            )
+            if NVLSAllGatherVDispatcher._residual_was_added_by_ar:
+                NVLSAllGatherVDispatcher._residual_was_added_by_ar = False
+                _residual_already_added = True
+        if using_fused_tp_inference_kernel or _residual_already_added:
             # In inference optimized transformer layer, there is no bias and dropout
             # The remaining residual add is already handled inside the
-            # MLP module.
+            # MLP module (fused-tp) or inside the AR kernel (fused-AR).
             hidden_states = mlp_output_with_bias[0]
         else:
             with self.bias_dropout_add_exec_handler():

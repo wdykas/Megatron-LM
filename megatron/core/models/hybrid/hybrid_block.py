@@ -214,6 +214,38 @@ class HybridStack(MegatronModule):
                 inner_mlp.segment_runtime = self.segment_runtime
                 inner_mlp.segment_local_layer_idx = local_idx
 
+        # v34 fused AR + residual_add + RMSNorm: pre-link each MoE
+        # TransformerLayer to the next layer's input-norm weight so the
+        # fused kernel can apply that norm and we can skip the separate
+        # input_layernorm kernel launch on the next layer. The next
+        # layer is either another TransformerLayer (with
+        # ``input_layernorm.weight``) or a MambaLayer (with
+        # ``norm.weight``). Set ``_next_input_norm_weights`` to the
+        # tensor or None — None means "no fusion possible here, fall
+        # back to standalone v33 path".
+        for i in range(len(self.layers) - 1):
+            cur = self.layers[i]
+            nxt = self.layers[i + 1]
+            is_moe = (
+                isinstance(cur, TransformerLayer)
+                and getattr(cur, "is_moe_layer", False)
+            )
+            if not is_moe:
+                continue
+            next_norm = None
+            nxt_iln = getattr(nxt, "input_layernorm", None)
+            if nxt_iln is not None and not isinstance(nxt_iln, IdentityOp):
+                next_norm = getattr(nxt_iln, "weight", None)
+            else:
+                nxt_norm = getattr(nxt, "norm", None)
+                if nxt_norm is not None and not isinstance(nxt_norm, IdentityOp):
+                    next_norm = getattr(nxt_norm, "weight", None)
+            # Wrap in a list to prevent nn.Module from registering the
+            # Parameter as a sub-parameter of this layer (which would
+            # break checkpoint loading by adding spurious keys to the
+            # MoE layer's state_dict).
+            cur._next_input_norm_weights_ref = [next_norm] if next_norm is not None else None
+
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
             self.final_norm = TENorm(
@@ -363,21 +395,69 @@ class HybridStack(MegatronModule):
             if hasattr(tok_disp, "_segment_input_is_global"):
                 tok_disp._segment_input_is_global = bool(flag_value)
 
+        # Partitioned-state Variant-B opt-in: if engine config has
+        # ``inference_partitioned_state=True`` AND abs_active, place a
+        # single AGV-V right before each MoE so MoE skip-AG fires on
+        # the global view, and slice global → per-rank for non-MoE
+        # layers (mamba / attention) which need per-rank shape. This
+        # gives partitioned mode the same per-(M+E)-pair collective
+        # count as default (1 AGV-V + 1 AR), matching default speed.
+        # The next optimization (fused matmul-multicast in mamba's
+        # out_proj) eliminates the AGV-V — see
+        # ``torch_symm_triton/fused_matmul_multicast.py``.
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as _LS
+        _MOE_SYM = _LS.MOE
+        decode_req_count = (
+            inference_context.padded_batch_dimensions.decode_req_count
+            if inference_context is not None
+            else 0
+        )
+        prefill_req_count = (
+            inference_context.padded_batch_dimensions.prefill_req_count
+            if inference_context is not None
+            else 0
+        )
+        partitioned_active = (
+            abs_active
+            and inference_context is not None
+            and getattr(inference_context, "_inference_partitioned_state", False)
+            and not getattr(inference_context, "_inference_replicate_requests", False)
+            and hidden_states.dim() == 3
+            and hidden_states.shape[1] == 1
+            and decode_req_count > 0
+            and prefill_req_count == 0
+        )
+        in_global_view = False
+
         with outer_fp8_context:
-            for layer in self.layers:
+            for local_idx, layer in enumerate(self.layers):
                 # Layers have 1-indexed layer numbers attribute.
                 inner_quant_context = get_inner_quant_context(self.config, layer.layer_number - 1)
 
-                # Tell this layer's MoE dispatcher (if any) whether its
-                # input is already in [G_total, H] form. In replicated-
-                # request mode every rank holds the global view from the
-                # start, so this is True for every layer and the
-                # dispatcher takes its skip-AG path. Under default /
-                # partitioned-engine mode the input is per-rank and the
-                # dispatcher's normal AGV path runs (this branch is a
-                # no-op since the flag stays at its False default).
+                if partitioned_active:
+                    layer_type = (
+                        self.layer_type_list[local_idx]
+                        if local_idx < len(self.layer_type_list)
+                        else None
+                    )
+                    is_moe = layer_type == _MOE_SYM
+                    if is_moe and not in_global_view:
+                        hidden_states = self._partitioned_pre_moe_agv(
+                            hidden_states, inference_context
+                        )
+                        in_global_view = True
+                    elif (not is_moe) and in_global_view:
+                        hidden_states = self._partitioned_slice_to_local(
+                            hidden_states, inference_context
+                        )
+                        in_global_view = False
+
+                # Tell this layer's MoE dispatcher whether its input is
+                # already global (skip-AG fires) or per-rank (normal
+                # AGV path needed).
                 if abs_active:
-                    _set_segment_dispatch_flag(layer, True)
+                    flag = (in_global_view if partitioned_active else True)
+                    _set_segment_dispatch_flag(layer, flag)
                 with inner_quant_context:
                     if isinstance(layer, TransformerLayer):
                         hidden_states, _ = layer(
@@ -403,6 +483,14 @@ class HybridStack(MegatronModule):
                 if isinstance(hidden_states, tuple):
                     hidden_states = hidden_states[0]
 
+        # Partitioned exit: if the layer loop ended in global view
+        # (last layer was MoE, no following attention to slice us back),
+        # slice down to per-rank for the engine's per-rank output path.
+        if partitioned_active and in_global_view:
+            hidden_states = self._partitioned_slice_to_local(
+                hidden_states, inference_context
+            )
+
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
             hidden_states = self.final_norm(hidden_states)
@@ -414,6 +502,107 @@ class HybridStack(MegatronModule):
         )
 
         return hidden_states
+
+    def _partitioned_pre_moe_agv(
+        self,
+        hidden_states: torch.Tensor,
+        inference_context: BaseInferenceContext,
+    ) -> torch.Tensor:
+        """Variable-count NVLS multimem all-gather right before each MoE.
+
+        Caller passes 3-D ``[local_tokens, 1, hidden]`` (the dynamic
+        engine's decode-step layout). We squeeze the seq dim to 2-D
+        for AGV, run the kernel, then unsqueeze back. AGV writes at
+        compact prefix-sum offsets (``rank * local_tokens``) since EP
+        sync makes every rank's ``local_tokens`` the same.
+
+        Returns ``[per_rank_max * ep_size, 1, hidden]`` on every rank;
+        valid contributions are at offsets ``[rank * local_tokens,
+        (rank+1) * local_tokens)`` for each rank.
+        """
+        from megatron.core.inference.communication.torch_symm_triton import (
+            are_tensors_nvls_eligible,
+            multicast_publish_constexpr,
+        )
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        ep_group = getattr(self.pg_collection, "ep", None)
+        if ep_group is None or ep_group.size() <= 1:
+            return hidden_states
+
+        was_3d = False
+        if hidden_states.dim() == 3 and hidden_states.shape[1] == 1:
+            hidden_states_2d = hidden_states.squeeze(1)
+            was_3d = True
+        elif hidden_states.dim() == 2:
+            hidden_states_2d = hidden_states
+        else:
+            return hidden_states
+
+        local_tokens, hidden_size = hidden_states_2d.shape
+        if not (
+            hidden_states_2d.dtype in (torch.bfloat16, torch.float32)
+            and are_tensors_nvls_eligible(hidden_states_2d)
+        ):
+            return hidden_states
+
+        agv_h = NVLSAllGatherVDispatcher._symm_agv_hidden
+        if agv_h is None or agv_h.get("handle") is None:
+            return hidden_states
+        per_rank_max = NVLSAllGatherVDispatcher._per_rank_worst_case_token_count
+        ep_size = ep_group.size()
+        rank = ep_group.rank()
+        global_max = per_rank_max * ep_size
+
+        # Use the constexpr-specialized multicast-publish kernel:
+        # launches exactly local_tokens CTAs (no per-rank-max padding,
+        # no ep_max_tokens runtime load). Saves the fused_metadata_update
+        # collective AND ~115 wasted CTAs from the variable AGV-V kernel.
+        output_2d_full = agv_h["tensor"].view(global_max, hidden_size)
+        multicast_publish_constexpr(
+            local_tensor=hidden_states_2d.contiguous(),
+            output_global_buffer=output_2d_full,
+            output_symm_mem_handle=agv_h["handle"],
+            rank=rank,
+            rank_token_offset=rank * local_tokens,
+        )
+        # Compact prefix-sum layout: valid rows are at [0, ep_size *
+        # local_tokens). Slice to that exact extent so the downstream
+        # MoE dispatcher sees ``_local_tokens = ep_size * local_tokens``
+        # (≈52 in our bench) instead of ``per_rank_max * ep_size``
+        # (=8192) — otherwise the combine AR runs over the entire
+        # registered buffer and costs 100× more than needed.
+        g_total = ep_size * local_tokens
+        output_2d = output_2d_full[:g_total]
+        if was_3d:
+            return output_2d.unsqueeze(1)
+        return output_2d
+
+    def _partitioned_slice_to_local(
+        self,
+        hidden_states: torch.Tensor,
+        inference_context: BaseInferenceContext,
+    ) -> torch.Tensor:
+        """Slice the global view back to this rank's per-rank chunk.
+
+        Multimem AGV-V layout (compact prefix-sum): with EP sync every
+        rank has the same ``local_tokens``, so rank r's data is at
+        offsets ``[r * local_tokens, (r+1) * local_tokens)``.
+        """
+        ep_group = getattr(self.pg_collection, "ep", None)
+        if ep_group is None or ep_group.size() <= 1:
+            return hidden_states
+        if hidden_states.dim() not in (2, 3):
+            return hidden_states
+        rank = ep_group.rank()
+        decode_req_count = inference_context.padded_batch_dimensions.decode_req_count
+        seq_len = 1 + getattr(inference_context, "num_speculative_tokens", 0)
+        local_tokens = decode_req_count * seq_len
+        return hidden_states[
+            rank * local_tokens : (rank + 1) * local_tokens
+        ].contiguous()
 
     def sharded_state_dict(
         self,
