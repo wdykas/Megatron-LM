@@ -833,26 +833,25 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # operation in MLP's fc2.
                 self._set_fc2_residual(residual)
 
-            # v33 fused AR + residual_add: when partitioned + Variant-B
-            # path is active (set by token_dispatch) and the toggle is
-            # on, stash the residual so ``token_combine`` can fold it
-            # into the AR kernel; bias_dropout_add is skipped below
-            # because ``_residual_was_added_by_ar`` will be set.
-            #
-            # v34 extends this: also stash next-layer's input-norm
-            # weights (pre-linked at hybrid_block init) so the fused
-            # kernel can apply the next layer's RMSNorm and we can
-            # skip the next layer's input norm entirely.
-            import os as _os
-            if (
-                self.is_moe_layer
-                and _os.environ.get("ABS_FUSED_AR_RESIDUAL", "0") == "1"
-            ):
-                from megatron.core.transformer.moe.token_dispatcher_inference import (
-                    NVLSAllGatherVDispatcher,
-                )
-                NVLSAllGatherVDispatcher._pending_residual = residual
-                if _os.environ.get("ABS_FUSED_AR_RESIDUAL_NORM", "0") == "1":
+            # Fused AR + residual_add (+ next-layer RMSNorm): when this
+            # MoE layer's combine is going to take the AR path
+            # (Variant-B / partitioned), stash the residual and (if
+            # pre-linked) the next layer's input-norm weight so
+            # ``token_combine`` can fold them into the AR kernel.
+            # Skipping the redundant ``bias_dropout_add`` and next-layer
+            # input norm saves 1-2 separate kernel launches per (M, E)
+            # pair. Gated on the dispatcher's ``_segment_input_is_global``
+            # flag (set by hybrid_block before this layer's forward) so
+            # this is a no-op on default DP / RSV-V paths.
+            if self.is_moe_layer:
+                _disp = getattr(self.mlp, "token_dispatcher", None)
+                if _disp is not None and getattr(
+                    _disp, "_segment_input_is_global", False
+                ):
+                    from megatron.core.transformer.moe.token_dispatcher_inference import (
+                        NVLSAllGatherVDispatcher,
+                    )
+                    NVLSAllGatherVDispatcher._pending_residual = residual
                     _ref = getattr(self, "_next_input_norm_weights_ref", None)
                     NVLSAllGatherVDispatcher._pending_next_norm_weights = (
                         _ref[0] if _ref is not None else None

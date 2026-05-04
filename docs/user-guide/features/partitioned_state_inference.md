@@ -293,12 +293,16 @@ is from skipping the publish step, not from any compute saving.
 Partitioned mode chooses the symmetric trade-off: pay one extra
 kernel per layer to keep per-rank state low.
 
-The v33 / v34 fused-kernel optimizations
-(`ABS_FUSED_AR_RESIDUAL[, _NORM]`) are *partitioned-mode only* — they
-fold the post-MoE `bias_dropout_add` and the next layer's
-`input_layernorm` into the same Triton kernel as the AR combine,
-saving 1-2 kernel launches per (M,E) pair. Microbench-confirmed; e2e
-gain at b=16 is ~+1-2% across runs.
+The fused-kernel optimizations (AR + residual_add + RMSNorm) are
+partitioned-mode only — they fold the post-MoE `bias_dropout_add` and
+the next layer's `input_layernorm` into the same Triton kernel as the
+AR combine, saving 1-2 kernel launches per (M,E) pair. They fire
+automatically when the dispatcher takes the AR path — no flag, no
+config field. The transformer layer detects the path via the
+dispatcher's `_segment_input_is_global` flag, stashes the residual
+plus the pre-linked next-layer norm weight, and the AR kernel folds
+both into its local-store step. Microbench-confirmed; e2e gain at
+b=16 is ~+1-2% across runs.
 
 ## Files
 
@@ -326,22 +330,15 @@ The session-added optimizations on top of partitioned mode:
 
 ## Reproducer
 
-```bash
-EXP_NAME=partitioned MODEL=nanov3 BATCH_SIZES=16 OSL=64 \
-  ABS_PARTITIONED_STATE=1 \
-  NUM_ITERS=10 NUM_WARMUP_ITERS=3 \
-  bash inference-bench/run_local.sh
+Run inference with `--inference-partitioned-state` on the engine:
+
+```
+python -m tools.run_dynamic_text_generation_server \
+    --inference-partitioned-state \
+    [...other inference args...]
 ```
 
-With v33 enabled (recommended at b≥16):
-
-```bash
-EXP_NAME=partitioned_v33 MODEL=nanov3 BATCH_SIZES=16 OSL=64 \
-  ABS_PARTITIONED_STATE=1 \
-  ABS_FUSED_AR_RESIDUAL=1 \
-  NUM_ITERS=10 NUM_WARMUP_ITERS=3 \
-  bash inference-bench/run_local.sh
-```
-
-Do not pair with `--inference-replicate-requests` (mutually exclusive
-at the coordinator) or with `--inference-decode-only-variant-b`.
+The fused-kernel optimizations fire automatically on the AR combine
+path — no separate flags. Do not pair with
+`--inference-replicate-requests` (mutually exclusive at the
+coordinator) or with `--inference-decode-only-variant-b`.

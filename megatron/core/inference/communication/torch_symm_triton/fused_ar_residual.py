@@ -208,11 +208,9 @@ def fused_multimem_ar_residual_norm(
     BLOCK_SIZE = min(triton.next_power_of_2(numel_per_token), 1024)
     num_warps = max(1, BLOCK_SIZE // 32)
     # At larger G the per-CTA barrier overhead × NUM_BLOCKS dominates;
-    # cap at 32 CTAs and stride. ABS_FUSED_AR_NORM_MAX_BLOCKS overrides.
-    import os as _os
-    _max_b_env = _os.environ.get("ABS_FUSED_AR_NORM_MAX_BLOCKS")
-    _max_b = int(_max_b_env) if _max_b_env else 32
-    NUM_BLOCKS = min(G, kwargs.get("max_num_blocks", _max_b))
+    # cap at 8 CTAs and stride. Tuned across b=8/16/32 to balance
+    # per-CTA work against barrier/launch overhead.
+    NUM_BLOCKS = min(G, kwargs.get("max_num_blocks", 8))
 
     _fused_multimem_ar_residual_norm_kernel[(NUM_BLOCKS,)](
         output_tensor.data_ptr(),

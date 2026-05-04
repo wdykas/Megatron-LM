@@ -609,19 +609,16 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
                 active[start:end].add_(shared_slice)
                 # Clear so subsequent layers don't re-fold stale data.
                 self._shared_local_slice = None
-            # v33/v34 fused AR + residual_add (+ optional RMSNorm): if
-            # the transformer layer stashed a residual on the dispatcher
-            # before this combine, fold the residual_add (and optionally
-            # the next layer's input RMSNorm) into the AR kernel. Saves
-            # 1-2 separate kernel launches per (M, E) pair. Toggles:
-            #   - ABS_FUSED_AR_RESIDUAL=1 -> AR + residual
-            #   - +ABS_FUSED_AR_RESIDUAL_NORM=1 -> also next-layer norm
-            import os as _os
+            # Fused AR + residual_add (+ optional next-layer RMSNorm):
+            # if the transformer layer stashed a residual on the
+            # dispatcher before this combine, fold the residual_add
+            # (and the next layer's input RMSNorm if pre-linked) into
+            # the AR kernel. Saves 1-2 separate kernel launches per
+            # (M, E) pair.
             pending = NVLSAllGatherVDispatcher._pending_residual
             pending_norm = NVLSAllGatherVDispatcher._pending_next_norm_weights
             if (
                 pending is not None
-                and _os.environ.get("ABS_FUSED_AR_RESIDUAL", "0") == "1"
                 and pending.numel() == active.numel()
                 and pending.dtype == active.dtype
             ):
@@ -633,8 +630,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
                 )
 
                 use_norm = (
-                    _os.environ.get("ABS_FUSED_AR_RESIDUAL_NORM", "0") == "1"
-                    and pending_norm is not None
+                    pending_norm is not None
                     and pending_norm.numel() == active.shape[-1]
                     and pending_norm.dtype == torch.bfloat16
                 )
