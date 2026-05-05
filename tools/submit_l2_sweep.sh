@@ -46,14 +46,24 @@ fi
 
 mkdir -p logs
 
+# Set CHAIN=1 to slurm-chain jobs via --dependency=afterany so each
+# job only starts after the previous completes. Useful when QOS limits
+# concurrent node counts. Default off — fires them all at once.
+CHAIN="${CHAIN:-0}"
+
 JOBIDS=()
+PREV_JOBID=""
 for N in $NODE_COUNTS; do
     EP=$((N * 4))
     for V in "${VARIANTS[@]}"; do
         IFS=':' read -r NAME EX MA <<< "$V"
         EXP="l2sweep_${NAME}_ep${EP}_b${BATCH_SIZES// /_}"
         echo "=== submitting: nodes=$N EP=$EP variant=$NAME ==="
-        JOBID=$(sbatch --parsable -N "$N" \
+        DEP_FLAG=""
+        if [ "$CHAIN" = "1" ] && [ -n "$PREV_JOBID" ]; then
+            DEP_FLAG="--dependency=afterany:$PREV_JOBID"
+        fi
+        JOBID=$(sbatch --parsable -N "$N" $DEP_FLAG \
             --output=logs/%x-%j.out --error=logs/%x-%j.err \
             --export=ALL,L2_PREFETCH_EXPERTS=$EX,L2_PREFETCH_MAMBA=$MA,\
 EXP_NAME=$EXP,MODEL=$MODEL,BATCH_SIZES="$BATCH_SIZES",OSL=$OSL,DATASET=$DATASET,\
@@ -61,6 +71,7 @@ NUM_ITERS=$NUM_ITERS,NUM_WARMUP_ITERS=$NUM_WARMUP_ITERS \
             inference-bench/submit.sh)
         echo "  jobid=$JOBID  L2_PREFETCH_EXPERTS=$EX L2_PREFETCH_MAMBA=$MA"
         JOBIDS+=("$JOBID:$EXP")
+        PREV_JOBID=$JOBID
     done
 done
 
