@@ -953,6 +953,26 @@ class TransformerConfig(ModelParallelConfig):
     fp8_recipe='mxfp8'. Set to True to disable fusion and use separate kernel
     launches (useful for debugging)."""
 
+    enable_attention_bounded_segments: bool = False
+    """If True, enable attention-bounded segment execution for inference
+    (Mamba+MoE hybrids). With the flag off, behavior matches baseline
+    exactly. With it on, the runtime identifies maximal runs of
+    non-attention layers between attention boundaries and exposes per-
+    segment metadata so MoE combine and Mamba state can be redirected
+    without round-tripping to the KV owner after every MoE layer.
+
+    See ``megatron/core/inference/attention_bounded_segments.py`` for
+    the runtime.
+    """
+
+    moe_combine_destination_policy: str = "original_owner"
+    """Policy for choosing the MoE combine destination rank when
+    ``enable_attention_bounded_segments`` is set. Supported values:
+    ``"original_owner"`` (baseline behavior, the default) and
+    ``"current_segment_owner"`` (skip-AG MoE: returns the all-reduced
+    global view from MoE combine, letting the next MoE layer skip its
+    all-gather; pairs with ``InferenceConfig.inference_replicate_requests``)."""
+
     inference_moe_token_dispatcher_type: Literal['nccl', 'nvls'] = 'nvls'
     """Token dispatcher to use for MoE expert parallelism during inference.
     - 'nccl': AllGather/ReduceScatter via NCCL. Fixed token counts per rank; requires

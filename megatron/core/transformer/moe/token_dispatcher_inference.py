@@ -30,6 +30,7 @@ import torch.distributed as dist
 
 from megatron.core.inference.communication.torch_symm_triton import (
     multimem_all_gatherv_3tensor,
+    multimem_all_reduce,
     multimem_reduce_scatter_v,
 )
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
@@ -314,6 +315,13 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         unpermute output directly into it, avoiding a copy before RSV."""
         return cls._symm_rsv["tensor"] if cls._symm_rsv is not None else None
 
+    # Set True by ``HybridStack.forward`` when the partitioned-state path
+    # is active for the step. Indicates that ``_step_metadata`` was
+    # populated via ``fused_metadata_update`` with per-rank prefix-sum
+    # offsets, so the skip-AG dispatch path should NOT overwrite those
+    # values with replicated-mode defaults.
+    _partitioned_metadata_set: bool = False
+
     @classmethod
     def _rank_token_offset(cls) -> torch.Tensor:
         return cls._step_metadata[1:2]
@@ -460,6 +468,27 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # on SharedExpertMLP.stream in dispatch_preprocess and joined in combine_postprocess.
         self._shared_expert_output: Optional[torch.Tensor] = None
 
+        # skip-AG MoE (attention-bounded segments): when True, the input
+        # to ``token_dispatch`` is already in ``[G, hidden]`` global
+        # form on every rank (replicated decode compute) and the AGV
+        # would just duplicate data. We skip it. ``token_combine``
+        # then uses an all-reduce (instead of reduce-scatter-V) so the
+        # output stays at ``[G, hidden]`` and chains into the next MoE
+        # layer's skipped AGV. Set per-step by HybridStack at segment
+        # entry, cleared at segment exit. See
+        # ``megatron/core/inference/attention_bounded_segments.py``.
+        self._segment_input_is_global: bool = False
+
+        # Shared experts on local slice. When the MoE layer's
+        # ``shared_experts_compute`` runs the shared-experts
+        # GEMM on this rank's [G/EP, hidden] slice (saving the
+        # redundant compute), it stashes the result here so the
+        # combine all-reduce folds it into the output at the slice's
+        # offset positions — no extra collective. Cleared after use.
+        self._shared_local_slice: Optional[torch.Tensor] = None
+        self._shared_local_start: int = 0
+        self._shared_local_end: int = 0
+
     # ── Dispatch path ─────────────────────────────────────────────────────────────
 
     def dispatch_preprocess(self, hidden_states, routing_map, probs):
@@ -493,6 +522,42 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             Also updates self.routing_map to [global_max, topk] int64.
         """
         if self.ep_size == 1:
+            return hidden_states, probs
+
+        # skip-AG MoE path: input is already in [G, hidden] global
+        # form on every rank (replicated compute upstream — typically
+        # because we're in decode and every rank shares the migrated
+        # mamba state). Skip the AGV (we already have the global
+        # view), but copy into the symm-mem AGV buffers so downstream
+        # NVLS expert kernels see the same buffer layout/pointers
+        # they'd see after the real AGV. Every rank ran the same
+        # router on the same input, so probs and routing_map are
+        # already global, and the metadata all-reduce-max returns G
+        # (same on every rank).
+        if self._segment_input_is_global:
+            # Under replication every rank already has the same [G, *]
+            # tensors and the AGV would just duplicate data we already
+            # have. Under CUDA graph capture, each decode batch size has
+            # its own captured graph; each graph sees a fixed G, so we
+            # can return the inputs at their native [G, *] shape (rather
+            # than copying into the [global_max, *] AGV symm-mem buffers)
+            # and let the experts kernel work directly on [G, *]. This
+            # eliminates 3 per-layer ``.copy_()`` kernel launches and the
+            # NVLS update_metadata collective.
+            G = hidden_states.shape[0]
+
+            if self._runs_metadata_sync:
+                # In partitioned mode hybrid_block already populated
+                # ``_step_metadata`` via ``fused_metadata_update`` with
+                # actual per-rank counts (g_total, prefix-sum offset,
+                # ep_max). Don't overwrite. In replicated mode no such
+                # call ran, so override with the [G, 0, G] values
+                # appropriate for replicated semantics.
+                if not NVLSAllGatherVDispatcher._partitioned_metadata_set:
+                    self.__class__._step_metadata[0:1].fill_(G)
+                    self.__class__._step_metadata[1:2].fill_(0)
+                    self.__class__._step_metadata[2:3].fill_(G)
+
             return hidden_states, probs
 
         if self._runs_metadata_sync:
@@ -551,12 +616,58 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
                 written directly to the RSV buffer, bf16 otherwise).
 
         Returns:
-            [local_tokens, hidden_size] bf16 local token outputs.
+            [local_tokens, hidden_size] bf16 local token outputs (or
+            [global_max, hidden_size] in skip-AG MoE mode where the
+            global view is preserved for the next layer).
         """
         if self.ep_size == 1:
             return hidden_states.to(torch.bfloat16)
 
         rsv = self.__class__._symm_rsv
+
+        # skip-AG MoE combine: instead of reduce-scattering back to per-
+        # rank slices, all-reduce only the active [0:G] rows of the
+        # RSV symm-mem buffer and keep that as the global view. The
+        # multimem AR kernel reads ``numel`` elements from the
+        # multicast pointer base — passing rsv[:G] as both input and
+        # output gets it to AR exactly the active region (G * hidden
+        # bytes per rank) instead of the full per-rank-worst-case
+        # buffer (global_max * hidden bytes).
+        #
+        # Shared experts are computed per-rank on a slice of the
+        # global view (``_shared_local_slice`` / start / end set by
+        # ``moe_layer.shared_experts_compute``). We fold that slice
+        # into the AR input at its rank-specific offset so the AR sum
+        # naturally spreads the shared contribution across the global
+        # view — no extra collective, the shared output rides the
+        # combine AR for free.
+        if self._segment_input_is_global:
+            if hidden_states is not rsv["tensor"]:
+                rsv["tensor"][: self._local_tokens].copy_(
+                    hidden_states[: self._local_tokens]
+                )
+            active = rsv["tensor"][: self._local_tokens]
+            shared_slice = self._shared_local_slice
+            if shared_slice is not None:
+                start = self._shared_local_start
+                end = self._shared_local_end
+                # Add this rank's shared output into the AR input at
+                # [start:end]. Each rank covers a disjoint range, so
+                # AR-sum produces the full shared contribution at the
+                # right positions on every rank (other ranks' slices
+                # contribute zero at this rank's range and vice versa).
+                active[start:end].add_(shared_slice)
+                # Clear so subsequent layers don't re-fold stale data.
+                self._shared_local_slice = None
+            # Use the Triton multimem all-reduce kernel: it takes
+            # ``numel`` explicitly and ARs exactly the active slice
+            # (G * hidden bytes per rank). PyTorch's native
+            # ``torch.ops.symm_mem.multimem_all_reduce_`` operates on
+            # the full registered buffer (global_max * hidden) and
+            # measured slower in this configuration; the slice-aware
+            # Triton kernel wins by 5-10% at b=1..4 here.
+            multimem_all_reduce(active, active, rsv["handle"])
+            return active.to(torch.bfloat16)
 
         if hidden_states is not rsv["tensor"]:
             rsv["tensor"].copy_(hidden_states)

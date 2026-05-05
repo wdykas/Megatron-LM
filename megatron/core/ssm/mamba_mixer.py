@@ -467,12 +467,102 @@ class MambaMixer(MegatronModule):
         """
         Executes dynamic inference by separating decode and prefill requests and
         running them independently.
+
+        Under skip-AG MoE request replication, ``hidden_states`` arrives in
+        ``[G, hidden]`` form on every rank (the global view). The body
+        below operates on whatever shape it is given — only the
+        ``in_proj`` GEMM gets sliced via ``_maybe_in_proj_on_local_slice``,
+        so the rest of the mamba path runs identically across ranks
+        given identical input and replicated state.
         """
         sequence_packing_available, reason_for_no_sequence_packing = (
             _check_mamba_sequence_packing_support(for_inference_not_training=True)
         )
         assert sequence_packing_available, reason_for_no_sequence_packing
 
+        return self._dynamic_inference_local(hidden_states, context)
+
+    def _maybe_in_proj_on_local_slice(
+        self, hidden_states: torch.Tensor, context: DynamicInferenceContext
+    ):
+        """Run in_proj on this rank's [G/N, hidden] slice and AG the result.
+
+        Returns the resulting [G, intermediate] tensor when the
+        optimization fires, or ``None`` to signal the caller should fall
+        back to the standard full-input ``in_proj`` path.
+
+        Conditions for firing:
+        - ``inference_context.skip_ag_moe_active`` is set (every rank
+          holds the same ``[G, hidden]`` view this step).
+        - 2D input (decode/mixed flat path; skip prefill 3D shape).
+        - ``ep_size > 1`` and ``G % ep_size == 0``.
+
+        MTP / speculative-decoding note: under
+        ``num_speculative_tokens = K``, ``hidden_states.shape[0]`` is
+        ``G × (K + 1)``. The slicing below partitions along the leading
+        dim and inherits ``G % ep_size == 0``, so each rank's slice
+        contains exactly ``G/ep_size`` requests' worth of contiguous
+        ``(K + 1)``-token groups — the layout the SSM kernel expects
+        after the downstream reshape to ``[decode_req_count, K + 1,
+        intermediate]``. No spec-decode-specific path needed.
+        """
+        if not getattr(context, "skip_ag_moe_active", False):
+            return None
+        if hidden_states.dim() != 2:
+            return None
+        ep_group = getattr(self.pg_collection, "ep", None)
+        tp_ep_group = getattr(self.pg_collection, "tp_ep", None)
+        if ep_group is None or tp_ep_group is None:
+            return None
+        ep_size = ep_group.size()
+        if ep_size <= 1:
+            return None
+        global_tokens = hidden_states.shape[0]
+        if global_tokens < ep_size or global_tokens % ep_size != 0:
+            return None
+
+        from megatron.core.inference.communication.torch_symm_triton import (
+            are_tensors_nvls_eligible,
+            multimem_all_gather,
+        )
+        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+        from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
+        from megatron.core.utils import get_pg_rank
+
+        rank = get_pg_rank(tp_ep_group)
+        local_tokens = global_tokens // ep_size
+        start = rank * local_tokens
+        end = start + local_tokens
+
+        local_input = hidden_states[start:end].contiguous()
+        local_output, _ = self.in_proj(local_input)
+        global_shape = (global_tokens,) + tuple(local_output.shape[1:])
+
+        if (
+            local_output.numel() > 0
+            and local_output.dtype in (torch.bfloat16, torch.float32)
+            and are_tensors_nvls_eligible(local_output)
+        ):
+            buf = SymmetricMemoryManager.get_buffer(
+                "ep", process_group=ep_group
+            ).maybe_get_tensor(list(global_shape), dtype=local_output.dtype)
+            if buf["handle"] is not None:
+                output = buf["tensor"].view(local_output.dtype).view(*global_shape)
+                multimem_all_gather(output, local_output, buf["handle"])
+                # No clone: the "ep" symm-mem buffer is owned exclusively
+                # by mamba's in_proj path within a single layer, and the
+                # next mamba layer's in_proj write only happens after
+                # this layer's downstream SSM kernels have consumed
+                # zxBCdt (kernels run in-order on the default stream).
+                # Saves a per-layer copy of [G, intermediate] bytes.
+                return output
+
+        return gather_from_sequence_parallel_region(local_output, group=tp_ep_group)
+
+    def _dynamic_inference_local(
+        self, hidden_states: torch.Tensor, context: DynamicInferenceContext
+    ):
+        """Original ``_dynamic_inference`` body, runs on the local-share view."""
         # Grab standard states
         conv_state, ssm_state = context.mamba_states_cache(self.layer_number - self.pp_layer_offset)
 
@@ -490,8 +580,17 @@ class MambaMixer(MegatronModule):
         decode_req_count = padded_dims.decode_req_count
         prefill_req_count = padded_dims.prefill_req_count
 
-        # Input projection
-        zxBCdt, _ = self.in_proj(hidden_states)
+        # Input projection. When the model is running with request
+        # replication every rank holds the same [G, hidden] view
+        # and ``in_proj`` would otherwise redundantly recompute the per-
+        # token projection on every rank. Slice to [G/N, hidden], project
+        # only this rank's slice, and all-gather the result. Saves
+        # (N-1)/N of the in_proj GEMM at the cost of one NVLS multimem
+        # AG. Falls back to the full-input path on prefill (3D shape) and
+        # for graph sizes that don't divide evenly.
+        zxBCdt = self._maybe_in_proj_on_local_slice(hidden_states, context)
+        if zxBCdt is None:
+            zxBCdt, _ = self.in_proj(hidden_states)
 
         y_decode = None
         y_prefill = None
@@ -560,7 +659,6 @@ class MambaMixer(MegatronModule):
         if is_using_quantization_scales(self.config):
             y[context.padding_slice] = 0.0
 
-        # Output projection
         out, out_bias = self.out_proj(y)
 
         return out, out_bias
@@ -1030,7 +1128,7 @@ class MambaMixer(MegatronModule):
         A_log is frozen during inference; recomputing it per token otherwise
         launches three small elementwise kernels (float cast, exp, neg) that
         rival ``selective_state_update`` itself in the decode profile. The
-        stride-0 expand view also triggers the kernel's TIE_HDIM fast path.
+        stride-0 expand view also triggers the kernel's TIE_HDIM skip-AG MoE path.
         """
         if self.training or torch.is_grad_enabled():
             base = -torch.exp(self.A_log.float())

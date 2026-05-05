@@ -99,6 +99,9 @@ class DataParallelInferenceCoordinator:
         prefix_caching_routing_alpha: float = 0.5,
         schedule_output_path: str | None = None,
         hostname: str | None = None,
+        replicate_requests: bool = False,
+        partitioned_state: bool = False,
+        replication_group_size: int = 1,
     ):
         """
         Initializes the inference coordinator.
@@ -203,6 +206,51 @@ class DataParallelInferenceCoordinator:
         # Schedule recording.
         self.schedule_output_path = schedule_output_path
         self.schedule_records = [] if schedule_output_path else None
+        # When True, every newly-submitted request is broadcast to the
+        # ranks of one *replication group* (== one model copy = one
+        # EP/TP/PP cluster) instead of load-balanced to a single rank.
+        # Required by the skip-AG MoE attention-bounded-segments inference
+        # path so each rank's mamba state stays in sync via deterministic
+        # recomputation. Sourced from
+        # ``InferenceConfig.inference_replicate_requests``.
+        #
+        # ``replication_group_size`` controls the broadcast scope. With
+        # group_size = data_parallel_size, every DP rank receives every
+        # request (full replication, kills cross-cluster DP scaling).
+        # With group_size = ep_size * tp_size * pp_size (the per-model-
+        # copy rank count, the usual skip-AG MoE setting), only the ranks
+        # within one model copy share each request and the coordinator
+        # still load-balances across model copies — preserving DP
+        # throughput scaling for multi-cluster deployments.
+        self.replicate_requests = replicate_requests
+        # ``partitioned_state``: pick a single owner rank per request
+        # (using the existing prefix-cache + load-balancer score) and
+        # constrain that owner to lie within one replication group, so
+        # the request lives on exactly one model copy. Mutually
+        # exclusive with ``replicate_requests``. Sourced from
+        # ``InferenceConfig.inference_partitioned_state``. Used by the
+        # skip-AG MoE partitioned-state path where mamba state lives only
+        # on the owner.
+        self.partitioned_state = partitioned_state
+        if self.replicate_requests and self.partitioned_state:
+            raise ValueError(
+                "replicate_requests and partitioned_state are mutually exclusive."
+            )
+        self.replication_group_size = max(1, int(replication_group_size))
+        # Both modes require data_parallel_size be a multiple of the
+        # replication group size: replication broadcasts within a group;
+        # partitioned routing still confines per-request ownership to a
+        # single group so the engine can rely on a model copy worth of
+        # consistent compute and state.
+        if (
+            (self.replicate_requests or self.partitioned_state)
+            and self.data_parallel_size % self.replication_group_size != 0
+        ):
+            raise ValueError(
+                f"data_parallel_size ({self.data_parallel_size}) must be a "
+                f"multiple of replication_group_size ({self.replication_group_size}) "
+                f"when replicate_requests or partitioned_state is enabled."
+            )
 
         # Deterministic rank index mapping (sorted identity -> 0-based index).
         sorted_identities = sorted(self.identities_of_data_parallel_ranks)
@@ -296,6 +344,24 @@ class DataParallelInferenceCoordinator:
             tokens = list(prompt)
         token_tensor = torch.tensor(tokens, dtype=torch.int64)
         return compute_block_hashes_batched(token_tensor, self.block_size_tokens)
+
+    def _identities_in_replication_group(self, primary_identity):
+        """Return all rank identities that share a replication group with ``primary_identity``.
+
+        Replication groups are contiguous in rank index: ranks
+        ``[k*G, (k+1)*G)`` form the k-th group, where ``G`` is
+        ``self.replication_group_size``. The "primary" is just the rank
+        whose identity was selected by the load balancer; any rank in
+        the group could equally serve that role.
+        """
+        primary_idx = self.identity_to_rank_index[primary_identity]
+        group_start = (primary_idx // self.replication_group_size) * self.replication_group_size
+        group_end = group_start + self.replication_group_size
+        return [
+            ident
+            for ident, ridx in self.identity_to_rank_index.items()
+            if group_start <= ridx < group_end
+        ]
 
     def get_best_data_parallel_rank(self, request_hashes):
         """Select the best DP rank based on prefix cache affinity and load.
@@ -452,17 +518,52 @@ class DataParallelInferenceCoordinator:
                 ):
                     request_hashes = request_hashes[:1]
 
-                # Account for the fact that some engines may have died.
-                for _ in range(len(self.identities_of_data_parallel_ranks)):
-                    next_identity = self.get_best_data_parallel_rank(request_hashes)
-                    if self._send_to_engine(next_identity, payload):
-                        break
+                if self.replicate_requests:
+                    # skip-AG MoE: broadcast this request to all ranks
+                    # within one *replication group* (one model copy)
+                    # so every rank in the group keeps its mamba state
+                    # in sync via deterministic recomputation. The group
+                    # is picked by the standard load balancer (any rank
+                    # in the group serves equally well) and we expand
+                    # it to its peers for the broadcast. Across groups
+                    # the load balancer continues to spread requests so
+                    # multi-cluster deployments keep DP throughput
+                    # scaling.
+                    primary_identity = None
+                    for _ in range(len(self.identities_of_data_parallel_ranks)):
+                        candidate = self.get_best_data_parallel_rank(request_hashes)
+                        # Probe the primary first; only accept the group
+                        # if at least the primary itself is reachable.
+                        if self._send_to_engine(candidate, payload):
+                            primary_identity = candidate
+                            break
+                    if primary_identity is None:
+                        logging.error(
+                            "Coordinator: no reachable engines for request %d",
+                            request_id,
+                        )
+                        del self.request_id_to_client_id[request_id]
+                        del self.request_id_to_client_request_id[request_id]
+                        return
+                    # Broadcast to the rest of the primary's replication
+                    # group (skipping the primary, already sent).
+                    for ident in self._identities_in_replication_group(primary_identity):
+                        if ident == primary_identity:
+                            continue
+                        self._send_to_engine(ident, payload)
+                    next_identity = primary_identity
                 else:
-                    # If all engines have died, we are in an abnormal state, and must exit cleanly.
-                    logging.error("Coordinator: no reachable engines for request %d", request_id)
-                    del self.request_id_to_client_id[request_id]
-                    del self.request_id_to_client_request_id[request_id]
-                    return
+                    # Account for the fact that some engines may have died.
+                    for _ in range(len(self.identities_of_data_parallel_ranks)):
+                        next_identity = self.get_best_data_parallel_rank(request_hashes)
+                        if self._send_to_engine(next_identity, payload):
+                            break
+                    else:
+                        # If all engines have died, we are in an abnormal state, and must exit cleanly.
+                        logging.error("Coordinator: no reachable engines for request %d", request_id)
+                        del self.request_id_to_client_id[request_id]
+                        del self.request_id_to_client_request_id[request_id]
+                        return
 
                 self.request_id_to_rank[request_id] = next_identity
                 self._pending_counts[self.identity_to_rank_index[next_identity]] += 1
@@ -539,8 +640,15 @@ class DataParallelInferenceCoordinator:
                 finished_requests = deserialized_payload[1]
 
                 for finished_request in finished_requests:
-                    self.detokenize(finished_request)
                     fid = finished_request["request_id"]
+                    # skip-AG MoE replicated requests: every DP rank generates
+                    # an identical finished response for the same request.
+                    # The first one to arrive wins; subsequent duplicates
+                    # are silently ignored (the request_id_to_client_id
+                    # entry is already gone).
+                    if fid not in self.request_id_to_client_id:
+                        continue
+                    self.detokenize(finished_request)
                     client_identity = self.request_id_to_client_id[fid]
                     client_request_identity = self.request_id_to_client_request_id[fid]
                     del self.request_id_to_client_id[fid]
@@ -617,6 +725,9 @@ class DataParallelInferenceCoordinator:
         prefix_caching_routing_alpha: float = 0.5,
         schedule_output_path: str | None = None,
         hostname: str | None = None,
+        replicate_requests: bool = False,
+        partitioned_state: bool = False,
+        replication_group_size: int = 1,
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -651,6 +762,9 @@ class DataParallelInferenceCoordinator:
             prefix_caching_routing_alpha=prefix_caching_routing_alpha,
             schedule_output_path=schedule_output_path,
             hostname=hostname,
+            replicate_requests=replicate_requests,
+            partitioned_state=partitioned_state,
+            replication_group_size=replication_group_size,
         )
         ready_event.set()
         try:

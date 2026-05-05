@@ -4,6 +4,7 @@ import logging
 from argparse import ArgumentParser
 from functools import partial
 from typing import Optional
+
 import torch
 
 from gpt_builders import gpt_builder
@@ -375,6 +376,8 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         num_speculative_tokens=args.num_speculative_tokens,
         use_synchronous_zmq_collectives=args.inference_use_synchronous_zmq_collectives,
         sampling_backend=args.inference_dynamic_batching_sampling_backend,
+        inference_replicate_requests=getattr(args, 'inference_replicate_requests', False),
+        inference_partitioned_state=getattr(args, 'inference_partitioned_state', False),
     )
 
 

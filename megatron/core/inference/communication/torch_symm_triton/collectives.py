@@ -204,6 +204,64 @@ def _multimem_reduce_scatter_kernel(
         block_start += tl.num_programs(axis=0) * BLOCK_SIZE
 
 
+@triton.jit
+def _multimem_all_reduce_kernel(
+    local_ptr,
+    multicast_ptr,
+    signal_pad_ptrs,
+    numel,
+    BLOCK_SIZE: tl.constexpr,
+    NUMEL_PER_THREAD: tl.constexpr,
+    RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+    REDUCE_F32: tl.constexpr = False,
+):
+    """All-reduce via NVLS multimem.
+
+    Each rank reads the full input from the multicast pointer (which yields
+    the hardware-summed value for each element across all ranks) and stores
+    the result to local memory. Conceptually a reduce-scatter where every
+    rank takes the full tensor, so the output is identical on all ranks.
+
+    Compared to chaining multimem_reduce_scatter + multimem_all_gather, this
+    saves one kernel launch and one cross-device synchronization barrier:
+    the AG round-trip is unnecessary because each rank reads the whole
+    reduced tensor directly via multimem load.
+
+    Used by the attention-bounded-segments combine path so that the next
+    MoE layer can skip its all-gather (the global view it needs is already
+    the output of this kernel).
+    """
+    symm_mem_sync(
+        signal_pad_ptrs,
+        None,
+        RANK,
+        WORLD_SIZE,
+        hasPreviousMemAccess=False,
+        hasSubsequentMemAccess=False,
+    )
+    sync_threads()
+
+    pid = tl.program_id(axis=0)
+    tid = get_flat_tid()
+
+    # From here on count in 128-bit packs (NUMEL_PER_THREAD elements per pack).
+    numel_128 = numel // NUMEL_PER_THREAD
+    block_start = pid * BLOCK_SIZE
+
+    while block_start < numel_128:
+        offsets = block_start + tid
+        mask = offsets < numel_128
+
+        # No per-rank slice offset: every rank consumes the full output.
+        multicast_ptrs = multicast_ptr.to(tl.pointer_type(tl.uint64)) + offsets * 2
+        local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + offsets * 2
+        (x, y, z, w) = ld_128(multicast_ptrs, mask=mask, multicast_op=True, reduce_f32=REDUCE_F32)
+        st_128(local_ptrs, x, y, z, w, mask=mask, multicast_op=False)
+
+        block_start += tl.num_programs(axis=0) * BLOCK_SIZE
+
+
 # ── Python wrappers ─────────────────────────────────────────────────────────
 
 _DEFAULT_KERNEL_CONFIG = {"max_num_blocks": 128, "num_warps": 32, "BLOCK_SIZE": 1024}
@@ -353,6 +411,69 @@ def multimem_reduce_scatter(
         output_tensor.element_size(), input_tensor.numel(), symm_mem_hdl.world_size, **kwargs
     )
     _multimem_reduce_scatter_kernel[(num_blocks, 1, 1)](
+        output_tensor.data_ptr(),
+        symm_mem_hdl.multicast_ptr,
+        symm_mem_hdl.signal_pad_ptrs_dev,
+        numel=input_tensor.numel(),
+        BLOCK_SIZE=config["BLOCK_SIZE"],
+        NUMEL_PER_THREAD=numel_per_thread,
+        RANK=symm_mem_hdl.rank,
+        WORLD_SIZE=symm_mem_hdl.world_size,
+        num_warps=config["num_warps"],
+        REDUCE_F32=reduce_f32,
+    )
+
+    return output_tensor
+
+
+def multimem_all_reduce(
+    output_tensor: torch.Tensor,
+    input_tensor: torch.Tensor,
+    symm_mem_hdl: _SymmetricMemory,
+    **kwargs,
+) -> torch.Tensor:
+    """Multicast all-reduce: sum across ranks, full result on every rank.
+
+    Mirrors ``multimem_reduce_scatter`` but writes the full reduced tensor
+    locally rather than only this rank's slice. Useful when the consumer
+    needs the global view (e.g., the next MoE layer's experts), allowing
+    the subsequent all-gather to be skipped entirely.
+
+    Args:
+        output_tensor: Local destination buffer with the same shape and
+            numel as ``input_tensor``. Must be 16-byte aligned for NVLS.
+        input_tensor: Symmetric memory buffer holding this rank's
+            contribution; the multicast pointer over this buffer yields
+            the per-element hardware sum.
+        symm_mem_hdl: Symmetric memory handle.
+
+    Returns:
+        ``output_tensor``, populated with the all-reduced value (same on
+        every rank up to NCCL/NVLS reduction-tree fp ordering).
+    """
+    assert HAVE_TRITON, "Triton is required for multimem all-reduce."
+    assert input_tensor.dtype in (
+        torch.bfloat16,
+        torch.float32,
+    ), f"Only bfloat16 and float32 are supported, got {input_tensor.dtype}"
+    assert (
+        input_tensor.dtype == output_tensor.dtype
+    ), f"Input and output dtypes must match: {input_tensor.dtype} vs {output_tensor.dtype}"
+    assert are_tensors_nvls_eligible(
+        output_tensor
+    ), "Output tensor must be 16-byte divisible on Hopper+ for NVLS."
+    assert input_tensor.numel() == output_tensor.numel(), (
+        "All-reduce input and output must have the same numel "
+        f"(got input={input_tensor.numel()}, output={output_tensor.numel()})"
+    )
+
+    reduce_f32 = input_tensor.dtype == torch.float32
+    # Pretend we're an "RS" with a single rank for grid sizing — that matches
+    # the work each thread does: it touches every element, not 1/world_size.
+    numel_per_thread, num_blocks, config = _kernel_launch_config(
+        output_tensor.element_size(), output_tensor.numel(), 1, **kwargs
+    )
+    _multimem_all_reduce_kernel[(num_blocks, 1, 1)](
         output_tensor.data_ptr(),
         symm_mem_hdl.multicast_ptr,
         symm_mem_hdl.signal_pad_ptrs_dev,

@@ -312,6 +312,37 @@ class InferenceConfig:
     performance variability for MoEs.
     """
 
+    inference_replicate_requests: bool = False
+    """If True, the data-parallel inference coordinator broadcasts each new
+    request to every DP rank instead of load-balancing. This is required by
+    the skip-AG MoE path so that each rank's Mamba state stays in sync via
+    deterministic recomputation on a shared global view. Default off keeps
+    the existing sharded scheduling.
+
+    Pairs with ``--enable-attention-bounded-segments`` and
+    ``--moe-combine-destination-policy current_segment_owner`` on
+    ``TransformerConfig``.
+    """
+
+    inference_partitioned_state: bool = False
+    """If True, run the skip-AG MoE path with per-rank request ownership
+    and on-demand NVLS all-gather of mamba outputs (instead of
+    replicating every request to every rank). Each request has exactly
+    one EP-rank owner; mamba state lives only there; the global view
+    used by the skip-AG MoE path is produced by an AG of the owners'
+    mamba outputs.
+
+    Mutually exclusive with ``inference_replicate_requests``. Cluster
+    state memory is O(total_requests) instead of O(EP × total_requests),
+    which lets the cluster hold ~EP× more concurrent requests at the
+    same per-GPU memory budget. Per-step latency at low batch matches
+    the replicated variant (same skip-AGV / AR savings).
+
+    Pairs with ``--enable-attention-bounded-segments`` and
+    ``--moe-combine-destination-policy current_segment_owner``.
+    """
+
+
     verbose: InitVar[bool] = False
     """Whether to log detailed context configuration at initialization.
     This is an InitVar and is not stored as a field on the config."""
@@ -332,3 +363,11 @@ class InferenceConfig:
                     "sampling_backend='flashinfer' requires the flashinfer package; "
                     "install it or set sampling_backend='torch'."
                 ) from e
+
+        if self.inference_replicate_requests and self.inference_partitioned_state:
+            raise ValueError(
+                "inference_replicate_requests and inference_partitioned_state are "
+                "mutually exclusive: replication broadcasts each request to every EP "
+                "rank, while partitioned state assigns each request to exactly one "
+                "owner. Pick one (or neither for default load-balanced inference)."
+            )

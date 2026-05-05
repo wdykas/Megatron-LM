@@ -279,6 +279,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Track requests currently being finished due to stop words (to skip extra token)
         self.stop_word_being_finished_ids: set[int] = set()
 
+
         # Timing and logging variables.
         self.rank = torch.distributed.get_rank()
         self.step_start_event = torch.cuda.Event(enable_timing=True)
@@ -558,6 +559,33 @@ class DynamicInferenceEngine(AbstractEngine):
                     "prefix_caching_routing_alpha": self.context.prefix_caching_routing_alpha,
                     "schedule_output_path": coordinator_schedule_output_path,
                     "hostname": hostname,
+                    # ``replicate_requests``: broadcasts each new request to
+                    # every rank in a model copy. Required by the
+                    # replicated-state skip-AG MoE inference path.
+                    #
+                    # ``partitioned_state``: assigns each new request to
+                    # exactly one rank in the model copy (the prefix-cache
+                    # / load-balance winner). Required by the partitioned-
+                    # state skip-AG MoE inference path where mamba state
+                    # lives only on the owner. Mutually exclusive with
+                    # replicate.
+                    "replicate_requests": getattr(
+                        self.context.config, "inference_replicate_requests", False
+                    ),
+                    "partitioned_state": getattr(
+                        self.context.config, "inference_partitioned_state", False
+                    ),
+                    # Replication group size = the rank count for one
+                    # model copy (EP × TP × PP). Within a model copy the
+                    # ranks are already in lockstep via collectives, so
+                    # broadcasting a request to the whole group is the
+                    # cheap thing. Across model copies, requests still
+                    # load-balance and DP throughput scaling is preserved.
+                    "replication_group_size": (
+                        get_pg_size(self.pg_collection.ep)
+                        * get_pg_size(self.pg_collection.tp)
+                        * get_pg_size(self.pg_collection.pp)
+                    ),
                 },
             )
             self.inference_coordinator_process.start()
