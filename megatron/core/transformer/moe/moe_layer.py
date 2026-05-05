@@ -395,6 +395,18 @@ class MoELayer(BaseMoELayer):
         ):
             self._inference_token_dispatcher.set_shared_experts(self.shared_experts)
 
+        # L2 prefetch hook for wide-EP decode. Fires only when env var
+        # ``L2_PREFETCH_EXPERTS=1`` is set. At wide EP the per-rank expert
+        # weights fit in L2 (~50-80 MB on Hopper/Blackwell); at narrow EP
+        # they don't and prefetching just thrashes.
+        import os as _os
+        self._l2_prefetch_enabled = _os.environ.get(
+            'L2_PREFETCH_EXPERTS', '0'
+        ) == '1'
+        self._l2_prefetch_stream: Optional[torch.cuda.Stream] = None
+        if self._l2_prefetch_enabled:
+            self._l2_prefetch_stream = torch.cuda.Stream(device='cuda')
+
     def train(self, mode: bool = True):
         """Swap token dispatcher when switching between train and eval modes."""
         super().train(mode)
@@ -599,7 +611,25 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     hidden_states, probs = intermediate_tensors
 
+                # L2 prefetch hook: kick off async reads of expert weights
+                # on a side stream while dispatch comm runs on the main
+                # stream. By the time the expert GEMMs run, the weights
+                # are already warm in L2. Only meaningful at wide EP where
+                # the per-rank weight footprint fits in L2.
+                if self._l2_prefetch_enabled and self._l2_prefetch_stream is not None:
+                    from megatron.core.inference.l2_prefetch import (
+                        collect_expert_weight_tensors,
+                        prefetch_into_l2,
+                    )
+                    self._l2_prefetch_stream.wait_stream(torch.cuda.current_stream())
+                    prefetch_into_l2(
+                        collect_expert_weight_tensors(self.experts),
+                        stream=self._l2_prefetch_stream,
+                    )
+
                 dispatched_input, probs = self.dispatch(hidden_states, probs)
+                if self._l2_prefetch_enabled and self._l2_prefetch_stream is not None:
+                    torch.cuda.current_stream().wait_stream(self._l2_prefetch_stream)
                 output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
                 assert (
                     mlp_bias is None

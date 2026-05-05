@@ -140,6 +140,29 @@ class MambaLayer(GraphableMegatronModule):
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
         hidden_states = apply_module(self.norm)(hidden_states)
 
+        # L2 prefetch hook: env-gated. Fires reads of mamba mixer weights
+        # on a side stream so the main mixer kernel hits warm L2.
+        if not hasattr(MambaLayer, '_l2_prefetch_state'):
+            import os as _os
+            MambaLayer._l2_prefetch_state = {
+                'enabled': _os.environ.get('L2_PREFETCH_MAMBA', '0') == '1',
+                'stream': None,
+            }
+        _pf = MambaLayer._l2_prefetch_state
+        if _pf['enabled'] and not self.training:
+            if _pf['stream'] is None:
+                _pf['stream'] = torch.cuda.Stream(device='cuda')
+            from megatron.core.inference.l2_prefetch import (
+                collect_mamba_weight_tensors,
+                prefetch_into_l2,
+            )
+            _pf['stream'].wait_stream(torch.cuda.current_stream())
+            prefetch_into_l2(
+                collect_mamba_weight_tensors(self.mixer),
+                stream=_pf['stream'],
+            )
+            torch.cuda.current_stream().wait_stream(_pf['stream'])
+
         mixer_out_with_bias = self.mixer(
             hidden_states, inference_context=inference_context, packed_seq_params=packed_seq_params
         )
