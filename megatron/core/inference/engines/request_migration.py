@@ -321,38 +321,13 @@ def build_kv_migration_plan(
 
 
 def serialize_bundle(bundle: RequestMigrationBundle) -> dict:
-    """Flatten the bundle to a msgpack-compatible dict."""
+    """Flatten the bundle to a msgpack-compatible dict.
 
-    def _serialize_mamba(m: Optional[MambaLayout]) -> Optional[dict]:
-        if m is None:
-            return None
-        return {
-            "num_mamba_layers_pp": m.num_mamba_layers_pp,
-            "conv_states_shape": list(m.conv_states_shape),
-            "ssm_states_shape": list(m.ssm_states_shape),
-            "conv_states_dtype_name": m.conv_states_dtype_name,
-            "ssm_states_dtype_name": m.ssm_states_dtype_name,
-        }
-
-    def _serialize_layout(layout: Optional[KVLayout]) -> Optional[dict]:
-        if layout is None:
-            return None
-        return {
-            "tp_size": layout.tp_size,
-            "pp_size": layout.pp_size,
-            "num_layers_total": layout.num_layers_total,
-            "num_kv_heads_total": layout.num_kv_heads_total,
-            "head_dim": layout.head_dim,
-            "block_size_tokens": layout.block_size_tokens,
-            "is_mla": layout.is_mla,
-            "kv_reduced_dim": layout.kv_reduced_dim,
-            "mamba": _serialize_mamba(layout.mamba),
-        }
-
-    # ``src_layout`` / ``dst_layout`` are *not* on the wire — they are
-    # invariant per (src_shard, dst_shard) pair and the receiving handler
-    # already has them via ``_migration_meta``. Restamping after
-    # deserialize avoids ~16x duplicate serialization per migration batch.
+    ``src_layout`` / ``dst_layout`` are intentionally *not* on the wire
+    — they're invariant per (src_shard, dst_shard) pair and the
+    receiving handler restamps them from its local ``_migration_meta``,
+    saving N× redundant serialization per batch.
+    """
     return {
         "request_id": bundle.request_id,
         "prompt_tokens": bundle.prompt_tokens,
@@ -1244,27 +1219,8 @@ def migrate_requests_cross_shard_batch(
 
 
 def deserialize_bundle(obj: dict) -> RequestMigrationBundle:
-    """Inverse of :func:`serialize_bundle`."""
-
-    def _deserialize_mamba(d: Optional[dict]) -> Optional[MambaLayout]:
-        if d is None:
-            return None
-        return MambaLayout(
-            num_mamba_layers_pp=d["num_mamba_layers_pp"],
-            conv_states_shape=tuple(d["conv_states_shape"]),
-            ssm_states_shape=tuple(d["ssm_states_shape"]),
-            conv_states_dtype_name=d["conv_states_dtype_name"],
-            ssm_states_dtype_name=d["ssm_states_dtype_name"],
-        )
-
-    def _deserialize_layout(d: Optional[dict]) -> Optional[KVLayout]:
-        if d is None:
-            return None
-        mamba_d = d.pop("mamba", None)
-        layout = KVLayout(**d)
-        layout.mamba = _deserialize_mamba(mamba_d)
-        return layout
-
+    """Inverse of :func:`serialize_bundle`. Layouts are restamped by
+    the caller from its local ``_migration_meta``."""
     routing_shape = obj.get("routing_indices_shape")
     return RequestMigrationBundle(
         request_id=obj["request_id"],
@@ -1282,8 +1238,6 @@ def deserialize_bundle(obj: dict) -> RequestMigrationBundle:
         num_kv_blocks=obj["num_kv_blocks"],
         last_block_offset=obj["last_block_offset"],
         src_block_ids=list(obj["src_block_ids"]),
-        src_layout=_deserialize_layout(obj.get("src_layout")),
-        dst_layout=_deserialize_layout(obj.get("dst_layout")),
         routing_indices_shape=(
             tuple(routing_shape) if routing_shape is not None else None
         ),
