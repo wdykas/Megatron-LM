@@ -694,14 +694,12 @@ class DynamicInferenceContext(BaseInferenceContext):
     def _allocate_memory_buffer(self):
         """Allocate the KV cache memory buffer.
 
-        When :mod:`megatron.core.inference.nvshmem_migration` has been
-        initialized (i.e. the inference interface is configured for
-        cross-shard request migration), the buffer is allocated on the
-        NVSHMEM symmetric heap so that direct one-sided ``put`` between
-        engines is possible without staging. Heterogeneous shards have
-        different per-rank KV sizes; the symmetric helper sizes the
-        underlying byte allocation to the world-wide max so every PE's
-        symmetric region is the same length.
+        Always a regular CUDA tensor — the cross-shard migration path
+        gathers/scatters via uniformly-sized NVSHMEM staging slots, so
+        the KV buffer itself is never an RDMA target and doesn't need
+        to live on the symmetric heap. This lets heterogeneous shards
+        size their per-rank KV pools independently without paying the
+        world-wide ``max(local_bytes)`` symmetric-heap overhead.
         """
         if self.cache_mla_latent:
             kv_shape = (
@@ -719,18 +717,11 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.num_attention_heads_per_partition,
                 self.hidden_size_per_attention_head,
             )
-        from megatron.core.inference import nvshmem_migration
-
-        if nvshmem_migration.is_initialized():
-            self.memory_buffer = nvshmem_migration.symmetric_empty(
-                kv_shape, dtype=self.params_dtype
-            )
-        else:
-            self.memory_buffer = torch.empty(
-                kv_shape,
-                dtype=self.params_dtype,
-                device=torch.cuda.current_device(),
-            )
+        self.memory_buffer = torch.empty(
+            kv_shape,
+            dtype=self.params_dtype,
+            device=torch.cuda.current_device(),
+        )
         if (
             self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
             and not self._uses_torch_memory_saver
@@ -742,14 +733,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             ).pin_memory()
 
     def _allocate_mamba_states(self):
-        """Allocate Mamba states for hybrid models."""
+        """Allocate Mamba states for hybrid models. Like the KV
+        ``memory_buffer``, these are regular CUDA tensors — the
+        migration path stages through uniformly-sized symmetric
+        slots, so the per-request state pools aren't NVSHMEM RDMA
+        targets and don't need world-equal byte allocations."""
         if self.is_hybrid_model:
             self.mamba_metadata = MambaMetadata(
                 max_requests=self.max_requests,
                 max_tokens=self.max_tokens,
                 d_conv=self.mamba_conv_states_shape[-1],
             )
-            from megatron.core.inference import nvshmem_migration
 
             mamba_conv_shape = (
                 self.num_mamba_layers,
@@ -759,26 +753,16 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.num_mamba_layers,
                 self.max_requests,
             ) + self.mamba_ssm_states_shape
-            # Mamba state must be in the symmetric heap for the same
-            # reason KV is — direct cross-shard put without staging.
-            if nvshmem_migration.is_initialized():
-                self.mamba_conv_states = nvshmem_migration.symmetric_empty(
-                    mamba_conv_shape, dtype=self.mamba_conv_states_dtype
-                )
-                self.mamba_ssm_states = nvshmem_migration.symmetric_empty(
-                    mamba_ssm_shape, dtype=self.mamba_ssm_states_dtype
-                )
-            else:
-                self.mamba_conv_states = torch.empty(
-                    mamba_conv_shape,
-                    dtype=self.mamba_conv_states_dtype,
-                    device=torch.cuda.current_device(),
-                )
-                self.mamba_ssm_states = torch.empty(
-                    mamba_ssm_shape,
-                    dtype=self.mamba_ssm_states_dtype,
-                    device=torch.cuda.current_device(),
-                )
+            self.mamba_conv_states = torch.empty(
+                mamba_conv_shape,
+                dtype=self.mamba_conv_states_dtype,
+                device=torch.cuda.current_device(),
+            )
+            self.mamba_ssm_states = torch.empty(
+                mamba_ssm_shape,
+                dtype=self.mamba_ssm_states_dtype,
+                device=torch.cuda.current_device(),
+            )
             if self.num_speculative_tokens > 0:
                 self.mamba_intermediate_conv_states = torch.empty(
                     (
