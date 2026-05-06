@@ -49,6 +49,7 @@ async def _run_text_gen_server(
     verbose: bool = False,
     fd: Optional[int] = None,
     hostname: Optional[str] = None,
+    disagg_length_threshold: Optional[int] = None,
 ):
     """
     Initializes and runs the async web server. Automatically starts and
@@ -82,23 +83,14 @@ async def _run_text_gen_server(
         app.config['verbose'] = verbose
         # Length-aware disagg routing: when a request body sets
         # ``disagg_pair=[prefill, decode]`` AND its tokenized prompt is
-        # shorter than --rl-disagg-length-threshold, the endpoint
+        # shorter than ``disagg_length_threshold``, the endpoint
         # routes the submit straight to the decode shard with no
-        # auto-disagg tag — the whole prefill→migrate→decode round-trip
-        # costs more than the short request would save. Threshold of
-        # None disables it (every disagg_pair request routes via
-        # prefill + migrate).
-        from megatron.training.global_vars import get_args
-        try:
-            args = get_args()
-            threshold = getattr(args, "rl_disagg_length_threshold", None)
-        except (AssertionError, RuntimeError):
-            # ``get_args`` raises before training initialization; the
-            # text-gen server can be imported in test contexts where
-            # there's no global args. Treat as "feature disabled".
-            threshold = None
+        # auto-disagg tag. ``None`` disables it (every disagg_pair
+        # request routes via prefill + migrate).
         app.config['disagg_length_threshold'] = (
-            int(threshold) if threshold is not None else None
+            int(disagg_length_threshold)
+            if disagg_length_threshold is not None
+            else None
         )
 
         # Register all blueprints from the 'endpoints' package
@@ -140,6 +132,7 @@ def _server_process_worker(
     verbose: bool = False,
     fd: Optional[int] = None,
     hostname: Optional[str] = None,
+    disagg_length_threshold: Optional[int] = None,
 ):
     """Synchronous worker function that sets up a new event loop for the separate process."""
     loop = asyncio.new_event_loop()
@@ -147,7 +140,15 @@ def _server_process_worker(
     try:
         loop.run_until_complete(
             _run_text_gen_server(
-                coordinator_addr, tokenizer, rank, server_port, parsers, verbose, fd, hostname
+                coordinator_addr,
+                tokenizer,
+                rank,
+                server_port,
+                parsers,
+                verbose,
+                fd,
+                hostname,
+                disagg_length_threshold,
             )
         )
     except KeyboardInterrupt:
@@ -170,6 +171,7 @@ def start_text_gen_server(
     verbose: bool = False,
     num_replicas: int = 4,
     hostname: Optional[str] = None,
+    disagg_length_threshold: Optional[int] = None,
 ):
     """Start the text generation server."""
     global _SERVER_PROCESSES
@@ -198,7 +200,17 @@ def start_text_gen_server(
     for i in range(num_replicas):
         p = mp.Process(
             target=_server_process_worker,
-            args=(coordinator_addr, tokenizer, rank, server_port, parsers, verbose, fd, hostname),
+            args=(
+                coordinator_addr,
+                tokenizer,
+                rank,
+                server_port,
+                parsers,
+                verbose,
+                fd,
+                hostname,
+                disagg_length_threshold,
+            ),
             daemon=True,
         )
         p.start()

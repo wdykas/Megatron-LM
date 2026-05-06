@@ -185,13 +185,12 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
     # without going through rank 0. Empty on ranks that aren't a
     # ``rank_offset`` for any shard.
     _shard_clients: dict = PrivateAttr(default_factory=dict)
-    # Migration metadata snapshot, computed at launch on every rank
-    # whose engine participates in any cross-shard migration. Maps
-    # ``(src_shard_index, dst_shard_index)`` → dict with the
-    # cross-shard process group, layouts and head offsets needed by
-    # ``migrate_requests_cross_shard_batch``. Pre-computing avoids
-    # paying the layout-build cost (and the ``build_cross_shard_group``
-    # collective) on every migration.
+    # Migration metadata snapshot. Maps
+    # ``(src_shard_index, dst_shard_index)`` → dict with the src/dst
+    # layouts and head offsets the engine handler needs. Pre-computing
+    # avoids paying the layout-build cost on every migration. The
+    # async NVSHMEM path needs no torch process group; the synchronous
+    # smoke-test path builds one on demand.
     _migration_meta: dict = PrivateAttr(default_factory=dict)
     # Round-robin counter used by the auto-disagg scheduler to spread
     # migration batches across the destination shard's DP replicas
@@ -341,6 +340,9 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                 parsers=[],
                 verbose=verbose,
                 hostname=host,
+                disagg_length_threshold=getattr(
+                    args, "rl_disagg_length_threshold", None
+                ),
             )
 
         # --- Exchange HTTP ports so every rank knows every shard's URL ----
@@ -959,20 +961,12 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         """Pre-compute migration metadata for ``(src, dst)`` and wire
         the engine's MIGRATE_BATCH handler.
 
-        Collective: every rank must call. ``build_cross_shard_group``
-        creates a torch process group covering ranks in src + dst,
-        which has to happen with all ranks in lockstep. The metadata
-        (layouts, head offsets, group handle) is then cached so the
-        per-migration cost is just the NCCL transport itself.
-
-        Bystander ranks (not in src or dst) still call this — their
-        local metadata for this pair is never consulted (engine
-        handler returns early for bystanders), but the
-        ``build_cross_shard_group`` collective requires their
-        participation.
+        Cheap and rank-local — the async NVSHMEM migration path uses
+        one-sided put_signal / signal_wait, no torch process group.
+        The synchronous (smoke-test) path that does need a cross-shard
+        ``dist.ProcessGroup`` builds it on demand via
+        :func:`megatron.core.inference.shards.build_cross_shard_group`.
         """
-        from megatron.core.inference.shards import build_cross_shard_group
-
         assert 0 <= src_shard_index < len(self._shards)
         assert 0 <= dst_shard_index < len(self._shards)
         assert src_shard_index != dst_shard_index
@@ -986,16 +980,9 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         in_src = src_shard.owns_rank(rank)
         in_dst = dst_shard.owns_rank(rank)
 
-        # Collective on every rank, even bystanders — the PG creation
-        # itself is world-synchronized.
-        cross_shard_group = build_cross_shard_group(
-            self._shards, [src_shard_index, dst_shard_index]
-        )
-
         meta = {
             "src_shard": src_shard,
             "dst_shard": dst_shard,
-            "cross_shard_group": cross_shard_group,
             "in_src": in_src,
             "in_dst": in_dst,
         }
