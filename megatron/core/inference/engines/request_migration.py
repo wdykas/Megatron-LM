@@ -15,12 +15,15 @@ is reused for the KV tensor transport. The module supplies:
 - :func:`build_kv_migration_plan` — given both shards' layouts + block
   ids, returns a flat list of :class:`KVMigrationOp` describing the
   tensor slices each rank sends / receives. Handles heterogeneous TP
-  by reshaping the head-dim partition. PP=1 on both sides for v0.
+  *and* heterogeneous PP by taking the (layer × head) intersection of
+  each (src rank, dst rank) pair's ownership.
 - :func:`execute_kv_migration_plan` — drives the plan's ops through
   :class:`NCCLCopyService` over a ``cross_shard_group`` process group.
-- :func:`migrate_request_cross_shard` — the one-shot collective
-  orchestration: snapshot on src → broadcast bundle → inject on dst →
-  broadcast block ids → transport → detach on src.
+- :func:`migrate_requests_cross_shard_batch` — collective orchestration
+  for N requests per call: snapshot on src → broadcast bundles → inject
+  on dst → broadcast block ids → one fused transport → detach on src.
+- :func:`migrate_request_cross_shard` — thin wrapper around the batch
+  primitive for the single-request case.
 
 Engine-side surgery (``snapshot_request`` / ``detach_request`` /
 ``inject_request``) lives alongside :class:`DynamicInferenceEngine`.
@@ -136,6 +139,12 @@ class RequestMigrationBundle:
     # kv_cache_epoch = list of (start_position, policy_epoch) pairs marking
     # segments of the KV that were produced by different policy weights.
     kv_cache_epoch: List[Tuple[int, int]] = field(default_factory=list)
+    # policy_epoch = list of (token_index, generation_epoch) pairs
+    # tracking which policy weights generated each prefix of the
+    # output. The HTTP InferenceResponse pydantic schema requires a
+    # list, so we ship it explicitly through the bundle (defaults to
+    # an empty list when the source request had no policy epochs).
+    policy_epoch: List[Tuple[int, int]] = field(default_factory=list)
 
     # --- Block bookkeeping (must match what the source engine had) -------
     # Number of KV blocks the request currently occupies.
@@ -150,6 +159,16 @@ class RequestMigrationBundle:
     # --- Source / destination KV layout (for plan construction) ----------
     src_layout: Optional[KVLayout] = None
     dst_layout: Optional[KVLayout] = None
+
+    # --- MoE router replay history ---------------------------------------
+    # Serialized form of ``DynamicInferenceRequest.routing_indices``,
+    # which has shape ``(total_tokens, num_layers, topk)`` and carries
+    # per-token per-layer expert routing decisions accumulated during
+    # generation. Empty / (0,0,0) means "no routing history". Flattened
+    # for wire efficiency; inject_request reshapes back via shape.
+    routing_indices_shape: Optional[Tuple[int, int, int]] = None
+    routing_indices_dtype_name: Optional[str] = None
+    routing_indices_flat: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -201,9 +220,9 @@ def build_kv_migration_plan(
             order as ``bundle.src_block_ids``.
 
     Returns:
-        A list of :class:`KVMigrationOp`. Every source-rank / destination-
-        rank pair that needs to exchange data appears exactly once per
-        (layer range × head range) block.
+        A list of :class:`KVMigrationOp`. Every (src_pp × dst_pp × src_tp
+        × dst_tp) combination with non-empty layer and head overlap
+        produces exactly one op.
 
     Heterogeneous-TP invariant: the plan emits one op per
     ``(src_tp_rank, dst_tp_rank)`` combination that shares head ownership.
@@ -215,8 +234,13 @@ def build_kv_migration_plan(
           is the slice that moves between them. When that intersection
           is empty the pair has no op.
 
-    PP reshape is intentionally not supported in v0 (``assert src_pp ==
-    dst_pp == 1``).
+    Pipeline-parallel reshape: the same intersection logic applies to
+    the layer dimension. Each pp_rank owns layers
+    ``[pp_rank * L/pp_size, (pp_rank+1) * L/pp_size)``; ops are emitted
+    for every (src_pp, dst_pp, src_tp, dst_tp) quadruple with non-empty
+    layer AND head overlap. Matched PP (src_pp_size == dst_pp_size) is
+    the common case and collapses to one op per pp stage; reshape
+    across PP works too.
     """
     assert bundle.src_layout is not None, "bundle.src_layout missing"
     assert bundle.dst_layout is not None, "bundle.dst_layout missing"
@@ -224,10 +248,6 @@ def build_kv_migration_plan(
     dst = bundle.dst_layout
     src.assert_divisible()
     dst.assert_divisible()
-    assert src.pp_size == 1 and dst.pp_size == 1, (
-        "v0 migration plan only supports PP=1 on both sides; got "
-        f"src_pp={src.pp_size}, dst_pp={dst.pp_size}"
-    )
     assert src.num_kv_heads_total == dst.num_kv_heads_total, (
         "num_kv_heads_total must match across shards — migration cannot "
         f"change model shape (src={src.num_kv_heads_total}, "
@@ -242,51 +262,52 @@ def build_kv_migration_plan(
         f"bundle.src_block_ids count ({len(bundle.src_block_ids)})"
     )
 
-    # With PP=1 both sides hold all layers on every rank.
-    layer_range = (0, src.num_layers_total)
-
-    ops: List[KVMigrationOp] = []
-
-    # MLA collapses the head dim; the "head_range" is just the reduced dim.
-    # We still emit one op per (src_tp, dst_tp) for symmetry, but both
-    # sides always hold the full reduced-dim tensor, so the op is
-    # effectively a full tensor copy between the rank-pair.
-    if src.is_mla:
-        head_range = (0, src.kv_reduced_dim or 0)
-        for sr in range(src.tp_size):
-            for dr in range(dst.tp_size):
-                ops.append(
-                    KVMigrationOp(
-                        src_rank=src_global_rank_of(sr, 0),
-                        dst_rank=dst_global_rank_of(dr, 0),
-                        layer_range=layer_range,
-                        head_range=head_range,
-                        src_block_ids=list(bundle.src_block_ids),
-                        dst_block_ids=list(dst_block_ids),
-                    )
-                )
-        return ops
-
+    src_layers_per_pp = src.num_layers_total // src.pp_size
+    dst_layers_per_pp = dst.num_layers_total // dst.pp_size
     src_heads = src.heads_per_tp
     dst_heads = dst.heads_per_tp
-    for sr in range(src.tp_size):
-        src_lo, src_hi = sr * src_heads, (sr + 1) * src_heads
-        for dr in range(dst.tp_size):
-            dst_lo, dst_hi = dr * dst_heads, (dr + 1) * dst_heads
-            overlap_lo = max(src_lo, dst_lo)
-            overlap_hi = min(src_hi, dst_hi)
-            if overlap_lo >= overlap_hi:
+    mla_head_range = (0, src.kv_reduced_dim or 0)
+    src_block_ids_copy = list(bundle.src_block_ids)
+    dst_block_ids_copy = list(dst_block_ids)
+
+    ops: List[KVMigrationOp] = []
+    for src_pp in range(src.pp_size):
+        src_layer_lo = src_pp * src_layers_per_pp
+        src_layer_hi = src_layer_lo + src_layers_per_pp
+        for dst_pp in range(dst.pp_size):
+            dst_layer_lo = dst_pp * dst_layers_per_pp
+            dst_layer_hi = dst_layer_lo + dst_layers_per_pp
+            layer_lo = max(src_layer_lo, dst_layer_lo)
+            layer_hi = min(src_layer_hi, dst_layer_hi)
+            if layer_lo >= layer_hi:
                 continue
-            ops.append(
-                KVMigrationOp(
-                    src_rank=src_global_rank_of(sr, 0),
-                    dst_rank=dst_global_rank_of(dr, 0),
-                    layer_range=layer_range,
-                    head_range=(overlap_lo, overlap_hi),
-                    src_block_ids=list(bundle.src_block_ids),
-                    dst_block_ids=list(dst_block_ids),
-                )
-            )
+            for sr in range(src.tp_size):
+                src_head_lo = sr * src_heads
+                src_head_hi = src_head_lo + src_heads
+                for dr in range(dst.tp_size):
+                    if src.is_mla:
+                        # MLA collapses head dim — every rank-pair in
+                        # the current layer overlap carries the full
+                        # reduced-dim tensor.
+                        head_range = mla_head_range
+                    else:
+                        dst_head_lo = dr * dst_heads
+                        dst_head_hi = dst_head_lo + dst_heads
+                        head_lo = max(src_head_lo, dst_head_lo)
+                        head_hi = min(src_head_hi, dst_head_hi)
+                        if head_lo >= head_hi:
+                            continue
+                        head_range = (head_lo, head_hi)
+                    ops.append(
+                        KVMigrationOp(
+                            src_rank=src_global_rank_of(sr, src_pp),
+                            dst_rank=dst_global_rank_of(dr, dst_pp),
+                            layer_range=(layer_lo, layer_hi),
+                            head_range=head_range,
+                            src_block_ids=src_block_ids_copy,
+                            dst_block_ids=dst_block_ids_copy,
+                        )
+                    )
     return ops
 
 
@@ -327,11 +348,19 @@ def serialize_bundle(bundle: RequestMigrationBundle) -> dict:
         "generated_log_probs": bundle.generated_log_probs,
         "generated_top_n_logprobs": bundle.generated_top_n_logprobs,
         "kv_cache_epoch": [list(p) for p in bundle.kv_cache_epoch],
+        "policy_epoch": [list(p) for p in bundle.policy_epoch],
         "num_kv_blocks": bundle.num_kv_blocks,
         "last_block_offset": bundle.last_block_offset,
         "src_block_ids": bundle.src_block_ids,
         "src_layout": _serialize_layout(bundle.src_layout),
         "dst_layout": _serialize_layout(bundle.dst_layout),
+        "routing_indices_shape": (
+            list(bundle.routing_indices_shape)
+            if bundle.routing_indices_shape is not None
+            else None
+        ),
+        "routing_indices_dtype_name": bundle.routing_indices_dtype_name,
+        "routing_indices_flat": bundle.routing_indices_flat,
     }
 
 
@@ -380,6 +409,152 @@ def _scatter_kv_slice(
         memory_buffer[:, layer_lo:layer_hi, block_ids, :, head_lo:head_hi, :] = data
 
 
+def _execute_kv_migration_plan_nvshmem(
+    ops: List[KVMigrationOp],
+    memory_buffer: torch.Tensor,
+    layout: KVLayout,
+    *,
+    my_src_head_offset: int = 0,
+    my_dst_head_offset: int = 0,
+    my_src_pp_layer_offset: int = 0,
+    my_dst_pp_layer_offset: int = 0,
+) -> None:
+    """NVSHMEM-direct KV transport. One-sided ``put`` between every
+    src/dst rank pair through a symmetric staging buffer, with
+    ``quiet`` as the only synchronization. No ``barrier_all``.
+
+    Walks ``ops`` in deterministic order on every rank so the same
+    ``StagingArena`` offsets are assigned on src and dst — that's the
+    invariant that lets ``nvshmem.core.put`` land each op's bytes at
+    the matching offset on the destination's symmetric staging buffer.
+    """
+    from megatron.core.inference import nvshmem_migration as _nv
+
+    rank = dist.get_rank()
+    arena = _nv.StagingArena()
+    stream = _nv.migration_stream()
+
+    # First pass on every rank: assign one staging *slot index* per op
+    # (regardless of participation), so src and dst agree on slot
+    # assignments. Each slot is an independent ``bytetensor`` so
+    # NVSHMEM tracks it as a single tensor handle.
+    op_slot: List[int] = []
+    op_sizes: List[int] = []
+    op_shapes: List[tuple] = []
+    elem_size = memory_buffer.element_size()
+    dtype = memory_buffer.dtype
+    for op in ops:
+        num_blocks = len(op.src_block_ids)
+        layer_span = op.layer_range[1] - op.layer_range[0]
+        head_span = op.head_range[1] - op.head_range[0]
+        if layout.is_mla:
+            shape = (layer_span, num_blocks, layout.block_size_tokens, head_span)
+        else:
+            shape = (
+                2,
+                layer_span,
+                num_blocks,
+                layout.block_size_tokens,
+                head_span,
+                layout.head_dim,
+            )
+        nelems = 1
+        for d in shape:
+            nelems *= d
+        nbytes = nelems * elem_size
+        op_slot.append(arena.take(nbytes))
+        op_sizes.append(nbytes)
+        op_shapes.append(shape)
+
+    # Each op gets a flag slot in addition to its staging slot — both
+    # src and dst look up by op index, so no coordination needed.
+    # The flag is what synchronizes src's put with dst's scatter:
+    # ``put_signal`` atomically delivers the data + sets the flag,
+    # and dst's ``signal_wait`` is a stream-ordered GPU wait. No
+    # ``quiet``, no ``barrier_all``.
+    op_flag: List[int] = []
+    for _ in ops:
+        op_flag.append(_nv.acquire_flag_slot())
+
+    sent_op_indices: List[int] = []
+    with torch.cuda.stream(stream):
+        # Src: gather → slot → put_signal (atomic put + flag set).
+        for i, op in enumerate(ops):
+            if rank != op.src_rank:
+                continue
+            slot_idx = op_slot[i]
+            flag_slot = op_flag[i]
+            nbytes = op_sizes[i]
+            shape = op_shapes[i]
+            src_blocks = torch.as_tensor(
+                op.src_block_ids, device=memory_buffer.device, dtype=torch.long
+            )
+            local_head_range = (
+                op.head_range[0] - my_src_head_offset,
+                op.head_range[1] - my_src_head_offset,
+            )
+            local_layer_range = (
+                op.layer_range[0] - my_src_pp_layer_offset,
+                op.layer_range[1] - my_src_pp_layer_offset,
+            )
+            send_tensor = _gather_kv_slice(
+                memory_buffer,
+                local_layer_range,
+                src_blocks,
+                local_head_range,
+                layout.is_mla,
+            )
+            slot = _nv.staging_slot(slot_idx)
+            slot[:nbytes].view(dtype).reshape(shape).copy_(
+                send_tensor, non_blocking=True
+            )
+            _nv.put_slot_with_signal(
+                slot_idx, flag_slot, op.dst_rank, nbytes=nbytes, stream=stream
+            )
+            sent_op_indices.append(i)
+
+        # Dst: stream-side wait on signal, then scatter slot →
+        # memory_buffer. Dependency on src's data arrival is
+        # enforced by NVSHMEM's put_signal atomicity.
+        for i, op in enumerate(ops):
+            if rank != op.dst_rank:
+                continue
+            slot_idx = op_slot[i]
+            flag_slot = op_flag[i]
+            nbytes = op_sizes[i]
+            shape = op_shapes[i]
+            _nv.wait_slot_signal(flag_slot, expected_value=1, stream=stream)
+            dst_blocks = torch.as_tensor(
+                op.dst_block_ids, device=memory_buffer.device, dtype=torch.long
+            )
+            local_head_range = (
+                op.head_range[0] - my_dst_head_offset,
+                op.head_range[1] - my_dst_head_offset,
+            )
+            local_layer_range = (
+                op.layer_range[0] - my_dst_pp_layer_offset,
+                op.layer_range[1] - my_dst_pp_layer_offset,
+            )
+            slot = _nv.staging_slot(slot_idx)
+            recv_view = slot[:nbytes].view(dtype).reshape(shape)
+            _scatter_kv_slice(
+                memory_buffer,
+                local_layer_range,
+                dst_blocks,
+                local_head_range,
+                layout.is_mla,
+                recv_view,
+            )
+
+    # After the migration stream completes, reset every flag we used
+    # so the slot can be recycled on the next migration. (Resets run
+    # on the host after stream sync so they don't race with the
+    # signal_wait.)
+    torch.cuda.current_stream().wait_stream(stream)
+    for slot in op_flag:
+        _nv.reset_flag(slot)
+
+
 def execute_kv_migration_plan(
     ops: List[KVMigrationOp],
     memory_buffer: torch.Tensor,
@@ -388,6 +563,8 @@ def execute_kv_migration_plan(
     *,
     my_src_head_offset: int = 0,
     my_dst_head_offset: int = 0,
+    my_src_pp_layer_offset: int = 0,
+    my_dst_pp_layer_offset: int = 0,
 ) -> None:
     """Execute a KV migration plan collectively across ``group``.
 
@@ -440,6 +617,26 @@ def execute_kv_migration_plan(
         Ranks that appear in no op still participate as a no-op at the
         collective level.
     """
+    # NVSHMEM-direct path: when the inference interface has initialized
+    # the NVSHMEM migration module (cross-shard topology), bypass the
+    # collective NCCL service entirely and use one-sided ``put`` over
+    # a symmetric staging buffer with a single ``quiet`` for completion.
+    # No ``barrier_all``; no engine pause beyond the kernel-launch cost
+    # of the gather/put/scatter sequence on the migration stream.
+    from megatron.core.inference import nvshmem_migration as _nv
+
+    if _nv.is_initialized():
+        _execute_kv_migration_plan_nvshmem(
+            ops,
+            memory_buffer,
+            layout,
+            my_src_head_offset=my_src_head_offset,
+            my_dst_head_offset=my_dst_head_offset,
+            my_src_pp_layer_offset=my_src_pp_layer_offset,
+            my_dst_pp_layer_offset=my_dst_pp_layer_offset,
+        )
+        return
+
     from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopyService
 
     rank = dist.get_rank()
@@ -464,8 +661,12 @@ def execute_kv_migration_plan(
                 op.head_range[0] - my_src_head_offset,
                 op.head_range[1] - my_src_head_offset,
             )
+            local_layer_range = (
+                op.layer_range[0] - my_src_pp_layer_offset,
+                op.layer_range[1] - my_src_pp_layer_offset,
+            )
             send_tensor = _gather_kv_slice(
-                memory_buffer, op.layer_range, src_blocks, local_head_range, layout.is_mla
+                memory_buffer, local_layer_range, src_blocks, local_head_range, layout.is_mla
             )
             service.submit_send(send_tensor, dest_rank=op.dst_rank, task_id=task_id)
 
@@ -500,14 +701,141 @@ def execute_kv_migration_plan(
             op.head_range[0] - my_dst_head_offset,
             op.head_range[1] - my_dst_head_offset,
         )
+        local_layer_range = (
+            op.layer_range[0] - my_dst_pp_layer_offset,
+            op.layer_range[1] - my_dst_pp_layer_offset,
+        )
         _scatter_kv_slice(
             memory_buffer,
-            op.layer_range,
+            local_layer_range,
             dst_blocks,
             local_head_range,
             layout.is_mla,
             recv_tensor,
         )
+
+
+def _execute_mamba_state_transport_nvshmem(
+    *,
+    role: str,
+    layout: KVLayout,
+    src_ranks: List[int],
+    dst_ranks: List[int],
+    src_mamba_conv_states: Optional[torch.Tensor] = None,
+    src_mamba_ssm_states: Optional[torch.Tensor] = None,
+    src_state_idx: Optional[int] = None,
+    dst_mamba_conv_states: Optional[torch.Tensor] = None,
+    dst_mamba_ssm_states: Optional[torch.Tensor] = None,
+    dst_state_idx: Optional[int] = None,
+) -> None:
+    """NVSHMEM-direct Mamba conv + SSM state transport.
+
+    Same shape contract as :func:`execute_mamba_state_transport` (v1
+    requires matched TP/PP between shards; per-pair 1:1 send) but
+    routed through the symmetric staging buffer with one-sided
+    ``put`` + ``quiet``. The Mamba state slot tensors are themselves
+    in the symmetric heap; we still stage because conv and ssm slices
+    are at distinct offsets within those tensors and we want a single
+    contiguous put per (kind, pair).
+    """
+    from megatron.core.inference import nvshmem_migration as _nv
+
+    rank = dist.get_rank()
+    arena = _nv.StagingArena()
+    stream = _nv.migration_stream()
+
+    # Pre-walk every (i, conv|ssm) pair on every rank to assign
+    # consistent staging slot indices. The mamba layout is matched
+    # between shards so the per-rank-pair shapes are identical.
+    conv_layers = layout.mamba.num_mamba_layers_pp
+    ssm_layers = layout.mamba.num_mamba_layers_pp
+    conv_shape = (conv_layers,) + tuple(layout.mamba.conv_states_shape)
+    ssm_shape = (ssm_layers,) + tuple(layout.mamba.ssm_states_shape)
+
+    if dst_mamba_conv_states is not None:
+        conv_dtype = dst_mamba_conv_states.dtype
+        ssm_dtype = dst_mamba_ssm_states.dtype
+    elif src_mamba_conv_states is not None:
+        conv_dtype = src_mamba_conv_states.dtype
+        ssm_dtype = src_mamba_ssm_states.dtype
+    else:
+        # Bystander: still need the offsets to stay consistent across
+        # ranks. Pick a sensible default (matches engine config).
+        conv_dtype = torch.bfloat16
+        ssm_dtype = torch.bfloat16
+
+    conv_elem = torch.empty((), dtype=conv_dtype).element_size()
+    ssm_elem = torch.empty((), dtype=ssm_dtype).element_size()
+    conv_nelems = 1
+    for d in conv_shape:
+        conv_nelems *= d
+    ssm_nelems = 1
+    for d in ssm_shape:
+        ssm_nelems *= d
+    conv_nbytes = conv_nelems * conv_elem
+    ssm_nbytes = ssm_nelems * ssm_elem
+
+    # Per-pair slots + flags. Flag pattern matches the KV path: src
+    # ``put_signal`` atomically delivers the data + sets a flag; dst
+    # ``signal_wait`` is a stream-ordered GPU wait. No barrier_all.
+    pair_state: List[Tuple[int, int, int, int]] = []
+    # (conv_slot, ssm_slot, conv_flag, ssm_flag) per pair
+    for _i in range(len(src_ranks)):
+        conv_slot = arena.take(conv_nbytes)
+        ssm_slot = arena.take(ssm_nbytes)
+        conv_flag = _nv.acquire_flag_slot()
+        ssm_flag = _nv.acquire_flag_slot()
+        pair_state.append((conv_slot, ssm_slot, conv_flag, ssm_flag))
+
+    flags_used: List[int] = []
+    with torch.cuda.stream(stream):
+        # Src: gather → slot → put_signal.
+        for i, (sr, dr) in enumerate(zip(src_ranks, dst_ranks)):
+            if rank != sr:
+                continue
+            assert src_mamba_conv_states is not None
+            assert src_mamba_ssm_states is not None
+            assert src_state_idx is not None
+            conv_slot, ssm_slot, conv_flag, ssm_flag = pair_state[i]
+            conv_send = src_mamba_conv_states[:, src_state_idx].contiguous()
+            ssm_send = src_mamba_ssm_states[:, src_state_idx].contiguous()
+            _nv.staging_slot(conv_slot)[:conv_nbytes].view(conv_dtype).reshape(
+                conv_shape
+            ).copy_(conv_send, non_blocking=True)
+            _nv.staging_slot(ssm_slot)[:ssm_nbytes].view(ssm_dtype).reshape(
+                ssm_shape
+            ).copy_(ssm_send, non_blocking=True)
+            _nv.put_slot_with_signal(
+                conv_slot, conv_flag, dr, nbytes=conv_nbytes, stream=stream
+            )
+            _nv.put_slot_with_signal(
+                ssm_slot, ssm_flag, dr, nbytes=ssm_nbytes, stream=stream
+            )
+            flags_used.extend([conv_flag, ssm_flag])
+
+        # Dst: signal_wait → scatter slot → state.
+        for i, (sr, dr) in enumerate(zip(src_ranks, dst_ranks)):
+            if rank != dr:
+                continue
+            assert dst_mamba_conv_states is not None
+            assert dst_mamba_ssm_states is not None
+            assert dst_state_idx is not None
+            conv_slot, ssm_slot, conv_flag, ssm_flag = pair_state[i]
+            _nv.wait_slot_signal(conv_flag, expected_value=1, stream=stream)
+            _nv.wait_slot_signal(ssm_flag, expected_value=1, stream=stream)
+            conv_recv = _nv.staging_slot(conv_slot)[:conv_nbytes].view(
+                conv_dtype
+            ).reshape(conv_shape)
+            ssm_recv = _nv.staging_slot(ssm_slot)[:ssm_nbytes].view(
+                ssm_dtype
+            ).reshape(ssm_shape)
+            dst_mamba_conv_states[:, dst_state_idx] = conv_recv
+            dst_mamba_ssm_states[:, dst_state_idx] = ssm_recv
+            flags_used.extend([conv_flag, ssm_flag])
+
+    torch.cuda.current_stream().wait_stream(stream)
+    for slot in flags_used:
+        _nv.reset_flag(slot)
 
 
 def execute_mamba_state_transport(
@@ -544,6 +872,25 @@ def execute_mamba_state_transport(
         f"Mamba state transport (v1) requires matched TP/PP between "
         f"shards — got src_ranks={src_ranks} and dst_ranks={dst_ranks}"
     )
+
+    # NVSHMEM-direct path: single ``put`` per (rank, state) pair into
+    # symmetric staging, ``quiet``, dst scatters. No ``barrier_all``.
+    from megatron.core.inference import nvshmem_migration as _nv
+
+    if _nv.is_initialized():
+        _execute_mamba_state_transport_nvshmem(
+            role=role,
+            layout=layout,
+            src_ranks=src_ranks,
+            dst_ranks=dst_ranks,
+            src_mamba_conv_states=src_mamba_conv_states,
+            src_mamba_ssm_states=src_mamba_ssm_states,
+            src_state_idx=src_state_idx,
+            dst_mamba_conv_states=dst_mamba_conv_states,
+            dst_mamba_ssm_states=dst_mamba_ssm_states,
+            dst_state_idx=dst_state_idx,
+        )
+        return
 
     from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopyService
 
@@ -668,61 +1015,140 @@ def migrate_request_cross_shard(
         The dst-side request id (useful to the caller for future
         lifecycle ops). ``None`` on bystanders.
     """
+    # Thin wrapper around the batch primitive so all of the actual
+    # collective / plan / transport logic lives in exactly one place.
+    # A 1-element batch is the natural single-request shape.
+    migrated_ids = migrate_requests_cross_shard_batch(
+        role=role,
+        engine=engine,
+        request_ids_src=[request_id_src] if request_id_src is not None else None,
+        src_layout=src_layout,
+        dst_layout=dst_layout,
+        src_ranks=src_ranks,
+        dst_ranks=dst_ranks,
+        cross_shard_group=cross_shard_group,
+        my_src_head_offset=my_src_head_offset,
+        my_dst_head_offset=my_dst_head_offset,
+        request_ids_dst=[request_id_dst] if request_id_dst is not None else None,
+    )
+    if migrated_ids:
+        return migrated_ids[0]
+    return None
+
+
+def migrate_requests_cross_shard_batch(
+    *,
+    role: str,
+    engine: "Optional[object]",
+    request_ids_src: Optional[List[int]],
+    src_layout: KVLayout,
+    dst_layout: KVLayout,
+    src_ranks: List[int],
+    dst_ranks: List[int],
+    cross_shard_group: "dist.ProcessGroup",
+    my_src_head_offset: int = 0,
+    my_dst_head_offset: int = 0,
+    request_ids_dst: Optional[List[int]] = None,
+) -> Optional[List[int]]:
+    """Migrate a batch of in-flight requests with a single KV collective.
+
+    Same contract as :func:`migrate_request_cross_shard` but ``N`` requests
+    per invocation. The whole batch goes through:
+
+      - one ``snapshot_request`` loop on src,
+      - one object-list broadcast (N bundles),
+      - one ``inject_request`` loop on dst,
+      - one object-list broadcast (N dst-block lists),
+      - **one** :func:`execute_kv_migration_plan` call whose op list is
+        the concatenation of per-request plans,
+      - one ``execute_mamba_state_transport`` per request (hybrid only),
+      - one ``detach_request`` loop on src.
+
+    Amortizes the NCCL collective + broadcast setup overhead across the
+    batch, which is the main win when the auto-disagg scheduler has
+    multiple requests ready to migrate in the same tick.
+
+    Args:
+        request_ids_src: Source-side request ids. Required when
+            ``role == "src"``; ignored otherwise (dst gets them from
+            the bundles).
+        request_ids_dst: Optional per-request destination ids. If
+            ``None``, each request keeps its src id on the dst side.
+        Other args mirror :func:`migrate_request_cross_shard`.
+
+    Returns:
+        List of dst-side request ids (same length as the input batch)
+        on ``role == "dst"``; ``None`` otherwise. Empty batches return
+        an empty list / ``None``.
+    """
     assert role in ("src", "dst", "bystander"), role
     src_root = src_ranks[0]
     dst_root = dst_ranks[0]
 
-    # --- Step 1+2: src builds bundle, all receive it. ------------------
-    bundle_box: List[Optional[RequestMigrationBundle]] = [None]
-    src_block_ids_box: List[Optional[torch.Tensor]] = [None]
+    # --- Step 1+2: src builds N bundles, broadcasts the list. ---------
+    bundles_box: List[Optional[List[RequestMigrationBundle]]] = [None]
     if role == "src":
-        assert engine is not None and request_id_src is not None
-        bundle, src_blocks = engine.snapshot_request(request_id_src)
-        bundle.src_layout = src_layout
-        bundle.dst_layout = dst_layout
-        # Populate the dst request id now so the payload reaching the
-        # destination is self-contained.
-        bundle.request_id = request_id_dst if request_id_dst is not None else request_id_src
-        bundle_box[0] = bundle
-        src_block_ids_box[0] = src_blocks.clone()
+        assert engine is not None and request_ids_src is not None
+        if request_ids_dst is not None:
+            assert len(request_ids_dst) == len(request_ids_src), (
+                f"request_ids_dst length ({len(request_ids_dst)}) must match "
+                f"request_ids_src length ({len(request_ids_src)})"
+            )
+        bundles: List[RequestMigrationBundle] = []
+        for i, req_id in enumerate(request_ids_src):
+            bundle, _src_blocks = engine.snapshot_request(req_id)
+            bundle.src_layout = src_layout
+            bundle.dst_layout = dst_layout
+            bundle.request_id = (
+                request_ids_dst[i] if request_ids_dst is not None else req_id
+            )
+            bundles.append(bundle)
+        bundles_box[0] = bundles
 
-    # broadcast_object_list sends Python objects via pickle/gloo; it
-    # works for mixed device layouts and handles None on non-root
-    # ranks.
-    dist.broadcast_object_list(bundle_box, src=src_root, group=cross_shard_group)
-    bundle = bundle_box[0]
-    assert bundle is not None
+    dist.broadcast_object_list(bundles_box, src=src_root, group=cross_shard_group)
+    bundles = bundles_box[0]
+    assert bundles is not None
+    if not bundles:
+        # Empty batch is a no-op; skip the remaining collectives rather
+        # than firing them with zero ops (NCCL tolerates zero ops but
+        # the extra barriers aren't worth it).
+        return [] if role == "dst" else None
 
-    # --- Step 3: dst injects, broadcasts new block ids. ---------------
-    dst_block_ids_list_box: List[Optional[List[int]]] = [None]
+    # --- Step 3: dst injects, collects N dst-block lists. -------------
+    dst_blocks_box: List[Optional[List[List[int]]]] = [None]
     if role == "dst":
         assert engine is not None
-        dst_blocks = engine.inject_request(bundle)
-        dst_block_ids_list_box[0] = dst_blocks.tolist()
+        all_dst_blocks: List[List[int]] = []
+        for bundle in bundles:
+            dst_blocks = engine.inject_request(bundle)
+            all_dst_blocks.append(dst_blocks.tolist())
+        dst_blocks_box[0] = all_dst_blocks
 
-    dist.broadcast_object_list(dst_block_ids_list_box, src=dst_root, group=cross_shard_group)
-    dst_block_ids_list = dst_block_ids_list_box[0]
-    assert dst_block_ids_list is not None
+    dist.broadcast_object_list(dst_blocks_box, src=dst_root, group=cross_shard_group)
+    all_dst_blocks = dst_blocks_box[0]
+    assert all_dst_blocks is not None
+    assert len(all_dst_blocks) == len(bundles)
 
-    # --- Step 4: every participant runs the plan. ---------------------
-    def _src_rank_of(tp: int, pp: int, _start=src_root) -> int:
-        # v0 has pp=1 so pp is a no-op; src_ranks is a contiguous
-        # [src_root, src_root + tp_size) window.
-        return _start + tp
+    # --- Step 4: concatenate per-request plans, run one collective. ---
+    # TP-major rank layout within each shard: (tp, pp) lives at offset
+    # ``pp * tp_size + tp``.
+    def _src_rank_of(tp: int, pp: int, _start=src_root, _tp=src_layout.tp_size) -> int:
+        return _start + pp * _tp + tp
 
-    def _dst_rank_of(tp: int, pp: int, _start=dst_root) -> int:
-        return _start + tp
+    def _dst_rank_of(tp: int, pp: int, _start=dst_root, _tp=dst_layout.tp_size) -> int:
+        return _start + pp * _tp + tp
 
-    ops = build_kv_migration_plan(
-        bundle,
-        src_global_rank_of=_src_rank_of,
-        dst_global_rank_of=_dst_rank_of,
-        dst_block_ids=dst_block_ids_list,
-    )
+    all_ops: List[KVMigrationOp] = []
+    for bundle, dst_block_ids in zip(bundles, all_dst_blocks):
+        all_ops.extend(
+            build_kv_migration_plan(
+                bundle,
+                src_global_rank_of=_src_rank_of,
+                dst_global_rank_of=_dst_rank_of,
+                dst_block_ids=dst_block_ids,
+            )
+        )
 
-    # Bystanders in the group still enter execute_kv_migration_plan so
-    # the underlying ``batch_isend_irecv`` stays balanced — they just
-    # have no send/recv ops matching their rank.
     if role == "src":
         memory_buffer = engine.context.memory_buffer
         layout = src_layout
@@ -730,65 +1156,79 @@ def migrate_request_cross_shard(
         memory_buffer = engine.context.memory_buffer
         layout = dst_layout
     else:
-        # Bystander: fabricate a zero-sized buffer of the right dtype /
-        # device so the helper's shape computations don't blow up; the
-        # helper still visits every op but skips ones not touching our
-        # rank. Use the dst layout's dtype — either side's would do.
         memory_buffer = torch.empty(0, device=torch.cuda.current_device())
         layout = dst_layout
 
+    my_rank = dist.get_rank()
+    my_src_pp_stage = (
+        (my_rank - src_root) // src_layout.tp_size if role == "src" else 0
+    )
+    my_dst_pp_stage = (
+        (my_rank - dst_root) // dst_layout.tp_size if role == "dst" else 0
+    )
+    src_layers_per_pp = src_layout.num_layers_total // src_layout.pp_size
+    dst_layers_per_pp = dst_layout.num_layers_total // dst_layout.pp_size
+    my_src_pp_layer_offset = my_src_pp_stage * src_layers_per_pp
+    my_dst_pp_layer_offset = my_dst_pp_stage * dst_layers_per_pp
+
     execute_kv_migration_plan(
-        ops,
+        all_ops,
         memory_buffer,
         layout,
         cross_shard_group,
         my_src_head_offset=my_src_head_offset,
         my_dst_head_offset=my_dst_head_offset,
+        my_src_pp_layer_offset=my_src_pp_layer_offset,
+        my_dst_pp_layer_offset=my_dst_pp_layer_offset,
     )
 
-    # --- Step 4b: Mamba/hybrid models — move the per-request conv +
-    #   SSM state alongside attention KV. v1 requires matched TP/PP
-    #   between src and dst (both layouts must agree on the same mamba
-    #   shape). Each rank reads its own state_idx from its engine.
+    # --- Step 4b: Mamba/hybrid state per request. ---------------------
+    # No batched equivalent today — each request owns a distinct mamba
+    # slot, and transport reads the slot tensor directly. Called in a
+    # loop; the per-request send/recv is already small compared to the
+    # attention KV.
     if src_layout.mamba is not None:
         assert dst_layout.mamba is not None, (
-            "src layout has Mamba state but dst layout does not — "
-            "shards must agree on model shape for migration"
+            "src layout has Mamba state but dst layout does not"
         )
-        src_state_idx = (
-            engine.get_mamba_state_idx_for(request_id_src) if role == "src" else None
-        )
-        dst_state_idx = (
-            engine.get_mamba_state_idx_for(bundle.request_id) if role == "dst" else None
-        )
-        execute_mamba_state_transport(
-            role=role,
-            layout=layout,
-            src_ranks=src_ranks,
-            dst_ranks=dst_ranks,
-            src_mamba_conv_states=(
-                engine.context.mamba_conv_states if role == "src" else None
-            ),
-            src_mamba_ssm_states=(
-                engine.context.mamba_ssm_states if role == "src" else None
-            ),
-            src_state_idx=src_state_idx,
-            dst_mamba_conv_states=(
-                engine.context.mamba_conv_states if role == "dst" else None
-            ),
-            dst_mamba_ssm_states=(
-                engine.context.mamba_ssm_states if role == "dst" else None
-            ),
-            dst_state_idx=dst_state_idx,
-            cross_shard_group=cross_shard_group,
-        )
+        for i, bundle in enumerate(bundles):
+            src_req_id = request_ids_src[i] if role == "src" else None
+            dst_req_id = bundle.request_id
+            src_state_idx = (
+                engine.get_mamba_state_idx_for(src_req_id) if role == "src" else None
+            )
+            dst_state_idx = (
+                engine.get_mamba_state_idx_for(dst_req_id) if role == "dst" else None
+            )
+            execute_mamba_state_transport(
+                role=role,
+                layout=layout,
+                src_ranks=src_ranks,
+                dst_ranks=dst_ranks,
+                src_mamba_conv_states=(
+                    engine.context.mamba_conv_states if role == "src" else None
+                ),
+                src_mamba_ssm_states=(
+                    engine.context.mamba_ssm_states if role == "src" else None
+                ),
+                src_state_idx=src_state_idx,
+                dst_mamba_conv_states=(
+                    engine.context.mamba_conv_states if role == "dst" else None
+                ),
+                dst_mamba_ssm_states=(
+                    engine.context.mamba_ssm_states if role == "dst" else None
+                ),
+                dst_state_idx=dst_state_idx,
+                cross_shard_group=cross_shard_group,
+            )
 
-    # --- Step 5: src cleans up its slot + releases source blocks. -----
+    # --- Step 5: src detaches each slot; returns new ids to dst. -----
     if role == "src":
-        engine.detach_request(request_id_src, keep_blocks=False)
-
+        for req_id in request_ids_src:
+            engine.detach_request(req_id, keep_blocks=False)
+        return None
     if role == "dst":
-        return bundle.request_id
+        return [b.request_id for b in bundles]
     return None
 
 
@@ -814,6 +1254,7 @@ def deserialize_bundle(obj: dict) -> RequestMigrationBundle:
         layout.mamba = _deserialize_mamba(mamba_d)
         return layout
 
+    routing_shape = obj.get("routing_indices_shape")
     return RequestMigrationBundle(
         request_id=obj["request_id"],
         prompt_tokens=list(obj["prompt_tokens"]),
@@ -826,9 +1267,15 @@ def deserialize_bundle(obj: dict) -> RequestMigrationBundle:
         ),
         generated_top_n_logprobs=obj.get("generated_top_n_logprobs"),
         kv_cache_epoch=[tuple(p) for p in obj.get("kv_cache_epoch", [])],
+        policy_epoch=[tuple(p) for p in obj.get("policy_epoch", [])],
         num_kv_blocks=obj["num_kv_blocks"],
         last_block_offset=obj["last_block_offset"],
         src_block_ids=list(obj["src_block_ids"]),
         src_layout=_deserialize_layout(obj.get("src_layout")),
         dst_layout=_deserialize_layout(obj.get("dst_layout")),
+        routing_indices_shape=(
+            tuple(routing_shape) if routing_shape is not None else None
+        ),
+        routing_indices_dtype_name=obj.get("routing_indices_dtype_name"),
+        routing_indices_flat=list(obj.get("routing_indices_flat", [])),
     )

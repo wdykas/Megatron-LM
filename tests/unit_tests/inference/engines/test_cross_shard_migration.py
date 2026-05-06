@@ -25,6 +25,7 @@ import torch.distributed as dist
 from megatron.core.inference.engines.request_migration import (
     KVLayout,
     migrate_request_cross_shard,
+    migrate_requests_cross_shard_batch,
 )
 
 
@@ -201,6 +202,130 @@ class TestCrossShardMigration:
             tokens_after = len(updated.generated_tokens)
             assert tokens_after > tokens_before, (
                 "migrated request did not produce new tokens after resume"
+            )
+
+        dist.destroy_process_group(cross_shard_group)
+
+    @torch.inference_mode()
+    def test_migrate_batch_two_requests_shard0_to_shard1(self):
+        """Batched variant: migrate N=2 requests in a single collective.
+
+        The batch primitive should leave the same post-conditions as
+        calling the single-request primitive twice — source engine
+        drops both, dst engine has both with positive KV block counts
+        and ≥1 carried token. The point of the batched call is the
+        single NCCL transport, not a different correctness contract.
+        """
+        from tests.unit_tests.inference.engines.test_dynamic_engine import (
+            DynamicEngineTestConfig,
+        )
+        from tests.unit_tests.inference.engines.test_dynamic_engine import (
+            TestDynamicInferenceEngine as _EngineScaffold,
+        )
+
+        rank = dist.get_rank()
+        in_shard0 = rank in (0, 1)
+        in_shard1 = rank in (2, 3)
+        src_ranks = [0, 1]
+        dst_ranks = [2, 3]
+
+        # Two initial requests per shard, migrate both of src's away to
+        # dst. dst ends with 4 active requests (its own 2 + 2 migrated);
+        # context_max_requests set accordingly.
+        config = DynamicEngineTestConfig(
+            num_requests=2,
+            min_prompt_length=8,
+            max_prompt_length=8,
+            num_tokens_to_generate=32,
+            num_gap_steps=2,
+            model_provider="gpt",
+            tensor_model_parallel_size=2,
+            context_max_requests=8,
+        )
+        env = _EngineScaffold._build_test_env(config)
+
+        for request in env.requests:
+            env.engine._add_request(request)
+            for _ in range(config.num_gap_steps):
+                _EngineScaffold._run_step(env)
+
+        model_config = env.engine.controller.inference_wrapped_model.model.config
+        ctx = env.engine.context
+        num_kv_heads = model_config.num_query_groups or model_config.num_attention_heads
+        layout_common = dict(
+            pp_size=1,
+            num_layers_total=model_config.num_layers,
+            num_kv_heads_total=num_kv_heads,
+            head_dim=ctx.hidden_size_per_attention_head,
+            block_size_tokens=ctx.block_size_tokens,
+            is_mla=False,
+        )
+        src_layout = KVLayout(tp_size=2, **layout_common)
+        dst_layout = KVLayout(tp_size=2, **layout_common)
+
+        my_src_head_offset = (
+            (rank - src_ranks[0]) * (num_kv_heads // 2) if in_shard0 else 0
+        )
+        my_dst_head_offset = (
+            (rank - dst_ranks[0]) * (num_kv_heads // 2) if in_shard1 else 0
+        )
+
+        cross_shard_group = dist.new_group(ranks=sorted(src_ranks + dst_ranks))
+
+        if in_shard0:
+            role = "src"
+            engine = env.engine
+            request_ids_src = [env.requests[0].request_id, env.requests[1].request_id]
+        elif in_shard1:
+            role = "dst"
+            engine = env.engine
+            request_ids_src = None
+        else:
+            role = "bystander"
+            engine = None
+            request_ids_src = None
+
+        migrated_ids = [20000, 20001]  # disjoint namespace so dst engine can't confuse us
+
+        returned = migrate_requests_cross_shard_batch(
+            role=role,
+            engine=engine,
+            request_ids_src=request_ids_src,
+            src_layout=src_layout,
+            dst_layout=dst_layout,
+            src_ranks=src_ranks,
+            dst_ranks=dst_ranks,
+            cross_shard_group=cross_shard_group,
+            my_src_head_offset=my_src_head_offset,
+            my_dst_head_offset=my_dst_head_offset,
+            request_ids_dst=migrated_ids,
+        )
+
+        if role == "src":
+            # Both original requests migrated out.
+            assert env.requests[0].request_id not in env.engine.requests
+            assert env.requests[1].request_id not in env.engine.requests
+
+        if role == "dst":
+            assert returned == migrated_ids, (
+                f"dst must report the migrated ids in order; got {returned!r}"
+            )
+            for mid in migrated_ids:
+                assert mid in env.engine.requests, f"migrated id {mid} missing on dst"
+                injected = env.engine.get_request(mid)
+                assert len(injected.generated_tokens) >= 1
+            # Continuation: decode step produces more tokens on at least
+            # one of the batched requests.
+            before = {
+                mid: len(env.engine.get_request(mid).generated_tokens) for mid in migrated_ids
+            }
+            _EngineScaffold._run_step(env)
+            _EngineScaffold._run_step(env)
+            after = {
+                mid: len(env.engine.get_request(mid).generated_tokens) for mid in migrated_ids
+            }
+            assert any(after[mid] > before[mid] for mid in migrated_ids), (
+                "no batched-migrated request produced new tokens after resume"
             )
 
         dist.destroy_process_group(cross_shard_group)

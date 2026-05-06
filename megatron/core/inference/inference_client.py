@@ -81,11 +81,23 @@ class InferenceClient:
         self.socket = socket
         self.deserialize = deserialize
         self.completion_futures = {}
+        # client_request_id → asyncio.Future[int] resolved when the coord
+        # acks the server-side id via Headers.SUBMIT_REQUEST_ACK. Callers
+        # that need the server id (to drive cross-shard migration of the
+        # in-flight request) await `wait_for_server_id(client_request_id)`.
+        self._server_id_futures = {}
         self.request_submission_times = {}
         self.next_request_id = 0
 
     def add_request(
-        self, prompt: Union[str, List[int]], sampling_params: SamplingParams
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: SamplingParams,
+        *,
+        target_shard_index: Optional[int] = None,
+        disagg_dst_shard_index: Optional[int] = None,
+        late_dst_shard_index: Optional[int] = None,
+        late_dst_min_tokens: Optional[int] = None,
     ) -> asyncio.Future:
         """
         Submits a new inference request to the coordinator.
@@ -99,6 +111,16 @@ class InferenceClient:
             sampling_params: An object containing the sampling parameters for
                 text generation (e.g., temperature, top_p). It must have a
                 `serialize()` method.
+            target_shard_index: If given, instruct the coordinator to route
+                this submit to an engine registered for that shard
+                (heterogeneous inference, disaggregated prefill/decode).
+                ``None`` preserves the legacy unscoped scheduling. Ignored
+                by coords that have no engines tagged with shards.
+            disagg_dst_shard_index: If given, the auto-disagg scheduler on
+                the serving side migrates this request to the named shard
+                as soon as it has produced its first decode token. This
+                is the per-request opt-in for HTTP-transparent disagg;
+                ``None`` means the request is not eligible for migration.
 
         Returns:
             asyncio.Future: A future that will be resolved with a
@@ -107,13 +129,86 @@ class InferenceClient:
         """
         request_id = self.next_request_id
         self.next_request_id += 1
-        payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
+        # Payload is variable-length so legacy 3-field clients keep
+        # working. The coord decodes positionally:
+        #   [..., target_shard, disagg_dst, late_dst, late_min]
+        # Each later field requires all earlier ones to be present
+        # (None is a valid placeholder).
+        payload: list = [
+            Headers.SUBMIT_REQUEST.value,
+            request_id,
+            prompt,
+            sampling_params.serialize(),
+        ]
+        late_set = (
+            late_dst_shard_index is not None and late_dst_min_tokens is not None
+        )
+        any_extra = (
+            target_shard_index is not None
+            or disagg_dst_shard_index is not None
+            or late_set
+        )
+        if any_extra:
+            payload.append(target_shard_index)
+        if disagg_dst_shard_index is not None or late_set:
+            payload.append(disagg_dst_shard_index)
+        if late_set:
+            payload.append(late_dst_shard_index)
+            payload.append(late_dst_min_tokens)
         payload_serialized = msgpack.packb(payload, use_bin_type=True)
         self.socket.send(payload_serialized)
         assert request_id not in self.completion_futures
-        self.completion_futures[request_id] = asyncio.get_running_loop().create_future()
+        loop = asyncio.get_running_loop()
+        self.completion_futures[request_id] = loop.create_future()
+        # Register an ack-future so a caller can recover the server-side id
+        # the coord assigns (see Headers.SUBMIT_REQUEST_ACK). Always create
+        # this; it's cheap and callers that don't need the id simply never
+        # await it.
+        self._server_id_futures[request_id] = loop.create_future()
         self.request_submission_times[request_id] = time.perf_counter()
         return self.completion_futures[request_id]
+
+    async def wait_for_server_id(self, client_request_id: int) -> int:
+        """Return the server-side id the coord assigned for this submit.
+
+        Resolves when the coord's SUBMIT_REQUEST_ACK arrives. Callers that
+        need the server id (cross-shard migration, direct engine inspection)
+        should await this before triggering the downstream op; the engine
+        only knows the request by its server id.
+        """
+        fut = self._server_id_futures.get(client_request_id)
+        if fut is None:
+            raise KeyError(
+                f"no server_id future for client_request_id={client_request_id}; "
+                "add_request was not called through this client"
+            )
+        return await fut
+
+    def update_request_rank(
+        self,
+        request_id: int,
+        new_shard_index: int,
+        new_dp_rank_within_shard: int = 0,
+    ) -> None:
+        """Inform the coordinator that ``request_id`` has been migrated.
+
+        Sent by the rank-0 driver after a successful engine-level
+        cross-shard migration. The coord rewrites ``request_id_to_rank``
+        and shifts pending-count accounting to the new owner so its
+        eventual ENGINE_REPLY reaches the original HTTP client.
+
+        Args:
+            request_id: Server-side (coord-visible) request id.
+            new_shard_index: Shard that now owns the request.
+            new_dp_rank_within_shard: DP rank inside that shard (0 for
+                the common single-DP-rank-per-shard case).
+        """
+        self._send_signal_to_engines(
+            Headers.UPDATE_REQUEST_RANK,
+            request_id,
+            new_shard_index,
+            new_dp_rank_within_shard,
+        )
 
     @trace_async_exceptions
     async def _recv_task(self):
@@ -138,6 +233,9 @@ class InferenceClient:
                         request_id
                     )
                     completion_future = self.completion_futures.pop(request_id)
+                    # Clean up the server-id future if it was never
+                    # awaited so we don't leak entries.
+                    self._server_id_futures.pop(request_id, None)
                     if completion_future.done():
                         logging.warning(f"Client: The future for {request_id} has been cancelled!")
                         continue
@@ -145,6 +243,11 @@ class InferenceClient:
                         DynamicInferenceRequest.deserialize(reply) if self.deserialize else reply
                     )
                     completion_future.set_result(completed_request)
+                elif header == Headers.SUBMIT_REQUEST_ACK:
+                    client_request_id, server_request_id = data[1:]
+                    fut = self._server_id_futures.get(client_request_id)
+                    if fut is not None and not fut.done():
+                        fut.set_result(server_request_id)
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue
@@ -188,18 +291,25 @@ class InferenceClient:
         payload_serialized = msgpack.packb(payload, use_bin_type=True)
         self.socket.send(payload_serialized)
 
-    def pause_engines(self):
+    def pause_engines(self, *, shard_indices: Optional[List[int]] = None):
         """Sends PAUSE to all engines via coordinator.
 
         The coordinator broadcasts PAUSE. Each engine reaches EP consensus,
         then synchronizes via a world-wide barrier before transitioning to
         PAUSED. Callers should await engine.paused for confirmation.
-        """
-        self._send_signal_to_engines(Headers.PAUSE)
 
-    def unpause_engines(self) -> None:
+        Args:
+            shard_indices: If provided, only engines registered with
+                those shard indices receive the PAUSE — other shards
+                keep serving. Used by cross-shard request migration to
+                quiesce just the two participating shards. ``None``
+                preserves whole-world behavior.
+        """
+        self._send_signal_to_engines(Headers.PAUSE, shard_indices)
+
+    def unpause_engines(self, *, shard_indices: Optional[List[int]] = None) -> None:
         """Sends UNPAUSE to all engines. No synchronization needed."""
-        self._send_signal_to_engines(Headers.UNPAUSE)
+        self._send_signal_to_engines(Headers.UNPAUSE, shard_indices)
 
     def set_generation_epoch(self, generation_epoch: int):
         """Sends a signal to stamp all in-flight requests with the given generation epoch.
@@ -209,19 +319,20 @@ class InferenceClient:
         """
         self._send_signal_to_engines(Headers.SET_GENERATION_EPOCH, generation_epoch)
 
-    def suspend_engines(self):
+    def suspend_engines(self, *, shard_indices: Optional[List[int]] = None):
         """Sends SUSPEND to all engines via coordinator. Requires PAUSED.
 
-        Callers should await engine.suspended for confirmation.
+        Callers should await engine.suspended for confirmation. See
+        :meth:`pause_engines` for the ``shard_indices`` contract.
         """
-        self._send_signal_to_engines(Headers.SUSPEND)
+        self._send_signal_to_engines(Headers.SUSPEND, shard_indices)
 
-    def resume_engines(self):
+    def resume_engines(self, *, shard_indices: Optional[List[int]] = None):
         """Sends RESUME to all engines via coordinator. Requires SUSPENDED.
 
         Callers should await engine.paused (or engine.running after UNPAUSE) for confirmation.
         """
-        self._send_signal_to_engines(Headers.RESUME)
+        self._send_signal_to_engines(Headers.RESUME, shard_indices)
 
     def stop_engines(self):
         """Sends STOP to all engines via coordinator. Requires PAUSED or SUSPENDED.
@@ -230,6 +341,40 @@ class InferenceClient:
         Does not affect the coordinator.
         """
         self._send_signal_to_engines(Headers.STOP)
+
+    def migrate_request_batch(
+        self,
+        request_ids: List[int],
+        src_shard_index: int,
+        dst_shard_index: int,
+        bundles: Optional[List[dict]] = None,
+        dst_dp_rank_within_shard: int = 0,
+    ) -> None:
+        """Tell engines in src + dst shards to migrate ``request_ids`` from
+        src to dst. The coordinator forwards a ``MIGRATE_BATCH`` signal to
+        the named shards' engines; each engine pops the signal and runs
+        its registered migration handler.
+
+        ``bundles`` is the per-request serialized
+        :class:`RequestMigrationBundle` (msgpack-compatible dict, one per
+        ``request_ids`` entry). Carrying bundles inline lets engines run
+        migration without a cross-shard broadcast — the dst engine has
+        the metadata it needs to allocate KV blocks the moment it sees
+        the signal. Pass ``None`` only for backward-compat paths that
+        rebuild bundles via the cross-shard collective.
+
+        Fire-and-forget: returns once the message is enqueued.
+        """
+        if bundles is None:
+            bundles = []
+        self._send_signal_to_engines(
+            Headers.MIGRATE_BATCH,
+            list(request_ids),
+            int(src_shard_index),
+            int(dst_shard_index),
+            list(bundles),
+            int(dst_dp_rank_within_shard),
+        )
 
     def shutdown_coordinator(self):
         """Tells the coordinator process to exit its main loop.
@@ -253,5 +398,9 @@ class InferenceClient:
             if not future.done():
                 future.cancel()
         self.completion_futures.clear()
+        for future in self._server_id_futures.values():
+            if not future.done():
+                future.cancel()
+        self._server_id_futures.clear()
         self.socket.close(linger=0)
         self.context.term()

@@ -184,8 +184,8 @@ class TestHybridMigration:
 @pytest.mark.skipif(
     not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
 )
-class TestRouterReplayReject:
-    """MoE router-replay migration is explicitly unsupported for now."""
+class TestRouterReplayRoundtrip:
+    """MoE router-replay history survives snapshot → inject."""
 
     @classmethod
     def teardown_class(cls):
@@ -196,9 +196,73 @@ class TestRouterReplayReject:
         Utils.destroy_model_parallel()
 
     @torch.inference_mode()
-    def test_snapshot_rejects_when_routing_indices_present(self):
-        """If the request has accumulated routing_indices, snapshot
-        must refuse — the bundle doesn't carry routing history yet."""
+    def test_routing_indices_survive_snapshot_then_inject(self):
+        """Snapshot captures ``routing_indices`` shape + values; after a
+        same-engine round-trip (detach + inject) the destination's
+        request has the same tensor restored. A real MoE engine would
+        then continue decode with deterministic router replay — here we
+        verify the bundle carries the history losslessly, which is the
+        part that used to be hard-refused.
+        """
+        config = DynamicEngineTestConfig(
+            num_requests=1,
+            min_prompt_length=8,
+            max_prompt_length=8,
+            num_tokens_to_generate=16,
+            num_gap_steps=2,
+            model_provider="gpt",
+            context_max_requests=4,
+        )
+        env = _EngineScaffold._build_test_env(config)
+        env.engine._add_request(env.requests[0])
+        for _ in range(config.num_gap_steps):
+            _EngineScaffold._run_step(env)
+
+        # Stamp deterministic routing_indices on the request. Shape
+        # matches the engine's real invariant
+        # (total_tokens, num_layers, topk); values are a permutation so
+        # we can verify lossless reinflation.
+        device = torch.cuda.current_device()
+        ri = torch.arange(4 * 3 * 2, dtype=torch.int32, device=device).reshape(4, 3, 2)
+        src_req = env.engine.get_request(env.requests[0].request_id)
+        src_req.routing_indices = ri.clone()
+
+        bundle, src_blocks = env.engine.snapshot_request(env.requests[0].request_id)
+        assert bundle.routing_indices_shape == (4, 3, 2), bundle.routing_indices_shape
+        assert bundle.routing_indices_dtype_name == "int32"
+        assert len(bundle.routing_indices_flat) == 24
+
+        # Simulate the transport: detach (keep blocks so inject has KV)
+        # then inject with a fresh id.
+        ctx = env.engine.context
+        kv_snapshot = ctx.memory_buffer[..., src_blocks, :, :, :].clone()
+        env.engine.detach_request(env.requests[0].request_id, keep_blocks=True)
+
+        from dataclasses import replace as dataclass_replace
+
+        injected_id = 500_000 + env.requests[0].request_id
+        injected_bundle = dataclass_replace(bundle, request_id=injected_id)
+        dst_blocks = env.engine.inject_request(injected_bundle)
+        ctx.memory_buffer[..., dst_blocks, :, :, :] = kv_snapshot
+        ctx.kv_block_allocator.release_memory_blocks(src_blocks)
+
+        dst_req = env.engine.get_request(injected_id)
+        assert dst_req.routing_indices is not None, (
+            "inject_request dropped routing_indices — migration lost MoE "
+            "replay history"
+        )
+        assert dst_req.routing_indices.shape == (4, 3, 2)
+        assert dst_req.routing_indices.dtype == torch.int32
+        torch.testing.assert_close(
+            dst_req.routing_indices.cpu(), ri.cpu(), rtol=0, atol=0
+        )
+
+    @torch.inference_mode()
+    def test_no_routing_indices_means_empty_bundle_fields(self):
+        """A request without routing_indices produces a bundle with
+        ``routing_indices_shape is None`` and an empty flat list —
+        nothing to rehydrate on the destination.
+        """
         config = DynamicEngineTestConfig(
             num_requests=1,
             min_prompt_length=8,
@@ -212,12 +276,6 @@ class TestRouterReplayReject:
         for _ in range(config.num_gap_steps):
             _EngineScaffold._run_step(env)
 
-        # Fake a populated routing_indices on the request record; the
-        # engine's step loop would normally populate this on a real MoE
-        # model but our GPT fixture doesn't run MoE.
-        req = env.engine.get_request(env.requests[0].request_id)
-        req.routing_indices = torch.zeros(
-            (4, 2, 2), dtype=torch.int32, device=torch.cuda.current_device()
-        )
-        with pytest.raises(AssertionError, match="routing_indices"):
-            env.engine.snapshot_request(env.requests[0].request_id)
+        bundle, _ = env.engine.snapshot_request(env.requests[0].request_id)
+        assert bundle.routing_indices_shape is None
+        assert bundle.routing_indices_flat == []

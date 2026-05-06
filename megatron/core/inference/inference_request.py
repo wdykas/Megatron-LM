@@ -374,6 +374,23 @@ class DynamicInferenceRequest(InferenceRequest):
     # Computed field - not passed by caller
     precomputed_block_hashes: List[int] = field(default_factory=list)
 
+    # Disaggregated-inference hint. When set, the auto-disagg scheduler
+    # on MegatronLocalMulti migrates this request to the named shard as
+    # soon as it has produced its first decode token. Untagged requests
+    # (``None``) remain on their serving shard end-to-end.
+    disagg_dst_shard_index: Optional[int] = None
+
+    # Two-stage / tail-cut migration hint. When ``late_dst_shard_index``
+    # and ``late_dst_min_tokens`` are both set, the auto-disagg scheduler
+    # migrates the request a second time once its generated_tokens count
+    # reaches ``late_dst_min_tokens``. The intended use case is
+    # "throughput-optimized decode for the bulk → latency-optimized
+    # decode for the tail": short rollouts run cheaply on a high-DP
+    # shard, long rollouts get pulled onto a high-TP shard once they
+    # cross the tail threshold.
+    late_dst_shard_index: Optional[int] = None
+    late_dst_min_tokens: Optional[int] = None
+
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
         if self.prompt_tokens is not None:

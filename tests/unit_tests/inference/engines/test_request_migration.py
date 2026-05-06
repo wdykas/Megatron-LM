@@ -187,22 +187,50 @@ def test_plan_mla():
         assert op.dst_rank == 2
 
 
-def test_plan_rejects_pp():
-    """PP>1 is unsupported in v0."""
-    bundle = _sample_bundle()
+def test_plan_matched_pp():
+    """src_pp == dst_pp > 1: one op per pp stage per (tp pair).
+
+    With PP=2, TP=1 on both sides and 4 layers, stage 0 owns layers
+    [0, 2) and stage 1 owns [2, 4). Every (src_pp, dst_pp) diagonal
+    pair emits one op covering that stage's layers; off-diagonal pairs
+    have no layer overlap and emit nothing.
+    """
+    bundle = _sample_bundle(src_tp=1, dst_tp=1, num_kv_heads=4, num_layers=4)
     bundle.src_layout.pp_size = 2
-    bundle.src_layout.num_layers_total = 4  # still divisible
-    try:
-        build_kv_migration_plan(
-            bundle,
-            src_global_rank_of=lambda tp, pp: 0,
-            dst_global_rank_of=lambda tp, pp: 1,
-            dst_block_ids=[200, 201, 202],
-        )
-    except AssertionError as e:
-        assert "PP=1" in str(e)
-    else:
-        raise AssertionError("expected PP>1 to be rejected")
+    bundle.dst_layout.pp_size = 2
+    # Ranks: src shard [0,1] with (tp=0,pp=0)=0, (tp=0,pp=1)=1;
+    # dst shard [2,3] with (tp=0,pp=0)=2, (tp=0,pp=1)=3.
+    ops = build_kv_migration_plan(
+        bundle,
+        src_global_rank_of=lambda tp, pp: pp,  # tp=1 so pp is the only stride
+        dst_global_rank_of=lambda tp, pp: 2 + pp,
+        dst_block_ids=[200, 201, 202],
+    )
+    # Diagonals only: (src_pp=0,dst_pp=0) + (src_pp=1,dst_pp=1).
+    assert len(ops) == 2
+    pairs = sorted((o.src_rank, o.dst_rank, o.layer_range) for o in ops)
+    assert pairs == [(0, 2, (0, 2)), (1, 3, (2, 4))]
+
+
+def test_plan_mismatched_pp_reshape():
+    """Reshape across PP: src_pp=1, dst_pp=2, 4 layers.
+
+    Source rank 0 owns all 4 layers; destination ranks 1 and 2 own
+    layers [0,2) and [2,4) respectively. Plan emits one op per dst
+    stage, each carrying just the layers that stage owns.
+    """
+    bundle = _sample_bundle(src_tp=1, dst_tp=1, num_kv_heads=4, num_layers=4)
+    bundle.src_layout.pp_size = 1
+    bundle.dst_layout.pp_size = 2
+    ops = build_kv_migration_plan(
+        bundle,
+        src_global_rank_of=lambda tp, pp: 0,
+        dst_global_rank_of=lambda tp, pp: 1 + pp,
+        dst_block_ids=[200, 201, 202],
+    )
+    assert len(ops) == 2
+    pairs = sorted((o.src_rank, o.dst_rank, o.layer_range) for o in ops)
+    assert pairs == [(0, 1, (0, 2)), (0, 2, (2, 4))]
 
 
 def test_plan_rejects_head_count_mismatch():

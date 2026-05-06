@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
 from itertools import repeat
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -296,6 +296,25 @@ class DynamicInferenceEngine(AbstractEngine):
         self._state_events[EngineState.RUNNING].set()
         self._pending_signals = deque()
 
+        # Cross-shard migration handler registered by the inference
+        # interface (e.g. ``MegatronLocalMulti``) at launch time.
+        # Invoked with ``(request_ids, src_shard, dst_shard, bundles)``
+        # — bundles are per-request serialized migration envelopes
+        # carried inline through the coord so dst engines don't need
+        # a cross-shard broadcast. The handler is non-blocking: it
+        # kicks off the NVSHMEM transport on the migration stream
+        # and pushes a pending entry into ``_pending_migrations``;
+        # :meth:`_poll_pending_migrations` finalizes them later.
+        self._migration_handler: Optional[
+            Callable[[List[int], int, int, List[dict]], None]
+        ] = None
+        # Pending migration entries. Each entry is an opaque dict
+        # owned by the migration handler — the engine just polls
+        # ``poll_fn(entry)`` once per tick and drops entries whose
+        # poll returns True. The handler does whatever finalization
+        # is needed (detach src blocks / scatter+inject on dst).
+        self._pending_migrations: List[dict] = []
+
         self.resume_request_ids = None
 
         # Speculative decoding acceptance tracking.
@@ -420,6 +439,61 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.capture_stats = capture_stats
 
+    def set_migration_handler(
+        self,
+        handler: Optional[Callable[[List[int], int, int, List[dict]], None]],
+    ) -> None:
+        """Register the cross-shard migration handler.
+
+        Invoked **non-blockingly** inside the engine's run loop when a
+        ``Headers.MIGRATE_BATCH`` signal arrives from the coordinator.
+        Receives ``(request_ids, src_shard, dst_shard, bundles)``.
+        Bundles are msgpack dicts carried inline on the coord channel
+        so the dst engine doesn't need a cross-shard broadcast.
+
+        The handler kicks off the NVSHMEM transport (``put_signal`` on
+        src, schedule scatter on dst) and pushes a pending entry into
+        :attr:`_pending_migrations`. The engine's tick poll
+        finalizes each entry once its asynchronous transport is done.
+        """
+        self._migration_handler = handler
+
+    def push_pending_migration(self, entry: dict) -> None:
+        """Register an in-flight migration entry. The handler builds
+        the dict; the only required key is ``poll`` — a callable that
+        returns ``True`` when the migration has completed and any
+        engine-side cleanup (e.g. ``detach_request`` on src,
+        ``inject_request`` + scatter on dst) has been performed.
+        """
+        assert callable(entry.get("poll")), (
+            "pending migration entry must include a callable 'poll'"
+        )
+        self._pending_migrations.append(entry)
+
+    def _poll_pending_migrations(self) -> int:
+        """Poll every pending migration's completion callback. Drop
+        entries whose ``poll()`` returns True. Returns the count of
+        completed migrations this tick. Called once per engine loop
+        iteration; cheap when no migrations are in flight."""
+        if not self._pending_migrations:
+            return 0
+        completed = 0
+        still_pending: List[dict] = []
+        for entry in self._pending_migrations:
+            try:
+                done = bool(entry["poll"]())
+            except Exception as e:  # pragma: no cover - defensive
+                logging.warning(
+                    "Engine: pending migration poll raised %s; dropping entry", e
+                )
+                done = True
+            if done:
+                completed += 1
+            else:
+                still_pending.append(entry)
+        self._pending_migrations = still_pending
+        return completed
+
     @internal_api
     async def start_listening_to_data_parallel_coordinator(
         self,
@@ -429,6 +503,8 @@ class DynamicInferenceEngine(AbstractEngine):
         hostname: str | None = None,
         coordinator_schedule_output_path: str | None = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
+        coordinator_addr: str | None = None,
+        shard_index: int | None = None,
     ):
         """Initializes ZMQ communication to connect the engine with an inference coordinator.
 
@@ -539,7 +615,15 @@ class DynamicInferenceEngine(AbstractEngine):
                     f"is already in use."
                 )
         elif not launch_inference_coordinator:
-            dp_addr = f"tcp://{local_ip}:{inference_coordinator_port}"
+            # Prefer an explicit addr (e.g. from a unified coord spawned
+            # outside this method by multi_shard.launch) over the legacy
+            # host:port assembly. The explicit addr carries host + port
+            # together so it also works across nodes where the coord
+            # binds on a different host than the engine.
+            if coordinator_addr is not None:
+                dp_addr = coordinator_addr
+            else:
+                dp_addr = f"tcp://{local_ip}:{inference_coordinator_port}"
         else:
             dp_addr = None
 
@@ -564,7 +648,15 @@ class DynamicInferenceEngine(AbstractEngine):
         torch.distributed.broadcast_object_list(bcast, src=mp_src, group=mp_group)
         [mp_req_addr, mp_len_addr] = bcast
 
-        identity = f'mp-coord-{dp_rank}'
+        # Identity must be unique across every engine that registers with
+        # the same coord. Per-shard coord only sees one shard's DP ranks,
+        # so `mp-coord-{dp_rank}` is unambiguous there; a unified coord
+        # can receive the same dp_rank from multiple shards, so prefix
+        # with the shard index when one was provided.
+        if shard_index is not None:
+            identity = f'mp-coord-s{shard_index}-{dp_rank}'
+        else:
+            identity = f'mp-coord-{dp_rank}'
         if self.is_mp_coordinator:
             # 1. Create dealer sockets where tp_rank = 0 and pp_rank = 0
             #    These will receive requests from an InferenceCoordinator.
@@ -573,8 +665,17 @@ class DynamicInferenceEngine(AbstractEngine):
             self.socket_for_receiving_requests.setsockopt(zmq.IDENTITY, identity.encode('utf-8'))
             self.socket_for_receiving_requests.connect(dp_addr)
 
-            # send empty string. this is used to register with the coordinator.
-            self.socket_for_receiving_requests.send(b"")
+            # Register with the coord. The legacy handshake is a single
+            # empty frame (b""); when a shard index is available we use
+            # REGISTER_DP_RANK instead so the coord can do shard-scoped
+            # routing for heterogeneous serving.
+            if shard_index is not None:
+                registration_payload = msgpack.packb(
+                    [Headers.REGISTER_DP_RANK.value, shard_index], use_bin_type=True
+                )
+                self.socket_for_receiving_requests.send(registration_payload)
+            else:
+                self.socket_for_receiving_requests.send(b"")
 
             # 2. Create a publisher socket. This is used to publish or broadcast
             #    requests within the model parallel group
@@ -910,24 +1011,23 @@ class DynamicInferenceEngine(AbstractEngine):
         )
         request = self.get_request(request_id)
 
-        # MoE router replay: the per-token per-layer routing decisions
-        # accumulated in ``request.routing_indices`` are *not* carried
-        # across shards yet, so a request that has recorded routing
-        # history would drop it on migration — breaking RL flows that
-        # rely on deterministic router replay. Refuse explicitly until
-        # the bundle gains a ``routing_indices`` field and
-        # inject_request hydrates it.
-        if getattr(request, "routing_indices", None) is not None and (
-            request.routing_indices.numel() > 0
-            if isinstance(request.routing_indices, torch.Tensor)
-            else len(request.routing_indices) > 0
-        ):
-            raise AssertionError(
-                f"request {request_id} has accumulated routing_indices "
-                f"(MoE router replay); migration does not yet carry "
-                f"routing history across shards. Disable router replay or "
-                f"wait for the follow-up that extends RequestMigrationBundle."
+        # MoE router-replay history: if the request has accumulated
+        # per-token per-layer routing decisions (shape
+        # (total_tokens, num_layers, topk)), serialize them into the
+        # bundle so inject_request can rehydrate on the destination.
+        # Empty / None => no history to carry.
+        routing_shape: Optional[Tuple[int, int, int]] = None
+        routing_dtype_name: Optional[str] = None
+        routing_flat: List[int] = []
+        ri = getattr(request, "routing_indices", None)
+        if isinstance(ri, torch.Tensor) and ri.numel() > 0:
+            assert ri.dim() == 3, (
+                f"routing_indices must be 3-D (total_tokens, num_layers, topk); "
+                f"got shape {tuple(ri.shape)}"
             )
+            routing_shape = tuple(int(d) for d in ri.shape)  # type: ignore[assignment]
+            routing_dtype_name = str(ri.dtype).split(".")[-1]
+            routing_flat = ri.detach().cpu().reshape(-1).tolist()
 
         # Locate the request's current slot in the context. Slots are
         # reshuffled across steps; a fresh lookup is required.
@@ -996,6 +1096,7 @@ class DynamicInferenceEngine(AbstractEngine):
             else None
         )
         kv_cache_epoch = [tuple(pair) for pair in (request.kv_cache_epoch or [])]
+        policy_epoch = [tuple(pair) for pair in (request.policy_epoch or [])]
 
         bundle = RequestMigrationBundle(
             request_id=request_id,
@@ -1005,11 +1106,15 @@ class DynamicInferenceEngine(AbstractEngine):
             generated_log_probs=generated_log_probs,
             generated_top_n_logprobs=None,
             kv_cache_epoch=kv_cache_epoch,
+            policy_epoch=policy_epoch,
             num_kv_blocks=block_count,
             last_block_offset=last_block_offset,
             src_block_ids=block_ids.tolist(),
             src_layout=src_layout,
             dst_layout=None,
+            routing_indices_shape=routing_shape,
+            routing_indices_dtype_name=routing_dtype_name,
+            routing_indices_flat=routing_flat,
         )
         return bundle, block_ids
 
@@ -1052,9 +1157,10 @@ class DynamicInferenceEngine(AbstractEngine):
         ``keep_blocks=False`` the blocks are released immediately —
         equivalent to a fire-and-forget abort.
 
-        Must be called between engine steps. Rejects Mamba / hybrid
-        models for now — their per-request mamba slot would also need
-        detachment and v0 only supports GPT-style attention.
+        Must be called between engine steps. Hybrid / Mamba models also
+        return the per-request Mamba state slot to the allocator as
+        part of the detach (see :meth:`get_mamba_state_idx_for` for how
+        the slot index is tracked).
 
         Args:
             request_id: Request to detach. Must be in the active batch.
@@ -1164,8 +1270,9 @@ class DynamicInferenceEngine(AbstractEngine):
                each returned block id (via the migration transport).
             3. The next call to :meth:`step_modern` will resume generation.
 
-        Must be called between engine steps. Rejects Mamba / hybrid
-        models for v0.
+        Must be called between engine steps. Hybrid / Mamba models also
+        allocate a fresh per-request Mamba state slot as part of the
+        injection; the caller fills it via the migration transport.
 
         Args:
             bundle: Migration envelope produced by
@@ -1201,15 +1308,36 @@ class DynamicInferenceEngine(AbstractEngine):
             prompt_tokens=prompt_tokens,
             sampling_params=sampling,
         )
-        # The engine uses list-style mutation (`generated_tokens += tokens`)
-        # on the active request; tensorisation happens at serialisation
-        # time. Mirror that here so a subsequent step can append cleanly.
+        # The engine uses list-style mutation (`generated_tokens += tokens`,
+        # ``generated_log_probs.append(...)``) on the active request;
+        # tensorisation happens at serialisation time. Mirror that here
+        # so a subsequent step can append cleanly. Wrapping log probs as
+        # a tensor instead — as we used to — breaks
+        # ``post_process_requests`` which does ``if not request.
+        # generated_log_probs:`` and then appends, both of which expect
+        # list semantics.
         request.generated_tokens = list(bundle.generated_tokens)
         if bundle.generated_log_probs is not None:
-            request.generated_log_probs = torch.tensor(
-                bundle.generated_log_probs, dtype=torch.float32, device=device
-            )
+            request.generated_log_probs = list(bundle.generated_log_probs)
         request.kv_cache_epoch = [tuple(p) for p in bundle.kv_cache_epoch]
+        # Restore policy_epoch from the bundle so the HTTP-side
+        # InferenceResponse pydantic schema (which requires a list)
+        # accepts the migrated request's reply.
+        request.policy_epoch = [tuple(p) for p in bundle.policy_epoch]
+        # Rehydrate MoE router-replay history if the source carried any.
+        # The engine's post_process_requests appends each step's routing
+        # decisions to this tensor (torch.cat along dim 0), so preserving
+        # the shape + dtype lets decode continue deterministically on
+        # the destination.
+        if (
+            bundle.routing_indices_shape is not None
+            and bundle.routing_indices_dtype_name is not None
+            and bundle.routing_indices_flat
+        ):
+            routing_dtype = getattr(torch, bundle.routing_indices_dtype_name)
+            request.routing_indices = torch.tensor(
+                bundle.routing_indices_flat, dtype=routing_dtype, device=device
+            ).reshape(bundle.routing_indices_shape)
         request.status = Status.ACTIVE_AND_GENERATING_TOKENS
 
         # Allocate KV blocks before touching context state so an
@@ -1236,7 +1364,15 @@ class DynamicInferenceEngine(AbstractEngine):
         ctx.request_ids[slot_idx] = bundle.request_id
         ctx.request_in_prefill_status_tensor[slot_idx] = 0  # DECODE, not PREFILL
         ctx.request_query_lengths[slot_idx] = 1
-        ctx.request_output_lengths[slot_idx] = total_len + num_tokens_to_generate
+        # ``request_output_lengths`` is the absolute cap: ``prompt + N`` where
+        # N = sampling.num_tokens_to_generate. It is set once in
+        # add_request (line ~1419 in dynamic_context.py) and never grows during
+        # generation. The earlier ``total_len + N`` here lets a migrated
+        # request generate N more tokens past its original cap and eventually
+        # overflow ``max_kv_block_count = ceil(max_seq / block_size)`` —
+        # observed as a CUDA index OOB in resume_paused_requests when
+        # ``request_kv_block_counts[row] == max_kv_block_count``.
+        ctx.request_output_lengths[slot_idx] = prompt_len + num_tokens_to_generate
 
         # Per-request sampling metadata (temperature, top_k, top_p,
         # termination_id, etc.). Without this the slot inherits stale /
@@ -1389,6 +1525,10 @@ class DynamicInferenceEngine(AbstractEngine):
         request_id: int,
         prompt: Union[str, List[int], Tensor],
         sampling_params: Optional[SamplingParams] = None,
+        *,
+        disagg_dst_shard_index: Optional[int] = None,
+        late_dst_shard_index: Optional[int] = None,
+        late_dst_min_tokens: Optional[int] = None,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add request to inference context.
 
@@ -1396,6 +1536,14 @@ class DynamicInferenceEngine(AbstractEngine):
             request_id (int): Unique ID of request.
             prompt (Union[str, Tensor]): Prompt as either a text string or token IDs.
             sampling_params (Optional[SamplingParams]): Sampling parameters for the request.
+            disagg_dst_shard_index: Optional shard index the auto-disagg
+                scheduler should migrate this request to once it has
+                produced a first decode token. ``None`` opts out.
+            late_dst_shard_index / late_dst_min_tokens: Optional second-
+                stage migration target. When both are set, the scheduler
+                migrates the request a second time once it has produced
+                ``late_dst_min_tokens`` total tokens — tail-cutting onto
+                a latency-optimized decode shard.
 
         Return:
             Returns an asyncio `Future[DynamicInferenceRequest]` for the user to wait on.
@@ -1438,6 +1586,9 @@ class DynamicInferenceEngine(AbstractEngine):
             sampling_params=sampling_params,
             block_size_tokens=self.context.block_size_tokens,
             enable_prefix_caching=self.context.enable_prefix_caching,
+            disagg_dst_shard_index=disagg_dst_shard_index,
+            late_dst_shard_index=late_dst_shard_index,
+            late_dst_min_tokens=late_dst_min_tokens,
         )
 
         # Add request.
@@ -2501,10 +2652,30 @@ class DynamicInferenceEngine(AbstractEngine):
             data = msgpack.unpackb(message, raw=False)
             header = Headers(data[0])
             if header == Headers.SUBMIT_REQUEST:
-                request_id, prompt, sampling_params = data[1:]
+                # Variable-length engine-facing SUBMIT:
+                #   3: legacy (request_id, prompt, params)
+                #   4: + disagg_dst_shard_index
+                #   6: + late_dst_shard_index, late_dst_min_tokens
+                fields = data[1:]
+                if len(fields) not in (3, 4, 6):
+                    raise ValueError(
+                        f"SUBMIT_REQUEST from coord expected 3, 4, or 6 fields, "
+                        f"got {len(fields)}"
+                    )
+                request_id, prompt, sampling_params = fields[:3]
+                disagg_dst = fields[3] if len(fields) >= 4 else None
+                late_dst = fields[4] if len(fields) >= 6 else None
+                late_min = fields[5] if len(fields) >= 6 else None
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 nvtx_range_push("add_request")
-                self.add_request(request_id, prompt, sampling_params)
+                self.add_request(
+                    request_id,
+                    prompt,
+                    sampling_params,
+                    disagg_dst_shard_index=disagg_dst,
+                    late_dst_shard_index=late_dst,
+                    late_dst_min_tokens=late_min,
+                )
                 nvtx_range_pop("add_request")
             elif header == Headers.SET_GENERATION_EPOCH:
                 new_generation_epoch = data[1]
@@ -2567,6 +2738,52 @@ class DynamicInferenceEngine(AbstractEngine):
                 if self.state == EngineState.SUSPENDED:
                     self._state_events[EngineState.SUSPENDED].clear()
                 self.state = EngineState.STOPPING
+
+            elif header == Headers.MIGRATE_BATCH:
+                # Coord-mediated cross-shard migration. Payload now
+                # carries ``bundles`` inline (one per request_id) so
+                # the dst engine has all metadata it needs to allocate
+                # KV blocks immediately — no cross-shard broadcast.
+                # The handler runs *non-blocking*: it kicks off the
+                # NVSHMEM transport on the migration stream and
+                # registers a pending entry; the engine's tick poll
+                # finalizes the migration when the data arrives.
+                handler = getattr(self, '_migration_handler', None)
+                if handler is None:
+                    logging.warning(
+                        "Engine: ignoring MIGRATE_BATCH (no handler registered)"
+                    )
+                else:
+                    bundles = []
+                    dst_dp_rank = 0
+                    if len(data) >= 6:
+                        (
+                            _,
+                            request_ids,
+                            src_shard_index,
+                            dst_shard_index,
+                            bundles,
+                            dst_dp_rank,
+                        ) = data
+                    elif len(data) >= 5:
+                        _, request_ids, src_shard_index, dst_shard_index, bundles = (
+                            data
+                        )
+                    else:
+                        _, request_ids, src_shard_index, dst_shard_index = data
+                    try:
+                        handler(
+                            request_ids,
+                            src_shard_index,
+                            dst_shard_index,
+                            bundles,
+                            dst_dp_rank,
+                        )
+                    except Exception as e:
+                        logging.error(
+                            "Engine: MIGRATE_BATCH handler raised %s — "
+                            "continuing run loop", e,
+                        )
 
             else:
                 raise UnknownHeaderError(header)
@@ -2712,6 +2929,11 @@ class DynamicInferenceEngine(AbstractEngine):
         try:
             while True:
                 self.schedule_requests()
+                # Drain any in-flight cross-shard migrations whose
+                # async transport has completed since the last tick.
+                # Cheap (just a few list-poll calls) when no
+                # migrations are pending.
+                self._poll_pending_migrations()
 
                 if self.state in (EngineState.RUNNING, EngineState.PAUSING):
                     local_pending = self.context.get_active_request_count() + len(

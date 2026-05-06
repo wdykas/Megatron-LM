@@ -692,28 +692,42 @@ class DynamicInferenceContext(BaseInferenceContext):
             logging.info("\n".join(log_lines))
 
     def _allocate_memory_buffer(self):
-        """Allocate the KV cache memory buffer."""
+        """Allocate the KV cache memory buffer.
+
+        When :mod:`megatron.core.inference.nvshmem_migration` has been
+        initialized (i.e. the inference interface is configured for
+        cross-shard request migration), the buffer is allocated on the
+        NVSHMEM symmetric heap so that direct one-sided ``put`` between
+        engines is possible without staging. Heterogeneous shards have
+        different per-rank KV sizes; the symmetric helper sizes the
+        underlying byte allocation to the world-wide max so every PE's
+        symmetric region is the same length.
+        """
         if self.cache_mla_latent:
-            self.memory_buffer = torch.empty(
-                (
-                    self.num_attention_layers,
-                    self.kv_block_allocator.total_count,
-                    self.block_size_tokens,
-                    self.kv_reduced_dim,
-                ),
-                dtype=self.params_dtype,
-                device=torch.cuda.current_device(),
+            kv_shape = (
+                self.num_attention_layers,
+                self.kv_block_allocator.total_count,
+                self.block_size_tokens,
+                self.kv_reduced_dim,
+            )
+        else:
+            kv_shape = (
+                2,  # key and value
+                self.num_attention_layers,
+                self.kv_block_allocator.total_count,
+                self.block_size_tokens,
+                self.num_attention_heads_per_partition,
+                self.hidden_size_per_attention_head,
+            )
+        from megatron.core.inference import nvshmem_migration
+
+        if nvshmem_migration.is_initialized():
+            self.memory_buffer = nvshmem_migration.symmetric_empty(
+                kv_shape, dtype=self.params_dtype
             )
         else:
             self.memory_buffer = torch.empty(
-                (
-                    2,  # key and value
-                    self.num_attention_layers,
-                    self.kv_block_allocator.total_count,
-                    self.block_size_tokens,
-                    self.num_attention_heads_per_partition,
-                    self.hidden_size_per_attention_head,
-                ),
+                kv_shape,
                 dtype=self.params_dtype,
                 device=torch.cuda.current_device(),
             )
@@ -735,16 +749,36 @@ class DynamicInferenceContext(BaseInferenceContext):
                 max_tokens=self.max_tokens,
                 d_conv=self.mamba_conv_states_shape[-1],
             )
-            self.mamba_conv_states = torch.empty(
-                (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
-                dtype=self.mamba_conv_states_dtype,
-                device=torch.cuda.current_device(),
-            )
-            self.mamba_ssm_states = torch.empty(
-                (self.num_mamba_layers, self.max_requests) + self.mamba_ssm_states_shape,
-                dtype=self.mamba_ssm_states_dtype,
-                device=torch.cuda.current_device(),
-            )
+            from megatron.core.inference import nvshmem_migration
+
+            mamba_conv_shape = (
+                self.num_mamba_layers,
+                self.max_requests,
+            ) + self.mamba_conv_states_shape
+            mamba_ssm_shape = (
+                self.num_mamba_layers,
+                self.max_requests,
+            ) + self.mamba_ssm_states_shape
+            # Mamba state must be in the symmetric heap for the same
+            # reason KV is — direct cross-shard put without staging.
+            if nvshmem_migration.is_initialized():
+                self.mamba_conv_states = nvshmem_migration.symmetric_empty(
+                    mamba_conv_shape, dtype=self.mamba_conv_states_dtype
+                )
+                self.mamba_ssm_states = nvshmem_migration.symmetric_empty(
+                    mamba_ssm_shape, dtype=self.mamba_ssm_states_dtype
+                )
+            else:
+                self.mamba_conv_states = torch.empty(
+                    mamba_conv_shape,
+                    dtype=self.mamba_conv_states_dtype,
+                    device=torch.cuda.current_device(),
+                )
+                self.mamba_ssm_states = torch.empty(
+                    mamba_ssm_shape,
+                    dtype=self.mamba_ssm_states_dtype,
+                    device=torch.cuda.current_device(),
+                )
             if self.num_speculative_tokens > 0:
                 self.mamba_intermediate_conv_states = torch.empty(
                     (

@@ -238,6 +238,86 @@ class TestTransportLocalCopy:
     def test_local_roundtrip_mla(self):
         self._roundtrip_buffer(is_mla=True, head_subslice=False)
 
+    def test_local_pp_stage_layer_offset(self):
+        """Explicit PP-stage offset translation.
+
+        Pretend we're rank 0 acting as both src and dst of a PP=2,
+        stage=1 layout: the memory buffer holds only layers local to
+        stage 1, which globally are layers [2, 4). The op emitted for
+        this stage has ``layer_range=(2, 4)`` in global indices; the
+        transport must subtract ``my_src_pp_layer_offset=2`` /
+        ``my_dst_pp_layer_offset=2`` to land on local buffer layers
+        [0, 2). Without the offset-subtraction we'd index out of range.
+        """
+        num_kv_heads = 4
+        num_layers_total = 4
+        num_layers_pp = num_layers_total // 2
+        block_size = 4
+        head_dim = 8
+
+        bundle = _build_bundle(
+            src_tp=1,
+            dst_tp=1,
+            num_kv_heads=num_kv_heads,
+            num_layers=num_layers_total,
+            block_size=block_size,
+            head_dim=head_dim,
+            src_block_ids=[0, 1],
+        )
+        bundle.src_layout.pp_size = 2
+        bundle.dst_layout.pp_size = 2
+
+        # Buffer only has stage 1's layers (the local slice).
+        buf = _alloc_memory_buffer(
+            num_layers_pp=num_layers_pp,
+            total_blocks=4,
+            block_size=block_size,
+            heads_per_tp=num_kv_heads,
+            head_dim=head_dim,
+        )
+        with torch.no_grad():
+            buf.copy_(
+                torch.arange(buf.numel(), dtype=buf.dtype, device=buf.device).view(
+                    buf.shape
+                )
+            )
+
+        # Rank mapping: (tp=0, pp=0)=99 (some other rank we don't play),
+        # (tp=0, pp=1)=0 (this rank is stage 1). Only the pp=1 op will
+        # have src_rank == dst_rank == 0 and actually execute.
+        ops = build_kv_migration_plan(
+            bundle,
+            src_global_rank_of=lambda tp, pp: 0 if pp == 1 else 99,
+            dst_global_rank_of=lambda tp, pp: 0 if pp == 1 else 99,
+            dst_block_ids=[2, 3],
+        )
+
+        # Stage-1 op touches layers [2, 4) globally.
+        stage1_ops = [o for o in ops if o.src_rank == 0 and o.dst_rank == 0]
+        assert len(stage1_ops) == 1
+        assert stage1_ops[0].layer_range == (2, 4)
+
+        # Snapshot source-block state from our local stage-1 buffer
+        # (layers 0..2 locally = layers 2..4 globally).
+        src_t = torch.tensor([0, 1], dtype=torch.long, device=buf.device)
+        expected = buf[:, 0:num_layers_pp, src_t, :, :, :].clone()
+
+        execute_kv_migration_plan(
+            ops,
+            buf,
+            bundle.src_layout,
+            group=None,
+            my_src_pp_layer_offset=2,
+            my_dst_pp_layer_offset=2,
+        )
+
+        dst_t = torch.tensor([2, 3], dtype=torch.long, device=buf.device)
+        got = buf[:, 0:num_layers_pp, dst_t, :, :, :]
+        assert torch.equal(got, expected), (
+            "PP-stage layer offset not correctly applied — the dst "
+            "slice at local layers [0, 2) does not match the src slice"
+        )
+
 
 @pytest.mark.skipif(
     torch.cuda.device_count() < 4,

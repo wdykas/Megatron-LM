@@ -566,7 +566,81 @@ try:
             return Response(f"Invalid sampling parameter: {e}", status=400)
 
         # --- 3. Send Requests to Engine ---
-        tasks = [client.add_request(prompt_tokens, sampling_params) for _ in range(n)]
+        # Optional shard-routing body fields:
+        #   "disagg_pair": [prefill_shard, decode_shard] — routes submit
+        #     to prefill_shard AND tags the request so the auto-disagg
+        #     scheduler migrates to decode_shard after first token.
+        #     No-op if the scheduler isn't running: request completes
+        #     end-to-end on prefill_shard.
+        #   "tail_cut": [late_dst_shard, min_tokens] — second-stage
+        #     migration. Once the request has produced ``min_tokens``
+        #     tokens, the scheduler migrates it again to the named
+        #     shard (typically a latency-optimized decode shard for
+        #     long-tail rollouts). Requires the second scheduler to be
+        #     running on the throughput decode shard.
+        #   "target_shard_index": int — lower-level pin without disagg.
+        #     Ignored when "disagg_pair" is set.
+        #
+        # Length-aware short-circuit: when the deployment sets
+        # DISAGG_LENGTH_THRESHOLD and the prompt is shorter than it,
+        # the disagg_pair request bypasses the prefill+migrate path and
+        # goes directly to the decode shard.
+        disagg_pair = req.get("disagg_pair")
+        tail_cut = req.get("tail_cut")
+        target_shard_index = req.get("target_shard_index")
+        disagg_dst_shard_index = None
+        late_dst_shard_index = None
+        late_dst_min_tokens = None
+        if disagg_pair is not None:
+            if (
+                not isinstance(disagg_pair, (list, tuple))
+                or len(disagg_pair) != 2
+                or not all(isinstance(x, int) for x in disagg_pair)
+            ):
+                return Response(
+                    "'disagg_pair' must be a 2-element list of ints "
+                    "[prefill_shard_index, decode_shard_index]",
+                    status=400,
+                )
+            if disagg_pair[0] == disagg_pair[1]:
+                return Response(
+                    "'disagg_pair' prefill and decode shards must differ",
+                    status=400,
+                )
+            prefill_idx, decode_idx = disagg_pair
+            threshold = current_app.config.get('disagg_length_threshold')
+            if threshold is not None and len(prompt_tokens) < threshold:
+                # Short prompt: skip migration, decode directly.
+                target_shard_index = decode_idx
+                # disagg_dst_shard_index stays None — no auto-disagg tag.
+            else:
+                target_shard_index = prefill_idx
+                disagg_dst_shard_index = decode_idx
+        if tail_cut is not None:
+            if (
+                not isinstance(tail_cut, (list, tuple))
+                or len(tail_cut) != 2
+                or not all(isinstance(x, int) for x in tail_cut)
+                or tail_cut[1] < 1
+            ):
+                return Response(
+                    "'tail_cut' must be a 2-element list of ints "
+                    "[late_dst_shard_index, min_tokens]",
+                    status=400,
+                )
+            late_dst_shard_index, late_dst_min_tokens = tail_cut
+
+        tasks = [
+            client.add_request(
+                prompt_tokens,
+                sampling_params,
+                target_shard_index=target_shard_index,
+                disagg_dst_shard_index=disagg_dst_shard_index,
+                late_dst_shard_index=late_dst_shard_index,
+                late_dst_min_tokens=late_dst_min_tokens,
+            )
+            for _ in range(n)
+        ]
 
         if current_app.config['verbose']:
             start_time = time.perf_counter()

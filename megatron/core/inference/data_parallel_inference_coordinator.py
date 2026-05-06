@@ -168,13 +168,29 @@ class DataParallelInferenceCoordinator:
         self.pipe_connection.close()
 
         logging.info("Inference Coordinator: waiting for connections from data parallel ranks...")
-        # First wait for all data parallel ranks to establish connections.
         self.identities_of_data_parallel_ranks = deque([])
-        # time.sleep(5)  # Give data parallel ranks time to spawn and connect.
+        # identity → shard_index collected during the initial barrier.
+        # REGISTER_DP_RANK carries the tag; legacy empty-bytes leaves it
+        # None (unscoped, matches any target_shard_index).
+        shard_tags: dict[bytes, int | None] = {}
         for _ in range(data_parallel_size):
-            identity, _ = self.router_socket.recv_multipart()
+            identity, serialized_payload = self.router_socket.recv_multipart()
             assert identity not in self.identities_of_data_parallel_ranks
             self.identities_of_data_parallel_ranks.append(identity)
+            if serialized_payload == b"":
+                shard_tags[identity] = None
+                continue
+            try:
+                deserialized = msgpack.unpackb(serialized_payload, raw=False)
+                assert Headers(deserialized[0]) == Headers.REGISTER_DP_RANK
+                shard_tags[identity] = (
+                    deserialized[1] if len(deserialized) > 1 else None
+                )
+            except Exception as e:
+                logging.warning(
+                    "Coordinator: could not parse registration from %s: %s", identity, e
+                )
+                shard_tags[identity] = None
         logging.info("Inference Coordinator: Connected with data parallel ranks...")
 
         # In deterministic mode, sort identities for consistent scheduling order.
@@ -221,43 +237,98 @@ class DataParallelInferenceCoordinator:
         self._hash_table: dict[int, dict[int, int]] = {}
         self._hash_assignment_counter = 0
 
-    def get_next_data_parallel_rank(self):
+        # Shard-aware routing: heterogeneous serving tags each engine
+        # with a shard_index so submits can carry target_shard_index and
+        # migration is a rank-mapping update (Headers.UPDATE_REQUEST_RANK).
+        # _shard_to_identities is a lazy cache keyed by shard_index.
+        self.identity_to_shard_index: dict[bytes, int | None] = {
+            ident: shard_tags.get(ident) for ident in self._identities_list
+        }
+        self._shard_to_identities: dict[int, list[bytes]] = {}
+
+    def get_next_data_parallel_rank(self, shard_index: int | None = None):
         """
         Selects the next data parallel rank using round-robin scheduling.
+
+        Args:
+            shard_index: If given, round-robin only across engines that
+                registered with that shard_index. Engines that registered
+                without shard metadata never match a shard-scoped pick.
 
         Returns:
             bytes: The ZMQ identity of the next data parallel rank to receive a request.
         """
-        identities = self.identities_of_data_parallel_ranks
+        identities = self._identities_for_shard(shard_index)
         if not identities:
-            raise RuntimeError("No engines connected")
+            raise RuntimeError(
+                f"No engines connected"
+                + (f" for shard {shard_index}" if shard_index is not None else "")
+            )
         idx = self._round_robin_idx % len(identities)
         self._round_robin_idx = idx + 1
         return identities[idx]
 
-    def _register_rank_identity(self, identity):
+    def _identities_for_shard(self, shard_index: int | None) -> list[bytes]:
+        """Ordered list of engine identities eligible for a routing decision.
+
+        Unscoped (shard_index=None) returns every connected engine. A scoped
+        pick returns only those engines whose REGISTER_DP_RANK carried that
+        shard_index; registration metadata is stable across a session so we
+        rebuild the list whenever membership changes.
+        """
+        if shard_index is None:
+            return list(self.identities_of_data_parallel_ranks)
+        cached = self._shard_to_identities.get(shard_index)
+        if cached is None:
+            cached = [
+                ident
+                for ident in self.identities_of_data_parallel_ranks
+                if self.identity_to_shard_index.get(ident) == shard_index
+            ]
+            self._shard_to_identities[shard_index] = cached
+        return cached
+
+    def _invalidate_shard_cache(self):
+        self._shard_to_identities.clear()
+
+    def _register_rank_identity(self, identity, shard_index: int | None = None):
         """Register a new rank identity in the scoring data structures.
 
         Called when a rank dynamically connects to a running coordinator
         (e.g. in tests that spawn the coordinator with data_parallel_size=0
         and let engines register after the fact).
+
+        Args:
+            shard_index: Optional shard tag for this engine. When given, the
+                coord will only dispatch shard-scoped submits to engines that
+                share this index. ``None`` preserves legacy unscoped behavior.
         """
         if identity in self.identity_to_rank_index:
+            # Identity already known; allow a late shard_index to attach.
+            if shard_index is not None and self.identity_to_shard_index.get(identity) is None:
+                self.identity_to_shard_index[identity] = shard_index
+                self._invalidate_shard_cache()
             return
         new_idx = len(self._identities_list)
         self.identity_to_rank_index[identity] = new_idx
         self._identities_list.append(identity)
         self._pending_counts = np.append(self._pending_counts, np.int32(0))
+        self.identity_to_shard_index[identity] = shard_index
+        self._invalidate_shard_cache()
         logging.info(
-            "Coordinator: registered engine %s as rank index %d (now %d engines)",
+            "Coordinator: registered engine %s as rank index %d"
+            " (shard=%s, now %d engines)",
             identity,
             new_idx,
+            shard_index,
             len(self._identities_list),
         )
 
     def _remove_engine(self, identity):
         """Remove a disconnected engine from the routing pool."""
         self.identities_of_data_parallel_ranks.remove(identity)
+        self.identity_to_shard_index.pop(identity, None)
+        self._invalidate_shard_cache()
         logging.warning(
             "Coordinator: removed engine %s (now %d engines)",
             identity,
@@ -297,7 +368,7 @@ class DataParallelInferenceCoordinator:
         token_tensor = torch.tensor(tokens, dtype=torch.int64)
         return compute_block_hashes_batched(token_tensor, self.block_size_tokens)
 
-    def get_best_data_parallel_rank(self, request_hashes):
+    def get_best_data_parallel_rank(self, request_hashes, shard_index: int | None = None):
         """Select the best DP rank based on prefix cache affinity and load.
 
         Uses a scoring function: score = alpha * match + (1 - alpha) * normalized_load
@@ -308,15 +379,19 @@ class DataParallelInferenceCoordinator:
 
         Args:
             request_hashes: List of block hashes for the request.
+            shard_index: If given, restrict the candidate pool to engines
+                that registered with this shard_index. Used by unified coord
+                to implement heterogeneous shard routing; ``None`` picks
+                from every connected engine.
 
         Returns:
             bytes: The ZMQ identity of the selected data parallel rank.
         """
         if self.prefix_caching_coordinator_policy == PrefixCachingCoordinatorPolicy.ROUND_ROBIN:
-            return self.get_next_data_parallel_rank()
+            return self.get_next_data_parallel_rank(shard_index=shard_index)
 
         if not self.enable_prefix_caching or not request_hashes:
-            return self.get_next_data_parallel_rank()
+            return self.get_next_data_parallel_rank(shard_index=shard_index)
 
         match, recency = self._match_vector(request_hashes)
 
@@ -326,8 +401,25 @@ class DataParallelInferenceCoordinator:
         free_slots = np.maximum(0, self.max_requests - self._pending_counts).astype(np.float64)
         scores = alpha * match + (1.0 - alpha) * (free_slots / self.max_requests)
 
-        # Tiebreak: highest score, then highest recency, then lowest rank index.
         n_ranks = len(self._identities_list)
+        if shard_index is not None:
+            # Mask out identities outside the target shard.
+            eligible = np.array(
+                [
+                    self.identity_to_shard_index.get(self._identities_list[i]) == shard_index
+                    for i in range(n_ranks)
+                ],
+                dtype=bool,
+            )
+            if not eligible.any():
+                raise RuntimeError(
+                    f"No engines connected for shard {shard_index}"
+                )
+            # Push non-eligible scores to -inf so lexsort never picks them.
+            scores = np.where(eligible, scores, -np.inf)
+            recency = np.where(eligible, recency, -np.inf)
+
+        # Tiebreak: highest score, then highest recency, then lowest rank index.
         order = np.lexsort((np.arange(n_ranks), -recency, -scores))
         best_idx = int(order[0])
         return self._identities_list[best_idx]
@@ -398,6 +490,15 @@ class DataParallelInferenceCoordinator:
             deserialized_payload = msgpack.unpackb(serialized_payload, raw=False)
             header = Headers(deserialized_payload[0])
 
+            if header == Headers.REGISTER_DP_RANK:
+                # Engine-side shard-aware registration. Payload:
+                # [REGISTER_DP_RANK, shard_index_or_None].
+                shard_index = deserialized_payload[1] if len(deserialized_payload) > 1 else None
+                if sender_identity not in self.identities_of_data_parallel_ranks:
+                    self.identities_of_data_parallel_ranks.append(sender_identity)
+                self._register_rank_identity(sender_identity, shard_index=shard_index)
+                continue
+
             if header == Headers.CONNECT:
                 if sender_identity in known_clients:
                     logging.info(
@@ -424,13 +525,47 @@ class DataParallelInferenceCoordinator:
                     continue
                 # this is a message from a client.
                 # route it to a data parallel rank
-                client_request_id, prompt, sampling_params = deserialized_payload[1:]
+                # Variable-length SUBMIT:
+                #   3: (client_req_id, prompt, params)
+                #   4: + target_shard_index (heterogeneous routing)
+                #   5: + disagg_dst_shard_index (auto-disagg opt-in)
+                #   7: + late_dst_shard_index, late_dst_min_tokens
+                #      (two-stage tail-cut migration)
+                fields = deserialized_payload[1:]
+                if len(fields) not in (3, 4, 5, 7):
+                    raise ValueError(
+                        f"SUBMIT_REQUEST expected 3, 4, 5, or 7 fields, got {len(fields)}"
+                    )
+                client_request_id, prompt, sampling_params = fields[:3]
+                target_shard_index = fields[3] if len(fields) >= 4 else None
+                disagg_dst_shard_index = fields[4] if len(fields) >= 5 else None
+                late_dst_shard_index = fields[5] if len(fields) >= 7 else None
+                late_dst_min_tokens = fields[6] if len(fields) >= 7 else None
                 # map client request_id to server request_id
                 # necessary because multiple clients might have the same request_id.
                 request_id = self.next_request_id
                 self.next_request_id += 1
                 self.request_id_to_client_id[request_id] = sender_identity
                 self.request_id_to_client_request_id[request_id] = client_request_id
+
+                # Echo the server-side id back to the client. Clients that
+                # need to drive mid-flight operations on the request
+                # (e.g. cross-shard migration) await this ack to learn the
+                # server id that both the engine and UPDATE_REQUEST_RANK
+                # expect.
+                self.router_socket.send_multipart(
+                    [
+                        sender_identity,
+                        msgpack.packb(
+                            [
+                                Headers.SUBMIT_REQUEST_ACK.value,
+                                client_request_id,
+                                request_id,
+                            ],
+                            use_bin_type=True,
+                        ),
+                    ]
+                )
 
                 # Serialize prompt.
                 if isinstance(prompt, (str, list)):
@@ -440,10 +575,26 @@ class DataParallelInferenceCoordinator:
                 else:
                     raise Exception("specialize for <%s> prompt." % type(prompt).__name__)
 
-                payload = msgpack.packb(
-                    [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params],
-                    use_bin_type=True,
+                # Forward to engine. Include disagg / late tags when
+                # set so the engine stashes them on the request for the
+                # auto-disagg scheduler to read. Engines accept 3-, 4-,
+                # or 6-field SUBMIT payloads.
+                engine_fields: list = [
+                    Headers.SUBMIT_REQUEST.value,
+                    request_id,
+                    prompt,
+                    sampling_params,
+                ]
+                late_set = (
+                    late_dst_shard_index is not None
+                    and late_dst_min_tokens is not None
                 )
+                if disagg_dst_shard_index is not None or late_set:
+                    engine_fields.append(disagg_dst_shard_index)
+                if late_set:
+                    engine_fields.append(late_dst_shard_index)
+                    engine_fields.append(late_dst_min_tokens)
+                payload = msgpack.packb(engine_fields, use_bin_type=True)
 
                 request_hashes = self.compute_request_hashes(prompt)
                 if (
@@ -453,13 +604,22 @@ class DataParallelInferenceCoordinator:
                     request_hashes = request_hashes[:1]
 
                 # Account for the fact that some engines may have died.
-                for _ in range(len(self.identities_of_data_parallel_ranks)):
-                    next_identity = self.get_best_data_parallel_rank(request_hashes)
+                # Retries are bounded by either the total number of engines
+                # (unscoped submit) or the engines in the target shard.
+                candidates = self._identities_for_shard(target_shard_index)
+                for _ in range(len(candidates)):
+                    next_identity = self.get_best_data_parallel_rank(
+                        request_hashes, shard_index=target_shard_index
+                    )
                     if self._send_to_engine(next_identity, payload):
                         break
                 else:
                     # If all engines have died, we are in an abnormal state, and must exit cleanly.
-                    logging.error("Coordinator: no reachable engines for request %d", request_id)
+                    logging.error(
+                        "Coordinator: no reachable engines for request %d (shard=%s)",
+                        request_id,
+                        target_shard_index,
+                    )
                     del self.request_id_to_client_id[request_id]
                     del self.request_id_to_client_request_id[request_id]
                     return
@@ -490,47 +650,101 @@ class DataParallelInferenceCoordinator:
                     logging.warning("Coordinator: ignoring signal from unknown client.")
                     continue
 
-                if header == Headers.PAUSE:
-                    idem_states = (self.CoordinatorState.PAUSED, self.CoordinatorState.SUSPENDED)
-                    if self.state == self.CoordinatorState.RUNNING:
-                        self.state = self.CoordinatorState.PAUSED
-                    elif self.state in idem_states:
-                        # Already paused/suspended, ignore redundant PAUSE.
-                        continue
-                    else:
-                        logging.warning("Coordinator: ignoring PAUSE in state %s", self.state)
-                        continue
-                elif header == Headers.UNPAUSE:
-                    if self.state != self.CoordinatorState.PAUSED:
-                        logging.warning("Coordinator: ignoring UNPAUSE in state %s", self.state)
-                        continue
-                    self.state = self.CoordinatorState.RUNNING
-                elif header == Headers.SUSPEND:
-                    if self.state != self.CoordinatorState.PAUSED:
-                        logging.warning("Coordinator: ignoring SUSPEND in state %s", self.state)
-                        continue
-                    self.state = self.CoordinatorState.SUSPENDED
-                elif header == Headers.RESUME:
-                    if self.state != self.CoordinatorState.SUSPENDED:
-                        logging.warning("Coordinator: ignoring RESUME in state %s", self.state)
-                        continue
-                    self.state = self.CoordinatorState.PAUSED
-                elif header == Headers.STOP:
-                    good_states = (self.CoordinatorState.PAUSED, self.CoordinatorState.SUSPENDED)
-                    if self.state not in good_states:
-                        logging.warning("Coordinator: ignoring STOP in state %s", self.state)
-                        continue
-                    self.state = self.CoordinatorState.STOPPING
+                # Optional shard-scope: PAUSE/UNPAUSE/SUSPEND/RESUME may
+                # carry a trailing ``shard_indices`` list (or ``None``).
+                # When set, the broadcast is filtered to engines in those
+                # shards only, and the coord's own state machine — which
+                # tracks whole-world state — is intentionally bypassed
+                # (per-engine state machines still validate). This lets
+                # cross-shard request migration quiesce just the two
+                # participating shards without stopping the world.
+                shard_indices: list | None = None
+                if header in (
+                    Headers.PAUSE,
+                    Headers.UNPAUSE,
+                    Headers.SUSPEND,
+                    Headers.RESUME,
+                ) and len(deserialized_payload) > 1:
+                    trailing = deserialized_payload[1]
+                    if trailing is None or isinstance(trailing, (list, tuple)):
+                        shard_indices = list(trailing) if trailing else None
 
-                # Broadcast the control signal if we're in a good state.
-                # Forward the full deserialized payload so that data-bearing
-                # signals (e.g. SET_GENERATION_EPOCH) retain their arguments.
-                broadcast_payload = msgpack.packb(deserialized_payload, use_bin_type=True)
-                for data_parallel_rank_id in list(self.identities_of_data_parallel_ranks):
-                    self._send_to_engine(data_parallel_rank_id, broadcast_payload)
+                if shard_indices is None:
+                    # Whole-world path — keep the existing coord-state
+                    # validation so sequencing bugs still get caught.
+                    if header == Headers.PAUSE:
+                        idem_states = (
+                            self.CoordinatorState.PAUSED,
+                            self.CoordinatorState.SUSPENDED,
+                        )
+                        if self.state == self.CoordinatorState.RUNNING:
+                            self.state = self.CoordinatorState.PAUSED
+                        elif self.state in idem_states:
+                            # Already paused/suspended, ignore redundant PAUSE.
+                            continue
+                        else:
+                            logging.warning(
+                                "Coordinator: ignoring PAUSE in state %s", self.state
+                            )
+                            continue
+                    elif header == Headers.UNPAUSE:
+                        if self.state != self.CoordinatorState.PAUSED:
+                            logging.warning(
+                                "Coordinator: ignoring UNPAUSE in state %s", self.state
+                            )
+                            continue
+                        self.state = self.CoordinatorState.RUNNING
+                    elif header == Headers.SUSPEND:
+                        if self.state != self.CoordinatorState.PAUSED:
+                            logging.warning(
+                                "Coordinator: ignoring SUSPEND in state %s", self.state
+                            )
+                            continue
+                        self.state = self.CoordinatorState.SUSPENDED
+                    elif header == Headers.RESUME:
+                        if self.state != self.CoordinatorState.SUSPENDED:
+                            logging.warning(
+                                "Coordinator: ignoring RESUME in state %s", self.state
+                            )
+                            continue
+                        self.state = self.CoordinatorState.PAUSED
+                    elif header == Headers.STOP:
+                        good_states = (
+                            self.CoordinatorState.PAUSED,
+                            self.CoordinatorState.SUSPENDED,
+                        )
+                        if self.state not in good_states:
+                            logging.warning(
+                                "Coordinator: ignoring STOP in state %s", self.state
+                            )
+                            continue
+                        self.state = self.CoordinatorState.STOPPING
+
+                # Determine broadcast targets. When a scope is set, only
+                # those shards' engines receive the signal; other shards
+                # keep running.
+                if shard_indices is None:
+                    targets = list(self.identities_of_data_parallel_ranks)
+                else:
+                    targets = []
+                    for sidx in shard_indices:
+                        targets.extend(self._identities_for_shard(sidx))
+
+                # Always broadcast a clean payload (without the shard
+                # scope) to engines so engine-side handlers don't need
+                # to care about the scoping knob.
+                if header == Headers.SET_GENERATION_EPOCH:
+                    # SET_GENERATION_EPOCH carries its data arg at pos 1.
+                    forward_payload = msgpack.packb(
+                        [header.value, deserialized_payload[1]], use_bin_type=True
+                    )
+                else:
+                    forward_payload = msgpack.packb([header.value], use_bin_type=True)
+                for data_parallel_rank_id in targets:
+                    self._send_to_engine(data_parallel_rank_id, forward_payload)
 
                 # STOP affects engines; reset coordinator to RUNNING to allow future engines.
-                if header == Headers.STOP:
+                if header == Headers.STOP and shard_indices is None:
                     self.state = self.CoordinatorState.RUNNING
 
             elif header == Headers.ENGINE_REPLY:
@@ -561,6 +775,181 @@ class DataParallelInferenceCoordinator:
                             ),
                         ]
                     )
+
+            elif header == Headers.MIGRATE_BATCH:
+                # Driver rank → coord → engines in src + dst shards.
+                # Payload: [MIGRATE_BATCH, request_ids, src_shard_index,
+                # dst_shard_index]. The coord forwards the same payload
+                # (verbatim) to every engine registered with src or dst
+                # shard_index; bystander shards are not touched. Each
+                # engine's signal handler invokes its registered
+                # migration callback which performs the NCCL transport
+                # on cross_shard_group.
+                if sender_identity not in known_clients:
+                    logging.warning(
+                        "Coordinator: ignoring MIGRATE_BATCH from unknown client."
+                    )
+                    continue
+                # Payload format:
+                #   [MIGRATE_BATCH, request_ids, src_shard, dst_shard,
+                #    bundles, dst_dp_rank_within_shard]
+                # ``bundles`` is the per-request serialized migration
+                # envelope; carried inline so engines can run async
+                # migration without a cross-shard broadcast.
+                # ``dst_dp_rank_within_shard`` selects which DP rank
+                # in the destination shard receives the migration —
+                # forwarding to all DP ranks would cause every dst
+                # replica to ``inject_request`` and scatter, double-
+                # writing KV blocks and corrupting state.
+                bundles = []
+                dst_dp_rank = 0
+                if len(deserialized_payload) >= 6:
+                    (
+                        _,
+                        request_ids,
+                        src_shard_index,
+                        dst_shard_index,
+                        bundles,
+                        dst_dp_rank,
+                    ) = deserialized_payload
+                elif len(deserialized_payload) >= 5:
+                    _, request_ids, src_shard_index, dst_shard_index, bundles = (
+                        deserialized_payload
+                    )
+                else:
+                    _, request_ids, src_shard_index, dst_shard_index = (
+                        deserialized_payload
+                    )
+
+                # Src side: every TP rank in src shard receives (each
+                # owns a head slice and contributes to the put).
+                # Dst side: only the chosen DP rank receives. We pick
+                # by parsing the engine's registered identity
+                # ``mp-coord-s{shard}-{dp_rank}`` rather than by
+                # registration index, since registration order isn't
+                # guaranteed to match dp_rank order.
+                src_targets = self._identities_for_shard(src_shard_index)
+                dst_idents = self._identities_for_shard(dst_shard_index)
+                dst_targets: list[bytes] = []
+                expected_suffix = f"-{dst_dp_rank}".encode()
+                for ident in dst_idents:
+                    if ident.endswith(expected_suffix):
+                        dst_targets = [ident]
+                        break
+                if not dst_targets:
+                    logging.warning(
+                        "Coordinator: dst_dp_rank=%d not found among %s for "
+                        "shard %d; falling back to first registered engine.",
+                        dst_dp_rank,
+                        [i.decode(errors='replace') for i in dst_idents],
+                        dst_shard_index,
+                    )
+                    dst_targets = [dst_idents[0]] if dst_idents else []
+                # Forward payload includes ``dst_dp_rank`` so the
+                # engine handler can compute the correct ``dst_root``
+                # global rank for its migration plan (otherwise the
+                # handler assumes rank_offset, which is wrong when
+                # the target dp_rank is not 0).
+                forward_payload = msgpack.packb(
+                    [
+                        header.value,
+                        request_ids,
+                        src_shard_index,
+                        dst_shard_index,
+                        bundles,
+                        dst_dp_rank,
+                    ],
+                    use_bin_type=True,
+                )
+                for data_parallel_rank_id in src_targets + dst_targets:
+                    self._send_to_engine(data_parallel_rank_id, forward_payload)
+
+            elif header == Headers.UPDATE_REQUEST_RANK:
+                # Driver rank notifies the coord that a live request's owning
+                # engine has changed (cross-shard migration). Payload:
+                # [UPDATE_REQUEST_RANK, request_id, new_shard_index,
+                # new_dp_rank_within_shard].
+                #
+                # The coord's view of the world is just "who will send the
+                # ENGINE_REPLY for this request" — so we rewrite
+                # request_id_to_rank and shift pending_counts from the old
+                # owner to the new one. No need to touch client tables:
+                # request_id_to_client_id / request_id_to_client_request_id
+                # remain valid because the HTTP client is the same.
+                if sender_identity not in known_clients:
+                    logging.warning(
+                        "Coordinator: ignoring UPDATE_REQUEST_RANK from unknown client."
+                    )
+                    continue
+                _, request_id, new_shard_index, new_dp_rank_within_shard = (
+                    deserialized_payload
+                )
+                if request_id not in self.request_id_to_client_id:
+                    logging.warning(
+                        "Coordinator: UPDATE_REQUEST_RANK for unknown request %d; "
+                        "ignoring (already replied or never submitted)",
+                        request_id,
+                    )
+                    continue
+                shard_identities = self._identities_for_shard(new_shard_index)
+                if not shard_identities:
+                    logging.error(
+                        "Coordinator: UPDATE_REQUEST_RANK request=%d target shard=%s "
+                        "has no engines; refusing to rewrite",
+                        request_id,
+                        new_shard_index,
+                    )
+                    continue
+                if new_dp_rank_within_shard < 0 or new_dp_rank_within_shard >= len(
+                    shard_identities
+                ):
+                    logging.error(
+                        "Coordinator: UPDATE_REQUEST_RANK request=%d dp_rank=%d "
+                        "out of range for shard %s (size %d)",
+                        request_id,
+                        new_dp_rank_within_shard,
+                        new_shard_index,
+                        len(shard_identities),
+                    )
+                    continue
+                # Match by identity suffix (``mp-coord-s{shard}-{dp_rank}``)
+                # rather than registration index — engines may register in
+                # any order, so ``shard_identities[dp_rank]`` is wrong when
+                # the order differs. This must agree with how MIGRATE_BATCH
+                # picks the dst engine, otherwise NVSHMEM data lands on one
+                # rank but the coord routes the reply through another.
+                expected_suffix = f"-{new_dp_rank_within_shard}".encode()
+                new_identity = None
+                for ident in shard_identities:
+                    if ident.endswith(expected_suffix):
+                        new_identity = ident
+                        break
+                if new_identity is None:
+                    logging.error(
+                        "Coordinator: UPDATE_REQUEST_RANK request=%d dp_rank=%d "
+                        "not found among %s for shard %s",
+                        request_id,
+                        new_dp_rank_within_shard,
+                        [i.decode(errors='replace') for i in shard_identities],
+                        new_shard_index,
+                    )
+                    continue
+                old_identity = self.request_id_to_rank.get(request_id)
+                if old_identity is not None:
+                    old_idx = self.identity_to_rank_index.get(old_identity)
+                    if old_idx is not None and self._pending_counts[old_idx] > 0:
+                        self._pending_counts[old_idx] -= 1
+                self.request_id_to_rank[request_id] = new_identity
+                new_idx = self.identity_to_rank_index.get(new_identity)
+                if new_idx is not None:
+                    self._pending_counts[new_idx] += 1
+                logging.info(
+                    "Coordinator: request %d migrated rank %s → %s (shard %s)",
+                    request_id,
+                    old_identity,
+                    new_identity,
+                    new_shard_index,
+                )
 
             elif header == Headers.SHUTDOWN:
                 if sender_identity not in known_clients:
