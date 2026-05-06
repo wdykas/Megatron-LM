@@ -37,6 +37,13 @@ class Headers(Enum):
     # consistent. Payload: [UPDATE_REQUEST_RANK, request_id, new_shard_index,
     # new_dp_rank_within_shard].
     UPDATE_REQUEST_RANK = auto()
+    # Batched form of UPDATE_REQUEST_RANK: rank-0 driver tells the coord
+    # that a *list* of request_ids has all migrated to the same
+    # ``(new_shard_index, new_dp_rank_within_shard)``. Saves 16 ZMQ
+    # send+recv+unpack round trips per migration batch. Payload:
+    # [UPDATE_REQUEST_RANKS_BATCH, request_ids, new_shard_index,
+    # new_dp_rank_within_shard].
+    UPDATE_REQUEST_RANKS_BATCH = auto()
     # Rank-0 driver → coordinator → engines in src+dst shards: trigger a
     # batched cross-shard request migration. The coord forwards this header
     # to engines in the named shards; each engine's run loop pops it from

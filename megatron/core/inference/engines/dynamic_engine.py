@@ -297,23 +297,17 @@ class DynamicInferenceEngine(AbstractEngine):
         self._pending_signals = deque()
 
         # Cross-shard migration handler registered by the inference
-        # interface (e.g. ``MegatronLocalMulti``) at launch time.
-        # Invoked with ``(request_ids, src_shard, dst_shard, bundles)``
-        # — bundles are per-request serialized migration envelopes
-        # carried inline through the coord so dst engines don't need
-        # a cross-shard broadcast. The handler is non-blocking: it
-        # kicks off the NVSHMEM transport on the migration stream
-        # and pushes a pending entry into ``_pending_migrations``;
-        # :meth:`_poll_pending_migrations` finalizes them later.
+        # interface at launch time. Invoked non-blockingly with
+        # ``(request_ids, src_shard, dst_shard, bundles, dst_dp_rank)``
+        # when a ``Headers.MIGRATE_BATCH`` arrives; pushes a pending
+        # poll into ``_pending_migrations`` for finalization.
         self._migration_handler: Optional[
-            Callable[[List[int], int, int, List[dict]], None]
+            Callable[[List[int], int, int, List[dict], int], None]
         ] = None
-        # Pending migration entries. Each entry is an opaque dict
-        # owned by the migration handler — the engine just polls
-        # ``poll_fn(entry)`` once per tick and drops entries whose
-        # poll returns True. The handler does whatever finalization
-        # is needed (detach src blocks / scatter+inject on dst).
-        self._pending_migrations: List[dict] = []
+        # Per-tick polls for in-flight migrations. Each callable
+        # returns True once its migration has completed and any
+        # engine-side cleanup has run.
+        self._pending_migrations: List[Callable[[], bool]] = []
 
         self.resume_request_ids = None
 
@@ -441,47 +435,37 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def set_migration_handler(
         self,
-        handler: Optional[Callable[[List[int], int, int, List[dict]], None]],
+        handler: Optional[Callable[[List[int], int, int, List[dict], int], None]],
     ) -> None:
         """Register the cross-shard migration handler.
 
         Invoked **non-blockingly** inside the engine's run loop when a
-        ``Headers.MIGRATE_BATCH`` signal arrives from the coordinator.
-        Receives ``(request_ids, src_shard, dst_shard, bundles)``.
-        Bundles are msgpack dicts carried inline on the coord channel
-        so the dst engine doesn't need a cross-shard broadcast.
-
-        The handler kicks off the NVSHMEM transport (``put_signal`` on
-        src, schedule scatter on dst) and pushes a pending entry into
-        :attr:`_pending_migrations`. The engine's tick poll
-        finalizes each entry once its asynchronous transport is done.
+        ``Headers.MIGRATE_BATCH`` signal arrives from the coordinator,
+        with ``(request_ids, src_shard, dst_shard, bundles, dst_dp_rank)``.
+        The handler kicks off the NVSHMEM transport on the migration
+        stream and registers a poll via :meth:`push_pending_migration`
+        for finalization on a later tick.
         """
         self._migration_handler = handler
 
-    def push_pending_migration(self, entry: dict) -> None:
-        """Register an in-flight migration entry. The handler builds
-        the dict; the only required key is ``poll`` — a callable that
-        returns ``True`` when the migration has completed and any
-        engine-side cleanup (e.g. ``detach_request`` on src,
-        ``inject_request`` + scatter on dst) has been performed.
+    def push_pending_migration(self, poll: Callable[[], bool]) -> None:
+        """Register an in-flight migration. ``poll`` returns ``True``
+        once the migration has completed and any engine-side cleanup
+        (e.g. ``release_memory_blocks`` on src) has run.
         """
-        assert callable(entry.get("poll")), (
-            "pending migration entry must include a callable 'poll'"
-        )
-        self._pending_migrations.append(entry)
+        self._pending_migrations.append(poll)
 
     def _poll_pending_migrations(self) -> int:
-        """Poll every pending migration's completion callback. Drop
-        entries whose ``poll()`` returns True. Returns the count of
-        completed migrations this tick. Called once per engine loop
-        iteration; cheap when no migrations are in flight."""
+        """Poll every pending migration; drop those that report done.
+        Returns the count of completed migrations this tick. Called
+        once per engine loop iteration; cheap when none are in flight."""
         if not self._pending_migrations:
             return 0
         completed = 0
-        still_pending: List[dict] = []
-        for entry in self._pending_migrations:
+        still_pending: List[Callable[[], bool]] = []
+        for poll in self._pending_migrations:
             try:
-                done = bool(entry["poll"]())
+                done = bool(poll())
             except Exception as e:  # pragma: no cover - defensive
                 logging.warning(
                     "Engine: pending migration poll raised %s; dropping entry", e
@@ -490,7 +474,7 @@ class DynamicInferenceEngine(AbstractEngine):
             if done:
                 completed += 1
             else:
-                still_pending.append(entry)
+                still_pending.append(poll)
         self._pending_migrations = still_pending
         return completed
 
@@ -1364,14 +1348,9 @@ class DynamicInferenceEngine(AbstractEngine):
         ctx.request_ids[slot_idx] = bundle.request_id
         ctx.request_in_prefill_status_tensor[slot_idx] = 0  # DECODE, not PREFILL
         ctx.request_query_lengths[slot_idx] = 1
-        # ``request_output_lengths`` is the absolute cap: ``prompt + N`` where
-        # N = sampling.num_tokens_to_generate. It is set once in
-        # add_request (line ~1419 in dynamic_context.py) and never grows during
-        # generation. The earlier ``total_len + N`` here lets a migrated
-        # request generate N more tokens past its original cap and eventually
-        # overflow ``max_kv_block_count = ceil(max_seq / block_size)`` —
-        # observed as a CUDA index OOB in resume_paused_requests when
-        # ``request_kv_block_counts[row] == max_kv_block_count``.
+        # ``request_output_lengths`` is the absolute cap (prompt + N); it
+        # must match what add_request would set so migrated requests
+        # cannot exceed ``max_kv_block_count`` and OOB in resume.
         ctx.request_output_lengths[slot_idx] = prompt_len + num_tokens_to_generate
 
         # Per-request sampling metadata (temperature, top_k, top_p,
@@ -2740,39 +2719,27 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.state = EngineState.STOPPING
 
             elif header == Headers.MIGRATE_BATCH:
-                # Coord-mediated cross-shard migration. Payload now
-                # carries ``bundles`` inline (one per request_id) so
-                # the dst engine has all metadata it needs to allocate
-                # KV blocks immediately — no cross-shard broadcast.
-                # The handler runs *non-blocking*: it kicks off the
-                # NVSHMEM transport on the migration stream and
-                # registers a pending entry; the engine's tick poll
-                # finalizes the migration when the data arrives.
-                handler = getattr(self, '_migration_handler', None)
-                if handler is None:
+                # Coord-mediated cross-shard migration. Bundles are
+                # carried inline (one per request_id) so the dst engine
+                # can allocate KV blocks without a cross-shard
+                # broadcast. The handler is non-blocking: it kicks off
+                # the NVSHMEM transport on the migration stream and
+                # registers a poll for finalization on a later tick.
+                if self._migration_handler is None:
                     logging.warning(
                         "Engine: ignoring MIGRATE_BATCH (no handler registered)"
                     )
                 else:
-                    bundles = []
-                    dst_dp_rank = 0
-                    if len(data) >= 6:
-                        (
-                            _,
-                            request_ids,
-                            src_shard_index,
-                            dst_shard_index,
-                            bundles,
-                            dst_dp_rank,
-                        ) = data
-                    elif len(data) >= 5:
-                        _, request_ids, src_shard_index, dst_shard_index, bundles = (
-                            data
-                        )
-                    else:
-                        _, request_ids, src_shard_index, dst_shard_index = data
+                    (
+                        _,
+                        request_ids,
+                        src_shard_index,
+                        dst_shard_index,
+                        bundles,
+                        dst_dp_rank,
+                    ) = data
                     try:
-                        handler(
+                        self._migration_handler(
                             request_ids,
                             src_shard_index,
                             dst_shard_index,

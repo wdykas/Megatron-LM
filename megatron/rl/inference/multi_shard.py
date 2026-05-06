@@ -193,6 +193,12 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
     # paying the layout-build cost (and the ``build_cross_shard_group``
     # collective) on every migration.
     _migration_meta: dict = PrivateAttr(default_factory=dict)
+    # Round-robin counter used by the auto-disagg scheduler to spread
+    # migration batches across the destination shard's DP replicas
+    # (one entry per src_shard_index). Without this every batch lands
+    # on dp_rank 0, which cuts effective dst capacity in half on
+    # ``tp=K + tp=1,dp=N`` configs.
+    _disagg_dst_dp_counter: dict = PrivateAttr(default_factory=dict)
     # When set, base_generate stamps every HTTP request with
     # ``disagg_pair=[src, dst]`` so the coord routes to the prefill shard
     # and the auto-disagg scheduler migrates after first token. Populated
@@ -872,17 +878,13 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         finally:
             await self.resume(shard_indices=scope)
 
-        # One UPDATE_REQUEST_RANK per request so the coord's dispatch
-        # table follows the batch — the coord has no batched variant of
-        # this message yet (each request has its own client future).
         client = self._unified_client
         if client is not None:
-            for req_id in (request_ids_dst or request_ids):
-                client.update_request_rank(
-                    request_id=req_id,
-                    new_shard_index=dst_shard_index,
-                    new_dp_rank_within_shard=0,
-                )
+            client.update_request_ranks_batch(
+                request_ids=list(request_ids_dst or request_ids),
+                new_shard_index=dst_shard_index,
+                new_dp_rank_within_shard=0,
+            )
 
         return migrated_ids
 
@@ -1035,21 +1037,16 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         """Engine-side handler for ``Headers.MIGRATE_BATCH`` —
         **non-blocking** on both src and dst.
 
-        - **Bundle delivery via coord (no cross-shard broadcast):**
-          ``bundles`` is the full per-request migration envelope shipped
-          inline by the auto-disagg scheduler.
-        - **Src side:** gather KV slices into staging slots and issue
-          ``put_signal`` on the migration stream. Record a CUDA event
-          covering the gather; push a pending entry whose ``poll``
-          callback detaches the request (frees src blocks) once the
-          event fires.
-        - **Dst side:** ``inject_request`` to allocate dst KV blocks +
-          register the request, then schedule ``signal_wait`` + scatter
-          on the migration stream and ``wait_stream`` the engine's
-          compute stream onto it. Future forward passes touching this
-          request's KV implicitly wait for scatter to complete.
+        - **Src:** gather KV slices into staging slots and issue
+          ``put_signal`` on the migration stream; push a poll that
+          frees src blocks once the migration event fires.
+        - **Dst:** ``inject_request`` to allocate dst KV blocks +
+          register the request, then ``signal_wait`` + scatter on the
+          migration stream and ``wait_stream`` the engine's compute
+          stream onto it.
 
         No ``barrier_all``, no cross-shard broadcast, no engine pause.
+        Exceptions propagate to the engine's run-loop catch.
         """
         meta = self._migration_meta.get((src_shard_index, dst_shard_index))
         if meta is None:
@@ -1064,37 +1061,6 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         if not (meta["in_src"] or meta["in_dst"]):
             return  # bystander; coord shouldn't forward to us anyway
 
-        try:
-            self._do_async_migrate_batch(
-                request_ids,
-                src_shard_index,
-                dst_shard_index,
-                bundles,
-                meta,
-                dst_dp_rank,
-            )
-        except Exception as e:
-            logger.error(
-                "[auto-disagg] async migration of %d requests (%d → %d) "
-                "raised %s — engine continues",
-                len(request_ids),
-                src_shard_index,
-                dst_shard_index,
-                e,
-            )
-
-    def _do_async_migrate_batch(
-        self,
-        request_ids: List[int],
-        src_shard_index: int,
-        dst_shard_index: int,
-        bundles: List[dict],
-        meta: dict,
-        dst_dp_rank: int = 0,
-    ) -> None:
-        """Body of :meth:`_on_migrate_batch_signal` — split out so the
-        outer wrapper can catch exceptions without losing the run
-        loop. See the parent docstring for the design."""
         from megatron.core.inference.engines.request_migration import (
             _gather_kv_slice,
             _scatter_kv_slice,
@@ -1108,15 +1074,11 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         src_layout = meta["src_layout"]
         dst_layout = meta["dst_layout"]
         src_root = src_shard.ranks()[0]
-        # ``dst_root`` is the global rank of TP-rank-0 of the *target
-        # dp replica* — not always rank_offset when dst has DP > 1.
-        # Within a shard ranks are laid out TP-major: rank
-        # ``rank_offset + dp * tp_size + tp``. The coord forwards
-        # MIGRATE_BATCH only to that one dp rank, and the migration
-        # plan must address the same rank for ``put_signal`` and
-        # scatter; mismatched ``dst_root`` would have the dst engine
-        # call ``inject_request`` (allocating blocks) but skip
-        # scatter, leaving its KV uninitialized.
+        # Within a shard, ranks are laid out TP-major:
+        # ``rank_offset + dp * tp_size + tp``. ``dst_root`` is TP-0 of
+        # the target dp replica; coord forwards MIGRATE_BATCH only to
+        # that one dp rank and the migration plan must address the
+        # same rank for ``put_signal`` and scatter.
         dst_root = dst_shard.rank_offset + dst_dp_rank * dst_layout.tp_size
 
         def _src_rank_of(tp: int, pp: int) -> int:
@@ -1125,8 +1087,13 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         def _dst_rank_of(tp: int, pp: int) -> int:
             return dst_root + pp * dst_layout.tp_size + tp
 
-        # Deserialize bundles inline (small dicts).
+        # Deserialize bundles inline (small dicts). Layouts aren't on the
+        # wire — restamp from the local meta so ``build_kv_migration_plan``
+        # can read them off the bundle.
         parsed_bundles = [deserialize_bundle(b) for b in bundles]
+        for b in parsed_bundles:
+            b.src_layout = src_layout
+            b.dst_layout = dst_layout
         engine = self._my_engine
         memory_buffer = engine.context.memory_buffer
         layout = src_layout if meta["in_src"] else dst_layout
@@ -1149,205 +1116,211 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
 
         stream = _nv.migration_stream()
 
-        # Src detaches each migrated request *now* (before the put_signal is
-        # scheduled) so the engine's main loop can't run another async_step
-        # and emit a stale ENGINE_REPLY for an already-migrated request.
-        # ``keep_blocks=True`` keeps the KV blocks alive for the gather
-        # kernels we'll enqueue below; the poll callback releases them once
-        # the migration's CUDA event has fired.
-        src_block_ids_to_free: List[torch.Tensor] = []
-        if meta["in_src"]:
-            for req_id in request_ids:
-                if req_id in engine.requests:
-                    src_block_ids_to_free.append(
-                        engine.detach_request(req_id, keep_blocks=True)
-                    )
-
-        # Dst injects each bundle (allocates dst blocks, registers
-        # request) and accumulates the (bundle, dst_blocks) pairs.
-        injected: List[Tuple[object, List[int]]] = []
-        if meta["in_dst"]:
-            for bundle in parsed_bundles:
-                dst_blocks = engine.inject_request(bundle).tolist()
-                injected.append((bundle, dst_blocks))
-
-        # Build per-bundle KV migration plans. Both src and dst walk
-        # the bundles in identical order so slot/flag assignment
-        # stays consistent.
-        all_ops_by_bundle: List[List] = []
-        for i, bundle in enumerate(parsed_bundles):
-            if meta["in_dst"]:
-                _, dst_blocks = injected[i]
-            else:
-                # On src we don't have dst_blocks; the bundle's
-                # ``num_kv_blocks`` is the count, the dst-side block
-                # ids are unknowable here. But the migration plan
-                # only needs (src_block_ids, dst_block_ids) at the
-                # src for the gather slice — the put_signal lands at
-                # the SAME staging-slot offset on dst regardless of
-                # which dst_block_ids dst will use. So the dst block
-                # list doesn't actually need to match between sides.
-                #
-                # Use src_block_ids as a placeholder; the migration
-                # plan's dst_block_ids field is consulted only on the
-                # dst side (during scatter), so a placeholder here is
-                # fine.
-                dst_blocks = list(bundle.src_block_ids)
-            ops = build_kv_migration_plan(
-                bundle,
-                src_global_rank_of=_src_rank_of,
-                dst_global_rank_of=_dst_rank_of,
-                dst_block_ids=dst_blocks,
-            )
-            all_ops_by_bundle.append(ops)
-
-        # Walk every (bundle, op) deterministically to assign slot +
-        # flag indices. Same order on src and dst → same slot/flag
-        # for each transfer.
-        arena = _nv.StagingArena()
-        op_meta: List[dict] = []
-        elem_size = memory_buffer.element_size()
-        dtype = memory_buffer.dtype
-        for ops in all_ops_by_bundle:
-            for op in ops:
-                num_blocks = len(op.src_block_ids)
-                layer_span = op.layer_range[1] - op.layer_range[0]
-                head_span = op.head_range[1] - op.head_range[0]
-                if layout.is_mla:
-                    shape = (
-                        layer_span,
-                        num_blocks,
-                        layout.block_size_tokens,
-                        head_span,
-                    )
-                else:
-                    shape = (
-                        2,
-                        layer_span,
-                        num_blocks,
-                        layout.block_size_tokens,
-                        head_span,
-                        layout.head_dim,
-                    )
-                nelems = 1
-                for d in shape:
-                    nelems *= d
-                nbytes = nelems * elem_size
-                op_meta.append(
-                    {
-                        "op": op,
-                        "shape": shape,
-                        "nbytes": nbytes,
-                        "slot": arena.take(nbytes),
-                        "flag": _nv.acquire_flag_slot(),
-                    }
-                )
-
-        # Schedule everything on the migration stream and return.
-        with torch.cuda.stream(stream):
+        # Detach src synchronously so async_step can't emit a stale
+        # ENGINE_REPLY for an already-migrated request. ``keep_blocks=True``
+        # keeps the KV blocks alive for the gather kernels we'll enqueue
+        # below; the poll callback releases them once the event fires.
+        try:
+            src_block_ids_to_free: List[torch.Tensor] = []
+            injected: List[Tuple[object, List[int]]] = []
             if meta["in_src"]:
-                # Gather + put_signal per op this rank participates in.
-                for entry in op_meta:
-                    op = entry["op"]
-                    if rank != op.src_rank:
-                        continue
-                    src_blocks = torch.as_tensor(
-                        op.src_block_ids, device=memory_buffer.device, dtype=torch.long
-                    )
-                    local_head_range = (
-                        op.head_range[0] - my_src_head_offset,
-                        op.head_range[1] - my_src_head_offset,
-                    )
-                    local_layer_range = (
-                        op.layer_range[0] - my_src_pp_layer_offset,
-                        op.layer_range[1] - my_src_pp_layer_offset,
-                    )
-                    send_tensor = _gather_kv_slice(
-                        memory_buffer,
-                        local_layer_range,
-                        src_blocks,
-                        local_head_range,
-                        layout.is_mla,
-                    )
-                    slot = _nv.staging_slot(entry["slot"])
-                    slot[: entry["nbytes"]].view(dtype).reshape(
-                        entry["shape"]
-                    ).copy_(send_tensor, non_blocking=True)
-                    _nv.put_slot_with_signal(
-                        entry["slot"],
-                        entry["flag"],
-                        op.dst_rank,
-                        nbytes=entry["nbytes"],
-                        stream=stream,
-                    )
+                for req_id in request_ids:
+                    if req_id in engine.requests:
+                        src_block_ids_to_free.append(
+                            engine.detach_request(req_id, keep_blocks=True)
+                        )
 
+            # Dst injects each bundle (allocates dst blocks, registers
+            # request) and accumulates the (bundle, dst_blocks) pairs.
             if meta["in_dst"]:
-                # signal_wait + scatter per op this rank participates in.
-                for entry in op_meta:
-                    op = entry["op"]
-                    if rank != op.dst_rank:
-                        continue
-                    _nv.wait_slot_signal(
-                        entry["flag"], expected_value=1, stream=stream
-                    )
-                    dst_blocks = torch.as_tensor(
-                        op.dst_block_ids, device=memory_buffer.device, dtype=torch.long
-                    )
-                    local_head_range = (
-                        op.head_range[0] - my_dst_head_offset,
-                        op.head_range[1] - my_dst_head_offset,
-                    )
-                    local_layer_range = (
-                        op.layer_range[0] - my_dst_pp_layer_offset,
-                        op.layer_range[1] - my_dst_pp_layer_offset,
-                    )
-                    slot = _nv.staging_slot(entry["slot"])
-                    recv_view = (
-                        slot[: entry["nbytes"]]
-                        .view(dtype)
-                        .reshape(entry["shape"])
-                    )
-                    _scatter_kv_slice(
-                        memory_buffer,
-                        local_layer_range,
-                        dst_blocks,
-                        local_head_range,
-                        layout.is_mla,
-                        recv_view,
+                for bundle in parsed_bundles:
+                    dst_blocks = engine.inject_request(bundle).tolist()
+                    injected.append((bundle, dst_blocks))
+
+            # Build per-bundle KV migration plans. Both src and dst walk
+            # the bundles in identical order so slot/flag assignment
+            # stays consistent. On src ``dst_block_ids`` is unknown and
+            # left to the plan helper to fill.
+            all_ops_by_bundle: List[List] = []
+            for i, bundle in enumerate(parsed_bundles):
+                dst_blocks = injected[i][1] if meta["in_dst"] else None
+                ops = build_kv_migration_plan(
+                    bundle,
+                    src_global_rank_of=_src_rank_of,
+                    dst_global_rank_of=_dst_rank_of,
+                    dst_block_ids=dst_blocks,
+                )
+                all_ops_by_bundle.append(ops)
+
+            # Walk every (bundle, op) deterministically to assign slot +
+            # flag indices. Same order on src and dst → same slot/flag
+            # for each transfer.
+            arena = _nv.StagingArena()
+            op_meta: List[dict] = []
+            elem_size = memory_buffer.element_size()
+            dtype = memory_buffer.dtype
+            # Flag slots are derived deterministically from
+            # ``(request_id, op_index_within_bundle)``: every src and
+            # dst rank looking at the same op picks the same flag,
+            # so we don't need a per-PE counter (which round-robin
+            # routing would desync, since not every dst replica
+            # participates in every batch).
+            MAX_OPS_PER_REQ = 32
+            for bundle_idx, ops in enumerate(all_ops_by_bundle):
+                req_id = parsed_bundles[bundle_idx].request_id
+                for op_idx_in_bundle, op in enumerate(ops):
+                    num_blocks = len(op.src_block_ids)
+                    layer_span = op.layer_range[1] - op.layer_range[0]
+                    head_span = op.head_range[1] - op.head_range[0]
+                    if layout.is_mla:
+                        shape = (
+                            layer_span,
+                            num_blocks,
+                            layout.block_size_tokens,
+                            head_span,
+                        )
+                    else:
+                        shape = (
+                            2,
+                            layer_span,
+                            num_blocks,
+                            layout.block_size_tokens,
+                            head_span,
+                            layout.head_dim,
+                        )
+                    nelems = 1
+                    for d in shape:
+                        nelems *= d
+                    nbytes = nelems * elem_size
+                    flag_key = req_id * MAX_OPS_PER_REQ + op_idx_in_bundle
+                    op_meta.append(
+                        {
+                            "op": op,
+                            "shape": shape,
+                            "nbytes": nbytes,
+                            "slot": arena.take(nbytes),
+                            "flag": _nv.flag_slot_for(flag_key),
+                        }
                     )
 
-            # Mark the end of this migration on the stream so the
-            # tick poll can query a CUDA event.
-            done_event = torch.cuda.Event()
-            done_event.record(stream)
+            # Schedule everything on the migration stream and return.
+            with torch.cuda.stream(stream):
+                if meta["in_src"]:
+                    # Gather + put_signal per op this rank participates in.
+                    for entry in op_meta:
+                        op = entry["op"]
+                        if rank != op.src_rank:
+                            continue
+                        src_blocks = torch.as_tensor(
+                            op.src_block_ids, device=memory_buffer.device, dtype=torch.long
+                        )
+                        local_head_range = (
+                            op.head_range[0] - my_src_head_offset,
+                            op.head_range[1] - my_src_head_offset,
+                        )
+                        local_layer_range = (
+                            op.layer_range[0] - my_src_pp_layer_offset,
+                            op.layer_range[1] - my_src_pp_layer_offset,
+                        )
+                        send_tensor = _gather_kv_slice(
+                            memory_buffer,
+                            local_layer_range,
+                            src_blocks,
+                            local_head_range,
+                            layout.is_mla,
+                        )
+                        slot = _nv.staging_slot(entry["slot"])
+                        slot[: entry["nbytes"]].view(dtype).reshape(
+                            entry["shape"]
+                        ).copy_(send_tensor, non_blocking=True)
+                        _nv.put_slot_with_signal(
+                            entry["slot"],
+                            entry["flag"],
+                            op.dst_rank,
+                            nbytes=entry["nbytes"],
+                            stream=stream,
+                        )
 
-        # Engine compute stream waits for the migration stream — any
-        # forward pass touching the migrated KV blocks (on either
-        # side) implicitly waits without us having to pause the
-        # engine here.
-        torch.cuda.default_stream().wait_stream(stream)
+                if meta["in_dst"]:
+                    # signal_wait + scatter per op this rank participates in.
+                    for entry in op_meta:
+                        op = entry["op"]
+                        if rank != op.dst_rank:
+                            continue
+                        _nv.wait_slot_signal(
+                            entry["flag"], expected_value=1, stream=stream
+                        )
+                        dst_blocks = torch.as_tensor(
+                            op.dst_block_ids, device=memory_buffer.device, dtype=torch.long
+                        )
+                        local_head_range = (
+                            op.head_range[0] - my_dst_head_offset,
+                            op.head_range[1] - my_dst_head_offset,
+                        )
+                        local_layer_range = (
+                            op.layer_range[0] - my_dst_pp_layer_offset,
+                            op.layer_range[1] - my_dst_pp_layer_offset,
+                        )
+                        slot = _nv.staging_slot(entry["slot"])
+                        recv_view = (
+                            slot[: entry["nbytes"]]
+                            .view(dtype)
+                            .reshape(entry["shape"])
+                        )
+                        _scatter_kv_slice(
+                            memory_buffer,
+                            local_layer_range,
+                            dst_blocks,
+                            local_head_range,
+                            layout.is_mla,
+                            recv_view,
+                        )
 
-        # Push pending entry whose poll resets the flags + (on src)
-        # detaches the freed requests once the event has fired.
-        flags_used = [e["flag"] for e in op_meta]
+                # Mark the end of this migration on the stream so the
+                # tick poll can query a CUDA event.
+                done_event = torch.cuda.Event()
+                done_event.record(stream)
 
-        def _poll() -> bool:
-            if not done_event.query():
-                return False
-            for slot in flags_used:
-                _nv.reset_flag(slot)
-            # Src detached each request synchronously above with
-            # ``keep_blocks=True`` so the gather kernel could read them
-            # safely. Now that the gather has completed, return the blocks
-            # to the KV allocator.
-            if meta["in_src"] and src_block_ids_to_free:
+            # Engine compute stream waits for the migration stream — any
+            # forward pass touching the migrated KV blocks (on either
+            # side) implicitly waits without us having to pause the
+            # engine here.
+            torch.cuda.default_stream().wait_stream(stream)
+
+            # Once the migration event fires: reset the flags and (on src)
+            # return the kept blocks to the allocator.
+            flags_used = [e["flag"] for e in op_meta]
+
+            def _poll() -> bool:
+                if not done_event.query():
+                    return False
+                for slot in flags_used:
+                    _nv.reset_flag(slot)
+                if meta["in_src"] and src_block_ids_to_free:
+                    allocator = engine.context.kv_block_allocator
+                    for blocks in src_block_ids_to_free:
+                        if blocks.numel() > 0:
+                            allocator.release_memory_blocks(blocks)
+                return True
+
+            engine.push_pending_migration(_poll)
+        except BaseException:
+            # Roll back the partially-applied migration so the engine doesn't
+            # leak GPU blocks. ``release_memory_blocks`` returns the kept
+            # blocks to the allocator; ``detach_request(keep_blocks=False)``
+            # does the same for any dst requests that were injected before
+            # the failure point.
+            if src_block_ids_to_free:
                 allocator = engine.context.kv_block_allocator
                 for blocks in src_block_ids_to_free:
                     if blocks.numel() > 0:
                         allocator.release_memory_blocks(blocks)
-            return True
-
-        engine.push_pending_migration({"poll": _poll})
+            for bundle, _ in injected:
+                if bundle.request_id in engine.requests:
+                    engine.detach_request(
+                        bundle.request_id, keep_blocks=False
+                    )
+            raise
 
     async def _pause_scheduler(self) -> None:
         """Stop all scheduler asyncio tasks. Configs stay in
@@ -1526,30 +1499,33 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
 
             for dst_shard_index, request_ids in groups.items():
                 try:
+                    # Layouts are not stamped here: they're invariant per
+                    # (src, dst) pair and the receiving handler restamps
+                    # from its own ``_migration_meta`` after deserialize.
                     bundles = []
                     for req_id in request_ids:
                         bundle, _ = self._my_engine.snapshot_request(req_id)
-                        # Stamp the layouts so the dst can build
-                        # the migration plan without re-deriving them.
-                        meta = self._migration_meta.get(
-                            (src_shard_index, dst_shard_index)
-                        )
-                        if meta is not None:
-                            bundle.src_layout = meta["src_layout"]
-                            bundle.dst_layout = meta["dst_layout"]
                         bundles.append(serialize_bundle(bundle))
+                    # Round-robin one batch at a time across the dst
+                    # shard's DP replicas so we don't stack every
+                    # migration on dp_rank 0.
+                    dst_shard = self._shards[dst_shard_index]
+                    dst_dp_size = max(int(dst_shard.spec.get("dp", 1)), 1)
+                    counter = self._disagg_dst_dp_counter.get(src_shard_index, 0)
+                    dst_dp_rank = counter % dst_dp_size
+                    self._disagg_dst_dp_counter[src_shard_index] = counter + 1
                     client.migrate_request_batch(
                         request_ids,
                         src_shard_index,
                         dst_shard_index,
                         bundles=bundles,
+                        dst_dp_rank_within_shard=dst_dp_rank,
                     )
-                    for req_id in request_ids:
-                        client.update_request_rank(
-                            request_id=req_id,
-                            new_shard_index=dst_shard_index,
-                            new_dp_rank_within_shard=0,
-                        )
+                    client.update_request_ranks_batch(
+                        request_ids=request_ids,
+                        new_shard_index=dst_shard_index,
+                        new_dp_rank_within_shard=dst_dp_rank,
+                    )
                     migrated_ids.update(request_ids)
                 except Exception as e:
                     logger.error(

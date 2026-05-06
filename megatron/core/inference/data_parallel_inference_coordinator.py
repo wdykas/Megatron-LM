@@ -291,6 +291,21 @@ class DataParallelInferenceCoordinator:
     def _invalidate_shard_cache(self):
         self._shard_to_identities.clear()
 
+    def _identity_for_dp_rank(
+        self, shard_index: int, dp_rank: int
+    ) -> bytes | None:
+        """Return the engine identity ``mp-coord-s{shard_index}-{dp_rank}``,
+        or ``None`` if no engine in the shard advertises that suffix.
+
+        Match by suffix (not by registration order) so MIGRATE_BATCH and
+        UPDATE_REQUEST_RANK always pick the same physical rank.
+        """
+        suffix = f"-{dp_rank}".encode()
+        for ident in self._identities_for_shard(shard_index):
+            if ident.endswith(suffix):
+                return ident
+        return None
+
     def _register_rank_identity(self, identity, shard_index: int | None = None):
         """Register a new rank identity in the scoring data structures.
 
@@ -777,66 +792,24 @@ class DataParallelInferenceCoordinator:
                     )
 
             elif header == Headers.MIGRATE_BATCH:
-                # Driver rank → coord → engines in src + dst shards.
                 # Payload: [MIGRATE_BATCH, request_ids, src_shard_index,
-                # dst_shard_index]. The coord forwards the same payload
-                # (verbatim) to every engine registered with src or dst
-                # shard_index; bystander shards are not touched. Each
-                # engine's signal handler invokes its registered
-                # migration callback which performs the NCCL transport
-                # on cross_shard_group.
+                # dst_shard_index, bundles, dst_dp_rank]. Bundles are the
+                # per-request serialized envelopes; carried inline so
+                # engines can run async migration without a cross-shard
+                # broadcast. Coord forwards the original bytes to every
+                # rank in src + the single chosen dst dp_rank.
                 if sender_identity not in known_clients:
                     logging.warning(
                         "Coordinator: ignoring MIGRATE_BATCH from unknown client."
                     )
                     continue
-                # Payload format:
-                #   [MIGRATE_BATCH, request_ids, src_shard, dst_shard,
-                #    bundles, dst_dp_rank_within_shard]
-                # ``bundles`` is the per-request serialized migration
-                # envelope; carried inline so engines can run async
-                # migration without a cross-shard broadcast.
-                # ``dst_dp_rank_within_shard`` selects which DP rank
-                # in the destination shard receives the migration —
-                # forwarding to all DP ranks would cause every dst
-                # replica to ``inject_request`` and scatter, double-
-                # writing KV blocks and corrupting state.
-                bundles = []
-                dst_dp_rank = 0
-                if len(deserialized_payload) >= 6:
-                    (
-                        _,
-                        request_ids,
-                        src_shard_index,
-                        dst_shard_index,
-                        bundles,
-                        dst_dp_rank,
-                    ) = deserialized_payload
-                elif len(deserialized_payload) >= 5:
-                    _, request_ids, src_shard_index, dst_shard_index, bundles = (
-                        deserialized_payload
-                    )
-                else:
-                    _, request_ids, src_shard_index, dst_shard_index = (
-                        deserialized_payload
-                    )
-
-                # Src side: every TP rank in src shard receives (each
-                # owns a head slice and contributes to the put).
-                # Dst side: only the chosen DP rank receives. We pick
-                # by parsing the engine's registered identity
-                # ``mp-coord-s{shard}-{dp_rank}`` rather than by
-                # registration index, since registration order isn't
-                # guaranteed to match dp_rank order.
+                _, _, src_shard_index, dst_shard_index, _, dst_dp_rank = (
+                    deserialized_payload
+                )
                 src_targets = self._identities_for_shard(src_shard_index)
-                dst_idents = self._identities_for_shard(dst_shard_index)
-                dst_targets: list[bytes] = []
-                expected_suffix = f"-{dst_dp_rank}".encode()
-                for ident in dst_idents:
-                    if ident.endswith(expected_suffix):
-                        dst_targets = [ident]
-                        break
-                if not dst_targets:
+                dst_target = self._identity_for_dp_rank(dst_shard_index, dst_dp_rank)
+                if dst_target is None:
+                    dst_idents = self._identities_for_shard(dst_shard_index)
                     logging.warning(
                         "Coordinator: dst_dp_rank=%d not found among %s for "
                         "shard %d; falling back to first registered engine.",
@@ -844,112 +817,80 @@ class DataParallelInferenceCoordinator:
                         [i.decode(errors='replace') for i in dst_idents],
                         dst_shard_index,
                     )
-                    dst_targets = [dst_idents[0]] if dst_idents else []
-                # Forward payload includes ``dst_dp_rank`` so the
-                # engine handler can compute the correct ``dst_root``
-                # global rank for its migration plan (otherwise the
-                # handler assumes rank_offset, which is wrong when
-                # the target dp_rank is not 0).
-                forward_payload = msgpack.packb(
-                    [
-                        header.value,
-                        request_ids,
-                        src_shard_index,
-                        dst_shard_index,
-                        bundles,
-                        dst_dp_rank,
-                    ],
-                    use_bin_type=True,
-                )
-                for data_parallel_rank_id in src_targets + dst_targets:
-                    self._send_to_engine(data_parallel_rank_id, forward_payload)
+                    if not dst_idents:
+                        continue
+                    dst_target = dst_idents[0]
+                for data_parallel_rank_id in [*src_targets, dst_target]:
+                    self._send_to_engine(data_parallel_rank_id, serialized_payload)
 
-            elif header == Headers.UPDATE_REQUEST_RANK:
-                # Driver rank notifies the coord that a live request's owning
-                # engine has changed (cross-shard migration). Payload:
-                # [UPDATE_REQUEST_RANK, request_id, new_shard_index,
-                # new_dp_rank_within_shard].
-                #
-                # The coord's view of the world is just "who will send the
-                # ENGINE_REPLY for this request" — so we rewrite
-                # request_id_to_rank and shift pending_counts from the old
-                # owner to the new one. No need to touch client tables:
-                # request_id_to_client_id / request_id_to_client_request_id
-                # remain valid because the HTTP client is the same.
+            elif header in (
+                Headers.UPDATE_REQUEST_RANK,
+                Headers.UPDATE_REQUEST_RANKS_BATCH,
+            ):
+                # Driver tells the coord that one or more live requests
+                # have migrated to ``(new_shard_index, new_dp_rank)``.
+                # Single payload: [hdr, request_id, shard, dp_rank].
+                # Batch payload:  [hdr, [request_ids...], shard, dp_rank].
+                # The coord rewrites ``request_id_to_rank`` and shifts
+                # ``_pending_counts`` so subsequent ENGINE_REPLY routing
+                # and load accounting target the new owner.
                 if sender_identity not in known_clients:
                     logging.warning(
-                        "Coordinator: ignoring UPDATE_REQUEST_RANK from unknown client."
+                        "Coordinator: ignoring %s from unknown client.",
+                        header.name,
                     )
                     continue
-                _, request_id, new_shard_index, new_dp_rank_within_shard = (
+                _, ids_field, new_shard_index, new_dp_rank_within_shard = (
                     deserialized_payload
                 )
-                if request_id not in self.request_id_to_client_id:
-                    logging.warning(
-                        "Coordinator: UPDATE_REQUEST_RANK for unknown request %d; "
-                        "ignoring (already replied or never submitted)",
-                        request_id,
-                    )
-                    continue
-                shard_identities = self._identities_for_shard(new_shard_index)
-                if not shard_identities:
-                    logging.error(
-                        "Coordinator: UPDATE_REQUEST_RANK request=%d target shard=%s "
-                        "has no engines; refusing to rewrite",
-                        request_id,
-                        new_shard_index,
-                    )
-                    continue
-                if new_dp_rank_within_shard < 0 or new_dp_rank_within_shard >= len(
-                    shard_identities
-                ):
-                    logging.error(
-                        "Coordinator: UPDATE_REQUEST_RANK request=%d dp_rank=%d "
-                        "out of range for shard %s (size %d)",
-                        request_id,
-                        new_dp_rank_within_shard,
-                        new_shard_index,
-                        len(shard_identities),
-                    )
-                    continue
-                # Match by identity suffix (``mp-coord-s{shard}-{dp_rank}``)
-                # rather than registration index — engines may register in
-                # any order, so ``shard_identities[dp_rank]`` is wrong when
-                # the order differs. This must agree with how MIGRATE_BATCH
-                # picks the dst engine, otherwise NVSHMEM data lands on one
-                # rank but the coord routes the reply through another.
-                expected_suffix = f"-{new_dp_rank_within_shard}".encode()
-                new_identity = None
-                for ident in shard_identities:
-                    if ident.endswith(expected_suffix):
-                        new_identity = ident
-                        break
+                request_ids_to_update = (
+                    list(ids_field)
+                    if header == Headers.UPDATE_REQUEST_RANKS_BATCH
+                    else [ids_field]
+                )
+                new_identity = self._identity_for_dp_rank(
+                    new_shard_index, new_dp_rank_within_shard
+                )
                 if new_identity is None:
                     logging.error(
-                        "Coordinator: UPDATE_REQUEST_RANK request=%d dp_rank=%d "
-                        "not found among %s for shard %s",
-                        request_id,
+                        "Coordinator: %s dp_rank=%d not found in shard %s "
+                        "(engines=%s)",
+                        header.name,
                         new_dp_rank_within_shard,
-                        [i.decode(errors='replace') for i in shard_identities],
                         new_shard_index,
+                        [
+                            i.decode(errors='replace')
+                            for i in self._identities_for_shard(new_shard_index)
+                        ],
                     )
                     continue
-                old_identity = self.request_id_to_rank.get(request_id)
-                if old_identity is not None:
-                    old_idx = self.identity_to_rank_index.get(old_identity)
-                    if old_idx is not None and self._pending_counts[old_idx] > 0:
-                        self._pending_counts[old_idx] -= 1
-                self.request_id_to_rank[request_id] = new_identity
                 new_idx = self.identity_to_rank_index.get(new_identity)
-                if new_idx is not None:
-                    self._pending_counts[new_idx] += 1
-                logging.info(
-                    "Coordinator: request %d migrated rank %s → %s (shard %s)",
-                    request_id,
-                    old_identity,
-                    new_identity,
-                    new_shard_index,
-                )
+                migrated = 0
+                for request_id in request_ids_to_update:
+                    if request_id not in self.request_id_to_client_id:
+                        logging.warning(
+                            "Coordinator: %s for unknown request %d; ignoring "
+                            "(already replied or never submitted)",
+                            header.name,
+                            request_id,
+                        )
+                        continue
+                    old_identity = self.request_id_to_rank.get(request_id)
+                    if old_identity is not None:
+                        old_idx = self.identity_to_rank_index.get(old_identity)
+                        if old_idx is not None and self._pending_counts[old_idx] > 0:
+                            self._pending_counts[old_idx] -= 1
+                    self.request_id_to_rank[request_id] = new_identity
+                    if new_idx is not None:
+                        self._pending_counts[new_idx] += 1
+                    migrated += 1
+                if migrated:
+                    logging.info(
+                        "Coordinator: %d request(s) migrated → %s (shard %s)",
+                        migrated,
+                        new_identity,
+                        new_shard_index,
+                    )
 
             elif header == Headers.SHUTDOWN:
                 if sender_identity not in known_clients:

@@ -210,6 +210,21 @@ class InferenceClient:
             new_dp_rank_within_shard,
         )
 
+    def update_request_ranks_batch(
+        self,
+        request_ids: List[int],
+        new_shard_index: int,
+        new_dp_rank_within_shard: int = 0,
+    ) -> None:
+        """Batched form of :meth:`update_request_rank`. All ids must share
+        the same ``(new_shard_index, new_dp_rank_within_shard)``."""
+        self._send_signal_to_engines(
+            Headers.UPDATE_REQUEST_RANKS_BATCH,
+            list(request_ids),
+            int(new_shard_index),
+            int(new_dp_rank_within_shard),
+        )
+
     @trace_async_exceptions
     async def _recv_task(self):
         """

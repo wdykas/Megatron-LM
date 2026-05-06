@@ -204,7 +204,7 @@ def build_kv_migration_plan(
     bundle: RequestMigrationBundle,
     src_global_rank_of: "Callable[[int, int], int]",
     dst_global_rank_of: "Callable[[int, int], int]",
-    dst_block_ids: List[int],
+    dst_block_ids: Optional[List[int]] = None,
 ) -> List[KVMigrationOp]:
     """Compute the set of tensor transfers that move a request's KV cache
     from the source shard to the destination shard.
@@ -217,7 +217,12 @@ def build_kv_migration_plan(
         dst_global_rank_of: Same for the destination shard.
         dst_block_ids: Block ids the destination engine's allocator
             already reserved for this request, in the same chronological
-            order as ``bundle.src_block_ids``.
+            order as ``bundle.src_block_ids``. **Required on dst-side
+            ranks** (used by the scatter step). On src-side ranks may
+            be ``None`` — the gather only consults ``bundle.src_block_ids``,
+            and the field is filled with a same-length placeholder so
+            the dst-only logic that reads ``op.dst_block_ids`` in
+            symmetric code paths still has a value of the right shape.
 
     Returns:
         A list of :class:`KVMigrationOp`. Every (src_pp × dst_pp × src_tp
@@ -257,6 +262,10 @@ def build_kv_migration_plan(
         "num_layers_total must match across shards"
     )
     assert src.is_mla == dst.is_mla, "MLA mode must match across shards"
+    if dst_block_ids is None:
+        # Src-side build: the gather doesn't read this field, but every
+        # op carries one for shape symmetry with dst-side ops.
+        dst_block_ids = list(bundle.src_block_ids)
     assert len(dst_block_ids) == len(bundle.src_block_ids), (
         f"dst_block_ids count ({len(dst_block_ids)}) must match "
         f"bundle.src_block_ids count ({len(bundle.src_block_ids)})"
@@ -340,6 +349,10 @@ def serialize_bundle(bundle: RequestMigrationBundle) -> dict:
             "mamba": _serialize_mamba(layout.mamba),
         }
 
+    # ``src_layout`` / ``dst_layout`` are *not* on the wire — they are
+    # invariant per (src_shard, dst_shard) pair and the receiving handler
+    # already has them via ``_migration_meta``. Restamping after
+    # deserialize avoids ~16x duplicate serialization per migration batch.
     return {
         "request_id": bundle.request_id,
         "prompt_tokens": bundle.prompt_tokens,
@@ -352,8 +365,6 @@ def serialize_bundle(bundle: RequestMigrationBundle) -> dict:
         "num_kv_blocks": bundle.num_kv_blocks,
         "last_block_offset": bundle.last_block_offset,
         "src_block_ids": bundle.src_block_ids,
-        "src_layout": _serialize_layout(bundle.src_layout),
-        "dst_layout": _serialize_layout(bundle.dst_layout),
         "routing_indices_shape": (
             list(bundle.routing_indices_shape)
             if bundle.routing_indices_shape is not None
