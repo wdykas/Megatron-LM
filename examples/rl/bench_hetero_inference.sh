@@ -34,22 +34,23 @@ EXIT_INTERVAL=${EXIT_INTERVAL:-20}
 LAG=${LAG:-2}
 PARALLEL_BATCHES=$((LAG + 1))
 
-# (name | shard_arg | extra inline env). The shard arg drives
-# ``--rl-inference-shards``; auto-disagg configs add the env vars that
-# MegatronLocalMulti.launch picks up (AUTO_DISAGG_SRC_SHARD,
-# AUTO_DISAGG_DST_SHARD).
+# (name | shard_arg | extra CLI flags). The shard arg drives
+# ``--rl-inference-shards``; auto-disagg configs append --rl-auto-disagg-*
+# flags that MegatronLocalMulti.launch consults.
+DISAGG_LENGTH_THRESHOLD=${DISAGG_LENGTH_THRESHOLD:-256}
+TAIL_CUT_MIN_TOKENS=${TAIL_CUT_MIN_TOKENS:-128}
 declare -a ALL_CONFIGS=(
   "homogeneous_tp4|tp=4,dp=1|"
   "homogeneous_tp2_dp2|tp=2,dp=2|"
   "hetero_balanced|tp=2,dp=1+tp=2,dp=1|"
   "hetero_prefill_decode|tp=2,dp=1+tp=1,dp=2|"
-  "hetero_prefill_decode_disagg|tp=2,dp=1+tp=1,dp=2|AUTO_DISAGG_SRC_SHARD=0 AUTO_DISAGG_DST_SHARD=1"
+  "hetero_prefill_decode_disagg|tp=2,dp=1+tp=1,dp=2|--rl-auto-disagg-src-shard 0 --rl-auto-disagg-dst-shard 1"
   # Length-aware: same hetero topology as _disagg, but the HTTP
-  # endpoint short-circuits prompts < ${DISAGG_LENGTH_THRESHOLD} tokens
+  # endpoint short-circuits prompts shorter than the threshold
   # straight to the decode shard (no migration). Compare against
   # _disagg to see how much migration overhead disappears for short
-  # traffic. Threshold default 256 — tune via env.
-  "hetero_disagg_length_aware|tp=2,dp=1+tp=1,dp=2|AUTO_DISAGG_SRC_SHARD=0 AUTO_DISAGG_DST_SHARD=1 DISAGG_LENGTH_THRESHOLD=${DISAGG_LENGTH_THRESHOLD:-256}"
+  # traffic.
+  "hetero_disagg_length_aware|tp=2,dp=1+tp=1,dp=2|--rl-auto-disagg-src-shard 0 --rl-auto-disagg-dst-shard 1 --rl-disagg-length-threshold $DISAGG_LENGTH_THRESHOLD"
   # Three-shard tail-cut. Shard 0 = TP=1 prefill, shard 1 = TP=1
   # throughput decode, shard 2 = TP=2 latency-optimized decode for
   # long-tail rollouts. Requests prefill on shard 0, migrate to shard
@@ -58,7 +59,7 @@ declare -a ALL_CONFIGS=(
   # per-token at TP=2). Compare against ``hetero_prefill_decode_disagg``
   # to see whether routing the slow-completing tail to a higher-TP
   # decode shard reduces p99 / max iter time.
-  "hetero_tail_cut|tp=1,dp=1+tp=1,dp=1+tp=2,dp=1|AUTO_DISAGG_SRC_SHARD=0 AUTO_DISAGG_DST_SHARD=1 TAIL_CUT_DST_SHARD=2 TAIL_CUT_MIN_TOKENS=${TAIL_CUT_MIN_TOKENS:-128}"
+  "hetero_tail_cut|tp=1,dp=1+tp=1,dp=1+tp=2,dp=1|--rl-auto-disagg-src-shard 0 --rl-auto-disagg-dst-shard 1 --rl-tail-cut-dst-shard 2 --rl-tail-cut-min-tokens $TAIL_CUT_MIN_TOKENS"
 )
 
 # Optional filter via $CONFIGS env (space-separated names).
@@ -89,11 +90,9 @@ RUN_LIST="$BENCH_OUT_DIR/run_paths.txt"
 : > "$RUN_LIST"
 
 for spec in "${SELECTED[@]}"; do
-    IFS='|' read -r name shard_arg extra_env <<< "$spec"
+    IFS='|' read -r name shard_arg extra_args <<< "$spec"
     EXP_NAME="bench_hetero_${name}_$(date +%s)"
 
-    # Build the env prefix so optional vars (AUTO_DISAGG_*) don't
-    # pollute configs that don't use them.
     # SLURM_ACCOUNT defaults to nemotron_sw_pre; override at the
     # script level by exporting SLURM_ACCOUNT before invocation.
     env_prefix=(
@@ -114,17 +113,12 @@ for spec in "${SELECTED[@]}"; do
         "ENV_CONFIG=$(realpath megatron-rl/examples/rl/environment_configs/countdown.yaml)"
         "EXP_NAME=$EXP_NAME"
     )
-    # Append config-specific env (e.g. AUTO_DISAGG_SRC_SHARD / DST).
-    if [[ -n "$extra_env" ]]; then
-        for kv in $extra_env; do
-            env_prefix+=("$kv")
-        done
-    fi
 
     "${env_prefix[@]}" ./run_job.sh -l qwen2p5_3b -- \
         --rl-partial-rollouts \
         --rl-num-parallel-generation-batches "$PARALLEL_BATCHES" \
-        --rl-inference-shards "$shard_arg"
+        --rl-inference-shards "$shard_arg" \
+        $extra_args
 
     # run_job.sh appends ``_$USER`` to the experiment name unless it
     # already ends with the user, so record the actual on-disk name.

@@ -3,7 +3,6 @@
 import asyncio
 import logging
 import multiprocessing as mp
-import os
 import socket
 from contextlib import contextmanager
 from typing import List, Optional
@@ -83,13 +82,24 @@ async def _run_text_gen_server(
         app.config['verbose'] = verbose
         # Length-aware disagg routing: when a request body sets
         # ``disagg_pair=[prefill, decode]`` AND its tokenized prompt is
-        # shorter than this threshold, the endpoint routes the submit
-        # directly to the decode shard with no auto-disagg tag — the
-        # whole prefill→migrate→decode round-trip costs more than the
-        # short request would save. Threshold of None disables it
-        # (every disagg_pair request routes via prefill + migrate).
-        threshold = os.environ.get("DISAGG_LENGTH_THRESHOLD")
-        app.config['disagg_length_threshold'] = int(threshold) if threshold else None
+        # shorter than --rl-disagg-length-threshold, the endpoint
+        # routes the submit straight to the decode shard with no
+        # auto-disagg tag — the whole prefill→migrate→decode round-trip
+        # costs more than the short request would save. Threshold of
+        # None disables it (every disagg_pair request routes via
+        # prefill + migrate).
+        from megatron.training.global_vars import get_args
+        try:
+            args = get_args()
+            threshold = getattr(args, "rl_disagg_length_threshold", None)
+        except (AssertionError, RuntimeError):
+            # ``get_args`` raises before training initialization; the
+            # text-gen server can be imported in test contexts where
+            # there's no global args. Treat as "feature disabled".
+            threshold = None
+        app.config['disagg_length_threshold'] = (
+            int(threshold) if threshold is not None else None
+        )
 
         # Register all blueprints from the 'endpoints' package
         for endpoint in endpoints.__all__:

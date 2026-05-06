@@ -436,62 +436,59 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             )
             await instance.run_disaggregated_smoke_test()
 
-        # Opt-in end-to-end disagg for every rollout. Setting both env
-        # vars starts the auto-disagg scheduler watching src_shard and
-        # stamps every subsequent base_generate with
-        # ``disagg_pair=[src, dst]`` — so each HTTP request lands on src,
-        # reaches first-token, then gets migrated to dst.
-        src_env = os.environ.get("AUTO_DISAGG_SRC_SHARD")
-        dst_env = os.environ.get("AUTO_DISAGG_DST_SHARD")
-        if src_env is not None and dst_env is not None and len(shards) >= 2:
-            src_idx = int(src_env)
-            dst_idx = int(dst_env)
-            assert src_idx != dst_idx, (
-                "AUTO_DISAGG_SRC_SHARD and AUTO_DISAGG_DST_SHARD must differ"
+        # Opt-in end-to-end disagg for every rollout. When
+        # --rl-auto-disagg-{src,dst}-shard are set, the scheduler
+        # watches src_shard and stamps every base_generate with
+        # ``disagg_pair=[src, dst]`` — each HTTP request lands on src,
+        # reaches first-token, then is migrated to dst for decode.
+        src_idx_arg = getattr(args, "rl_auto_disagg_src_shard", None)
+        dst_idx_arg = getattr(args, "rl_auto_disagg_dst_shard", None)
+        if src_idx_arg is not None and dst_idx_arg is not None and len(shards) >= 2:
+            assert src_idx_arg != dst_idx_arg, (
+                "--rl-auto-disagg-src-shard and --rl-auto-disagg-dst-shard "
+                "must differ"
             )
             log_single_rank(
                 logger,
                 logging.INFO,
                 "[auto-disagg] enabling scheduler: src=%d dst=%d — every "
                 "base_generate call will stamp disagg_pair=[%d, %d]",
-                src_idx,
-                dst_idx,
-                src_idx,
-                dst_idx,
+                src_idx_arg,
+                dst_idx_arg,
+                src_idx_arg,
+                dst_idx_arg,
             )
-            instance._disagg_rollout_pair = (src_idx, dst_idx)
-            instance._register_migration_pair(src_idx, dst_idx)
-            instance.enable_auto_disagg(src_shard_index=src_idx)
+            instance._disagg_rollout_pair = (src_idx_arg, dst_idx_arg)
+            instance._register_migration_pair(src_idx_arg, dst_idx_arg)
+            instance.enable_auto_disagg(src_shard_index=src_idx_arg)
 
-        # Two-stage tail-cut. When TAIL_CUT_DST_SHARD is set, every
-        # rollout is also stamped with ``tail_cut=[dst, n]`` and a
-        # second scheduler is spun up watching the disagg dst shard
-        # (the throughput decode shard) — once a request there has
-        # produced ``n`` tokens, the second scheduler migrates it to
-        # the latency-optimized shard.
-        tail_dst_env = os.environ.get("TAIL_CUT_DST_SHARD")
-        tail_min_env = os.environ.get("TAIL_CUT_MIN_TOKENS")
+        # Two-stage tail-cut. When --rl-tail-cut-{dst-shard,min-tokens}
+        # are set, every rollout is also stamped with
+        # ``tail_cut=[dst, n]`` and a second scheduler watches the
+        # throughput-decode shard — once a request there has produced
+        # ``n`` tokens, the second scheduler migrates it to the
+        # latency-optimized shard.
+        tail_dst_arg = getattr(args, "rl_tail_cut_dst_shard", None)
+        tail_min_arg = getattr(args, "rl_tail_cut_min_tokens", None)
         if (
-            tail_dst_env is not None
-            and tail_min_env is not None
-            and dst_env is not None
+            tail_dst_arg is not None
+            and tail_min_arg is not None
+            and dst_idx_arg is not None
             and len(shards) >= 3
         ):
-            tail_dst = int(tail_dst_env)
-            tail_min = int(tail_min_env)
-            throughput_decode = int(dst_env)
-            assert tail_dst != throughput_decode, (
-                "TAIL_CUT_DST_SHARD must differ from AUTO_DISAGG_DST_SHARD"
+            assert tail_dst_arg != dst_idx_arg, (
+                "--rl-tail-cut-dst-shard must differ from "
+                "--rl-auto-disagg-dst-shard"
             )
             log_single_rank(
                 logger,
                 logging.INFO,
                 "[auto-disagg] enabling tail-cut: src=%d dst=%d min_tokens=%d",
-                throughput_decode,
-                tail_dst,
-                tail_min,
+                dst_idx_arg,
+                tail_dst_arg,
+                tail_min_arg,
             )
-            instance._tail_cut_rollout_config = (tail_dst, tail_min)
+            instance._tail_cut_rollout_config = (tail_dst_arg, tail_min_arg)
             instance._register_migration_pair(throughput_decode, tail_dst)
             instance.enable_auto_disagg(src_shard_index=throughput_decode)
 

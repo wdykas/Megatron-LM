@@ -2541,6 +2541,56 @@ def _add_rl_args(parser):
         ),
     )
     group.add_argument(
+        '--rl-auto-disagg-src-shard',
+        type=int,
+        default=None,
+        help=(
+            'Index of the prefill shard for end-to-end auto-disaggregated rollouts. '
+            'When paired with --rl-auto-disagg-dst-shard, every base_generate call '
+            'is stamped with disagg_pair=[src, dst]: requests land on src, generate '
+            'their first token, and are migrated to dst for the rest of decode.'
+        ),
+    )
+    group.add_argument(
+        '--rl-auto-disagg-dst-shard',
+        type=int,
+        default=None,
+        help='Index of the decode shard paired with --rl-auto-disagg-src-shard.',
+    )
+    group.add_argument(
+        '--rl-disagg-length-threshold',
+        type=int,
+        default=None,
+        help=(
+            'Prompts shorter than this many tokens skip the prefill→decode migration '
+            'and are routed straight to the decode shard. Only consulted when an '
+            'HTTP request carries disagg_pair. Default (None) disables the '
+            'short-circuit so every disagg_pair request goes through prefill + '
+            'migrate.'
+        ),
+    )
+    group.add_argument(
+        '--rl-tail-cut-dst-shard',
+        type=int,
+        default=None,
+        help=(
+            'Index of the latency-optimized decode shard for two-stage tail-cut. '
+            'Pairs with --rl-tail-cut-min-tokens: once a request on the '
+            'throughput-decode shard (--rl-auto-disagg-dst-shard) has produced '
+            '--rl-tail-cut-min-tokens tokens, a second scheduler migrates it to '
+            'this shard. Requires --rl-auto-disagg-dst-shard to also be set.'
+        ),
+    )
+    group.add_argument(
+        '--rl-tail-cut-min-tokens',
+        type=int,
+        default=None,
+        help=(
+            'Token threshold above which a long-running request is migrated from '
+            'the throughput-decode shard to --rl-tail-cut-dst-shard.'
+        ),
+    )
+    group.add_argument(
         '--rl-inference-model-unified-memory-level',
         type=int,
         default=0,
