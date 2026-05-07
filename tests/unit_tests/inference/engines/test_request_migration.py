@@ -43,7 +43,6 @@ def _sample_bundle(
         generated_tokens=[5, 6, 7],
         sampling_params={"temperature": 0.8, "top_p": 0.95},
         generated_log_probs=[-0.1, -0.2, -0.3],
-        generated_top_n_logprobs=None,
         kv_cache_epoch=[(0, 0), (4, 1)],
         num_kv_blocks=num_blocks,
         last_block_offset=7,

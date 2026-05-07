@@ -184,40 +184,21 @@ class InferenceClient:
             )
         return await fut
 
-    def update_request_rank(
-        self,
-        request_id: int,
-        new_shard_index: int,
-        new_dp_rank_within_shard: int = 0,
-    ) -> None:
-        """Inform the coordinator that ``request_id`` has been migrated.
-
-        Sent by the rank-0 driver after a successful engine-level
-        cross-shard migration. The coord rewrites ``request_id_to_rank``
-        and shifts pending-count accounting to the new owner so its
-        eventual ENGINE_REPLY reaches the original HTTP client.
-
-        Args:
-            request_id: Server-side (coord-visible) request id.
-            new_shard_index: Shard that now owns the request.
-            new_dp_rank_within_shard: DP rank inside that shard (0 for
-                the common single-DP-rank-per-shard case).
-        """
-        self._send_signal_to_engines(
-            Headers.UPDATE_REQUEST_RANK,
-            request_id,
-            new_shard_index,
-            new_dp_rank_within_shard,
-        )
-
     def update_request_ranks_batch(
         self,
         request_ids: List[int],
         new_shard_index: int,
         new_dp_rank_within_shard: int = 0,
     ) -> None:
-        """Batched form of :meth:`update_request_rank`. All ids must share
-        the same ``(new_shard_index, new_dp_rank_within_shard)``."""
+        """Inform the coordinator that the listed requests have been
+        migrated to ``(new_shard_index, new_dp_rank_within_shard)``.
+
+        Sent by the migration handler after a successful cross-shard
+        transfer. The coord rewrites ``request_id_to_rank`` for each id
+        and shifts pending-count accounting to the new owner so each
+        request's eventual ENGINE_REPLY reaches the original HTTP
+        client. All ids must share the same destination.
+        """
         self._send_signal_to_engines(
             Headers.UPDATE_REQUEST_RANKS_BATCH,
             list(request_ids),

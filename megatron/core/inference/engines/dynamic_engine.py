@@ -455,13 +455,12 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         self._pending_migrations.append(poll)
 
-    def _poll_pending_migrations(self) -> int:
+    def _poll_pending_migrations(self) -> None:
         """Poll every pending migration; drop those that report done.
-        Returns the count of completed migrations this tick. Called
-        once per engine loop iteration; cheap when none are in flight."""
+        Called once per engine loop iteration; cheap when none are in
+        flight."""
         if not self._pending_migrations:
-            return 0
-        completed = 0
+            return
         still_pending: List[Callable[[], bool]] = []
         for poll in self._pending_migrations:
             try:
@@ -471,12 +470,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     "Engine: pending migration poll raised %s; dropping entry", e
                 )
                 done = True
-            if done:
-                completed += 1
-            else:
+            if not done:
                 still_pending.append(poll)
         self._pending_migrations = still_pending
-        return completed
 
     @internal_api
     async def start_listening_to_data_parallel_coordinator(
@@ -986,7 +982,6 @@ class DynamicInferenceEngine(AbstractEngine):
         # Import here to avoid a cyclic dependency at module-load time.
         from megatron.core.inference.engines.request_migration import (
             KVLayout,
-            MambaLayout,
             RequestMigrationBundle,
         )
 
@@ -1040,16 +1035,6 @@ class DynamicInferenceEngine(AbstractEngine):
         pg = getattr(ctx, "pg_collection", None)
         tp_size = get_pg_size(pg.tp) if pg is not None else 1
         pp_size = get_pg_size(pg.pp) if pg is not None else 1
-        mamba_layout: Optional[MambaLayout] = None
-        if ctx.is_hybrid_model:
-            mamba_layout = MambaLayout(
-                num_mamba_layers_pp=ctx.num_mamba_layers,
-                conv_states_shape=tuple(ctx.mamba_conv_states_shape),
-                ssm_states_shape=tuple(ctx.mamba_ssm_states_shape),
-                conv_states_dtype_name=str(ctx.mamba_conv_states_dtype).split(".")[-1],
-                ssm_states_dtype_name=str(ctx.mamba_ssm_states_dtype).split(".")[-1],
-            )
-
         src_layout = KVLayout(
             tp_size=tp_size,
             pp_size=pp_size,
@@ -1061,7 +1046,6 @@ class DynamicInferenceEngine(AbstractEngine):
             block_size_tokens=ctx.block_size_tokens,
             is_mla=getattr(ctx, "is_mla", False),
             kv_reduced_dim=getattr(ctx, "kv_reduced_dim", None),
-            mamba=mamba_layout,
         )
 
         def _as_list(x) -> list:
@@ -1088,7 +1072,6 @@ class DynamicInferenceEngine(AbstractEngine):
             generated_tokens=generated_tokens,
             sampling_params=sampling_params,
             generated_log_probs=generated_log_probs,
-            generated_top_n_logprobs=None,
             kv_cache_epoch=kv_cache_epoch,
             policy_epoch=policy_epoch,
             num_kv_blocks=block_count,
@@ -1266,9 +1249,7 @@ class DynamicInferenceEngine(AbstractEngine):
         Returns:
             1-D tensor of block ids the caller must fill.
         """
-        from megatron.core.inference.engines.request_migration import (
-            RequestMigrationBundle,
-        )
+        from megatron.core.inference.engines.request_migration import RequestMigrationBundle
 
         assert isinstance(bundle, RequestMigrationBundle)
         assert bundle.request_id not in self.requests, (

@@ -44,16 +44,18 @@ class Headers(Enum):
     # [UPDATE_REQUEST_RANKS_BATCH, request_ids, new_shard_index,
     # new_dp_rank_within_shard].
     UPDATE_REQUEST_RANKS_BATCH = auto()
-    # Rank-0 driver → coordinator → engines in src+dst shards: trigger a
-    # batched cross-shard request migration. The coord forwards this header
-    # to engines in the named shards; each engine's run loop pops it from
+    # Decider rank → coordinator → engines in src + chosen dst dp_rank:
+    # trigger a batched cross-shard request migration. The coord forwards
+    # this header to every rank in the src shard and to the single chosen
+    # dst dp_rank's engines; each engine's run loop pops it from
     # ``_pending_signals`` and invokes the migration callback registered
-    # via ``engine.set_migration_handler(...)``. The callback runs sync
-    # NCCL on ``cross_shard_group`` to move KV blocks for the listed
-    # request ids from src → dst. Replaces the prior PG-33 broadcast
-    # design (cross-PG NCCL ordering deadlock). Payload sent over the
-    # wire: ``[MIGRATE_BATCH, request_ids, src_shard_index,
-    # dst_shard_index]``. Forwarded to engines as the same 4-tuple.
+    # via ``engine.set_migration_handler(...)``. The callback runs the
+    # NVSHMEM one-sided ``put_signal`` / ``signal_wait`` transport on the
+    # migration stream — no NCCL collective, no engine pause.
+    # Wire payload: ``[MIGRATE_BATCH, request_ids, src_shard_index,
+    # dst_shard_index, bundles, dst_dp_rank]``. ``bundles`` are the
+    # per-request serialized envelopes; carrying them inline lets the
+    # dst engine register the requests without a cross-shard broadcast.
     MIGRATE_BATCH = auto()
 
 

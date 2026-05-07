@@ -7,11 +7,12 @@ in a single op; dst's ``signal_wait`` on the same flag implies all bytes
 have arrived. Both sides issue everything on a dedicated migration
 stream, so neither engine has to pause its run loop.
 
-Symmetric heap: the engine's KV ``memory_buffer`` (and Mamba state
-buffers) are allocated via ``nvshmem.core.interop.torch.bytetensor``
-sized to ``MAX(local_size)`` across all PEs. Smaller-shard ranks
-waste the trailing bytes; in exchange the migration code can issue
-``put`` directly on KV slices without staging.
+KV / Mamba buffers themselves are *not* in the symmetric heap; only the
+fixed-size symmetric staging slots (one ``bytetensor`` per slot,
+allocated up front in :func:`maybe_init_nvshmem`) and per-op flags are.
+The migration handler stages each op into a slot, ``put_signal``s the
+slot to the matching offset on the destination's symmetric region, and
+the destination scatters the slot back into its local buffer.
 """
 
 from __future__ import annotations
@@ -45,7 +46,6 @@ _migration_stream: Optional[torch.cuda.Stream] = None
 # ``signal_wait``).
 _flag_pool: List[torch.Tensor] = []
 _flag_pool_buffers: List[object] = []  # cuda.core Buffer per slot
-_flag_pool_next: int = 0
 _flag_pool_size: int = 0
 _staging_slots: List[torch.Tensor] = []  # pool of symmetric uint8[SLOT_BYTES]
 _staging_slot_bytes: int = 0
@@ -99,7 +99,7 @@ def maybe_init_nvshmem(group: Optional[dist.ProcessGroup] = None) -> None:
     this is a hard dependency rather than a graceful fallback.
     """
     global _initialized, _my_pe, _n_pes, _migration_stream
-    global _flag_pool_size, _flag_pool_next
+    global _flag_pool_size
 
     if _initialized:
         return
@@ -155,9 +155,6 @@ def maybe_init_nvshmem(group: Optional[dist.ProcessGroup] = None) -> None:
 
     _migration_stream = torch.cuda.Stream()
 
-    # Flip ``_initialized`` *before* the pool allocations so the
-    # ``symmetric_empty`` / ``symmetric_zeros`` helpers don't see a
-    # half-initialized module.
     _initialized = True
 
     global _flag_pool, _flag_pool_buffers
@@ -170,7 +167,6 @@ def maybe_init_nvshmem(group: Optional[dist.ProcessGroup] = None) -> None:
         buf, _, _ = nvshmem.core.tensor_get_buffer(flag)
         _flag_pool.append(flag)
         _flag_pool_buffers.append(buf)
-    _flag_pool_next = 0
 
     global _staging_slots, _staging_slot_bytes, _staging_num_slots
     _staging_slot_bytes = int(
@@ -196,70 +192,6 @@ def maybe_init_nvshmem(group: Optional[dist.ProcessGroup] = None) -> None:
     )
 
 
-def _max_bytes_across_ranks(local_bytes: int) -> int:
-    """Collective: returns ``max(local_bytes)`` across the world."""
-    t = torch.tensor([local_bytes], dtype=torch.int64, device=torch.cuda.current_device())
-    dist.all_reduce(t, op=dist.ReduceOp.MAX)
-    return int(t.item())
-
-
-def symmetric_empty(shape, *, dtype: torch.dtype) -> torch.Tensor:
-    """Allocate a torch tensor of the given shape/dtype backed by the
-    NVSHMEM symmetric heap.
-
-    Collective: all PEs must call with consistent shape/dtype semantics.
-    The actual byte allocation is the **max** required across PEs — every
-    PE gets a buffer of that size, then views the prefix as ``shape``.
-    Lets heterogeneous shards share one symmetric region without padding
-    the on-device shape.
-
-    Returns a tensor of ``shape`` (this PE's view); the underlying
-    bytetensor handle is held in module state to keep it alive.
-    """
-    assert _initialized, "call maybe_init_nvshmem() before symmetric_empty"
-
-    elem_size = torch.empty((), dtype=dtype).element_size()
-    local_numel = 1
-    for d in shape:
-        local_numel *= d
-    local_bytes = local_numel * elem_size
-    max_bytes = _max_bytes_across_ranks(local_bytes)
-
-    bytetensor = nvshmem.core.interop.torch.bytetensor(
-        (max_bytes,), dtype=torch.uint8
-    )
-    typed = bytetensor[:local_bytes].view(dtype).reshape(shape)
-    typed._nvshmem_byte_handle = bytetensor  # noqa: SLF001 — pin so GC keeps the symmetric region
-    return typed
-
-
-def symmetric_zeros(shape, *, dtype: torch.dtype) -> torch.Tensor:
-    """Like :func:`symmetric_empty` but zero-initialized, with a barrier
-    before returning so peer reads cannot observe uninitialized values.
-    """
-    t = symmetric_empty(shape, dtype=dtype)
-    t.zero_()
-    torch.cuda.synchronize()
-    nvshmem.core.barrier_all(stream=torch.cuda.current_stream())
-    torch.cuda.synchronize()
-    return t
-
-
-def acquire_flag_slot() -> int:
-    """Reserve one slot in the symmetric flag pool via a per-PE counter.
-
-    Safe only when every participating PE advances its counter by the
-    same amount on every migration. Round-robin routing breaks that
-    (a dst replica that sat out one batch resumes with a stale
-    counter); prefer :func:`flag_slot_for` with a deterministic key.
-    """
-    global _flag_pool_next
-    assert _initialized
-    slot = _flag_pool_next
-    _flag_pool_next = (_flag_pool_next + 1) % _flag_pool_size
-    return slot
-
-
 def flag_slot_for(key: int) -> int:
     """Deterministic flag-slot index from ``key``.
 
@@ -272,15 +204,6 @@ def flag_slot_for(key: int) -> int:
     """
     assert _initialized
     return key % _flag_pool_size
-
-
-def reset_flag_pool() -> None:
-    """Reset the flag pool counter to 0. Local-only — caller must
-    ensure all PEs invoke this together so counters stay aligned.
-    """
-    global _flag_pool_next
-    assert _initialized
-    _flag_pool_next = 0
 
 
 def flag_buffer(slot: int) -> object:

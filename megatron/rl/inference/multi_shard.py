@@ -55,7 +55,6 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 async def _spawn_unified_coord(
-    shards: "List[InferenceShard]",
     *,
     host: str,
     engine: "Optional[DynamicInferenceEngine]",
@@ -92,7 +91,9 @@ async def _spawn_unified_coord(
         ctx = engine.context
         spawn_context = multiprocessing.get_context('spawn')
         coord_pipe, coord_process_pipe = spawn_context.Pipe()
-        ready_event = spawn_context.Event()  # kept for entrypoint API; not awaited here
+        # ``entrypoint`` calls ``ready_event.set()``; we don't read it
+        # here (we wait on ``coord_pipe.recv()`` for the bound address).
+        ready_event = spawn_context.Event()
         coord_process = spawn_context.Process(
             target=DataParallelInferenceCoordinator.entrypoint,
             kwargs={
@@ -169,17 +170,16 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
     _auto_disagg_tasks: List[asyncio.Task] = PrivateAttr(default_factory=list)
     _scheduler_stop: bool = PrivateAttr(default=False)
     # Per-shard ``InferenceClient`` keyed by shard_index. Each shard's
-    # ``rank_offset`` rank holds a client so it can post migration
-    # triggers (and ``UPDATE_REQUEST_RANK`` follow-ups) to the coord
+    # ``rank_offset`` rank holds a client; the decider rank of any
+    # shard that calls ``enable_auto_disagg`` uses its client to post
+    # ``MIGRATE_BATCH`` and ``UPDATE_REQUEST_RANKS_BATCH`` to the coord
     # without going through rank 0. Empty on ranks that aren't a
     # ``rank_offset`` for any shard.
     _shard_clients: dict = PrivateAttr(default_factory=dict)
     # Migration metadata snapshot. Maps
     # ``(src_shard_index, dst_shard_index)`` → dict with the src/dst
     # layouts and head offsets the engine handler needs. Pre-computing
-    # avoids paying the layout-build cost on every migration. The
-    # async NVSHMEM path needs no torch process group; the synchronous
-    # smoke-test path builds one on demand.
+    # avoids paying the layout-build cost on every migration.
     _migration_meta: dict = PrivateAttr(default_factory=dict)
     # Round-robin counter used by the auto-disagg scheduler to spread
     # migration batches across the destination shard's DP replicas
@@ -289,7 +289,6 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
 
         total_dp_size = sum(int(s.spec.get("dp", 1)) for s in shards)
         unified_coord_addr = await _spawn_unified_coord(
-            shards,
             host=host,
             engine=my_engine,
             data_parallel_size=total_dp_size,
@@ -343,12 +342,14 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             s.http_url = f"http://{host}:{port}" if port >= 0 else None
 
         # --- Build per-shard InferenceClients on each shard's rank_offset ---
-        # Each shard's first rank gets a client. Rank 0's client drives
-        # the lifecycle (pause/resume/stop/shutdown via _drive_all);
-        # other shards' clients are used by their auto-disagg scheduler
-        # to post migration triggers (``MIGRATE_BATCH``) without going
-        # through rank 0. Multiple clients on one coord is fine — the
-        # coord identifies them by ZMQ identity at CONNECT time.
+        # Each shard's first rank gets a client. Rank 0's drives the
+        # lifecycle (pause/resume/stop/shutdown via _drive_all). The
+        # decider rank of any shard whose auto-disagg scheduler is later
+        # enabled uses its client to post ``MIGRATE_BATCH`` directly to
+        # the coord without going through rank 0. Clients on rank_offsets
+        # that never become deciders are vestigial but harmless — the
+        # coord identifies clients by ZMQ identity at CONNECT time and
+        # idle ones consume nothing.
         shard_clients: dict = {}
         for s in shards:
             if rank == s.rank_offset:
@@ -554,19 +555,14 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
     # local engine state so the engine-side broadcast from the
     # coordinator brings them along.
 
-    @property
-    def _unified_client(self) -> Optional[InferenceClient]:
-        """rank 0's single unified lifecycle client, or ``None`` elsewhere."""
-        return self._lifecycle_client
-
     def _drive_all(self, fn_name: str, *args, **kwargs) -> None:
         """Call ``fn_name(*args, **kwargs)`` on the unified lifecycle
-        client (rank 0 only). The unified coord then broadcasts to every
-        engine, so a single call reaches all shards.
+        client (rank 0 only — ``_lifecycle_client`` is ``None``
+        elsewhere). The unified coord then broadcasts to every engine,
+        so a single call reaches all shards.
         """
-        client = self._unified_client
-        if client is not None:
-            getattr(client, fn_name)(*args, **kwargs)
+        if self._lifecycle_client is not None:
+            getattr(self._lifecycle_client, fn_name)(*args, **kwargs)
 
     def set_generation_epoch(self, generation_epoch: int) -> None:
         self._drive_all("set_generation_epoch", generation_epoch)
@@ -726,16 +722,15 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
     # plan to the coordinator via
     # ``InferenceClient.migrate_request_batch(...)``. The coord
     # forwards a ``Headers.MIGRATE_BATCH`` signal to the engines in
-    # src + dst shards; each engine pops the signal off its
-    # ``_pending_signals`` queue and invokes the registered migration
-    # handler (:meth:`_on_migrate_batch_signal`), which runs sync
-    # NCCL on the cross-shard process group to move KV blocks.
+    # the src shard + the chosen dst dp_rank; each engine pops the
+    # signal off its ``_pending_signals`` queue and invokes the
+    # registered migration handler (:meth:`_on_migrate_batch_signal`),
+    # which runs the NVSHMEM ``put_signal`` / ``signal_wait`` transport
+    # on the migration stream — no NCCL collective, no engine pause.
     #
     # No cross-rank broadcast is required to coordinate the migration
     # decision — only the decider decides, and the trigger flows over
     # the coord's ZMQ control channel (same path as PAUSE / SUSPEND).
-    # That avoids the cross-PG NCCL ordering deadlock the prior
-    # broadcast-based designs hit.
 
     def enable_auto_disagg(
         self,
@@ -784,13 +779,9 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         self, src_shard_index: int, dst_shard_index: int
     ) -> None:
         """Pre-compute migration metadata for ``(src, dst)`` and wire
-        the engine's MIGRATE_BATCH handler.
-
-        Cheap and rank-local — the async NVSHMEM migration path uses
-        one-sided put_signal / signal_wait, no torch process group.
-        The synchronous (smoke-test) path that does need a cross-shard
-        ``dist.ProcessGroup`` builds it on demand via
-        :func:`megatron.core.inference.shards.build_cross_shard_group`.
+        the engine's MIGRATE_BATCH handler. Cheap and rank-local — the
+        NVSHMEM migration path uses one-sided put_signal / signal_wait,
+        no torch process group.
         """
         assert 0 <= src_shard_index < len(self._shards)
         assert 0 <= dst_shard_index < len(self._shards)
@@ -1114,6 +1105,10 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
 
             engine.push_pending_migration(_poll)
         except BaseException:
+            # Catch ``BaseException`` (not ``Exception``) so
+            # ``KeyboardInterrupt`` mid-migration still triggers the
+            # block-release path before propagating — otherwise an
+            # interrupt during the gather/put leaks GPU blocks.
             # Roll back the partially-applied migration so the engine doesn't
             # leak GPU blocks. ``release_memory_blocks`` returns the kept
             # blocks to the allocator; ``detach_request(keep_blocks=False)``
@@ -1235,11 +1230,11 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         Each tick: inspect the local engine's request dict, build per-
         dst migration plans, and submit each plan to the coordinator
         via ``InferenceClient.migrate_request_batch``. The coord
-        forwards a ``MIGRATE_BATCH`` signal to engines in src + dst,
-        which run :meth:`_on_migrate_batch_signal` in their run loop
-        to perform the NCCL transport. Nothing on this loop blocks on
-        NCCL — the migration is asynchronous from the scheduler's
-        perspective.
+        forwards a ``MIGRATE_BATCH`` signal to engines in src + the
+        chosen dst dp_rank, which run :meth:`_on_migrate_batch_signal`
+        in their run loop to perform the NVSHMEM transport. Nothing on
+        this loop blocks on the actual transport — the migration is
+        asynchronous from the scheduler's perspective.
         """
         src_shard = self._shards[src_shard_index]
         decider_rank = src_shard.rank_offset
@@ -1349,10 +1344,4 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                     # ids still resident on this engine, so successful
                     # migrations drop out naturally on the next pass.
                     migrated_ids.update(request_ids)
-
-    # ---- Disaggregated inference ---------------------------------------
-
-    # ---- Smoke tests ---------------------------------------------------
-
-    # ---- Reachability introspection ------------------------------------
 
