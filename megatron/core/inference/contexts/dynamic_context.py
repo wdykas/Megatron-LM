@@ -692,36 +692,31 @@ class DynamicInferenceContext(BaseInferenceContext):
             logging.info("\n".join(log_lines))
 
     def _allocate_memory_buffer(self):
-        """Allocate the KV cache memory buffer.
-
-        Always a regular CUDA tensor — the cross-shard migration path
-        gathers/scatters via uniformly-sized NVSHMEM staging slots, so
-        the KV buffer itself is never an RDMA target and doesn't need
-        to live on the symmetric heap. This lets heterogeneous shards
-        size their per-rank KV pools independently without paying the
-        world-wide ``max(local_bytes)`` symmetric-heap overhead.
-        """
+        """Allocate the KV cache memory buffer."""
         if self.cache_mla_latent:
-            kv_shape = (
-                self.num_attention_layers,
-                self.kv_block_allocator.total_count,
-                self.block_size_tokens,
-                self.kv_reduced_dim,
+            self.memory_buffer = torch.empty(
+                (
+                    self.num_attention_layers,
+                    self.kv_block_allocator.total_count,
+                    self.block_size_tokens,
+                    self.kv_reduced_dim,
+                ),
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device(),
             )
         else:
-            kv_shape = (
-                2,  # key and value
-                self.num_attention_layers,
-                self.kv_block_allocator.total_count,
-                self.block_size_tokens,
-                self.num_attention_heads_per_partition,
-                self.hidden_size_per_attention_head,
+            self.memory_buffer = torch.empty(
+                (
+                    2,  # key and value
+                    self.num_attention_layers,
+                    self.kv_block_allocator.total_count,
+                    self.block_size_tokens,
+                    self.num_attention_heads_per_partition,
+                    self.hidden_size_per_attention_head,
+                ),
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device(),
             )
-        self.memory_buffer = torch.empty(
-            kv_shape,
-            dtype=self.params_dtype,
-            device=torch.cuda.current_device(),
-        )
         if (
             self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
             and not self._uses_torch_memory_saver
@@ -733,33 +728,20 @@ class DynamicInferenceContext(BaseInferenceContext):
             ).pin_memory()
 
     def _allocate_mamba_states(self):
-        """Allocate Mamba states for hybrid models. Like the KV
-        ``memory_buffer``, these are regular CUDA tensors — the
-        migration path stages through uniformly-sized symmetric
-        slots, so the per-request state pools aren't NVSHMEM RDMA
-        targets and don't need world-equal byte allocations."""
+        """Allocate Mamba states for hybrid models."""
         if self.is_hybrid_model:
             self.mamba_metadata = MambaMetadata(
                 max_requests=self.max_requests,
                 max_tokens=self.max_tokens,
                 d_conv=self.mamba_conv_states_shape[-1],
             )
-
-            mamba_conv_shape = (
-                self.num_mamba_layers,
-                self.max_requests,
-            ) + self.mamba_conv_states_shape
-            mamba_ssm_shape = (
-                self.num_mamba_layers,
-                self.max_requests,
-            ) + self.mamba_ssm_states_shape
             self.mamba_conv_states = torch.empty(
-                mamba_conv_shape,
+                (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
                 dtype=self.mamba_conv_states_dtype,
                 device=torch.cuda.current_device(),
             )
             self.mamba_ssm_states = torch.empty(
-                mamba_ssm_shape,
+                (self.num_mamba_layers, self.max_requests) + self.mamba_ssm_states_shape,
                 dtype=self.mamba_ssm_states_dtype,
                 device=torch.cuda.current_device(),
             )
