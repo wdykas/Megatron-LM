@@ -44,6 +44,16 @@ class _PlanCacheKey:
     src_config: Optional[Tuple[int, int, int, int, int]]
     dst_config: Optional[Tuple[int, int, int, int, int]]
     num_experts: Optional[int]
+    # Stable identifier for the dst shard, used to disambiguate idle-rank
+    # entries across different shard swaps. Two ranks that are both idle
+    # for two different shards would otherwise collide on
+    # ``(rank, src, None, ne)`` and skip ``build_centralized_reshard_plan``'s
+    # world-collective gather_object — deadlocking the active rank for the
+    # second shard which doesn't have the cache hit. Callers that swap
+    # multiple shards from one world should pass a per-shard identifier
+    # (typically ``(rank_offset, world_size)``); default ``None`` preserves
+    # behavior for callers that swap one shard at a time.
+    dst_shard_signature: Optional[Tuple[int, int]] = None
 
 
 def _get_config_tuple(core) -> Optional[Tuple[int, int, int, int, int]]:
@@ -74,7 +84,11 @@ def _get_config_tuple(core) -> Optional[Tuple[int, int, int, int, int]]:
 
 
 def _build_plan_cache_key(
-    src_core, tgt_core, num_experts: Optional[int], group=None
+    src_core,
+    tgt_core,
+    num_experts: Optional[int],
+    group=None,
+    dst_shard_signature: Optional[Tuple[int, int]] = None,
 ) -> _PlanCacheKey:
     """Build cache key for reshard plan.
 
@@ -83,6 +97,9 @@ def _build_plan_cache_key(
         tgt_core: Target model core (or None for non-collocated source/idle ranks)
         num_experts: Number of MoE experts (or None for non-MoE models)
         group: Optional process group for rank query
+        dst_shard_signature: Optional ``(rank_offset, world_size)`` for the dst
+            shard, distinguishing entries when ``tgt_core is None``. See
+            :class:`_PlanCacheKey` for the deadlock this prevents.
 
     Returns:
         Cache key that uniquely identifies this reshard configuration for this rank
@@ -92,7 +109,11 @@ def _build_plan_cache_key(
     src_config = _get_config_tuple(src_core)
     dst_config = _get_config_tuple(tgt_core)
     return _PlanCacheKey(
-        rank=rank, src_config=src_config, dst_config=dst_config, num_experts=num_experts
+        rank=rank,
+        src_config=src_config,
+        dst_config=dst_config,
+        num_experts=num_experts,
+        dst_shard_signature=dst_shard_signature,
     )
 
 
@@ -197,14 +218,31 @@ def _unwrap_model_cores(src_model, target_model):
     return src_core, tgt_core, num_experts
 
 
-def _build_or_get_plan(src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset):
+def _build_or_get_plan(
+    src_core,
+    tgt_core,
+    num_experts,
+    group,
+    src_rank_offset,
+    dst_rank_offset,
+    dst_shard_signature: Optional[Tuple[int, int]] = None,
+):
     """Return the cached reshard plan, building it (collectively) if not yet cached.
 
     All participating ranks must call this simultaneously when the plan is not
     yet cached, because build_centralized_reshard_plan uses collective communication.
+
+    ``dst_shard_signature`` disambiguates idle-rank cache entries across shard
+    swaps; see :class:`_PlanCacheKey`.
     """
     global _plan_cache
-    cache_key = _build_plan_cache_key(src_core, tgt_core, num_experts, group=group)
+    cache_key = _build_plan_cache_key(
+        src_core,
+        tgt_core,
+        num_experts,
+        group=group,
+        dst_shard_signature=dst_shard_signature,
+    )
     if cache_key not in _plan_cache:
         _plan_cache[cache_key] = build_centralized_reshard_plan(
             src_core,
@@ -279,6 +317,7 @@ def prepare_swap_model_weights(
     group=None,
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
+    dst_shard_signature: Optional[Tuple[int, int]] = None,
 ):
     """Pre-build and cache the reshard plan and any format-conversion transforms.
 
@@ -311,7 +350,13 @@ def prepare_swap_model_weights(
     """
     src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target_model)
     plan = _build_or_get_plan(
-        src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset
+        src_core,
+        tgt_core,
+        num_experts,
+        group,
+        src_rank_offset,
+        dst_rank_offset,
+        dst_shard_signature=dst_shard_signature,
     )
 
     # Auto-detect and set up MXFP8 transform on the plan for the target model.
@@ -328,6 +373,7 @@ def swap_model_weights(
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
     transform: Optional[ReshardTransform] = None,
+    dst_shard_signature: Optional[Tuple[int, int]] = None,
 ):
     """
     Orchestrate weight swap/refit.
@@ -362,7 +408,13 @@ def swap_model_weights(
     if transform is None:
         src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target_model)
         plan = _build_or_get_plan(
-            src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset
+            src_core,
+            tgt_core,
+            num_experts,
+            group,
+            src_rank_offset,
+            dst_rank_offset,
+            dst_shard_signature=dst_shard_signature,
         )
         transform = getattr(plan, 'transform', None)
 
@@ -374,6 +426,7 @@ def swap_model_weights(
         src_rank_offset=src_rank_offset,
         dst_rank_offset=dst_rank_offset,
         transform=transform,
+        dst_shard_signature=dst_shard_signature,
     )
 
 
@@ -438,6 +491,7 @@ def reshard_model_weights(
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
     transform: Optional[ReshardTransform] = None,
+    dst_shard_signature: Optional[Tuple[int, int]] = None,
 ):
     """Reshard and copy model weights from ``src_model`` to ``target_model`` using ``service``.
 
@@ -456,7 +510,13 @@ def reshard_model_weights(
     src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target_model)
     _harmonize_buffer_dtypes(src_core, tgt_core, group=group)
     plan = _build_or_get_plan(
-        src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset
+        src_core,
+        tgt_core,
+        num_experts,
+        group,
+        src_rank_offset,
+        dst_rank_offset,
+        dst_shard_signature=dst_shard_signature,
     )
     execute_reshard_plan(
         plan, src_core, tgt_core, service=service, group=group, transform=transform
