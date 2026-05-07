@@ -15,18 +15,13 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from megatron.core.inference.shards import (
-    InferenceShard,
-    build_inference_pg_collections_for_shards,
-    clear_cross_shard_group_cache,
-)
+from megatron.core.inference.shards import InferenceShard, build_inference_pg_collections_for_shards
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.resharding.refit import clear_all_caches, swap_model_weights
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.rl.parallel_utils import (
-    build_cross_shard_group,
     get_inference_shards,
     get_my_inference_shard,
     set_inference_shards,
@@ -244,48 +239,6 @@ def _training_pg_collection_from_mpu():
 
 
 @pytest.mark.skipif(
-    torch.cuda.device_count() < 4, reason="need >=4 GPUs for cross-shard group test"
-)
-def test_cross_shard_group_broadcast():
-    """Verify that :func:`build_cross_shard_group` makes DP replicas reachable
-    to each other via ordinary torch collectives."""
-    Utils.initialize_model_parallel(
-        tensor_model_parallel_size=1, pipeline_model_parallel_size=1
-    )
-    try:
-        rank = dist.get_rank()
-        device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        specs = [
-            dict(tp=2, pp=1, ep=1, expt_tp=2, dp=1),  # ranks 0,1
-            dict(tp=1, pp=1, ep=1, expt_tp=1, dp=2),  # ranks 2,3
-        ]
-        shards = build_inference_pg_collections_for_shards(
-            total_world_size=dist.get_world_size(), shards=specs
-        )
-        set_inference_shards(shards)
-        # Group spanning BOTH shards — i.e. all 4 ranks. Broadcasting a value
-        # from shard 0's rank 0 to shard 1's ranks validates that cross-shard
-        # communication is reachable through plain torch.distributed.
-        both = build_cross_shard_group([0, 1])
-        assert both is not None
-        val = torch.tensor([42.0 if rank == 0 else 0.0], device=device)
-        dist.broadcast(val, src=0, group=both)
-        assert val.item() == 42.0
-
-        # Also: group spanning only shard 1, verified from outside.
-        only_shard1 = build_cross_shard_group([1])
-        if rank in (2, 3):
-            assert only_shard1 is not None
-            members = dist.get_process_group_ranks(only_shard1)
-            assert sorted(members) == [2, 3]
-        else:
-            assert only_shard1 is None
-    finally:
-        set_inference_shards(None)
-        Utils.destroy_model_parallel()
-
-
-@pytest.mark.skipif(
     torch.cuda.device_count() < 4, reason="need >=4 GPUs for heterogeneous refit"
 )
 def test_heterogeneous_refit_end_to_end():
@@ -356,53 +309,6 @@ def test_heterogeneous_refit_end_to_end():
         Utils.destroy_model_parallel()
         gc.collect()
         torch.cuda.empty_cache()
-
-
-@pytest.mark.skipif(
-    torch.cuda.device_count() < 4, reason="need >=4 GPUs for cross-shard group cache test"
-)
-def test_cross_shard_group_cache_reuses_groups():
-    """Repeated calls for the same union return the same ProcessGroup (and no
-    deadlock), while a call for a different union produces a distinct group."""
-    Utils.initialize_model_parallel(
-        tensor_model_parallel_size=1, pipeline_model_parallel_size=1
-    )
-    try:
-        specs = [
-            dict(tp=2, pp=1, ep=1, expt_tp=2, dp=1),  # ranks 0,1
-            dict(tp=1, pp=1, ep=1, expt_tp=1, dp=2),  # ranks 2,3
-        ]
-        shards = build_inference_pg_collections_for_shards(
-            total_world_size=dist.get_world_size(), shards=specs
-        )
-        set_inference_shards(shards)
-
-        # Same union → same cached group on every rank.
-        g1 = build_cross_shard_group([0, 1])
-        g2 = build_cross_shard_group([0, 1])
-        assert g1 is g2
-
-        # Argument order doesn't matter — caching is set-based, not list-based.
-        g3 = build_cross_shard_group([1, 0])
-        assert g1 is g3
-
-        # A different union is a distinct group (even if the current rank is
-        # in both — we still expect a fresh entry).
-        g_other = build_cross_shard_group([0])
-        if dist.get_rank() in (0, 1):
-            assert g_other is not None
-            assert g_other is not g1
-
-        # After deregistering shards the cache is flushed; re-registering and
-        # building again must produce a *different* group instance.
-        set_inference_shards(None)
-        clear_cross_shard_group_cache()  # explicit — set_inference_shards(None) also clears
-        set_inference_shards(shards)
-        g4 = build_cross_shard_group([0, 1])
-        assert g4 is not g1, "cache should have been cleared"
-    finally:
-        set_inference_shards(None)
-        Utils.destroy_model_parallel()
 
 
 def test_multi_shard_routing_picks_fast_shard():

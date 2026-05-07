@@ -7,11 +7,9 @@ The process-group building primitives are framework-agnostic and live in
 convenience layer on top:
 
 - a module-level shard registry (``set_inference_shards`` / ``get_inference_shards``),
-- a wrapper around :func:`megatron.core.inference.shards.build_cross_shard_group`
-  that reads the registry,
 - a wrapper around
   :func:`megatron.core.resharding.refit.swap_model_weights_across_shards` that
-  likewise reads the registry.
+  reads the registry.
 
 Downstream frameworks (NeMo-RL, verl, etc.) should import directly from
 ``megatron.core.inference.shards`` and ``megatron.core.resharding.refit`` and
@@ -24,15 +22,11 @@ back-compat with code that already imports them from this module.
 
 from typing import List, Optional
 
-import torch.distributed as dist
-
 # Re-export the framework-agnostic primitives from core.
-from megatron.core.inference.shards import InferenceShard
-from megatron.core.inference.shards import build_cross_shard_group as _core_build_cross_shard_group
 from megatron.core.inference.shards import (
+    InferenceShard,
     build_inference_pg_collection,
     build_inference_pg_collections_for_shards,
-    clear_cross_shard_group_cache,
 )
 from megatron.core.resharding.refit import (
     swap_model_weights_across_shards as _core_swap_model_weights_across_shards,
@@ -42,8 +36,6 @@ __all__ = [
     "InferenceShard",
     "build_inference_pg_collection",
     "build_inference_pg_collections_for_shards",
-    "build_cross_shard_group",
-    "clear_cross_shard_group_cache",
     "set_inference_shards",
     "get_inference_shards",
     "get_my_inference_shard",
@@ -61,16 +53,10 @@ _INFERENCE_SHARDS: Optional[List[InferenceShard]] = None
 
 
 def set_inference_shards(shards: Optional[List[InferenceShard]]) -> None:
-    """Register the inference-shard layout constructed during setup.
-
-    Passing ``None`` deregisters and also flushes the cross-shard group cache
-    — process groups from a prior distributed world are not valid once torch
-    distributed has been reinitialized.
-    """
+    """Register the inference-shard layout constructed during setup. Pass
+    ``None`` to deregister."""
     global _INFERENCE_SHARDS
     _INFERENCE_SHARDS = shards
-    if shards is None:
-        clear_cross_shard_group_cache()
 
 
 def get_inference_shards() -> Optional[List[InferenceShard]]:
@@ -90,21 +76,6 @@ def get_my_inference_shard() -> Optional[InferenceShard]:
 
 
 # ---- Registry-driven wrappers ------------------------------------------------
-
-
-def build_cross_shard_group(shard_indices: List[int]) -> Optional[dist.ProcessGroup]:
-    """Build a cross-shard group using the registered shard layout.
-
-    Thin wrapper around
-    :func:`megatron.core.inference.shards.build_cross_shard_group` that reads
-    the registry. Every rank must call this simultaneously.
-    """
-    shards = get_inference_shards()
-    if shards is None:
-        raise RuntimeError(
-            "No inference shards registered. Call set_inference_shards first."
-        )
-    return _core_build_cross_shard_group(shards, shard_indices)
 
 
 def swap_weights_across_shards(src_model, inference_model, refit_method: str) -> None:
