@@ -9,10 +9,10 @@ shards with 1/latency weighting.
 
 Cross-shard request migration runs over NVSHMEM one-sided
 ``put_signal`` / ``signal_wait`` on a dedicated stream, so neither the
-src nor dst engine pauses its run loop. The auto-disagg scheduler
-(``_auto_disagg_loop``) on the src shard's decider rank picks
-candidates and posts ``MIGRATE_BATCH`` to the coord, which forwards the
-signal to the participating ranks in src + dst.
+src nor dst engine pauses its run loop. Each registered
+:class:`MigrationPolicy` runs on its src shard's decider rank, picks
+candidates, and posts ``MIGRATE_BATCH`` to the coord, which forwards
+the signal to the participating ranks in src + the chosen dst dp_rank.
 """
 import asyncio
 import logging
@@ -155,23 +155,24 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
     _next_shard: int = PrivateAttr(default=0)
     _route_lock: Optional[asyncio.Lock] = PrivateAttr(default=None)
 
-    # Auto-disagg scheduler state — coord-mediated design.
+    # Migration scheduler state — coord-mediated, policy-driven.
     #
-    # The scheduler runs as an asyncio task on the **decider rank** of
-    # each watched src shard (the shard's ``rank_offset``). Each tick
-    # the decider inspects its local engine's request dict, builds
-    # bundles, and submits ``MIGRATE_BATCH`` via
-    # ``InferenceClient.migrate_request_batch(...)``. The coord forwards
-    # the signal to participating ranks in src + dst, which run the
-    # registered migration handler in their own run loop — NVSHMEM
-    # one-sided put_signal / signal_wait on a dedicated stream, no
-    # torch process group, no host-side pause.
-    _scheduler_configs: List[tuple] = PrivateAttr(default_factory=list)
-    _auto_disagg_tasks: List[asyncio.Task] = PrivateAttr(default_factory=list)
+    # Each registered :class:`MigrationPolicy` runs as an asyncio task
+    # on the decider rank of its ``src_shard_index`` (the shard's
+    # ``rank_offset``). Each tick, the policy's ``is_eligible`` is
+    # called per request on that shard's engine; eligible requests
+    # are bundled and submitted as ``MIGRATE_BATCH`` via the shard's
+    # ``InferenceClient``. The coord forwards the signal to participating
+    # ranks in src + the chosen dst dp_rank, which run the migration
+    # handler in their run loop — NVSHMEM one-sided put_signal /
+    # signal_wait on a dedicated stream, no torch process group, no
+    # host-side pause.
+    _migration_policies: list = PrivateAttr(default_factory=list)
+    _migration_tasks: List[asyncio.Task] = PrivateAttr(default_factory=list)
     _scheduler_stop: bool = PrivateAttr(default=False)
     # Per-shard ``InferenceClient`` keyed by shard_index. Each shard's
     # ``rank_offset`` rank holds a client; the decider rank of any
-    # shard that calls ``enable_auto_disagg`` uses its client to post
+    # registered :class:`MigrationPolicy` uses its client to post
     # ``MIGRATE_BATCH`` and ``UPDATE_REQUEST_RANKS_BATCH`` to the coord
     # without going through rank 0. Empty on ranks that aren't a
     # ``rank_offset`` for any shard.
@@ -425,9 +426,15 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                 src_idx_arg,
                 dst_idx_arg,
             )
+            from .migration_policy import FirstTokenDisaggPolicy
+
             instance._disagg_rollout_pair = (src_idx_arg, dst_idx_arg)
             instance._register_migration_pair(src_idx_arg, dst_idx_arg)
-            instance.enable_auto_disagg(src_shard_index=src_idx_arg)
+            instance.register_migration_policy(
+                FirstTokenDisaggPolicy(
+                    src_shard_index=src_idx_arg, dst_shard_index=dst_idx_arg
+                )
+            )
 
         # Two-stage tail-cut. When --rl-tail-cut-{dst-shard,min-tokens}
         # are set, every rollout is also stamped with
@@ -455,9 +462,17 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                 tail_dst_arg,
                 tail_min_arg,
             )
+            from .migration_policy import TailCutPolicy
+
             instance._tail_cut_rollout_config = (tail_dst_arg, tail_min_arg)
             instance._register_migration_pair(dst_idx_arg, tail_dst_arg)
-            instance.enable_auto_disagg(src_shard_index=dst_idx_arg)
+            instance.register_migration_policy(
+                TailCutPolicy(
+                    src_shard_index=dst_idx_arg,
+                    dst_shard_index=tail_dst_arg,
+                    min_tokens=int(tail_min_arg),
+                )
+            )
 
         return instance
 
@@ -732,48 +747,34 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
     # decision — only the decider decides, and the trigger flows over
     # the coord's ZMQ control channel (same path as PAUSE / SUSPEND).
 
-    def enable_auto_disagg(
-        self,
-        src_shard_index: int,
-        *,
-        poll_interval_s: float = 0.05,
-        max_batch_size: int = 16,
-    ) -> None:
-        """Register an auto-disagg scheduler watching one src shard.
+    def register_migration_policy(self, policy) -> None:
+        """Register a :class:`MigrationPolicy` instance.
 
         Collective: every rank must call (so each rank's instance has
-        the same ``_scheduler_configs`` for symmetric pause/resume,
-        even though only the decider rank actually runs the loop).
+        the same ``_migration_policies`` list for symmetric pause /
+        resume, even though only the decider rank for each policy
+        actually runs the loop).
 
-        Per-request opt-in: a request on ``src_shard_index`` is
-        migrated when one of its tags fires — either
-        ``disagg_dst_shard_index`` at first decode token, or
-        (``late_dst_shard_index``, ``late_dst_min_tokens``) once the
-        token threshold is met. Untagged requests stay put.
+        The policy's asyncio task is spawned lazily by the next
+        whole-world :meth:`resume`. We don't spawn at register time
+        because ``_resume_scheduler`` needs an actively-running
+        asyncio loop, and registration is typically called from
+        :meth:`launch` while the launch coroutine is still running
+        (loop is alive there, but tasks should only run during
+        actual inference windows so we don't accumulate stale work
+        between launch and the first resume).
 
-        Args:
-            src_shard_index: Shard whose engine the scheduler polls.
-            max_batch_size: Upper bound on migrations fired per tick.
+        Multiple policies can target the same src shard; they each
+        get their own asyncio task and their own ``migrated_ids``
+        memo. Policies are independent — first to fire on a given
+        request wins, and the others see the request gone from
+        ``engine.requests`` on the next tick.
         """
-        assert 0 <= src_shard_index < len(self._shards)
-        assert max_batch_size >= 1, "max_batch_size must be >= 1"
-        for cfg in self._scheduler_configs:
-            if cfg[0] == src_shard_index:
-                raise RuntimeError(
-                    f"auto-disagg scheduler already running for src shard "
-                    f"{src_shard_index}"
-                )
-        # Tasks are spawned lazily by the next whole-world
-        # :meth:`resume`. We don't spawn at enable time because
-        # ``_resume_scheduler`` needs an actively-running asyncio
-        # loop, and ``enable_auto_disagg`` is called from
-        # :meth:`launch` while the launch coroutine is still running
-        # (loop is alive there, but tasks should only run during
-        # actual inference windows so we don't accumulate stale work
-        # between launch and the first resume).
-        self._scheduler_configs.append(
-            (src_shard_index, poll_interval_s, max_batch_size)
-        )
+        assert 0 <= policy.src_shard_index < len(self._shards)
+        assert 0 <= policy.dst_shard_index < len(self._shards)
+        assert policy.src_shard_index != policy.dst_shard_index
+        assert policy.max_batch_size >= 1
+        self._migration_policies.append(policy)
 
     def _register_migration_pair(
         self, src_shard_index: int, dst_shard_index: int
@@ -1127,120 +1128,89 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             raise
 
     async def _pause_scheduler(self) -> None:
-        """Stop all scheduler asyncio tasks. Configs stay in
-        ``_scheduler_configs`` so :meth:`_resume_scheduler` can respawn
+        """Stop all migration-policy asyncio tasks. Policies stay in
+        ``_migration_policies`` so :meth:`_resume_scheduler` can respawn
         them at the next whole-world :meth:`resume`."""
-        if not self._auto_disagg_tasks:
+        if not self._migration_tasks:
             return
         self._scheduler_stop = True
-        for t in self._auto_disagg_tasks:
+        for t in self._migration_tasks:
             try:
                 await t
             except asyncio.CancelledError:
                 pass
             except Exception as e:  # pragma: no cover - defensive
-                logger.warning("[auto-disagg] task raised on pause: %s", e)
-        self._auto_disagg_tasks.clear()
+                logger.warning("[migration] task raised on pause: %s", e)
+        self._migration_tasks.clear()
         self._scheduler_stop = False
 
     def _resume_scheduler(self) -> None:
-        """Spawn one asyncio task per stored config. No-op on ranks
-        that aren't a decider for any config (the task loop returns
-        immediately on non-decider ranks anyway, but skipping the
-        spawn avoids cluttering the loop)."""
-        if self._auto_disagg_tasks:
+        """Spawn one asyncio task per registered policy. No-op on ranks
+        that aren't a decider for any policy."""
+        if self._migration_tasks:
             return
-        if not self._scheduler_configs:
+        if not self._migration_policies:
             return
         self._scheduler_stop = False
         loop = asyncio.get_running_loop()
         rank = dist.get_rank()
-        for src_shard_index, poll, batch in self._scheduler_configs:
-            decider_rank = self._shards[src_shard_index].rank_offset
+        for policy in self._migration_policies:
+            decider_rank = self._shards[policy.src_shard_index].rank_offset
             if rank != decider_rank:
                 continue  # non-decider ranks don't participate
-            self._auto_disagg_tasks.append(
+            self._migration_tasks.append(
                 loop.create_task(
-                    self._auto_disagg_loop(src_shard_index, poll, batch),
-                    name=f"megatron_local_multi.auto_disagg@s{src_shard_index}",
+                    self._run_policy_loop(policy),
+                    name=(
+                        f"megatron_local_multi.{type(policy).__name__}"
+                        f"@s{policy.src_shard_index}->s{policy.dst_shard_index}"
+                    ),
                 )
             )
 
     async def disable_auto_disagg(self) -> None:
-        """Stop every auto-disagg scheduler instance and forget configs.
-        Idempotent. Distinct from :meth:`_pause_scheduler` in that
-        ``_scheduler_configs`` is cleared, so a subsequent
+        """Stop every migration-policy task and forget registered
+        policies. Idempotent. Distinct from :meth:`_pause_scheduler`
+        in that ``_migration_policies`` is cleared, so a subsequent
         :meth:`_resume_scheduler` won't respawn anything."""
-        self._scheduler_configs.clear()
+        self._migration_policies.clear()
         await self._pause_scheduler()
 
     @staticmethod
-    def _migration_target(entry, current_shard_index: int) -> Optional[int]:
-        """Pick where the request in ``entry`` should migrate to from
-        ``current_shard_index``.
+    def _live_request(entry):
+        """Return the live :class:`DynamicInferenceRequest` from a
+        :class:`RequestEntry`, or ``None`` if the entry has no record.
 
-        Takes a :class:`RequestEntry` (the value type stored in
-        ``engine.requests``) and reads the live request from
-        ``entry.record[-1]``. Returns the dst shard index, or ``None``
-        if no trigger fires. First-token disagg takes priority over
-        the tail-cut trigger so a freshly-prefilled request lands on
-        the throughput decode shard before any late-stage move.
+        ``engine.requests`` maps id → RequestEntry; the live request
+        is the last item in ``entry.record`` (records grow on
+        cross-shard migrations to track ancestor states).
         """
         # ``engine.requests`` maps id → RequestEntry; the live request
         # is the last item in ``entry.record`` (records grow on
         # cross-shard migrations to track ancestor states).
         record = getattr(entry, "record", None)
+        record = getattr(entry, "record", None)
         if not record:
             return None
-        req = record[-1]
-        gen_tokens = getattr(req, "generated_tokens", None)
-        if gen_tokens is None:
-            return None
-        n = (
-            gen_tokens.numel()
-            if isinstance(gen_tokens, torch.Tensor)
-            else len(gen_tokens)
-        )
-        # First-token disagg.
-        disagg = getattr(req, "disagg_dst_shard_index", None)
-        if disagg is not None and disagg != current_shard_index and n >= 1:
-            return disagg
-        # Tail-cut: only fires once ``late_dst_min_tokens`` tokens have
-        # accumulated AND we're not already on the late dst shard.
-        late_dst = getattr(req, "late_dst_shard_index", None)
-        late_min = getattr(req, "late_dst_min_tokens", None)
-        if (
-            late_dst is not None
-            and late_min is not None
-            and late_dst != current_shard_index
-            and n >= late_min
-        ):
-            return late_dst
-        return None
+        return record[-1]
 
-    async def _auto_disagg_loop(
-        self,
-        src_shard_index: int,
-        poll_interval_s: float,
-        max_batch_size: int,
-    ) -> None:
-        """Per-tick decision loop. **Runs only on the decider rank**
-        (``self._shards[src_shard_index].rank_offset``).
+    async def _run_policy_loop(self, policy) -> None:
+        """Generic per-tick decision loop for one :class:`MigrationPolicy`.
+        **Runs only on the decider rank**
+        (``self._shards[policy.src_shard_index].rank_offset``).
 
-        Each tick: inspect the local engine's request dict, build per-
-        dst migration plans, and submit each plan to the coordinator
-        via ``InferenceClient.migrate_request_batch``. The coord
-        forwards a ``MIGRATE_BATCH`` signal to engines in src + the
-        chosen dst dp_rank, which run :meth:`_on_migrate_batch_signal`
-        in their run loop to perform the NVSHMEM transport. Nothing on
-        this loop blocks on the actual transport — the migration is
+        Each tick: ask the policy which requests on the watched
+        engine are eligible, batch them up to ``policy.max_batch_size``,
+        and submit one ``MIGRATE_BATCH`` to the coord. Nothing on this
+        loop blocks on the actual transport — the migration is
         asynchronous from the scheduler's perspective.
         """
-        src_shard = self._shards[src_shard_index]
-        decider_rank = src_shard.rank_offset
+        src_shard_index = policy.src_shard_index
+        dst_shard_index = policy.dst_shard_index
+        decider_rank = self._shards[src_shard_index].rank_offset
         rank = dist.get_rank()
         assert rank == decider_rank, (
-            f"_auto_disagg_loop should only run on decider rank "
+            f"_run_policy_loop should only run on decider rank "
             f"{decider_rank} (got rank {rank})"
         )
         if self._my_engine is None:
@@ -1248,8 +1218,9 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         client = self._shard_clients.get(src_shard_index)
         if client is None:
             logger.error(
-                "[auto-disagg] no InferenceClient for shard %d on rank %d "
+                "[migration:%s] no InferenceClient for shard %d on rank %d "
                 "— scheduler cannot post migrations",
+                type(policy).__name__,
                 src_shard_index,
                 rank,
             )
@@ -1263,7 +1234,7 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         migrated_ids: set = set()
 
         while not self._scheduler_stop:
-            await asyncio.sleep(poll_interval_s)
+            await asyncio.sleep(policy.poll_interval_s)
             if self._scheduler_stop:
                 return
             if not self._my_engine._state_events[EngineState.RUNNING].is_set():
@@ -1272,76 +1243,78 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             # Snapshot active requests; tolerate races with the engine
             # task by retrying on RuntimeError (dict changed size
             # during iteration).
-            groups: dict = {}
+            eligible: List[int] = []
             try:
                 active_ids = set(self._my_engine.requests.keys())
                 migrated_ids &= active_ids
                 for req_id, entry in list(self._my_engine.requests.items()):
                     if req_id in migrated_ids:
                         continue
-                    dst = self._migration_target(entry, src_shard_index)
-                    if dst is None:
+                    req = self._live_request(entry)
+                    if req is None:
                         continue
-                    bucket = groups.setdefault(dst, [])
-                    if len(bucket) < max_batch_size:
-                        bucket.append(int(req_id))
+                    if not policy.is_eligible(req):
+                        continue
+                    eligible.append(int(req_id))
+                    if len(eligible) >= policy.max_batch_size:
+                        break
             except RuntimeError:
                 continue
 
-            if not groups:
+            if not eligible:
                 continue
 
-            # Submit one batched migration per dst. We snapshot each
-            # request on the local (decider) engine to build the
-            # bundle and ship it inline through the coord — so the
-            # dst engine doesn't need a cross-shard broadcast to
-            # learn the request's metadata. This is what makes the
+            # Snapshot each request on the local (decider) engine to
+            # build the bundle and ship it inline through the coord —
+            # so the dst engine doesn't need a cross-shard broadcast
+            # to learn the request's metadata. This is what makes the
             # whole migration handler non-blocking on both sides.
             from megatron.core.inference.engines.request_migration import serialize_bundle
 
-            for dst_shard_index, request_ids in groups.items():
-                try:
-                    # Layouts are not stamped here: they're invariant per
-                    # (src, dst) pair and the receiving handler restamps
-                    # from its own ``_migration_meta`` after deserialize.
-                    bundles = []
-                    for req_id in request_ids:
-                        bundle, _ = self._my_engine.snapshot_request(req_id)
-                        bundles.append(serialize_bundle(bundle))
-                    # Round-robin one batch at a time across the dst
-                    # shard's DP replicas so we don't stack every
-                    # migration on dp_rank 0.
-                    dst_shard = self._shards[dst_shard_index]
-                    dst_dp_size = max(int(dst_shard.spec.get("dp", 1)), 1)
-                    counter = self._disagg_dst_dp_counter.get(src_shard_index, 0)
-                    dst_dp_rank = counter % dst_dp_size
-                    self._disagg_dst_dp_counter[src_shard_index] = counter + 1
-                    client.migrate_request_batch(
-                        request_ids,
-                        src_shard_index,
-                        dst_shard_index,
-                        bundles=bundles,
-                        dst_dp_rank_within_shard=dst_dp_rank,
-                    )
-                    client.update_request_ranks_batch(
-                        request_ids=request_ids,
-                        new_shard_index=dst_shard_index,
-                        new_dp_rank_within_shard=dst_dp_rank,
-                    )
-                except Exception as e:
-                    logger.error(
-                        "[auto-disagg] failed to submit migration of %d "
-                        "requests (%d → %d): %s",
-                        len(request_ids),
-                        src_shard_index,
-                        dst_shard_index,
-                        e,
-                    )
-                finally:
-                    # Always mark the ids migrated — including on failure —
-                    # so a persistent error doesn't retry-storm the same
-                    # batch every poll tick. The set is pruned each tick to
-                    # ids still resident on this engine, so successful
-                    # migrations drop out naturally on the next pass.
-                    migrated_ids.update(request_ids)
+            try:
+                # Layouts are not stamped here: they're invariant per
+                # (src, dst) pair and the receiving handler restamps
+                # from its own ``_migration_meta`` after deserialize.
+                bundles = []
+                for req_id in eligible:
+                    bundle, _ = self._my_engine.snapshot_request(req_id)
+                    bundles.append(serialize_bundle(bundle))
+                # Round-robin one batch at a time across the dst
+                # shard's DP replicas so we don't stack every migration
+                # on dp_rank 0.
+                dst_shard = self._shards[dst_shard_index]
+                dst_dp_size = max(int(dst_shard.spec.get("dp", 1)), 1)
+                counter_key = (src_shard_index, dst_shard_index)
+                counter = self._disagg_dst_dp_counter.get(counter_key, 0)
+                dst_dp_rank = counter % dst_dp_size
+                self._disagg_dst_dp_counter[counter_key] = counter + 1
+                client.migrate_request_batch(
+                    eligible,
+                    src_shard_index,
+                    dst_shard_index,
+                    bundles=bundles,
+                    dst_dp_rank_within_shard=dst_dp_rank,
+                )
+                client.update_request_ranks_batch(
+                    request_ids=eligible,
+                    new_shard_index=dst_shard_index,
+                    new_dp_rank_within_shard=dst_dp_rank,
+                )
+            except Exception as e:
+                logger.error(
+                    "[migration:%s] failed to submit migration of %d "
+                    "requests (%d → %d): %s",
+                    type(policy).__name__,
+                    len(eligible),
+                    src_shard_index,
+                    dst_shard_index,
+                    e,
+                )
+            finally:
+                # Always mark the ids migrated — including on failure —
+                # so a persistent error doesn't retry-storm the same
+                # batch every poll tick. The set is pruned each tick to
+                # ids still resident on this engine, so successful
+                # migrations drop out naturally on the next pass.
+                migrated_ids.update(eligible)
 
