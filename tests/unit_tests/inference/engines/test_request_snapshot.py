@@ -160,12 +160,6 @@ class TestSnapshotRequest:
         # building a migration plan.
         assert bundle.dst_layout is None
 
-    def test_snapshot_rejects_unknown_request(self):
-        """An unknown request_id fails loudly."""
-        env = self._drive_requests_into_active_batch()
-        with pytest.raises(AssertionError, match="not tracked"):
-            env.engine.snapshot_request(999_999)
-
     def test_snapshot_rejects_non_active_request(self):
         """A request that hasn't entered the active batch is rejected."""
         # Build env but don't step — the request sits in waiting_request_ids

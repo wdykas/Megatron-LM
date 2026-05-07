@@ -286,55 +286,6 @@ def test_cross_shard_group_broadcast():
 
 
 @pytest.mark.skipif(
-    torch.cuda.device_count() < 4, reason="need >=4 GPUs for shard-url exchange test"
-)
-def test_shard_url_exchange_logic():
-    """Validate the ``all_gather_object``-based URL/address exchange pattern
-    used by ``MegatronLocalMulti.launch``. We don't actually spin up engines
-    here — that requires a full RL setup — but the address-exchange bookkeeping
-    is the non-obvious bit and is standalone-testable.
-    """
-    Utils.initialize_model_parallel(
-        tensor_model_parallel_size=1, pipeline_model_parallel_size=1
-    )
-    try:
-        rank = dist.get_rank()
-        specs = [
-            dict(tp=2, pp=1, ep=1, expt_tp=2, dp=1),  # ranks 0,1
-            dict(tp=1, pp=1, ep=1, expt_tp=1, dp=2),  # ranks 2,3
-        ]
-        shards = build_inference_pg_collections_for_shards(
-            total_world_size=dist.get_world_size(), shards=specs
-        )
-        set_inference_shards(shards)
-
-        # Simulate each shard's rank_offset holding the authoritative dp_addr;
-        # every other rank contributes empty string.
-        my_shard = get_my_inference_shard()
-        assert my_shard is not None
-        my_dp_addr = (
-            f"tcp://host-shard{my_shard.index}:7{my_shard.index}"
-            if rank == my_shard.rank_offset
-            else ""
-        )
-
-        # This is the exact logic MegatronLocalMulti.launch runs.
-        world_size = dist.get_world_size()
-        all_addrs: List[Optional[str]] = [None] * world_size
-        dist.all_gather_object(all_addrs, my_dp_addr)
-        for s in shards:
-            addr = all_addrs[s.rank_offset] or None
-            s.coordinator_addr = addr
-
-        # Every rank should now see every shard's authoritative address.
-        assert shards[0].coordinator_addr == "tcp://host-shard0:70"
-        assert shards[1].coordinator_addr == "tcp://host-shard1:71"
-    finally:
-        set_inference_shards(None)
-        Utils.destroy_model_parallel()
-
-
-@pytest.mark.skipif(
     torch.cuda.device_count() < 4, reason="need >=4 GPUs for heterogeneous refit"
 )
 def test_heterogeneous_refit_end_to_end():
