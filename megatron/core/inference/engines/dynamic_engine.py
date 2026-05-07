@@ -955,11 +955,12 @@ class DynamicInferenceEngine(AbstractEngine):
         """Read-only extract of a request's current migration state.
 
         Produces the metadata envelope + the physical KV block ids the
-        request currently occupies, without mutating engine/context state.
-        This is the first half of an inter-engine migration: a caller can
-        use the block-id tensor to drive a CopyService transport (reading
-        directly from ``self.context.memory_buffer``), then orchestrate
-        eviction and injection on the destination engine.
+        request currently occupies, without mutating engine/context
+        state. This is the first half of an inter-engine migration: the
+        caller stages each block's slice through the NVSHMEM migration
+        stream (``put_signal`` / ``signal_wait``), then orchestrates
+        eviction on the source via :meth:`detach_request` and injection
+        on the destination via :meth:`inject_request`.
 
         Must be called between engine steps. The returned block-id tensor
         is a view of ``context.request_to_kv_block_ids`` and is valid
@@ -1110,7 +1111,13 @@ class DynamicInferenceEngine(AbstractEngine):
         return state_idx if state_idx >= 0 else None
 
     @experimental_api
-    def detach_request(self, request_id: int, *, keep_blocks: bool = True) -> Tensor:
+    def detach_request(
+        self,
+        request_id: int,
+        *,
+        keep_blocks: bool = True,
+        keep_mamba_state: bool = False,
+    ) -> Tensor:
         """Remove a request from the active batch without finishing it.
 
         Undoes the slot bookkeeping for ``request_id`` — swaps it out to
@@ -1118,21 +1125,30 @@ class DynamicInferenceEngine(AbstractEngine):
         ``total_request_count``, and drops the engine-side
         :attr:`requests` entry. When ``keep_blocks=True`` (the migration
         use-case) the KV blocks the request occupied are **not** returned
-        to the allocator; the caller is handed a tensor of those block ids
-        and becomes responsible for eventually releasing them (typically
-        after a :class:`CopyService` send completes). When
-        ``keep_blocks=False`` the blocks are released immediately —
+        to the allocator; the caller is handed a tensor of those block
+        ids and becomes responsible for eventually releasing them
+        (typically after the migration transport's CUDA event fires).
+        When ``keep_blocks=False`` the blocks are released immediately —
         equivalent to a fire-and-forget abort.
 
-        Must be called between engine steps. Hybrid / Mamba models also
-        return the per-request Mamba state slot to the allocator as
-        part of the detach (see :meth:`get_mamba_state_idx_for` for how
-        the slot index is tracked).
+        For hybrid / Mamba models the per-request Mamba state slot is
+        also released by default. Pass ``keep_mamba_state=True`` to keep
+        the slot live (the migration handler does this so its async
+        transport can read the conv / SSM state after detach has
+        returned). The caller must then free the slot via
+        :meth:`release_mamba_state_slot` once the transport is done.
+
+        Must be called between engine steps.
 
         Args:
             request_id: Request to detach. Must be in the active batch.
             keep_blocks: If True, the returned block ids remain allocated
                 in the KV block allocator; caller must free them later.
+            keep_mamba_state: If True (and the engine is hybrid), the
+                per-request Mamba state slot stays allocated; caller
+                must read its index via :meth:`get_mamba_state_idx_for`
+                **before** calling detach and free it later via
+                :meth:`release_mamba_state_slot`.
 
         Returns:
             1-D tensor of the physical KV block ids the request occupied.
@@ -1194,13 +1210,12 @@ class DynamicInferenceEngine(AbstractEngine):
         # Reset the now-unused edge slot.
         ctx.request_to_kv_block_ids[last_active, :] = -1
         ctx.request_kv_block_counts[last_active] = 0
-        if ctx.is_hybrid_model:
+        if ctx.is_hybrid_model and not keep_mamba_state:
             # After the swap, the detached request's mamba state idx
             # lives at the last_active slot. Free it through the
-            # allocator regardless of ``keep_blocks`` — the KV
-            # ``keep_blocks`` flag is specific to the KV allocator. The
-            # migration transport has already copied the mamba state
-            # by the time detach runs, so its storage is safe to release.
+            # allocator. ``keep_mamba_state=True`` skips this — the
+            # migration handler reads the state asynchronously and
+            # releases the slot itself once its transport completes.
             if mamba_state_to_free is not None:
                 # free_slots reads request_to_mamba_state_idx[last_active]
                 # (currently set to ``mamba_state_to_free`` after the
@@ -1209,6 +1224,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 ctx.mamba_metadata.free_slots(
                     torch.tensor([last_active], device=device)
                 )
+        elif ctx.is_hybrid_model and keep_mamba_state:
+            # Caller will free this slot after the transport completes.
+            # Clear the swap-target's pointer so a future allocator scan
+            # doesn't see a dangling reference into a slot that's no
+            # longer in the active region.
+            ctx.mamba_metadata.request_to_mamba_state_idx[last_active] = -1
 
         del self.requests[request_id]
 
@@ -1216,6 +1237,30 @@ class DynamicInferenceEngine(AbstractEngine):
             ctx.kv_block_allocator.release_memory_blocks(block_ids)
 
         return block_ids
+
+    @experimental_api
+    def release_mamba_state_slot(self, mamba_state_idx: int) -> None:
+        """Return a Mamba state slot to the allocator.
+
+        Used by the migration handler in tandem with
+        :meth:`detach_request(keep_mamba_state=True)`: the handler
+        captures the slot index, reads its conv / SSM state on the
+        migration stream, and calls this once the transport's event
+        fires.
+
+        No-op on pure-attention engines. The
+        ``mamba_metadata.free_slots`` API expects an active-batch slot
+        index (it reads ``request_to_mamba_state_idx[slot]``); we use
+        the right-edge sentinel slot here since it has no live request
+        and can be repurposed as a one-shot free-list entry.
+        """
+        ctx = self.context
+        if not ctx.is_hybrid_model:
+            return
+        device = torch.cuda.current_device()
+        sentinel = ctx.total_request_count
+        ctx.mamba_metadata.request_to_mamba_state_idx[sentinel] = mamba_state_idx
+        ctx.mamba_metadata.free_slots(torch.tensor([sentinel], device=device))
 
     @experimental_api
     def inject_request(

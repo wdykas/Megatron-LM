@@ -919,22 +919,48 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         # ENGINE_REPLY for an already-migrated request. ``keep_blocks=True``
         # keeps the KV blocks alive for the gather kernels we'll enqueue
         # below; the poll callback releases them once the event fires.
+        # ``keep_mamba_state=True`` does the same for the per-request
+        # Mamba slot on hybrid models — the transport reads the slot's
+        # conv/SSM state on the migration stream, and the poll callback
+        # releases the slot once the event fires.
         try:
             src_block_ids_to_free: List[torch.Tensor] = []
+            src_mamba_state_indices: List[Optional[int]] = []
             injected: List[Tuple[object, List[int]]] = []
+            dst_mamba_state_indices: List[Optional[int]] = []
+            is_hybrid = engine.context.is_hybrid_model
             if meta["in_src"]:
                 for req_id in request_ids:
                     if req_id in engine.requests:
-                        src_block_ids_to_free.append(
-                            engine.detach_request(req_id, keep_blocks=True)
+                        # Capture mamba state idx BEFORE detach — even
+                        # with ``keep_mamba_state=True`` the slot index
+                        # is no longer reachable through the request
+                        # after detach (it's been removed from
+                        # ``engine.requests``).
+                        src_mamba_state_indices.append(
+                            engine.get_mamba_state_idx_for(req_id) if is_hybrid else None
                         )
+                        src_block_ids_to_free.append(
+                            engine.detach_request(
+                                req_id,
+                                keep_blocks=True,
+                                keep_mamba_state=is_hybrid,
+                            )
+                        )
+                    else:
+                        src_mamba_state_indices.append(None)
 
-            # Dst injects each bundle (allocates dst blocks, registers
-            # request) and accumulates the (bundle, dst_blocks) pairs.
+            # Dst injects each bundle (allocates dst blocks + a fresh
+            # mamba state slot on hybrid models) and accumulates the
+            # (bundle, dst_blocks) pairs.
             if meta["in_dst"]:
                 for bundle in parsed_bundles:
                     dst_blocks = engine.inject_request(bundle).tolist()
                     injected.append((bundle, dst_blocks))
+                    dst_mamba_state_indices.append(
+                        engine.get_mamba_state_idx_for(bundle.request_id)
+                        if is_hybrid else None
+                    )
 
             # Build per-bundle KV migration plans. Both src and dst walk
             # the bundles in identical order so slot/flag assignment
@@ -999,6 +1025,85 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                             "nbytes": nbytes,
                             "slot": arena.take(nbytes),
                             "flag": _nv.flag_slot_for(flag_key),
+                        }
+                    )
+
+            # Mamba state ops for hybrid models: per request, one conv +
+            # one ssm transfer per (matched) src↔dst rank. v1 requires
+            # matched TP/PP between shards, so each src rank is paired
+            # with its same-(tp, pp) dst rank — local_idx in the shard's
+            # rank window is the index on both sides.
+            #
+            # Flag offsets ``MAX_OPS_PER_REQ - 2`` (conv) and
+            # ``MAX_OPS_PER_REQ - 1`` (ssm) keep mamba flags out of the
+            # KV-op range ``[0, num_kv_ops)``.
+            mamba_meta: List[dict] = []
+            if is_hybrid:
+                assert src_layout.tp_size == dst_layout.tp_size, (
+                    "hybrid migration v1 requires matched TP between shards"
+                )
+                assert src_layout.pp_size == dst_layout.pp_size, (
+                    "hybrid migration v1 requires matched PP between shards"
+                )
+                ctx = engine.context
+                conv_states = ctx.mamba_conv_states  # [layers, slots, *conv_shape]
+                ssm_states = ctx.mamba_ssm_states  # [layers, slots, *ssm_shape]
+                conv_per_slot = conv_states.shape[2:]
+                ssm_per_slot = ssm_states.shape[2:]
+                conv_dtype_local = conv_states.dtype
+                ssm_dtype_local = ssm_states.dtype
+                conv_layers = conv_states.shape[0]
+                ssm_layers = ssm_states.shape[0]
+                conv_shape = (conv_layers,) + tuple(conv_per_slot)
+                ssm_shape = (ssm_layers,) + tuple(ssm_per_slot)
+                conv_elem = torch.empty((), dtype=conv_dtype_local).element_size()
+                ssm_elem = torch.empty((), dtype=ssm_dtype_local).element_size()
+                conv_nelems = 1
+                for d in conv_shape:
+                    conv_nelems *= d
+                ssm_nelems = 1
+                for d in ssm_shape:
+                    ssm_nelems *= d
+                conv_nbytes = conv_nelems * conv_elem
+                ssm_nbytes = ssm_nelems * ssm_elem
+                # Local position of this rank within its shard. Same
+                # local_idx maps to the paired rank in the other shard
+                # under the matched-TP/PP constraint.
+                if meta["in_src"]:
+                    my_local_idx = rank - src_root
+                    paired_dst_rank = dst_root + my_local_idx
+                    paired_src_rank = rank
+                elif meta["in_dst"]:
+                    my_local_idx = rank - dst_root
+                    paired_src_rank = src_root + my_local_idx
+                    paired_dst_rank = rank
+                else:
+                    my_local_idx = -1
+                    paired_src_rank = -1
+                    paired_dst_rank = -1
+                for bundle_idx, bundle in enumerate(parsed_bundles):
+                    req_id = bundle.request_id
+                    conv_flag = _nv.flag_slot_for(
+                        req_id * MAX_OPS_PER_REQ + (MAX_OPS_PER_REQ - 2)
+                    )
+                    ssm_flag = _nv.flag_slot_for(
+                        req_id * MAX_OPS_PER_REQ + (MAX_OPS_PER_REQ - 1)
+                    )
+                    mamba_meta.append(
+                        {
+                            "bundle_idx": bundle_idx,
+                            "src_rank": paired_src_rank,
+                            "dst_rank": paired_dst_rank,
+                            "conv_slot": arena.take(conv_nbytes),
+                            "conv_flag": conv_flag,
+                            "conv_nbytes": conv_nbytes,
+                            "conv_shape": conv_shape,
+                            "conv_dtype": conv_dtype_local,
+                            "ssm_slot": arena.take(ssm_nbytes),
+                            "ssm_flag": ssm_flag,
+                            "ssm_nbytes": ssm_nbytes,
+                            "ssm_shape": ssm_shape,
+                            "ssm_dtype": ssm_dtype_local,
                         }
                     )
 
@@ -1075,6 +1180,73 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                             recv_view,
                         )
 
+                # Mamba state transfer — per request, two slot puts per
+                # src rank (conv + ssm), paired 1:1 with same-(tp, pp)
+                # dst rank under the matched-TP/PP constraint.
+                if is_hybrid and meta["in_src"]:
+                    conv_states = engine.context.mamba_conv_states
+                    ssm_states = engine.context.mamba_ssm_states
+                    for entry in mamba_meta:
+                        src_state_idx = src_mamba_state_indices[entry["bundle_idx"]]
+                        if src_state_idx is None:
+                            continue
+                        # Conv
+                        conv_send = conv_states[:, src_state_idx].contiguous()
+                        slot = _nv.staging_slot(entry["conv_slot"])
+                        slot[: entry["conv_nbytes"]].view(entry["conv_dtype"]).reshape(
+                            entry["conv_shape"]
+                        ).copy_(conv_send, non_blocking=True)
+                        _nv.put_slot_with_signal(
+                            entry["conv_slot"],
+                            entry["conv_flag"],
+                            entry["dst_rank"],
+                            nbytes=entry["conv_nbytes"],
+                            stream=stream,
+                        )
+                        # SSM
+                        ssm_send = ssm_states[:, src_state_idx].contiguous()
+                        slot = _nv.staging_slot(entry["ssm_slot"])
+                        slot[: entry["ssm_nbytes"]].view(entry["ssm_dtype"]).reshape(
+                            entry["ssm_shape"]
+                        ).copy_(ssm_send, non_blocking=True)
+                        _nv.put_slot_with_signal(
+                            entry["ssm_slot"],
+                            entry["ssm_flag"],
+                            entry["dst_rank"],
+                            nbytes=entry["ssm_nbytes"],
+                            stream=stream,
+                        )
+
+                if is_hybrid and meta["in_dst"]:
+                    conv_states = engine.context.mamba_conv_states
+                    ssm_states = engine.context.mamba_ssm_states
+                    for entry in mamba_meta:
+                        dst_state_idx = dst_mamba_state_indices[entry["bundle_idx"]]
+                        if dst_state_idx is None:
+                            continue
+                        # Conv
+                        _nv.wait_slot_signal(
+                            entry["conv_flag"], expected_value=1, stream=stream
+                        )
+                        slot = _nv.staging_slot(entry["conv_slot"])
+                        conv_recv = (
+                            slot[: entry["conv_nbytes"]]
+                            .view(entry["conv_dtype"])
+                            .reshape(entry["conv_shape"])
+                        )
+                        conv_states[:, dst_state_idx] = conv_recv
+                        # SSM
+                        _nv.wait_slot_signal(
+                            entry["ssm_flag"], expected_value=1, stream=stream
+                        )
+                        slot = _nv.staging_slot(entry["ssm_slot"])
+                        ssm_recv = (
+                            slot[: entry["ssm_nbytes"]]
+                            .view(entry["ssm_dtype"])
+                            .reshape(entry["ssm_shape"])
+                        )
+                        ssm_states[:, dst_state_idx] = ssm_recv
+
                 # Mark the end of this migration on the stream so the
                 # tick poll can query a CUDA event.
                 done_event = torch.cuda.Event()
@@ -1087,8 +1259,12 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             torch.cuda.default_stream().wait_stream(stream)
 
             # Once the migration event fires: reset the flags and (on src)
-            # return the kept blocks to the allocator.
+            # return the kept blocks + the kept mamba state slots to
+            # the allocators.
             flags_used = [e["flag"] for e in op_meta]
+            for entry in mamba_meta:
+                flags_used.append(entry["conv_flag"])
+                flags_used.append(entry["ssm_flag"])
 
             def _poll() -> bool:
                 if not done_event.query():
@@ -1100,6 +1276,10 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                     for blocks in src_block_ids_to_free:
                         if blocks.numel() > 0:
                             allocator.release_memory_blocks(blocks)
+                if meta["in_src"] and is_hybrid:
+                    for src_state_idx in src_mamba_state_indices:
+                        if src_state_idx is not None:
+                            engine.release_mamba_state_slot(src_state_idx)
                 return True
 
             engine.push_pending_migration(_poll)
@@ -1118,6 +1298,10 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                 for blocks in src_block_ids_to_free:
                     if blocks.numel() > 0:
                         allocator.release_memory_blocks(blocks)
+            if is_hybrid and src_mamba_state_indices:
+                for src_state_idx in src_mamba_state_indices:
+                    if src_state_idx is not None:
+                        engine.release_mamba_state_slot(src_state_idx)
             for bundle, _ in injected:
                 if bundle.request_id in engine.requests:
                     engine.detach_request(
