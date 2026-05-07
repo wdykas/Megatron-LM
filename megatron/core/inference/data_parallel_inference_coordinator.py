@@ -168,6 +168,7 @@ class DataParallelInferenceCoordinator:
         self.pipe_connection.close()
 
         logging.info("Inference Coordinator: waiting for connections from data parallel ranks...")
+        # First wait for all data parallel ranks to establish connections.
         self.identities_of_data_parallel_ranks = deque([])
         # identity → shard_index collected during the initial barrier.
         # REGISTER_DP_RANK carries the tag; legacy empty-bytes leaves it
@@ -480,6 +481,43 @@ class DataParallelInferenceCoordinator:
                 return present.astype(np.float64) * ((i + 1.0) / n), recency
         return zeros, zeros.copy()
 
+    def _advance_lifecycle_state(self, header) -> bool:
+        """Validate + apply a whole-world coord state transition for
+        PAUSE / UNPAUSE / SUSPEND / RESUME / STOP.
+
+        Returns ``True`` if the caller should proceed to broadcast the
+        signal; ``False`` if the header was ignored (idempotent or
+        out-of-order) and the caller should continue.
+        """
+        State = self.CoordinatorState
+        if header == Headers.PAUSE:
+            if self.state == State.RUNNING:
+                self.state = State.PAUSED
+                return True
+            if self.state in (State.PAUSED, State.SUSPENDED):
+                return False  # idempotent
+        elif header == Headers.UNPAUSE:
+            if self.state == State.PAUSED:
+                self.state = State.RUNNING
+                return True
+        elif header == Headers.SUSPEND:
+            if self.state == State.PAUSED:
+                self.state = State.SUSPENDED
+                return True
+        elif header == Headers.RESUME:
+            if self.state == State.SUSPENDED:
+                self.state = State.PAUSED
+                return True
+        elif header == Headers.STOP:
+            if self.state in (State.PAUSED, State.SUSPENDED):
+                self.state = State.STOPPING
+                return True
+        else:
+            # Other headers don't drive the lifecycle state machine.
+            return True
+        logging.warning("Coordinator: ignoring %s in state %s", header.name, self.state)
+        return False
+
     def start(self):
         """
         Starts the main event loop for the coordinator.
@@ -687,55 +725,12 @@ class DataParallelInferenceCoordinator:
                         shard_indices = list(trailing) if trailing else None
 
                 if shard_indices is None:
-                    # Whole-world path — keep the existing coord-state
-                    # validation so sequencing bugs still get caught.
-                    if header == Headers.PAUSE:
-                        idem_states = (
-                            self.CoordinatorState.PAUSED,
-                            self.CoordinatorState.SUSPENDED,
-                        )
-                        if self.state == self.CoordinatorState.RUNNING:
-                            self.state = self.CoordinatorState.PAUSED
-                        elif self.state in idem_states:
-                            # Already paused/suspended, ignore redundant PAUSE.
-                            continue
-                        else:
-                            logging.warning(
-                                "Coordinator: ignoring PAUSE in state %s", self.state
-                            )
-                            continue
-                    elif header == Headers.UNPAUSE:
-                        if self.state != self.CoordinatorState.PAUSED:
-                            logging.warning(
-                                "Coordinator: ignoring UNPAUSE in state %s", self.state
-                            )
-                            continue
-                        self.state = self.CoordinatorState.RUNNING
-                    elif header == Headers.SUSPEND:
-                        if self.state != self.CoordinatorState.PAUSED:
-                            logging.warning(
-                                "Coordinator: ignoring SUSPEND in state %s", self.state
-                            )
-                            continue
-                        self.state = self.CoordinatorState.SUSPENDED
-                    elif header == Headers.RESUME:
-                        if self.state != self.CoordinatorState.SUSPENDED:
-                            logging.warning(
-                                "Coordinator: ignoring RESUME in state %s", self.state
-                            )
-                            continue
-                        self.state = self.CoordinatorState.PAUSED
-                    elif header == Headers.STOP:
-                        good_states = (
-                            self.CoordinatorState.PAUSED,
-                            self.CoordinatorState.SUSPENDED,
-                        )
-                        if self.state not in good_states:
-                            logging.warning(
-                                "Coordinator: ignoring STOP in state %s", self.state
-                            )
-                            continue
-                        self.state = self.CoordinatorState.STOPPING
+                    # Whole-world path — validate + apply the coord
+                    # state-machine transition. Scoped path bypasses the
+                    # whole-world state (per-engine state machines still
+                    # validate).
+                    if not self._advance_lifecycle_state(header):
+                        continue
 
                 # Determine broadcast targets. When a scope is set, only
                 # those shards' engines receive the signal; other shards
