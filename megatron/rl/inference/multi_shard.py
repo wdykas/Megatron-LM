@@ -76,6 +76,7 @@ async def _spawn_unified_coord(
     registered yet.
     """
     import multiprocessing
+
     from megatron.core.inference.data_parallel_inference_coordinator import (
         DataParallelInferenceCoordinator,
     )
@@ -703,9 +704,8 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         # Rank layout within a shard is TP-major: (tp_rank, pp_rank)
         # sits at ``pp_rank * tp_size + tp_rank`` from rank_offset.
         # Head offset is driven by the TP component only; the PP
-        # layer offset is computed inside
-        # ``migrate_requests_cross_shard_batch`` from each rank's
-        # position.
+        # layer offset is computed inside the migration handler from
+        # each rank's position.
         head_offset = 0
         if participates:
             tp_rank = (rank - shard.rank_offset) % tp
@@ -870,13 +870,13 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         if not (meta["in_src"] or meta["in_dst"]):
             return  # bystander; coord shouldn't forward to us anyway
 
+        from megatron.core.inference import nvshmem_migration as _nv
         from megatron.core.inference.engines.request_migration import (
             _gather_kv_slice,
             _scatter_kv_slice,
             build_kv_migration_plan,
             deserialize_bundle,
         )
-        from megatron.core.inference import nvshmem_migration as _nv
 
         src_shard = meta["src_shard"]
         dst_shard = meta["dst_shard"]
@@ -1302,9 +1302,7 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             # dst engine doesn't need a cross-shard broadcast to
             # learn the request's metadata. This is what makes the
             # whole migration handler non-blocking on both sides.
-            from megatron.core.inference.engines.request_migration import (
-                serialize_bundle,
-            )
+            from megatron.core.inference.engines.request_migration import serialize_bundle
 
             for dst_shard_index, request_ids in groups.items():
                 try:

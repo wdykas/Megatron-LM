@@ -4,9 +4,12 @@
 
 Moves an in-flight generation request — prompt, generated tokens, sampling
 params, logprob history, *and* its KV cache — from one
-:class:`DynamicInferenceEngine` to another whose parallelism differs. The
-existing :class:`~megatron.core.resharding.copy_services.nccl_copy_service.NCCLCopyService`
-is reused for the KV tensor transport. The module supplies:
+:class:`DynamicInferenceEngine` to another whose parallelism differs. KV
+tensor transport rides on the symmetric NVSHMEM staging buffer set up
+by :mod:`megatron.core.inference.nvshmem_migration`; one-sided
+``put_signal`` delivers the data and arms a per-op flag, and the dst
+side ``signal_wait``s on the same flag from the migration stream — no
+NCCL collective and no ``barrier_all``. The module supplies:
 
 - :class:`RequestMigrationBundle` — metadata envelope that travels with
   the request (everything except the KV tensors themselves).
@@ -18,15 +21,15 @@ is reused for the KV tensor transport. The module supplies:
   *and* heterogeneous PP by taking the (layer × head) intersection of
   each (src rank, dst rank) pair's ownership.
 - :func:`execute_kv_migration_plan` — drives the plan's ops through
-  :class:`NCCLCopyService` over a ``cross_shard_group`` process group.
-- :func:`migrate_requests_cross_shard_batch` — collective orchestration
-  for N requests per call: snapshot on src → broadcast bundles → inject
-  on dst → broadcast block ids → one fused transport → detach on src.
-- :func:`migrate_request_cross_shard` — thin wrapper around the batch
-  primitive for the single-request case.
+  one-sided NVSHMEM ``put_signal`` over a symmetric staging buffer.
+- :func:`execute_mamba_state_transport` — same NVSHMEM-direct path for
+  per-request Mamba conv + SSM state on hybrid models.
 
 Engine-side surgery (``snapshot_request`` / ``detach_request`` /
 ``inject_request``) lives alongside :class:`DynamicInferenceEngine`.
+The production migration handler in :mod:`megatron.rl.inference.multi_shard`
+inlines the NVSHMEM gather/put/scatter sequence directly for the
+non-blocking signal path.
 """
 
 from dataclasses import dataclass, field
@@ -395,7 +398,7 @@ def _scatter_kv_slice(
         memory_buffer[:, layer_lo:layer_hi, block_ids, :, head_lo:head_hi, :] = data
 
 
-def _execute_kv_migration_plan_nvshmem(
+def execute_kv_migration_plan(
     ops: List[KVMigrationOp],
     memory_buffer: torch.Tensor,
     layout: KVLayout,
@@ -405,16 +408,61 @@ def _execute_kv_migration_plan_nvshmem(
     my_src_pp_layer_offset: int = 0,
     my_dst_pp_layer_offset: int = 0,
 ) -> None:
-    """NVSHMEM-direct KV transport. One-sided ``put`` between every
-    src/dst rank pair through a symmetric staging buffer, with
-    ``quiet`` as the only synchronization. No ``barrier_all``.
+    """Execute a KV migration plan over the symmetric NVSHMEM heap.
+
+    For each :class:`KVMigrationOp` the current rank plays at most two
+    roles:
+
+    - if ``rank == op.src_rank``: gather the op's slice from the local
+      ``memory_buffer`` into a symmetric staging slot, then
+      ``put_signal`` it to the matching slot + flag on ``op.dst_rank``;
+    - if ``rank == op.dst_rank``: ``signal_wait`` for the per-op flag
+      to arrive (stream-ordered GPU wait, not a host barrier), then
+      scatter the slot back into the local ``memory_buffer``.
 
     Walks ``ops`` in deterministic order on every rank so the same
     ``StagingArena`` offsets are assigned on src and dst — that's the
-    invariant that lets ``nvshmem.core.put`` land each op's bytes at
-    the matching offset on the destination's symmetric staging buffer.
+    invariant that lets each op's bytes land at the matching offset on
+    the destination's symmetric staging buffer.
+
+    **Global vs local head/layer indices.** ``op.head_range`` and
+    ``op.layer_range`` are in the model's *global* index space. Each
+    rank's ``memory_buffer`` holds only its local TP/PP slice. The
+    ``my_src_*_offset`` / ``my_dst_*_offset`` parameters tell the
+    transport where this rank's slice starts in global space, so the
+    op's global range can be translated into the local buffer's index
+    range. Callers that aren't in the src (resp. dst) shard can leave
+    those offsets at their default ``0``.
+
+    Args:
+        ops: Output of :func:`build_kv_migration_plan`.
+        memory_buffer: This rank's KV cache buffer. Contract:
+            - non-MLA shape:
+              ``(2, num_layers_pp, total_blocks, block_size, heads_per_tp, head_dim)``
+            - MLA shape:
+              ``(num_layers_pp, total_blocks, block_size, kv_reduced_dim)``
+        layout: This rank's KV layout. Its ``is_mla`` flag selects
+            between the two buffer shapes.
+        my_src_head_offset: Global head index at which this rank's src
+            buffer slice starts. Only consulted when this rank appears
+            as ``op.src_rank`` for some op.
+        my_dst_head_offset: Global head index at which this rank's dst
+            buffer slice starts. Only consulted when this rank appears
+            as ``op.dst_rank`` for some op.
+        my_src_pp_layer_offset / my_dst_pp_layer_offset: Same idea for
+            the PP layer dimension.
+
+    Requires :mod:`megatron.core.inference.nvshmem_migration` to be
+    initialized; raises a :class:`RuntimeError` otherwise.
     """
     from megatron.core.inference import nvshmem_migration as _nv
+
+    if not _nv.is_initialized():
+        raise RuntimeError(
+            "execute_kv_migration_plan requires NVSHMEM migration to be "
+            "initialized. Call nvshmem_migration.initialize(...) before "
+            "invoking the cross-shard transport."
+        )
 
     rank = dist.get_rank()
     arena = _nv.StagingArena()
@@ -541,167 +589,7 @@ def _execute_kv_migration_plan_nvshmem(
         _nv.reset_flag(slot)
 
 
-def execute_kv_migration_plan(
-    ops: List[KVMigrationOp],
-    memory_buffer: torch.Tensor,
-    layout: KVLayout,
-    group: "Optional[dist.ProcessGroup]",
-    *,
-    my_src_head_offset: int = 0,
-    my_dst_head_offset: int = 0,
-    my_src_pp_layer_offset: int = 0,
-    my_dst_pp_layer_offset: int = 0,
-) -> None:
-    """Execute a KV migration plan collectively across ``group``.
-
-    Every rank in ``group`` must call this function. For each
-    :class:`KVMigrationOp` the current rank plays at most two roles:
-
-    - if ``rank == op.src_rank``: gather the op's slice from the local
-      ``memory_buffer`` into a staging tensor, ``submit_send`` it;
-    - if ``rank == op.dst_rank``: allocate a staging tensor of the op's
-      expected shape, ``submit_recv`` into it, then scatter the result
-      back into the local ``memory_buffer``.
-
-    Same-rank ops (``src_rank == dst_rank``) are handled by
-    :class:`NCCLCopyService` through its ``task_id`` matching — no
-    network traffic, just a device-local copy on its dedicated stream.
-
-    **Global vs local head indices.** ``op.head_range`` is in the
-    model's *global* head index space (e.g. heads ``[0, num_kv_heads_total)``).
-    Each rank's ``memory_buffer`` holds only its local TP slice. The
-    ``my_src_head_offset`` / ``my_dst_head_offset`` parameters tell the
-    transport where this rank's slice starts in global head space, so
-    the op's global range can be translated into the local buffer's
-    index range. Callers that aren't in the src (resp. dst) shard can
-    leave those offsets at their default ``0``.
-
-    Args:
-        ops: Output of :func:`build_kv_migration_plan`.
-        memory_buffer: This rank's KV cache buffer. Contract:
-            - non-MLA shape:
-              ``(2, num_layers_pp, total_blocks, block_size, heads_per_tp, head_dim)``
-            - MLA shape:
-              ``(num_layers_pp, total_blocks, block_size, kv_reduced_dim)``
-        layout: This rank's KV layout. Its ``is_mla`` flag selects
-            between the two buffer shapes.
-        group: Cross-shard process group returned by
-            :func:`megatron.core.inference.shards.build_cross_shard_group`.
-            Must contain the union of all ops' src and dst ranks.
-            ``None`` is permitted for the single-rank-local case
-            (collectives are no-ops then).
-        my_src_head_offset: Global head index at which this rank's src
-            buffer slice starts. Only consulted when this rank appears
-            as ``op.src_rank`` for some op.
-        my_dst_head_offset: Global head index at which this rank's dst
-            buffer slice starts. Only consulted when this rank appears
-            as ``op.dst_rank`` for some op.
-
-    Notes:
-        Every rank in ``group`` must enter this function so the
-        collective under the hood (``batch_isend_irecv``) stays balanced.
-        Ranks that appear in no op still participate as a no-op at the
-        collective level.
-    """
-    # NVSHMEM-direct path: when the inference interface has initialized
-    # the NVSHMEM migration module (cross-shard topology), bypass the
-    # collective NCCL service entirely and use one-sided ``put`` over
-    # a symmetric staging buffer with a single ``quiet`` for completion.
-    # No ``barrier_all``; no engine pause beyond the kernel-launch cost
-    # of the gather/put/scatter sequence on the migration stream.
-    from megatron.core.inference import nvshmem_migration as _nv
-
-    if _nv.is_initialized():
-        _execute_kv_migration_plan_nvshmem(
-            ops,
-            memory_buffer,
-            layout,
-            my_src_head_offset=my_src_head_offset,
-            my_dst_head_offset=my_dst_head_offset,
-            my_src_pp_layer_offset=my_src_pp_layer_offset,
-            my_dst_pp_layer_offset=my_dst_pp_layer_offset,
-        )
-        return
-
-    from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopyService
-
-    rank = dist.get_rank()
-    service = NCCLCopyService(group=group)
-
-    # Keep recv-side staging tensors alive until the service runs so
-    # their buffers don't get freed mid-flight. Each entry is (op, tensor).
-    pending_recvs: List[Tuple[KVMigrationOp, torch.Tensor]] = []
-
-    for task_id, op in enumerate(ops):
-        is_src = rank == op.src_rank
-        is_dst = rank == op.dst_rank
-        if not (is_src or is_dst):
-            continue
-
-        device = memory_buffer.device
-        dtype = memory_buffer.dtype
-
-        if is_src:
-            src_blocks = torch.as_tensor(op.src_block_ids, device=device, dtype=torch.long)
-            local_head_range = (
-                op.head_range[0] - my_src_head_offset,
-                op.head_range[1] - my_src_head_offset,
-            )
-            local_layer_range = (
-                op.layer_range[0] - my_src_pp_layer_offset,
-                op.layer_range[1] - my_src_pp_layer_offset,
-            )
-            send_tensor = _gather_kv_slice(
-                memory_buffer, local_layer_range, src_blocks, local_head_range, layout.is_mla
-            )
-            service.submit_send(send_tensor, dest_rank=op.dst_rank, task_id=task_id)
-
-        if is_dst:
-            # Compute the shape the incoming tensor must have.
-            num_blocks = len(op.dst_block_ids)
-            layer_span = op.layer_range[1] - op.layer_range[0]
-            head_span = op.head_range[1] - op.head_range[0]
-            if layout.is_mla:
-                shape = (layer_span, num_blocks, layout.block_size_tokens, head_span)
-            else:
-                shape = (
-                    2,
-                    layer_span,
-                    num_blocks,
-                    layout.block_size_tokens,
-                    head_span,
-                    layout.head_dim,
-                )
-            recv_tensor = torch.empty(shape, dtype=dtype, device=device)
-            service.submit_recv(recv_tensor, src_rank=op.src_rank, task_id=task_id)
-            pending_recvs.append((op, recv_tensor))
-
-    service.run()
-
-    # Scatter every received slice back into the local memory buffer.
-    for op, recv_tensor in pending_recvs:
-        dst_blocks = torch.as_tensor(
-            op.dst_block_ids, device=memory_buffer.device, dtype=torch.long
-        )
-        local_head_range = (
-            op.head_range[0] - my_dst_head_offset,
-            op.head_range[1] - my_dst_head_offset,
-        )
-        local_layer_range = (
-            op.layer_range[0] - my_dst_pp_layer_offset,
-            op.layer_range[1] - my_dst_pp_layer_offset,
-        )
-        _scatter_kv_slice(
-            memory_buffer,
-            local_layer_range,
-            dst_blocks,
-            local_head_range,
-            layout.is_mla,
-            recv_tensor,
-        )
-
-
-def _execute_mamba_state_transport_nvshmem(
+def execute_mamba_state_transport(
     *,
     role: str,
     layout: KVLayout,
@@ -714,17 +602,46 @@ def _execute_mamba_state_transport_nvshmem(
     dst_mamba_ssm_states: Optional[torch.Tensor] = None,
     dst_state_idx: Optional[int] = None,
 ) -> None:
-    """NVSHMEM-direct Mamba conv + SSM state transport.
+    """Transport Mamba conv + SSM state for one request across shards.
 
-    Same shape contract as :func:`execute_mamba_state_transport` (v1
-    requires matched TP/PP between shards; per-pair 1:1 send) but
-    routed through the symmetric staging buffer with one-sided
-    ``put`` + ``quiet``. The Mamba state slot tensors are themselves
-    in the symmetric heap; we still stage because conv and ssm slices
-    are at distinct offsets within those tensors and we want a single
-    contiguous put per (kind, pair).
+    For v1 we require **matched TP and PP** between the shards so the
+    state tensor shapes are identical on both sides — each src rank
+    sends its per-layer state slice to the corresponding dst rank
+    (``src_ranks[i] → dst_ranks[i]``) with no reshape. Heterogeneous
+    TP/PP on Mamba would need a reshape layer analogous to
+    :func:`build_kv_migration_plan`; that's deferred.
+
+    Routes per (rank, state) pair through the symmetric NVSHMEM
+    staging buffer: src ``put_signal``s a contiguous conv (or ssm)
+    slice and arms its flag, dst ``signal_wait``s and scatters back
+    into its state slot. The Mamba state tensors themselves live in
+    the symmetric heap, but conv and ssm slices are at distinct
+    offsets within them, so we still stage to keep one contiguous
+    transfer per (kind, pair). No NCCL collective and no
+    ``barrier_all``.
+
+    ``role`` is informational and used for assertion clarity. A pure
+    attention model (``layout.mamba is None``) is a no-op.
+
+    Requires :mod:`megatron.core.inference.nvshmem_migration` to be
+    initialized; raises a :class:`RuntimeError` otherwise.
     """
+    if layout.mamba is None:
+        return  # pure attention model; nothing to do
+
+    assert len(src_ranks) == len(dst_ranks), (
+        f"Mamba state transport (v1) requires matched TP/PP between "
+        f"shards — got src_ranks={src_ranks} and dst_ranks={dst_ranks}"
+    )
+
     from megatron.core.inference import nvshmem_migration as _nv
+
+    if not _nv.is_initialized():
+        raise RuntimeError(
+            "execute_mamba_state_transport requires NVSHMEM migration to "
+            "be initialized. Call nvshmem_migration.initialize(...) before "
+            "invoking the cross-shard transport."
+        )
 
     rank = dist.get_rank()
     arena = _nv.StagingArena()
@@ -822,400 +739,6 @@ def _execute_mamba_state_transport_nvshmem(
     torch.cuda.current_stream().wait_stream(stream)
     for slot in flags_used:
         _nv.reset_flag(slot)
-
-
-def execute_mamba_state_transport(
-    *,
-    role: str,
-    layout: KVLayout,
-    src_ranks: List[int],
-    dst_ranks: List[int],
-    src_mamba_conv_states: Optional[torch.Tensor] = None,
-    src_mamba_ssm_states: Optional[torch.Tensor] = None,
-    src_state_idx: Optional[int] = None,
-    dst_mamba_conv_states: Optional[torch.Tensor] = None,
-    dst_mamba_ssm_states: Optional[torch.Tensor] = None,
-    dst_state_idx: Optional[int] = None,
-    cross_shard_group: "dist.ProcessGroup",
-) -> None:
-    """Transport Mamba conv + SSM state for one request across shards.
-
-    For v1 we require **matched TP and PP** between the shards so the
-    state tensor shapes are identical on both sides — each src rank
-    sends its per-layer state slice to the corresponding dst rank
-    (``src_ranks[i] → dst_ranks[i]``) with no reshape. Heterogeneous
-    TP/PP on Mamba would need a reshape layer analogous to
-    :func:`build_kv_migration_plan`; that's deferred.
-
-    Runs collectively over ``cross_shard_group``. Non-participating
-    ranks in the group enter the underlying ``NCCLCopyService`` with
-    no ops so the ``batch_isend_irecv`` stays balanced.
-    """
-    if layout.mamba is None:
-        return  # pure attention model; nothing to do
-
-    assert len(src_ranks) == len(dst_ranks), (
-        f"Mamba state transport (v1) requires matched TP/PP between "
-        f"shards — got src_ranks={src_ranks} and dst_ranks={dst_ranks}"
-    )
-
-    # NVSHMEM-direct path: single ``put`` per (rank, state) pair into
-    # symmetric staging, ``quiet``, dst scatters. No ``barrier_all``.
-    from megatron.core.inference import nvshmem_migration as _nv
-
-    if _nv.is_initialized():
-        _execute_mamba_state_transport_nvshmem(
-            role=role,
-            layout=layout,
-            src_ranks=src_ranks,
-            dst_ranks=dst_ranks,
-            src_mamba_conv_states=src_mamba_conv_states,
-            src_mamba_ssm_states=src_mamba_ssm_states,
-            src_state_idx=src_state_idx,
-            dst_mamba_conv_states=dst_mamba_conv_states,
-            dst_mamba_ssm_states=dst_mamba_ssm_states,
-            dst_state_idx=dst_state_idx,
-        )
-        return
-
-    from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopyService
-
-    rank = dist.get_rank()
-    service = NCCLCopyService(group=cross_shard_group)
-
-    # Each (src_ranks[i], dst_ranks[i]) pair exchanges a conv-state
-    # slice and an SSM-state slice. Tag with distinct task_ids so the
-    # same-rank local-copy path can match them.
-    pending_recvs: List[Tuple[str, torch.Tensor]] = []
-    for i, (sr, dr) in enumerate(zip(src_ranks, dst_ranks)):
-        is_src = rank == sr
-        is_dst = rank == dr
-        if not (is_src or is_dst):
-            continue
-        if is_src:
-            assert src_mamba_conv_states is not None
-            assert src_mamba_ssm_states is not None
-            assert src_state_idx is not None
-            # Gather this request's state across all PP-local Mamba layers.
-            conv_send = src_mamba_conv_states[:, src_state_idx].contiguous()
-            ssm_send = src_mamba_ssm_states[:, src_state_idx].contiguous()
-            service.submit_send(conv_send, dest_rank=dr, task_id=2 * i)
-            service.submit_send(ssm_send, dest_rank=dr, task_id=2 * i + 1)
-        if is_dst:
-            assert dst_mamba_conv_states is not None
-            assert dst_mamba_ssm_states is not None
-            assert dst_state_idx is not None
-            conv_recv = torch.empty(
-                (layout.mamba.num_mamba_layers_pp,) + tuple(layout.mamba.conv_states_shape),
-                dtype=dst_mamba_conv_states.dtype,
-                device=dst_mamba_conv_states.device,
-            )
-            ssm_recv = torch.empty(
-                (layout.mamba.num_mamba_layers_pp,) + tuple(layout.mamba.ssm_states_shape),
-                dtype=dst_mamba_ssm_states.dtype,
-                device=dst_mamba_ssm_states.device,
-            )
-            service.submit_recv(conv_recv, src_rank=sr, task_id=2 * i)
-            service.submit_recv(ssm_recv, src_rank=sr, task_id=2 * i + 1)
-            pending_recvs.append(("conv", conv_recv))
-            pending_recvs.append(("ssm", ssm_recv))
-
-    service.run()
-
-    # Scatter received state into the dst slot.
-    if role == "dst":
-        assert dst_mamba_conv_states is not None
-        assert dst_mamba_ssm_states is not None
-        assert dst_state_idx is not None
-        for kind, recv_tensor in pending_recvs:
-            if kind == "conv":
-                dst_mamba_conv_states[:, dst_state_idx] = recv_tensor
-            else:
-                dst_mamba_ssm_states[:, dst_state_idx] = recv_tensor
-
-
-def migrate_request_cross_shard(
-    *,
-    role: str,
-    engine: "Optional[object]",
-    request_id_src: Optional[int],
-    src_layout: KVLayout,
-    dst_layout: KVLayout,
-    src_ranks: List[int],
-    dst_ranks: List[int],
-    cross_shard_group: "dist.ProcessGroup",
-    my_src_head_offset: int = 0,
-    my_dst_head_offset: int = 0,
-    request_id_dst: Optional[int] = None,
-) -> Optional[int]:
-    """Migrate one in-flight request from the src shard to the dst shard.
-
-    Collective across ``cross_shard_group``. Every rank in
-    ``src_ranks ∪ dst_ranks`` must enter this function simultaneously.
-    Engines must be quiescent (no in-flight step); the caller (e.g.
-    ``MegatronLocalMulti.migrate_request``) is responsible for the
-    pause/resume bracket.
-
-    Flow (each step is aligned on every rank in the group):
-
-        1. ``src shard rank 0`` calls ``engine.snapshot_request`` to
-           build the migration :class:`RequestMigrationBundle`.
-        2. Broadcast the bundle through ``cross_shard_group`` so every
-           rank — in particular every rank of the dst shard — has it.
-        3. ``dst shard rank 0`` calls ``engine.inject_request(bundle)``
-           to register the request in DECODE state with fresh KV
-           blocks allocated. Broadcasts the new block ids.
-        4. Every rank builds the KV plan from the (now-global-visible)
-           bundle + dst_block_ids and drives
-           :func:`execute_kv_migration_plan`, which moves the per-layer
-           KV slices through ``NCCLCopyService`` over
-           ``cross_shard_group``.
-        5. ``src shard rank 0`` calls ``engine.detach_request`` with
-           ``keep_blocks=False`` to free the now-stale source blocks
-           and clean up the active-batch slot.
-
-    Args:
-        role: ``"src"``, ``"dst"``, or ``"bystander"`` (latter is only
-            legal when the caller is in ``cross_shard_group`` but not
-            in either shard — unlikely but permitted).
-        engine: The rank-local engine; ``None`` for bystanders.
-        request_id_src: Source-side request id. Required when
-            ``role == "src"``; ignored otherwise (dst learns it from
-            the bundle).
-        src_layout / dst_layout: KV layout descriptors. Populated by
-            the caller from each shard's process-group config.
-        src_ranks / dst_ranks: Global ranks making up the two shards'
-            rank windows. Used to pick broadcast roots and to feed the
-            plan's global-rank-of callable.
-        cross_shard_group: The torch process group spanning
-            ``src_ranks ∪ dst_ranks``. Callers typically obtain this
-            from :func:`megatron.core.inference.shards.build_cross_shard_group`.
-        my_src_head_offset / my_dst_head_offset: See
-            :func:`execute_kv_migration_plan`.
-        request_id_dst: The request id to register on the destination
-            engine. Defaults to the source id; supply a different value
-            when the two engines share a caller's request-id namespace
-            (e.g. same-engine round-trip tests).
-
-    Returns:
-        The dst-side request id (useful to the caller for future
-        lifecycle ops). ``None`` on bystanders.
-    """
-    # Thin wrapper around the batch primitive so all of the actual
-    # collective / plan / transport logic lives in exactly one place.
-    # A 1-element batch is the natural single-request shape.
-    migrated_ids = migrate_requests_cross_shard_batch(
-        role=role,
-        engine=engine,
-        request_ids_src=[request_id_src] if request_id_src is not None else None,
-        src_layout=src_layout,
-        dst_layout=dst_layout,
-        src_ranks=src_ranks,
-        dst_ranks=dst_ranks,
-        cross_shard_group=cross_shard_group,
-        my_src_head_offset=my_src_head_offset,
-        my_dst_head_offset=my_dst_head_offset,
-        request_ids_dst=[request_id_dst] if request_id_dst is not None else None,
-    )
-    if migrated_ids:
-        return migrated_ids[0]
-    return None
-
-
-def migrate_requests_cross_shard_batch(
-    *,
-    role: str,
-    engine: "Optional[object]",
-    request_ids_src: Optional[List[int]],
-    src_layout: KVLayout,
-    dst_layout: KVLayout,
-    src_ranks: List[int],
-    dst_ranks: List[int],
-    cross_shard_group: "dist.ProcessGroup",
-    my_src_head_offset: int = 0,
-    my_dst_head_offset: int = 0,
-    request_ids_dst: Optional[List[int]] = None,
-) -> Optional[List[int]]:
-    """Migrate a batch of in-flight requests with a single KV collective.
-
-    Same contract as :func:`migrate_request_cross_shard` but ``N`` requests
-    per invocation. The whole batch goes through:
-
-      - one ``snapshot_request`` loop on src,
-      - one object-list broadcast (N bundles),
-      - one ``inject_request`` loop on dst,
-      - one object-list broadcast (N dst-block lists),
-      - **one** :func:`execute_kv_migration_plan` call whose op list is
-        the concatenation of per-request plans,
-      - one ``execute_mamba_state_transport`` per request (hybrid only),
-      - one ``detach_request`` loop on src.
-
-    Amortizes the NCCL collective + broadcast setup overhead across the
-    batch, which is the main win when the auto-disagg scheduler has
-    multiple requests ready to migrate in the same tick.
-
-    Args:
-        request_ids_src: Source-side request ids. Required when
-            ``role == "src"``; ignored otherwise (dst gets them from
-            the bundles).
-        request_ids_dst: Optional per-request destination ids. If
-            ``None``, each request keeps its src id on the dst side.
-        Other args mirror :func:`migrate_request_cross_shard`.
-
-    Returns:
-        List of dst-side request ids (same length as the input batch)
-        on ``role == "dst"``; ``None`` otherwise. Empty batches return
-        an empty list / ``None``.
-    """
-    assert role in ("src", "dst", "bystander"), role
-    src_root = src_ranks[0]
-    dst_root = dst_ranks[0]
-
-    # --- Step 1+2: src builds N bundles, broadcasts the list. ---------
-    bundles_box: List[Optional[List[RequestMigrationBundle]]] = [None]
-    if role == "src":
-        assert engine is not None and request_ids_src is not None
-        if request_ids_dst is not None:
-            assert len(request_ids_dst) == len(request_ids_src), (
-                f"request_ids_dst length ({len(request_ids_dst)}) must match "
-                f"request_ids_src length ({len(request_ids_src)})"
-            )
-        bundles: List[RequestMigrationBundle] = []
-        for i, req_id in enumerate(request_ids_src):
-            bundle, _src_blocks = engine.snapshot_request(req_id)
-            bundle.src_layout = src_layout
-            bundle.dst_layout = dst_layout
-            bundle.request_id = (
-                request_ids_dst[i] if request_ids_dst is not None else req_id
-            )
-            bundles.append(bundle)
-        bundles_box[0] = bundles
-
-    dist.broadcast_object_list(bundles_box, src=src_root, group=cross_shard_group)
-    bundles = bundles_box[0]
-    assert bundles is not None
-    if not bundles:
-        # Empty batch is a no-op; skip the remaining collectives rather
-        # than firing them with zero ops (NCCL tolerates zero ops but
-        # the extra barriers aren't worth it).
-        return [] if role == "dst" else None
-
-    # --- Step 3: dst injects, collects N dst-block lists. -------------
-    dst_blocks_box: List[Optional[List[List[int]]]] = [None]
-    if role == "dst":
-        assert engine is not None
-        all_dst_blocks: List[List[int]] = []
-        for bundle in bundles:
-            dst_blocks = engine.inject_request(bundle)
-            all_dst_blocks.append(dst_blocks.tolist())
-        dst_blocks_box[0] = all_dst_blocks
-
-    dist.broadcast_object_list(dst_blocks_box, src=dst_root, group=cross_shard_group)
-    all_dst_blocks = dst_blocks_box[0]
-    assert all_dst_blocks is not None
-    assert len(all_dst_blocks) == len(bundles)
-
-    # --- Step 4: concatenate per-request plans, run one collective. ---
-    # TP-major rank layout within each shard: (tp, pp) lives at offset
-    # ``pp * tp_size + tp``.
-    def _src_rank_of(tp: int, pp: int, _start=src_root, _tp=src_layout.tp_size) -> int:
-        return _start + pp * _tp + tp
-
-    def _dst_rank_of(tp: int, pp: int, _start=dst_root, _tp=dst_layout.tp_size) -> int:
-        return _start + pp * _tp + tp
-
-    all_ops: List[KVMigrationOp] = []
-    for bundle, dst_block_ids in zip(bundles, all_dst_blocks):
-        all_ops.extend(
-            build_kv_migration_plan(
-                bundle,
-                src_global_rank_of=_src_rank_of,
-                dst_global_rank_of=_dst_rank_of,
-                dst_block_ids=dst_block_ids,
-            )
-        )
-
-    if role == "src":
-        memory_buffer = engine.context.memory_buffer
-        layout = src_layout
-    elif role == "dst":
-        memory_buffer = engine.context.memory_buffer
-        layout = dst_layout
-    else:
-        memory_buffer = torch.empty(0, device=torch.cuda.current_device())
-        layout = dst_layout
-
-    my_rank = dist.get_rank()
-    my_src_pp_stage = (
-        (my_rank - src_root) // src_layout.tp_size if role == "src" else 0
-    )
-    my_dst_pp_stage = (
-        (my_rank - dst_root) // dst_layout.tp_size if role == "dst" else 0
-    )
-    src_layers_per_pp = src_layout.num_layers_total // src_layout.pp_size
-    dst_layers_per_pp = dst_layout.num_layers_total // dst_layout.pp_size
-    my_src_pp_layer_offset = my_src_pp_stage * src_layers_per_pp
-    my_dst_pp_layer_offset = my_dst_pp_stage * dst_layers_per_pp
-
-    execute_kv_migration_plan(
-        all_ops,
-        memory_buffer,
-        layout,
-        cross_shard_group,
-        my_src_head_offset=my_src_head_offset,
-        my_dst_head_offset=my_dst_head_offset,
-        my_src_pp_layer_offset=my_src_pp_layer_offset,
-        my_dst_pp_layer_offset=my_dst_pp_layer_offset,
-    )
-
-    # --- Step 4b: Mamba/hybrid state per request. ---------------------
-    # No batched equivalent today — each request owns a distinct mamba
-    # slot, and transport reads the slot tensor directly. Called in a
-    # loop; the per-request send/recv is already small compared to the
-    # attention KV.
-    if src_layout.mamba is not None:
-        assert dst_layout.mamba is not None, (
-            "src layout has Mamba state but dst layout does not"
-        )
-        for i, bundle in enumerate(bundles):
-            src_req_id = request_ids_src[i] if role == "src" else None
-            dst_req_id = bundle.request_id
-            src_state_idx = (
-                engine.get_mamba_state_idx_for(src_req_id) if role == "src" else None
-            )
-            dst_state_idx = (
-                engine.get_mamba_state_idx_for(dst_req_id) if role == "dst" else None
-            )
-            execute_mamba_state_transport(
-                role=role,
-                layout=layout,
-                src_ranks=src_ranks,
-                dst_ranks=dst_ranks,
-                src_mamba_conv_states=(
-                    engine.context.mamba_conv_states if role == "src" else None
-                ),
-                src_mamba_ssm_states=(
-                    engine.context.mamba_ssm_states if role == "src" else None
-                ),
-                src_state_idx=src_state_idx,
-                dst_mamba_conv_states=(
-                    engine.context.mamba_conv_states if role == "dst" else None
-                ),
-                dst_mamba_ssm_states=(
-                    engine.context.mamba_ssm_states if role == "dst" else None
-                ),
-                dst_state_idx=dst_state_idx,
-                cross_shard_group=cross_shard_group,
-            )
-
-    # --- Step 5: src detaches each slot; returns new ids to dst. -----
-    if role == "src":
-        for req_id in request_ids_src:
-            engine.detach_request(req_id, keep_blocks=False)
-        return None
-    if role == "dst":
-        return [b.request_id for b in bundles]
-    return None
 
 
 def deserialize_bundle(obj: dict) -> RequestMigrationBundle:

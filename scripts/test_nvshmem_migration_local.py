@@ -117,7 +117,7 @@ def test_kv_migration_plan() -> None:
 
 
 def _real_test_kv_migration_plan() -> None:
-    """End-to-end ``_execute_kv_migration_plan_nvshmem`` on a fake KV.
+    """End-to-end ``execute_kv_migration_plan`` on a fake KV.
 
     shard_0 = ranks [0,1], shard_1 = ranks [2,3]. Both with matched
     TP=2 / PP=1. Each rank owns its half of a 4-head KV cache. We
@@ -130,7 +130,7 @@ def _real_test_kv_migration_plan() -> None:
     from megatron.core.inference.engines.request_migration import (
         KVLayout,
         KVMigrationOp,
-        _execute_kv_migration_plan_nvshmem,
+        execute_kv_migration_plan,
     )
 
     rank = dist.get_rank()
@@ -199,7 +199,7 @@ def _real_test_kv_migration_plan() -> None:
     else:
         head_offset = local_heads
 
-    _execute_kv_migration_plan_nvshmem(
+    execute_kv_migration_plan(
         ops,
         memory_buffer,
         layout,
@@ -235,7 +235,7 @@ def _real_test_kv_migration_plan() -> None:
         )
 
     dist.barrier()
-    log0("[PASS] _execute_kv_migration_plan_nvshmem: KV bytes migrated correctly")
+    log0("[PASS] execute_kv_migration_plan: KV bytes migrated correctly")
 
 
 def test_kv_migration_round_trip() -> None:
@@ -246,7 +246,7 @@ def test_kv_migration_round_trip() -> None:
     from megatron.core.inference.engines.request_migration import (
         KVLayout,
         KVMigrationOp,
-        _execute_kv_migration_plan_nvshmem,
+        execute_kv_migration_plan,
     )
 
     rank = dist.get_rank()
@@ -289,7 +289,7 @@ def test_kv_migration_round_trip() -> None:
             src_block_ids=[0], dst_block_ids=[6],
         ),
     ]
-    _execute_kv_migration_plan_nvshmem(
+    execute_kv_migration_plan(
         ops_a, memory_buffer, layout,
         my_src_head_offset=head_offset, my_dst_head_offset=head_offset,
     )
@@ -310,7 +310,7 @@ def test_kv_migration_round_trip() -> None:
             src_block_ids=[2], dst_block_ids=[7],
         ),
     ]
-    _execute_kv_migration_plan_nvshmem(
+    execute_kv_migration_plan(
         ops_b, memory_buffer, layout,
         my_src_head_offset=head_offset, my_dst_head_offset=head_offset,
     )

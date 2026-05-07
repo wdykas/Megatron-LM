@@ -54,7 +54,12 @@ def _sample_bundle(
 
 
 def test_bundle_roundtrip():
-    """Bundle → dict → bundle preserves every field."""
+    """Bundle → dict → bundle preserves every wire field.
+
+    ``src_layout`` / ``dst_layout`` are intentionally not on the wire
+    (the receiving handler restamps them from ``_migration_meta``), so
+    they round-trip as ``None``.
+    """
     bundle = _sample_bundle()
     restored = deserialize_bundle(serialize_bundle(bundle))
     assert restored.request_id == bundle.request_id
@@ -66,8 +71,8 @@ def test_bundle_roundtrip():
     assert restored.num_kv_blocks == bundle.num_kv_blocks
     assert restored.last_block_offset == bundle.last_block_offset
     assert restored.src_block_ids == bundle.src_block_ids
-    assert restored.src_layout == bundle.src_layout
-    assert restored.dst_layout == bundle.dst_layout
+    assert restored.src_layout is None
+    assert restored.dst_layout is None
 
 
 def _check_plan_coverage(ops, bundle):
