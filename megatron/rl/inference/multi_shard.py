@@ -18,7 +18,7 @@ import asyncio
 import logging
 import time
 from collections import deque
-from typing import Deque, List, Optional
+from typing import Deque, List, Optional, Tuple
 
 import httpx
 import torch
@@ -182,22 +182,25 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
     # layouts and head offsets the engine handler needs. Pre-computing
     # avoids paying the layout-build cost on every migration.
     _migration_meta: dict = PrivateAttr(default_factory=dict)
-    # Round-robin counter used by the auto-disagg scheduler to spread
-    # migration batches across the destination shard's DP replicas
-    # (one entry per src_shard_index). Without this every batch lands
-    # on dp_rank 0, which cuts effective dst capacity in half on
+    # Round-robin counter used by the migration scheduler to spread
+    # batches across the destination shard's DP replicas (keyed by
+    # ``(src_shard, dst_shard)``). Without this every batch lands on
+    # dp_rank 0, which cuts effective dst capacity in half on
     # ``tp=K + tp=1,dp=N`` configs.
     _disagg_dst_dp_counter: dict = PrivateAttr(default_factory=dict)
     # When set, base_generate stamps every HTTP request with
     # ``disagg_pair=[src, dst]`` so the coord routes to the prefill shard
-    # and the auto-disagg scheduler migrates after first token. Populated
-    # by the AUTO_DISAGG_SRC_SHARD/AUTO_DISAGG_DST_SHARD env gate in launch.
+    # and the registered :class:`FirstTokenDisaggPolicy` migrates after
+    # first token. Populated by the
+    # ``--rl-auto-disagg-src-shard`` / ``--rl-auto-disagg-dst-shard``
+    # CLI args in :meth:`launch`.
     _disagg_rollout_pair: Optional[tuple] = PrivateAttr(default=None)
     # When set, base_generate stamps requests with ``tail_cut=[dst, n]``
-    # so the auto-disagg scheduler does a *second* migration once the
-    # request has produced ``n`` tokens — typically pulling long-tail
-    # rollouts off the throughput decode shard onto a smaller, latency-
-    # optimized decode shard. ``(dst_shard_index, min_tokens)`` tuple.
+    # so the registered :class:`TailCutPolicy` migrates the request a
+    # second time once it has produced ``n`` tokens — typically pulling
+    # long-tail rollouts off the throughput decode shard onto a smaller,
+    # latency-optimized decode shard. ``(dst_shard_index, min_tokens)``
+    # tuple.
     _tail_cut_rollout_config: Optional[tuple] = PrivateAttr(default=None)
     # Sliding windows of recent per-shard response durations (seconds); used
     # for 1/latency-weighted routing once each shard has some history.
@@ -226,7 +229,7 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                 shard this rank is in). ``None`` on idle ranks that aren't in
                 any shard.
             shards: Full shard layout, shared across all ranks. Each shard's
-                ``coordinator_addr`` / ``http_url`` will be populated in place.
+                ``http_url`` will be populated in place.
             host: Hostname for HTTP bind and ZMQ addresses that must be
                 reachable from other ranks.
             base_port: Port of the first shard's text-gen server. Shard ``i``
@@ -303,17 +306,11 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                 shard_index=my_shard.index,
             )
 
-        # Every shard exposes the same unified coord address; downstream
-        # code (HTTP server, lifecycle client, OpenAI routing) stays
-        # shard-indexed for legibility but ultimately talks to one coord.
-        for s in shards:
-            s.coordinator_addr = unified_coord_addr
-
         # --- Start per-shard text-gen server on the shard's rank_offset ---
-        # The HTTP server's subprocesses create their own InferenceClient against
-        # `coordinator_addr`, so no outer client is needed here for HTTP. The
-        # lifecycle client (pause/resume/...) is created separately on rank 0
-        # below, independent of shard membership.
+        # The HTTP server's subprocesses create their own InferenceClient
+        # against ``unified_coord_addr``, so no outer client is needed here
+        # for HTTP. The lifecycle client (pause/resume/...) is created
+        # separately on rank 0 below, independent of shard membership.
         my_http_port: int = -1
         if my_shard is not None and rank == my_shard.rank_offset:
             my_http_port = base_port + my_shard.index
@@ -345,8 +342,8 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         # --- Build per-shard InferenceClients on each shard's rank_offset ---
         # Each shard's first rank gets a client. Rank 0's drives the
         # lifecycle (pause/resume/stop/shutdown via _drive_all). The
-        # decider rank of any shard whose auto-disagg scheduler is later
-        # enabled uses its client to post ``MIGRATE_BATCH`` directly to
+        # decider rank of any shard with a registered :class:`MigrationPolicy`
+        # uses its client to post ``MIGRATE_BATCH`` directly to
         # the coord without going through rank 0. Clients on rank_offsets
         # that never become deciders are vestigial but harmless — the
         # coord identifies clients by ZMQ identity at CONNECT time and
@@ -457,7 +454,7 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             log_single_rank(
                 logger,
                 logging.INFO,
-                "[auto-disagg] enabling tail-cut: src=%d dst=%d min_tokens=%d",
+                "[tail-cut] enabling: src=%d dst=%d min_tokens=%d",
                 dst_idx_arg,
                 tail_dst_arg,
                 tail_min_arg,
@@ -521,7 +518,7 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         # (src, dst) shard pair. The HTTP endpoint routes the submit to
         # src via the coord's target_shard_index and stamps
         # disagg_dst_shard_index on the engine-side request so the
-        # auto-disagg scheduler migrates it at first token. The HTTP
+        # registered FirstTokenDisaggPolicy migrates it at first token. The HTTP
         # server's choice of shard (idx above) becomes irrelevant —
         # the coord overrides with target_shard_index=src.
         if self._disagg_rollout_pair is not None:
@@ -595,10 +592,10 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
 
     async def resume(self, *, shard_indices: Optional[List[int]] = None) -> None:
         # Whole-world resume: drive engines to RUNNING (engine-owning
-        # ranks), then respawn the auto-disagg scheduler so it ticks
-        # only inside this synchronized inference window. Idle ranks
-        # still need ``_resume_scheduler`` so their broadcast partner
-        # is alive — hence the finally block.
+        # ranks), then respawn the migration-policy scheduler tasks so
+        # they tick only inside this synchronized inference window.
+        # Idle ranks still need ``_resume_scheduler`` so their broadcast
+        # partner is alive — hence the finally block.
         try:
             if self._my_engine is None:
                 return
@@ -615,12 +612,13 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                 self._resume_scheduler()
 
     async def suspend(self, *, shard_indices: Optional[List[int]] = None) -> None:
-        # Cancel scheduler tasks BEFORE driving engines to PAUSED so an
-        # in-flight scheduler tick doesn't try to start a migration
-        # (which would itself call scoped suspend/resume) while the
-        # outer whole-world suspend is racing it. Scoped suspends from
-        # the migration primitive itself leave the scheduler alone —
-        # they have ``shard_indices`` set.
+        # Cancel migration-policy scheduler tasks before driving engines
+        # to PAUSED so an in-flight policy tick doesn't try to schedule
+        # a migration during the outer whole-world suspend. Scoped
+        # suspends (``shard_indices`` set) are reserved for downstream
+        # callers that lifecycle individual shards independently; they
+        # leave the scheduler tasks alone since other shards are still
+        # serving.
         if shard_indices is None:
             await self._pause_scheduler()
         if self._my_engine is None:
@@ -633,9 +631,9 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         await self._my_engine.wait_until(EngineState.SUSPENDED)
 
     async def kill(self) -> None:
-        # Stop the auto-disagg scheduler before engines so in-flight
-        # polling doesn't race with teardown.
-        await self.disable_auto_disagg()
+        # Stop migration-policy tasks before engines so an in-flight
+        # policy tick doesn't race with teardown.
+        await self.disable_migration_policies()
 
         # Close all HTTP connections on every rank so idle clients don't leak.
         for c in self._openai_clients:
@@ -852,7 +850,7 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         meta = self._migration_meta.get((src_shard_index, dst_shard_index))
         if meta is None:
             logger.error(
-                "[auto-disagg] no migration metadata for (%d, %d) — "
+                "[migration] no metadata for (%d, %d) — "
                 "registered pairs: %s",
                 src_shard_index,
                 dst_shard_index,
@@ -1168,7 +1166,7 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                 )
             )
 
-    async def disable_auto_disagg(self) -> None:
+    async def disable_migration_policies(self) -> None:
         """Stop every migration-policy task and forget registered
         policies. Idempotent. Distinct from :meth:`_pause_scheduler`
         in that ``_migration_policies`` is cleared, so a subsequent
@@ -1185,10 +1183,6 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         is the last item in ``entry.record`` (records grow on
         cross-shard migrations to track ancestor states).
         """
-        # ``engine.requests`` maps id → RequestEntry; the live request
-        # is the last item in ``entry.record`` (records grow on
-        # cross-shard migrations to track ancestor states).
-        record = getattr(entry, "record", None)
         record = getattr(entry, "record", None)
         if not record:
             return None

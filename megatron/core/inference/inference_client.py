@@ -288,7 +288,7 @@ class InferenceClient:
         self.socket.send(payload_serialized)
 
     def pause_engines(self, *, shard_indices: Optional[List[int]] = None):
-        """Sends PAUSE to all engines via coordinator.
+        """Sends PAUSE to engines via coordinator.
 
         The coordinator broadcasts PAUSE. Each engine reaches EP consensus,
         then synchronizes via a world-wide barrier before transitioning to
@@ -297,9 +297,14 @@ class InferenceClient:
         Args:
             shard_indices: If provided, only engines registered with
                 those shard indices receive the PAUSE — other shards
-                keep serving. Used by cross-shard request migration to
-                quiesce just the two participating shards. ``None``
-                preserves whole-world behavior.
+                keep serving. ``None`` preserves whole-world behavior.
+
+                The cross-shard request-migration handler in this repo
+                does **not** use scoped pause — its NVSHMEM transport
+                runs without quiescing either shard. The scope hook is
+                kept as a downstream-friendly extension point for
+                external frameworks (NeMo-RL, verl, etc.) that may want
+                to lifecycle individual shards independently.
         """
         self._send_signal_to_engines(Headers.PAUSE, shard_indices)
 

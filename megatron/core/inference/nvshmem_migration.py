@@ -64,20 +64,6 @@ DEFAULT_STAGING_SLOT_BYTES = 16 * 1024 * 1024  # 16 MB per slot
 DEFAULT_STAGING_NUM_SLOTS = 128  # 2 GB total per PE
 
 
-def is_initialized() -> bool:
-    return _initialized
-
-
-def my_pe() -> int:
-    assert _initialized, "NVSHMEM not initialized"
-    return _my_pe
-
-
-def n_pes() -> int:
-    assert _initialized, "NVSHMEM not initialized"
-    return _n_pes
-
-
 def migration_stream() -> torch.cuda.Stream:
     """Dedicated CUDA stream for migration puts so they don't serialize
     against the engine's compute stream."""
@@ -91,12 +77,11 @@ def maybe_init_nvshmem(group: Optional[dist.ProcessGroup] = None) -> None:
 
     Collective: every rank must call. Idempotent — subsequent calls
     are no-ops. Sets up the migration stream and the symmetric flag /
-    staging pools. Safe to call before allocating any symmetric KV
-    memory.
+    staging pools.
 
     Raises ``RuntimeError`` if ``nvshmem.core`` is not importable —
-    cross-shard migration is required for the auto-disagg path, so
-    this is a hard dependency rather than a graceful fallback.
+    cross-shard migration depends on it, so this is a hard dependency
+    rather than a graceful fallback.
     """
     global _initialized, _my_pe, _n_pes, _migration_stream
     global _flag_pool_size
@@ -134,10 +119,8 @@ def maybe_init_nvshmem(group: Optional[dist.ProcessGroup] = None) -> None:
     num_ranks = group.size() if group is not None else dist.get_world_size()
     rank_id = group.rank() if group is not None else dist.get_rank()
 
-    uniqueid = nvshmem.core.get_unique_id(empty=True)
     if rank_id == 0:
-        uniqueid = nvshmem.core.get_unique_id()
-        bcast = [uniqueid]
+        bcast = [nvshmem.core.get_unique_id()]
     else:
         bcast = [None]
     dist.broadcast_object_list(bcast, src=0, group=group)

@@ -670,9 +670,11 @@ class DataParallelInferenceCoordinator:
                 # When set, the broadcast is filtered to engines in those
                 # shards only, and the coord's own state machine — which
                 # tracks whole-world state — is intentionally bypassed
-                # (per-engine state machines still validate). This lets
-                # cross-shard request migration quiesce just the two
-                # participating shards without stopping the world.
+                # (per-engine state machines still validate). This is a
+                # downstream-friendly extension point: in-tree the
+                # cross-shard migration handler runs without scoped pause
+                # (NVSHMEM transport, no quiesce required), but external
+                # frameworks may use it to lifecycle individual shards.
                 shard_indices: list | None = None
                 if header in (
                     Headers.PAUSE,

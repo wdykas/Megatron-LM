@@ -203,9 +203,6 @@ class InferenceShard:
             participates in the collective process-group creation for every
             shard (``dist.new_group`` is world-collective); only members get a
             usable handle.
-        coordinator_addr: ZMQ DEALER address of the shard's
-            ``DataParallelInferenceCoordinator``; populated by a serving-layer
-            consumer (e.g. ``MegatronLocalMulti.launch``).
         http_url: HTTP base URL of the shard's text-generation server;
             populated by a serving-layer consumer.
     """
@@ -215,7 +212,6 @@ class InferenceShard:
     rank_offset: int
     world_size: int
     pg_collection: Optional[ProcessGroupCollection]
-    coordinator_addr: Optional[str] = None
     http_url: Optional[str] = None
 
     def ranks(self) -> List[int]:
