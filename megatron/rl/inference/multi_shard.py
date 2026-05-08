@@ -944,10 +944,20 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         )
         tp = int(shard.spec["tp"])
         pp = int(shard.spec.get("pp", 1))
+        # ``num_layers_total`` for the KV plan is the count of *attention*
+        # layers in the whole model — the KV cache only exists for
+        # attention layers. For hybrid (Mamba) models this differs from
+        # ``model_config.num_layers`` (which counts all layer types).
+        # For pure transformers ``ctx.num_attention_layers`` is per-PP-rank,
+        # so multiply back to whole-model.
+        if ctx.is_hybrid_model:
+            num_attention_layers_total = ctx.num_attention_layers
+        else:
+            num_attention_layers_total = ctx.num_attention_layers * pp
         layout = KVLayout(
             tp_size=tp,
             pp_size=pp,
-            num_layers_total=model_config.num_layers,
+            num_layers_total=num_attention_layers_total,
             num_kv_heads_total=num_kv_heads_total,
             head_dim=ctx.hidden_size_per_attention_head,
             block_size_tokens=ctx.block_size_tokens,
