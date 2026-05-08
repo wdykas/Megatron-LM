@@ -445,62 +445,10 @@ def validate_args(args, defaults={}):
                     "--rl-inference-{tensor,pipeline,expert,expert-tensor}-model-parallel-size "
                     "flags. Use one or the other."
                 )
-            parsed = []
-            total_ranks = 0
-            # Accept either ";" or "+" as the shard separator. "+" is
-            # convenient from shell recipes where quoting the semicolon is
-            # fiddly (it's a command terminator otherwise).
-            shards_raw = args.rl_inference_shards.replace("+", ";")
-            for shard_str in shards_raw.split(";"):
-                shard_str = shard_str.strip()
-                if not shard_str:
-                    continue
-                spec = {}
-                for kv in shard_str.split(","):
-                    kv = kv.strip()
-                    if not kv:
-                        continue
-                    if "=" not in kv:
-                        raise AssertionError(
-                            f"Bad --rl-inference-shards spec entry {kv!r}: expected key=value."
-                        )
-                    k, v = kv.split("=", 1)
-                    k = k.strip(); v = v.strip()
-                    if k not in ("tp", "pp", "ep", "expt_tp", "dp"):
-                        raise AssertionError(
-                            f"Unknown key {k!r} in --rl-inference-shards (allowed: tp,pp,ep,expt_tp,dp)."
-                        )
-                    spec[k] = int(v)
-                # Defaults: everything else is 1; expt_tp defaults to tp.
-                spec.setdefault("tp", 1)
-                spec.setdefault("pp", 1)
-                spec.setdefault("ep", 1)
-                spec.setdefault("dp", 1)
-                spec.setdefault("expt_tp", spec["tp"])
-                # Validate expert decomposition is consistent on the shard's rank count:
-                # expt_tp*ep*pp must divide shard_world so the expert grid tiles cleanly.
-                shard_world = spec["tp"] * spec["pp"] * spec["dp"]
-                expert_block = spec["expt_tp"] * spec["ep"] * spec["pp"]
-                assert shard_world % expert_block == 0, (
-                    f"Shard {spec} has tp*pp*dp={shard_world} but "
-                    f"expt_tp*ep*pp={expert_block} does not divide it; "
-                    f"choose compatible sizes."
-                )
-                parsed.append(spec)
-                total_ranks += shard_world
-            assert parsed, "--rl-inference-shards was empty after parsing."
-            # Enforce full coverage: every rank must belong to exactly one shard.
-            # Idle ranks would silently skip the world-collective refit loop
-            # (`swap_model_weights_across_shards` runs one swap call per shard on
-            # every rank) and deadlock the surviving ranks. Allowing idle ranks
-            # requires lifting the refit gate in training/rl_utils and routing
-            # None-targets through the collective on their behalf; until that
-            # lands, require equality.
-            assert total_ranks == args.world_size, (
-                f"--rl-inference-shards consumes {total_ranks} ranks but world size is "
-                f"{args.world_size}; specs must partition the full world."
+            from megatron.rl.inference.shards_spec import parse_inference_shards_spec
+            args.rl_inference_shards_parsed = parse_inference_shards_spec(
+                args.rl_inference_shards, args.world_size
             )
-            args.rl_inference_shards_parsed = parsed
         else:
             args.rl_inference_shards_parsed = None
 

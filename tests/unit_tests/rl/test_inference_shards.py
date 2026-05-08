@@ -72,27 +72,33 @@ def _find_my_shard(shards: List[InferenceShard]) -> Optional[InferenceShard]:
 
 
 def test_parse_rl_inference_shards_string():
-    """Non-distributed: parser in validate_args turns the CLI string into a list
-    of dict shard specs with sensible defaults."""
-    # Reproduce the parsing logic inline to avoid pulling in full arg parsing.
-    # If this test diverges from megatron/training/arguments.py, update both.
-    s = "tp=2,pp=1,ep=1,dp=1;tp=4,dp=2"
-    parsed = []
-    for shard_str in s.split(";"):
-        spec = {}
-        for kv in shard_str.split(","):
-            k, v = kv.split("=")
-            spec[k] = int(v)
-        spec.setdefault("tp", 1)
-        spec.setdefault("pp", 1)
-        spec.setdefault("ep", 1)
-        spec.setdefault("dp", 1)
-        spec.setdefault("expt_tp", spec["tp"])
-        parsed.append(spec)
+    """Non-distributed: ``parse_inference_shards_spec`` turns the CLI
+    string into a list of dict shard specs with sensible defaults.
+    Covers both ``;`` and ``+`` separators + the expt_tp/dp defaults.
+    """
+    from megatron.rl.inference.shards_spec import parse_inference_shards_spec
 
-    assert len(parsed) == 2
-    assert parsed[0] == {"tp": 2, "pp": 1, "ep": 1, "dp": 1, "expt_tp": 2}
-    assert parsed[1] == {"tp": 4, "pp": 1, "ep": 1, "dp": 2, "expt_tp": 4}
+    # Two shards, ``;`` separator. World = tp*pp*dp summed = 2 + 8 = 10.
+    parsed = parse_inference_shards_spec("tp=2,pp=1,ep=1,dp=1;tp=4,dp=2", world_size=10)
+    assert parsed == [
+        {"tp": 2, "pp": 1, "ep": 1, "dp": 1, "expt_tp": 2},
+        {"tp": 4, "pp": 1, "ep": 1, "dp": 2, "expt_tp": 4},
+    ]
+
+    # ``+`` separator should be equivalent.
+    parsed_plus = parse_inference_shards_spec("tp=2,dp=1+tp=1,dp=2", world_size=4)
+    assert parsed_plus == [
+        {"tp": 2, "pp": 1, "ep": 1, "dp": 1, "expt_tp": 2},
+        {"tp": 1, "pp": 1, "ep": 1, "dp": 2, "expt_tp": 1},
+    ]
+
+    # World-size mismatch should fail loudly.
+    with pytest.raises(AssertionError, match="must partition the full world"):
+        parse_inference_shards_spec("tp=2,dp=1", world_size=8)
+
+    # Unknown key should be rejected.
+    with pytest.raises(AssertionError, match="Unknown key"):
+        parse_inference_shards_spec("tp=2,nope=1", world_size=2)
 
 
 @pytest.mark.skipif(
