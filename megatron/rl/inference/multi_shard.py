@@ -212,77 +212,96 @@ def _build_mamba_op_meta(
     arena,
     parsed_bundles,
     engine_ctx,
-    meta: dict,
-    rank: int,
-    src_root: int,
-    dst_root: int,
+    src_mamba_layout,
+    dst_mamba_layout,
+    src_global_rank_of,
+    dst_global_rank_of,
 ) -> List[dict]:
     """Per-request mamba conv/ssm transfer metadata.
 
-    v1 only — pairs src↔dst ranks 1:1 by ``local_idx`` under the
-    matched-TP/PP constraint enforced at registration. Flag offsets
-    ``MAX_OPS_PER_REQ - 2`` (conv) and ``- 1`` (ssm) keep mamba flags
-    out of the KV-op range ``[0, num_kv_ops)``.
+    Plan-driven — calls :func:`build_mamba_migration_plan` to enumerate
+    one transfer per ``(src_tp × dst_tp)`` overlap on the matched PP
+    diagonal. Each op claims two flag slots (conv + ssm) packed into
+    the per-request flag-key budget at descending indices from
+    ``MAX_OPS_PER_REQ - 1`` so KV ops keep the low-index range.
+
+    Returns a list of dicts, one per (bundle × mamba op). The handler
+    iterates these and gates each entry on rank match.
     """
     from megatron.core.inference import nvshmem_migration as _nv
+    from megatron.core.inference.engines.request_migration import (
+        build_mamba_migration_plan,
+    )
 
     conv_states = engine_ctx.mamba_conv_states  # [layers, slots, *conv_shape]
     ssm_states = engine_ctx.mamba_ssm_states  # [layers, slots, *ssm_shape]
-    conv_shape = (conv_states.shape[0],) + tuple(conv_states.shape[2:])
-    ssm_shape = (ssm_states.shape[0],) + tuple(ssm_states.shape[2:])
     conv_dtype_local = conv_states.dtype
     ssm_dtype_local = ssm_states.dtype
     conv_elem = torch.empty((), dtype=conv_dtype_local).element_size()
     ssm_elem = torch.empty((), dtype=ssm_dtype_local).element_size()
-    conv_nelems = 1
-    for d in conv_shape:
-        conv_nelems *= d
-    ssm_nelems = 1
-    for d in ssm_shape:
-        ssm_nelems *= d
-    conv_nbytes = conv_nelems * conv_elem
-    ssm_nbytes = ssm_nelems * ssm_elem
-
-    # Local position of this rank within its shard. Same local_idx maps
-    # to the paired rank in the other shard under matched TP/PP.
-    if meta["in_src"]:
-        my_local_idx = rank - src_root
-        paired_dst_rank = dst_root + my_local_idx
-        paired_src_rank = rank
-    elif meta["in_dst"]:
-        my_local_idx = rank - dst_root
-        paired_src_rank = src_root + my_local_idx
-        paired_dst_rank = rank
-    else:
-        paired_src_rank = -1
-        paired_dst_rank = -1
+    num_layers_total = src_mamba_layout.num_layers_total
+    headdim = src_mamba_layout.headdim
+    d_state = src_mamba_layout.d_state
+    d_conv = src_mamba_layout.d_conv
 
     mamba_meta: List[dict] = []
     for bundle_idx, bundle in enumerate(parsed_bundles):
+        ops = build_mamba_migration_plan(
+            bundle,
+            src_mamba_layout,
+            dst_mamba_layout,
+            src_global_rank_of,
+            dst_global_rank_of,
+        )
+        # Guard against silent flag-key collision: each mamba op claims
+        # two indices (conv + ssm). Together with KV ops and reserved
+        # slots, their packed offsets must stay in
+        # ``[0, MAX_OPS_PER_REQ)``.
+        assert 2 * len(ops) <= MAX_OPS_PER_REQ, (
+            f"bundle has {len(ops)} mamba ops needing {2*len(ops)} flag "
+            f"slots but MAX_OPS_PER_REQ = {MAX_OPS_PER_REQ}; raise the "
+            f"constant or split the bundle"
+        )
         req_id = bundle.request_id
-        conv_flag = _nv.flag_slot_for(
-            req_id * MAX_OPS_PER_REQ + (MAX_OPS_PER_REQ - 2)
-        )
-        ssm_flag = _nv.flag_slot_for(
-            req_id * MAX_OPS_PER_REQ + (MAX_OPS_PER_REQ - 1)
-        )
-        mamba_meta.append(
-            {
-                "bundle_idx": bundle_idx,
-                "src_rank": paired_src_rank,
-                "dst_rank": paired_dst_rank,
-                "conv_slot": arena.take(conv_nbytes),
-                "conv_flag": conv_flag,
-                "conv_nbytes": conv_nbytes,
-                "conv_shape": conv_shape,
-                "conv_dtype": conv_dtype_local,
-                "ssm_slot": arena.take(ssm_nbytes),
-                "ssm_flag": ssm_flag,
-                "ssm_nbytes": ssm_nbytes,
-                "ssm_shape": ssm_shape,
-                "ssm_dtype": ssm_dtype_local,
-            }
-        )
+        for op_local_idx, op in enumerate(ops):
+            conv_span = op.conv_d_inner_range[1] - op.conv_d_inner_range[0]
+            ssm_span = op.ssm_nheads_range[1] - op.ssm_nheads_range[0]
+            # Per-op shape: full layer dim (matched-PP invariant, see
+            # ``build_mamba_migration_plan``) × overlap span × per-row dims.
+            conv_shape = (num_layers_total, conv_span, d_conv)
+            ssm_shape = (num_layers_total, ssm_span, headdim, d_state)
+            conv_nelems = 1
+            for d in conv_shape:
+                conv_nelems *= d
+            ssm_nelems = 1
+            for d in ssm_shape:
+                ssm_nelems *= d
+            conv_nbytes = conv_nelems * conv_elem
+            ssm_nbytes = ssm_nelems * ssm_elem
+            # Mamba claims the high indices; conv at -1-2k, ssm at -2-2k
+            # for op_local_idx=k. KV ops fill the low indices.
+            conv_flag_idx = MAX_OPS_PER_REQ - 1 - 2 * op_local_idx
+            ssm_flag_idx = MAX_OPS_PER_REQ - 2 - 2 * op_local_idx
+            conv_flag = _nv.flag_slot_for(req_id * MAX_OPS_PER_REQ + conv_flag_idx)
+            ssm_flag = _nv.flag_slot_for(req_id * MAX_OPS_PER_REQ + ssm_flag_idx)
+            mamba_meta.append(
+                {
+                    "bundle_idx": bundle_idx,
+                    "op": op,
+                    "src_rank": op.src_rank,
+                    "dst_rank": op.dst_rank,
+                    "conv_slot": arena.take(conv_nbytes),
+                    "conv_flag": conv_flag,
+                    "conv_nbytes": conv_nbytes,
+                    "conv_shape": conv_shape,
+                    "conv_dtype": conv_dtype_local,
+                    "ssm_slot": arena.take(ssm_nbytes),
+                    "ssm_flag": ssm_flag,
+                    "ssm_nbytes": ssm_nbytes,
+                    "ssm_shape": ssm_shape,
+                    "ssm_dtype": ssm_dtype_local,
+                }
+            )
     return mamba_meta
 
 
@@ -946,6 +965,35 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             head_offset = tp_rank * (num_kv_heads_total // tp)
         return layout, head_offset
 
+    def _mamba_layout_for(self, shard: InferenceShard) -> "object":
+        """Build a :class:`MambaLayout` for the given shard from this
+        rank's local engine context.
+
+        Reads ``mamba_conv_states_shape`` and ``mamba_ssm_states_shape``
+        off the context to recover ``d_inner_total`` and ``nheads_total``
+        (multiply by the shard's ``tp_size``). Whole-model dimensions
+        like ``d_state`` and ``headdim`` come from the same context.
+        """
+        from megatron.core.inference.engines.request_migration import MambaLayout
+
+        ctx = self._my_engine.context
+        tp = int(shard.spec["tp"])
+        pp = int(shard.spec.get("pp", 1))
+        # ``mamba_conv_states_shape`` = (d_inner_local_tp, d_conv)
+        # ``mamba_ssm_states_shape``  = (nheads_local_tp, headdim, d_state)
+        d_inner_local_tp, d_conv = ctx.mamba_conv_states_shape
+        nheads_local_tp, headdim, d_state = ctx.mamba_ssm_states_shape
+        return MambaLayout(
+            tp_size=tp,
+            pp_size=pp,
+            num_layers_total=ctx.num_mamba_layers,
+            d_inner_total=d_inner_local_tp * tp,
+            nheads_total=nheads_local_tp * tp,
+            d_conv=d_conv,
+            headdim=headdim,
+            d_state=d_state,
+        )
+
     # ---- Auto-disagg scheduler -----------------------------------------
     #
     # Per-request opt-in: a request gets migrated iff it was submitted
@@ -1040,21 +1088,27 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             dst_layout, my_dst_head_offset = self._layout_and_head_offset(
                 dst_shard, self._my_engine, rank, participates=in_dst
             )
-            # v1 hybrid migration pairs src↔dst ranks 1:1 by local_idx,
-            # which only works when TP and PP match. Fail fast at
-            # registration so misconfiguration doesn't surface only
-            # when the first migration fires.
+            # Mamba state migration supports heterogeneous TP via the
+            # plan-builder in ``request_migration``. PP must still match
+            # because the per-request mamba state buffer indexes by
+            # global mamba layer (every PP rank has the full layer
+            # dim, only writes to its own); a hetero-PP migration
+            # would need to walk the layer_type_list to filter
+            # ownership-aware transfers, which v1 doesn't do.
             if self._my_engine.context.is_hybrid_model:
-                assert src_layout.tp_size == dst_layout.tp_size, (
-                    f"hybrid migration v1 requires matched TP between "
-                    f"shards (src={src_layout.tp_size}, "
-                    f"dst={dst_layout.tp_size})"
-                )
                 assert src_layout.pp_size == dst_layout.pp_size, (
-                    f"hybrid migration v1 requires matched PP between "
+                    f"hybrid migration requires matched PP between "
                     f"shards (src={src_layout.pp_size}, "
-                    f"dst={dst_layout.pp_size})"
+                    f"dst={dst_layout.pp_size}); hetero-PP is a "
+                    "future extension."
                 )
+                # Mamba layout — read off the local engine context.
+                # All ranks in a shard share the same layout (model is
+                # replicated within a shard's TP/PP block).
+                src_mamba_layout = self._mamba_layout_for(src_shard)
+                dst_mamba_layout = self._mamba_layout_for(dst_shard)
+                meta["src_mamba_layout"] = src_mamba_layout
+                meta["dst_mamba_layout"] = dst_mamba_layout
             meta.update(
                 {
                     "src_layout": src_layout,
@@ -1238,10 +1292,10 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                     arena,
                     parsed_bundles,
                     engine.context,
-                    meta,
-                    rank,
-                    src_root,
-                    dst_root,
+                    meta["src_mamba_layout"],
+                    meta["dst_mamba_layout"],
+                    _src_rank_of,
+                    _dst_rank_of,
                 )
 
             # Schedule everything on the migration stream and return.
@@ -1317,18 +1371,31 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                             recv_view,
                         )
 
-                # Mamba state transfer — per request, two slot puts per
-                # src rank (conv + ssm), paired 1:1 with same-(tp, pp)
-                # dst rank under the matched-TP/PP constraint.
+                # Mamba state transfer — plan-driven. One op per
+                # (src_tp × dst_tp) overlap on the matched-PP diagonal.
+                # Each op carries a global ``conv_d_inner_range`` and
+                # ``ssm_nheads_range``; convert to local indices using
+                # the rank's TP offset within its shard.
                 if is_hybrid and meta["in_src"]:
+                    src_mamba_layout = meta["src_mamba_layout"]
+                    my_src_tp_rank = (rank - src_root) % src_mamba_layout.tp_size
+                    my_src_d_off = my_src_tp_rank * src_mamba_layout.d_inner_per_tp
+                    my_src_h_off = my_src_tp_rank * src_mamba_layout.nheads_per_tp
                     conv_states = engine.context.mamba_conv_states
                     ssm_states = engine.context.mamba_ssm_states
                     for entry in mamba_meta:
+                        op = entry["op"]
+                        if rank != op.src_rank:
+                            continue
                         src_state_idx = src_mamba_state_indices[entry["bundle_idx"]]
                         if src_state_idx is None:
                             continue
+                        d_lo = op.conv_d_inner_range[0] - my_src_d_off
+                        d_hi = op.conv_d_inner_range[1] - my_src_d_off
+                        h_lo = op.ssm_nheads_range[0] - my_src_h_off
+                        h_hi = op.ssm_nheads_range[1] - my_src_h_off
                         # Conv
-                        conv_send = conv_states[:, src_state_idx].contiguous()
+                        conv_send = conv_states[:, src_state_idx, d_lo:d_hi].contiguous()
                         slot = _nv.staging_slot(entry["conv_slot"])
                         slot[: entry["conv_nbytes"]].view(entry["conv_dtype"]).reshape(
                             entry["conv_shape"]
@@ -1341,7 +1408,7 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                             stream=stream,
                         )
                         # SSM
-                        ssm_send = ssm_states[:, src_state_idx].contiguous()
+                        ssm_send = ssm_states[:, src_state_idx, h_lo:h_hi].contiguous()
                         slot = _nv.staging_slot(entry["ssm_slot"])
                         slot[: entry["ssm_nbytes"]].view(entry["ssm_dtype"]).reshape(
                             entry["ssm_shape"]
@@ -1355,12 +1422,23 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                         )
 
                 if is_hybrid and meta["in_dst"]:
+                    dst_mamba_layout = meta["dst_mamba_layout"]
+                    my_dst_tp_rank = (rank - dst_root) % dst_mamba_layout.tp_size
+                    my_dst_d_off = my_dst_tp_rank * dst_mamba_layout.d_inner_per_tp
+                    my_dst_h_off = my_dst_tp_rank * dst_mamba_layout.nheads_per_tp
                     conv_states = engine.context.mamba_conv_states
                     ssm_states = engine.context.mamba_ssm_states
                     for entry in mamba_meta:
+                        op = entry["op"]
+                        if rank != op.dst_rank:
+                            continue
                         dst_state_idx = dst_mamba_state_indices[entry["bundle_idx"]]
                         if dst_state_idx is None:
                             continue
+                        d_lo = op.conv_d_inner_range[0] - my_dst_d_off
+                        d_hi = op.conv_d_inner_range[1] - my_dst_d_off
+                        h_lo = op.ssm_nheads_range[0] - my_dst_h_off
+                        h_hi = op.ssm_nheads_range[1] - my_dst_h_off
                         # Conv
                         _nv.wait_slot_signal(
                             entry["conv_flag"], expected_value=1, stream=stream
@@ -1371,7 +1449,7 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                             .view(entry["conv_dtype"])
                             .reshape(entry["conv_shape"])
                         )
-                        conv_states[:, dst_state_idx] = conv_recv
+                        conv_states[:, dst_state_idx, d_lo:d_hi] = conv_recv
                         # SSM
                         _nv.wait_slot_signal(
                             entry["ssm_flag"], expected_value=1, stream=stream
@@ -1382,7 +1460,7 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                             .view(entry["ssm_dtype"])
                             .reshape(entry["ssm_shape"])
                         )
-                        ssm_states[:, dst_state_idx] = ssm_recv
+                        ssm_states[:, dst_state_idx, h_lo:h_hi] = ssm_recv
 
                 # Mark the end of this migration on the stream so the
                 # tick poll can query a CUDA event.

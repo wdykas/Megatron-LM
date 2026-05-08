@@ -21,6 +21,13 @@ drives them directly with one-sided NVSHMEM ``put_signal`` /
   tensor slices each rank sends / receives. Handles heterogeneous TP
   *and* heterogeneous PP by taking the (layer × head) intersection of
   each (src rank, dst rank) pair's ownership.
+- :class:`MambaLayout` / :class:`MambaMigrationOp` /
+  :func:`build_mamba_migration_plan` — analogous machinery for hybrid
+  models. Mamba per-request state has two TP-sharded buffers (conv on
+  ``d_inner``, ssm on ``nheads``); the plan emits one op per
+  ``(src_pp × dst_pp × src_tp × dst_tp)`` quadruple with non-empty
+  layer overlap, each carrying the conv- and ssm-dim intersections to
+  transfer.
 - :func:`_gather_kv_slice` / :func:`_scatter_kv_slice` — local-buffer
   side of each op; the handler calls them directly around the NVSHMEM
   put/wait.
@@ -288,6 +295,200 @@ def build_kv_migration_plan(
                             dst_block_ids=dst_block_ids_copy,
                         )
                     )
+    return ops
+
+
+# ---- Mamba state migration -------------------------------------------------
+#
+# Hybrid (Mamba) models carry per-request conv + ssm state alongside the
+# attention KV cache. The two state tensors share the same TP axis but
+# shard on different dimensions:
+#
+#   conv_state: (num_layers_pp, max_requests, d_inner_local_tp, d_conv)
+#   ssm_state:  (num_layers_pp, max_requests, nheads_local_tp, headdim, d_state)
+#
+# A single TP rank owns ``d_inner_local_tp`` rows of the conv state and
+# ``nheads_local_tp`` rows of the ssm state, both partitioned at the
+# same TP boundaries (``d_inner_total = d_inner_local_tp * tp_size``,
+# same for nheads). A migration op moves the (layer × d_inner × nheads)
+# intersection between one src rank and one dst rank — same shape of
+# (pp, tp) overlap as KV migration, just on different state dims.
+
+
+@dataclass
+class MambaLayout:
+    """Per-shard Mamba-state layout descriptor.
+
+    All fields except ``tp_size`` / ``pp_size`` are whole-model
+    invariants and must match between src and dst layouts. Mirrors
+    :class:`KVLayout` for the SSM/conv state buffers a hybrid model
+    keeps per-request.
+    """
+
+    tp_size: int
+    pp_size: int
+    num_layers_total: int
+    # ``d_inner_total`` shards across TP for the conv state.
+    d_inner_total: int
+    # ``nheads_total`` shards across TP for the SSM state.
+    nheads_total: int
+    d_conv: int
+    headdim: int
+    d_state: int
+
+    def assert_divisible(self) -> None:
+        """TP divides both d_inner and nheads; PP divides layer count."""
+        assert self.d_inner_total % self.tp_size == 0, (
+            f"d_inner_total={self.d_inner_total} must be divisible by "
+            f"tp_size={self.tp_size}"
+        )
+        assert self.nheads_total % self.tp_size == 0, (
+            f"nheads_total={self.nheads_total} must be divisible by "
+            f"tp_size={self.tp_size}"
+        )
+        assert self.num_layers_total % self.pp_size == 0, (
+            f"num_layers_total={self.num_layers_total} must be divisible "
+            f"by pp_size={self.pp_size}"
+        )
+
+    @property
+    def d_inner_per_tp(self) -> int:
+        return self.d_inner_total // self.tp_size
+
+    @property
+    def nheads_per_tp(self) -> int:
+        return self.nheads_total // self.tp_size
+
+
+@dataclass
+class MambaMigrationOp:
+    """One conv+ssm tensor transfer in the Mamba migration plan.
+
+    Represents "source rank ``src_rank`` sends its slice of the
+    layer ``layer_range`` mamba state — conv rows
+    ``conv_d_inner_range`` and ssm rows ``ssm_nheads_range`` — to dst
+    rank ``dst_rank`` for request ``request_id``". A single op drives
+    both conv and ssm transfers because the two share the same TP
+    boundary; one (src, dst) rank pair always overlaps on both
+    dimensions or neither.
+    """
+
+    src_rank: int
+    dst_rank: int
+    request_id: int
+    # Which one this is among the per-request mamba ops; used to
+    # derive disjoint flag-slot indices from the shared per-request
+    # key budget. See ``MAX_OPS_PER_REQ`` in
+    # ``megatron.rl.inference.multi_shard``.
+    op_index_in_request: int
+    layer_range: Tuple[int, int]  # global layer indices, [start, end)
+    conv_d_inner_range: Tuple[int, int]  # conv d_inner indices, [start, end)
+    ssm_nheads_range: Tuple[int, int]  # ssm nheads indices, [start, end)
+
+
+def build_mamba_migration_plan(
+    bundle: RequestMigrationBundle,
+    src_layout: MambaLayout,
+    dst_layout: MambaLayout,
+    src_global_rank_of: "Callable[[int, int], int]",
+    dst_global_rank_of: "Callable[[int, int], int]",
+) -> List[MambaMigrationOp]:
+    """Compute the conv + ssm transfers that move a request's mamba
+    state from the source shard to the destination shard.
+
+    Heterogeneous-TP supported via the same
+    intersection-of-overlapping-ranges pattern as
+    :func:`build_kv_migration_plan`. **PP must match** between the two
+    shards: the per-request mamba state buffer indexes by global
+    mamba layer (every PP rank holds the full layer dim, only writes
+    its own subset), so under matched PP each PP rank transfers its
+    slot's whole layer dimension to the matched dst PP rank — unused
+    entries on src equal unused entries on dst, so the transfer is
+    correct without ownership filtering. Hetero-PP would need to walk
+    the layer_type_list to filter; not implemented in v1.
+
+    For each ``pp × (src_tp × dst_tp)`` triple, emit one op iff both
+    the conv ``d_inner`` ranges and the ssm ``nheads`` ranges overlap
+    on TP. The two TP-shard dims partition at the same boundaries
+    (same TP rank count), so an empty d_inner overlap implies an
+    empty nheads overlap and vice versa.
+
+    Args:
+        bundle: Request envelope. Only ``request_id`` is read.
+        src_layout / dst_layout: shard-level mamba layouts. Whole-model
+            invariants must match; PP sizes must match.
+        src_global_rank_of / dst_global_rank_of: ``(tp_rank, pp_rank)
+            -> global_rank`` for each shard.
+
+    Returns:
+        Flat list of :class:`MambaMigrationOp`. Each op's
+        ``op_index_in_request`` is its 0-based position in the
+        returned list. ``layer_range`` always spans the whole buffer
+        ``(0, num_layers_total)`` under v1's matched-PP constraint.
+    """
+    src_layout.assert_divisible()
+    dst_layout.assert_divisible()
+    assert src_layout.pp_size == dst_layout.pp_size, (
+        f"hybrid migration v1 requires matched PP "
+        f"(src={src_layout.pp_size}, dst={dst_layout.pp_size})"
+    )
+    assert src_layout.num_layers_total == dst_layout.num_layers_total, (
+        "num_layers_total must match across shards"
+    )
+    assert src_layout.d_inner_total == dst_layout.d_inner_total, (
+        f"d_inner_total must match: src={src_layout.d_inner_total}, "
+        f"dst={dst_layout.d_inner_total}"
+    )
+    assert src_layout.nheads_total == dst_layout.nheads_total, (
+        f"nheads_total must match: src={src_layout.nheads_total}, "
+        f"dst={dst_layout.nheads_total}"
+    )
+    assert src_layout.d_conv == dst_layout.d_conv, "d_conv mismatch"
+    assert src_layout.headdim == dst_layout.headdim, "headdim mismatch"
+    assert src_layout.d_state == dst_layout.d_state, "d_state mismatch"
+
+    pp_size = src_layout.pp_size
+    src_d_inner = src_layout.d_inner_per_tp
+    dst_d_inner = dst_layout.d_inner_per_tp
+    src_nheads = src_layout.nheads_per_tp
+    dst_nheads = dst_layout.nheads_per_tp
+    layer_range = (0, src_layout.num_layers_total)
+
+    ops: List[MambaMigrationOp] = []
+    op_idx = 0
+    # Diagonal over PP under the matched-PP invariant: each src PP
+    # rank transfers to the dst PP rank at the same stage.
+    for pp in range(pp_size):
+        for sr in range(src_layout.tp_size):
+            src_d_lo = sr * src_d_inner
+            src_d_hi = src_d_lo + src_d_inner
+            src_h_lo = sr * src_nheads
+            src_h_hi = src_h_lo + src_nheads
+            for dr in range(dst_layout.tp_size):
+                dst_d_lo = dr * dst_d_inner
+                dst_d_hi = dst_d_lo + dst_d_inner
+                dst_h_lo = dr * dst_nheads
+                dst_h_hi = dst_h_lo + dst_nheads
+                d_lo = max(src_d_lo, dst_d_lo)
+                d_hi = min(src_d_hi, dst_d_hi)
+                h_lo = max(src_h_lo, dst_h_lo)
+                h_hi = min(src_h_hi, dst_h_hi)
+                # Both dims share the TP rank, so empty overlap on
+                # one implies empty on the other.
+                if d_lo >= d_hi:
+                    continue
+                ops.append(
+                    MambaMigrationOp(
+                        src_rank=src_global_rank_of(sr, pp),
+                        dst_rank=dst_global_rank_of(dr, pp),
+                        request_id=bundle.request_id,
+                        op_index_in_request=op_idx,
+                        layer_range=layer_range,
+                        conv_d_inner_range=(d_lo, d_hi),
+                        ssm_nheads_range=(h_lo, h_hi),
+                    )
+                )
+                op_idx += 1
     return ops
 
 

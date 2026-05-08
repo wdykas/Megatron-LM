@@ -13,8 +13,10 @@ Runs non-distributed. Exercises:
 """
 from megatron.core.inference.engines.request_migration import (
     KVLayout,
+    MambaLayout,
     RequestMigrationBundle,
     build_kv_migration_plan,
+    build_mamba_migration_plan,
     deserialize_bundle,
     serialize_bundle,
 )
@@ -252,3 +254,145 @@ def test_plan_rejects_head_count_mismatch():
         assert "num_kv_heads_total" in str(e)
     else:
         raise AssertionError("expected head-count mismatch to be rejected")
+
+
+# ---- Mamba migration plan ---------------------------------------------------
+
+
+def _mamba_bundle() -> RequestMigrationBundle:
+    """Minimal bundle for mamba-plan tests. Only ``request_id`` is read
+    by the plan-builder; other fields can be defaults."""
+    return RequestMigrationBundle(
+        request_id=7,
+        prompt_tokens=[1, 2],
+        generated_tokens=[3],
+        sampling_params={},
+    )
+
+
+def _mamba_layouts(src_tp: int, dst_tp: int, pp_size: int = 1):
+    base = dict(
+        pp_size=pp_size,
+        num_layers_total=8,
+        d_inner_total=64,
+        nheads_total=16,
+        d_conv=4,
+        headdim=4,
+        d_state=16,
+    )
+    return MambaLayout(tp_size=src_tp, **base), MambaLayout(tp_size=dst_tp, **base)
+
+
+def _check_mamba_dst_coverage(ops, dst_layout):
+    """Each dst rank's d_inner / nheads ranges are tiled exactly once."""
+    expected_d = dst_layout.d_inner_per_tp
+    expected_h = dst_layout.nheads_per_tp
+    by_dst: dict = {}
+    for op in ops:
+        by_dst.setdefault(op.dst_rank, []).append(op)
+    for dst_rank, dst_ops in by_dst.items():
+        d_total = sum(hi - lo for lo, hi in (op.conv_d_inner_range for op in dst_ops))
+        h_total = sum(hi - lo for lo, hi in (op.ssm_nheads_range for op in dst_ops))
+        assert d_total == expected_d, f"dst {dst_rank} d_inner {d_total} != {expected_d}"
+        assert h_total == expected_h, f"dst {dst_rank} nheads {h_total} != {expected_h}"
+
+
+def test_mamba_plan_matched_tp():
+    """src_tp == dst_tp → one op per matched rank, no reshape."""
+    bundle = _mamba_bundle()
+    src_layout, dst_layout = _mamba_layouts(src_tp=4, dst_tp=4)
+    ops = build_mamba_migration_plan(
+        bundle,
+        src_layout,
+        dst_layout,
+        src_global_rank_of=lambda tp, pp: tp,
+        dst_global_rank_of=lambda tp, pp: 100 + tp,
+    )
+    assert len(ops) == 4
+    for i, op in enumerate(ops):
+        assert op.src_rank == i
+        assert op.dst_rank == 100 + i
+        assert op.conv_d_inner_range == (i * 16, (i + 1) * 16)
+        assert op.ssm_nheads_range == (i * 4, (i + 1) * 4)
+    _check_mamba_dst_coverage(ops, dst_layout)
+
+
+def test_mamba_plan_reshape_up():
+    """src_tp=1 → dst_tp=4: one src rank fans out to 4 dst ranks."""
+    bundle = _mamba_bundle()
+    src_layout, dst_layout = _mamba_layouts(src_tp=1, dst_tp=4)
+    ops = build_mamba_migration_plan(
+        bundle,
+        src_layout,
+        dst_layout,
+        src_global_rank_of=lambda tp, pp: 0,
+        dst_global_rank_of=lambda tp, pp: 100 + tp,
+    )
+    assert len(ops) == 4
+    for i, op in enumerate(ops):
+        assert op.src_rank == 0
+        assert op.dst_rank == 100 + i
+        # Each dst rank receives 1/4 of the d_inner / nheads dim
+        assert op.conv_d_inner_range == (i * 16, (i + 1) * 16)
+        assert op.ssm_nheads_range == (i * 4, (i + 1) * 4)
+    _check_mamba_dst_coverage(ops, dst_layout)
+
+
+def test_mamba_plan_reshape_down():
+    """src_tp=4 → dst_tp=1: 4 src ranks merge into one dst rank."""
+    bundle = _mamba_bundle()
+    src_layout, dst_layout = _mamba_layouts(src_tp=4, dst_tp=1)
+    ops = build_mamba_migration_plan(
+        bundle,
+        src_layout,
+        dst_layout,
+        src_global_rank_of=lambda tp, pp: tp,
+        dst_global_rank_of=lambda tp, pp: 100,
+    )
+    assert len(ops) == 4
+    for i, op in enumerate(ops):
+        assert op.src_rank == i
+        assert op.dst_rank == 100
+        assert op.conv_d_inner_range == (i * 16, (i + 1) * 16)
+        assert op.ssm_nheads_range == (i * 4, (i + 1) * 4)
+    _check_mamba_dst_coverage(ops, dst_layout)
+
+
+def test_mamba_plan_partial_overlap():
+    """src_tp=2 → dst_tp=4: overlapping ranges produce 4 ops, dst tiled."""
+    bundle = _mamba_bundle()
+    src_layout, dst_layout = _mamba_layouts(src_tp=2, dst_tp=4)
+    ops = build_mamba_migration_plan(
+        bundle,
+        src_layout,
+        dst_layout,
+        src_global_rank_of=lambda tp, pp: tp,
+        dst_global_rank_of=lambda tp, pp: 100 + tp,
+    )
+    # src rank 0 owns [0,32) d_inner, dst ranks 0+1 own [0,16) and [16,32)
+    # → 2 ops from src 0; src rank 1 covers dst 2+3 → 2 ops. Total 4.
+    assert len(ops) == 4
+    src_to_dsts: dict = {}
+    for op in ops:
+        src_to_dsts.setdefault(op.src_rank, []).append(op.dst_rank)
+    assert src_to_dsts == {0: [100, 101], 1: [102, 103]}
+    _check_mamba_dst_coverage(ops, dst_layout)
+
+
+def test_mamba_plan_rejects_pp_mismatch():
+    """v1 requires matched PP."""
+    bundle = _mamba_bundle()
+    src_layout, dst_layout = _mamba_layouts(src_tp=2, dst_tp=2, pp_size=1)
+    dst_layout.pp_size = 2
+    try:
+        build_mamba_migration_plan(
+            bundle,
+            src_layout,
+            dst_layout,
+            src_global_rank_of=lambda tp, pp: tp,
+            dst_global_rank_of=lambda tp, pp: 100 + tp,
+        )
+    except AssertionError as e:
+        assert "PP" in str(e)
+    else:
+        raise AssertionError("expected PP-mismatch to be rejected")
