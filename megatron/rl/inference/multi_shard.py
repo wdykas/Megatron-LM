@@ -18,7 +18,7 @@ import asyncio
 import logging
 import time
 from collections import deque
-from typing import Deque, List, Optional, Tuple
+from typing import Callable, Deque, Dict, List, Optional, Tuple
 
 import httpx
 import torch
@@ -52,6 +52,18 @@ from ..server.api import InferenceServer
 
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+# Per-request flag-slot budget. Each migration packs
+# ``(request_id, op_index_within_bundle)`` into the key passed to
+# :func:`nvshmem_migration.flag_slot_for`, so two requests' flags
+# can't collide as long as ``op_index < MAX_OPS_PER_REQ``. KV ops
+# claim ``[0, num_kv_ops)``; Mamba conv/ssm reuse the top two
+# indices ``MAX_OPS_PER_REQ - 2`` and ``- 1``. A bundle's KV op
+# count must stay below ``MAX_OPS_PER_REQ - 2`` (asserted in the
+# handler) — bump this if a future migration grows the per-bundle
+# op fanout.
+MAX_OPS_PER_REQ = 32
 
 
 async def _spawn_unified_coord(
@@ -124,6 +136,210 @@ async def _spawn_unified_coord(
     return dp_addr
 
 
+# ---- Migration handler helpers ---------------------------------------------
+#
+# These factor metadata construction and the poll/rollback closures out of
+# :meth:`MegatronLocalMulti._on_migrate_batch_signal` so the handler reads as
+# orchestration rather than ~480 lines of nested branches.
+
+
+def _build_kv_op_meta(
+    arena,
+    parsed_bundles,
+    all_ops_by_bundle,
+    layout,
+    memory_buffer,
+) -> List[dict]:
+    """Walk every (bundle, op) deterministically and assign a staging
+    slot + flag index to each KV transfer.
+
+    Both src and dst call this with identical inputs, so the
+    ``(slot, flag)`` choice for each op matches across PEs without any
+    cross-rank coordination.
+    """
+    from megatron.core.inference import nvshmem_migration as _nv
+
+    op_meta: List[dict] = []
+    elem_size = memory_buffer.element_size()
+    for bundle_idx, ops in enumerate(all_ops_by_bundle):
+        # Guard against silent flag-key collision: the top two indices
+        # are reserved for mamba conv/ssm, and op N+1 would alias the
+        # next request's KV flag.
+        assert len(ops) <= MAX_OPS_PER_REQ - 2, (
+            f"bundle has {len(ops)} KV ops but MAX_OPS_PER_REQ-2 "
+            f"= {MAX_OPS_PER_REQ - 2}; raise MAX_OPS_PER_REQ or "
+            f"split the bundle"
+        )
+        req_id = parsed_bundles[bundle_idx].request_id
+        for op_idx_in_bundle, op in enumerate(ops):
+            num_blocks = len(op.src_block_ids)
+            layer_span = op.layer_range[1] - op.layer_range[0]
+            head_span = op.head_range[1] - op.head_range[0]
+            if layout.is_mla:
+                shape = (
+                    layer_span,
+                    num_blocks,
+                    layout.block_size_tokens,
+                    head_span,
+                )
+            else:
+                shape = (
+                    2,
+                    layer_span,
+                    num_blocks,
+                    layout.block_size_tokens,
+                    head_span,
+                    layout.head_dim,
+                )
+            nelems = 1
+            for d in shape:
+                nelems *= d
+            nbytes = nelems * elem_size
+            flag_key = req_id * MAX_OPS_PER_REQ + op_idx_in_bundle
+            op_meta.append(
+                {
+                    "op": op,
+                    "shape": shape,
+                    "nbytes": nbytes,
+                    "slot": arena.take(nbytes),
+                    "flag": _nv.flag_slot_for(flag_key),
+                }
+            )
+    return op_meta
+
+
+def _build_mamba_op_meta(
+    arena,
+    parsed_bundles,
+    engine_ctx,
+    meta: dict,
+    rank: int,
+    src_root: int,
+    dst_root: int,
+) -> List[dict]:
+    """Per-request mamba conv/ssm transfer metadata.
+
+    v1 only — pairs src↔dst ranks 1:1 by ``local_idx`` under the
+    matched-TP/PP constraint enforced at registration. Flag offsets
+    ``MAX_OPS_PER_REQ - 2`` (conv) and ``- 1`` (ssm) keep mamba flags
+    out of the KV-op range ``[0, num_kv_ops)``.
+    """
+    from megatron.core.inference import nvshmem_migration as _nv
+
+    conv_states = engine_ctx.mamba_conv_states  # [layers, slots, *conv_shape]
+    ssm_states = engine_ctx.mamba_ssm_states  # [layers, slots, *ssm_shape]
+    conv_shape = (conv_states.shape[0],) + tuple(conv_states.shape[2:])
+    ssm_shape = (ssm_states.shape[0],) + tuple(ssm_states.shape[2:])
+    conv_dtype_local = conv_states.dtype
+    ssm_dtype_local = ssm_states.dtype
+    conv_elem = torch.empty((), dtype=conv_dtype_local).element_size()
+    ssm_elem = torch.empty((), dtype=ssm_dtype_local).element_size()
+    conv_nelems = 1
+    for d in conv_shape:
+        conv_nelems *= d
+    ssm_nelems = 1
+    for d in ssm_shape:
+        ssm_nelems *= d
+    conv_nbytes = conv_nelems * conv_elem
+    ssm_nbytes = ssm_nelems * ssm_elem
+
+    # Local position of this rank within its shard. Same local_idx maps
+    # to the paired rank in the other shard under matched TP/PP.
+    if meta["in_src"]:
+        my_local_idx = rank - src_root
+        paired_dst_rank = dst_root + my_local_idx
+        paired_src_rank = rank
+    elif meta["in_dst"]:
+        my_local_idx = rank - dst_root
+        paired_src_rank = src_root + my_local_idx
+        paired_dst_rank = rank
+    else:
+        paired_src_rank = -1
+        paired_dst_rank = -1
+
+    mamba_meta: List[dict] = []
+    for bundle_idx, bundle in enumerate(parsed_bundles):
+        req_id = bundle.request_id
+        conv_flag = _nv.flag_slot_for(
+            req_id * MAX_OPS_PER_REQ + (MAX_OPS_PER_REQ - 2)
+        )
+        ssm_flag = _nv.flag_slot_for(
+            req_id * MAX_OPS_PER_REQ + (MAX_OPS_PER_REQ - 1)
+        )
+        mamba_meta.append(
+            {
+                "bundle_idx": bundle_idx,
+                "src_rank": paired_src_rank,
+                "dst_rank": paired_dst_rank,
+                "conv_slot": arena.take(conv_nbytes),
+                "conv_flag": conv_flag,
+                "conv_nbytes": conv_nbytes,
+                "conv_shape": conv_shape,
+                "conv_dtype": conv_dtype_local,
+                "ssm_slot": arena.take(ssm_nbytes),
+                "ssm_flag": ssm_flag,
+                "ssm_nbytes": ssm_nbytes,
+                "ssm_shape": ssm_shape,
+                "ssm_dtype": ssm_dtype_local,
+            }
+        )
+    return mamba_meta
+
+
+def _release_src_state(
+    meta: dict,
+    is_hybrid: bool,
+    src_block_ids_to_free: List[torch.Tensor],
+    src_mamba_state_indices: List[Optional[int]],
+    engine,
+) -> None:
+    """Return src-side KV blocks + mamba slots to their allocators.
+
+    Used by both the success-path poll callback and the rollback path
+    in the migration handler. Rank-local — only acts when this rank
+    actually held src state.
+    """
+    if meta["in_src"] and src_block_ids_to_free:
+        allocator = engine.context.kv_block_allocator
+        for blocks in src_block_ids_to_free:
+            if blocks.numel() > 0:
+                allocator.release_memory_blocks(blocks)
+    if meta["in_src"] and is_hybrid:
+        for src_state_idx in src_mamba_state_indices:
+            if src_state_idx is not None:
+                engine.release_mamba_state_slot(src_state_idx)
+
+
+def _make_migration_poll_callback(
+    done_event: torch.cuda.Event,
+    flags_used: List[int],
+    meta: dict,
+    is_hybrid: bool,
+    src_block_ids_to_free: List[torch.Tensor],
+    src_mamba_state_indices: List[Optional[int]],
+    engine,
+) -> Callable[[], bool]:
+    """Build the poll callback the engine ticks each loop iteration.
+
+    Returns ``True`` once the migration's ``done_event`` has fired —
+    at which point the flags are reset to ``0`` and src-side KV
+    blocks / mamba slots are returned to the allocators.
+    """
+    from megatron.core.inference import nvshmem_migration as _nv
+
+    def _poll() -> bool:
+        if not done_event.query():
+            return False
+        for slot in flags_used:
+            _nv.reset_flag(slot)
+        _release_src_state(
+            meta, is_hybrid, src_block_ids_to_free, src_mamba_state_indices, engine
+        )
+        return True
+
+    return _poll
+
+
 class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
     """Fanout inference server across heterogeneous inference shards.
 
@@ -167,7 +383,7 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
     # handler in their run loop — NVSHMEM one-sided put_signal /
     # signal_wait on a dedicated stream, no torch process group, no
     # host-side pause.
-    _migration_policies: list = PrivateAttr(default_factory=list)
+    _migration_policies: List[object] = PrivateAttr(default_factory=list)
     _migration_tasks: List[asyncio.Task] = PrivateAttr(default_factory=list)
     _scheduler_stop: bool = PrivateAttr(default=False)
     # Per-shard ``InferenceClient`` keyed by shard_index. Each shard's
@@ -176,32 +392,33 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
     # ``MIGRATE_BATCH`` and ``UPDATE_REQUEST_RANKS_BATCH`` to the coord
     # without going through rank 0. Empty on ranks that aren't a
     # ``rank_offset`` for any shard.
-    _shard_clients: dict = PrivateAttr(default_factory=dict)
+    _shard_clients: Dict[int, InferenceClient] = PrivateAttr(default_factory=dict)
     # Migration metadata snapshot. Maps
     # ``(src_shard_index, dst_shard_index)`` → dict with the src/dst
     # layouts and head offsets the engine handler needs. Pre-computing
     # avoids paying the layout-build cost on every migration.
-    _migration_meta: dict = PrivateAttr(default_factory=dict)
+    _migration_meta: Dict[Tuple[int, int], dict] = PrivateAttr(default_factory=dict)
     # Round-robin counter used by the migration scheduler to spread
     # batches across the destination shard's DP replicas (keyed by
-    # ``(src_shard, dst_shard)``). Without this every batch lands on
-    # dp_rank 0, which cuts effective dst capacity in half on
-    # ``tp=K + tp=1,dp=N`` configs.
-    _disagg_dst_dp_counter: dict = PrivateAttr(default_factory=dict)
+    # ``(src_shard, dst_shard)``). Lives on every rank but only the
+    # decider rank for each ``(src, dst)`` pair mutates and reads its
+    # own keys. Without this every batch lands on dp_rank 0, which cuts
+    # effective dst capacity in half on ``tp=K + tp=1,dp=N`` configs.
+    _disagg_dst_dp_counter: Dict[Tuple[int, int], int] = PrivateAttr(default_factory=dict)
     # When set, base_generate stamps every HTTP request with
     # ``disagg_pair=[src, dst]`` so the coord routes to the prefill shard
     # and the registered :class:`FirstTokenDisaggPolicy` migrates after
     # first token. Populated by the
     # ``--rl-auto-disagg-src-shard`` / ``--rl-auto-disagg-dst-shard``
     # CLI args in :meth:`launch`.
-    _disagg_rollout_pair: Optional[tuple] = PrivateAttr(default=None)
+    _disagg_rollout_pair: Optional[Tuple[int, int]] = PrivateAttr(default=None)
     # When set, base_generate stamps requests with ``tail_cut=[dst, n]``
     # so the registered :class:`TailCutPolicy` migrates the request a
     # second time once it has produced ``n`` tokens — typically pulling
     # long-tail rollouts off the throughput decode shard onto a smaller,
     # latency-optimized decode shard. ``(dst_shard_index, min_tokens)``
     # tuple.
-    _tail_cut_rollout_config: Optional[tuple] = PrivateAttr(default=None)
+    _tail_cut_rollout_config: Optional[Tuple[int, int]] = PrivateAttr(default=None)
     # Sliding windows of recent per-shard response durations (seconds); used
     # for 1/latency-weighted routing once each shard has some history.
     # _in_flight counts pending requests per shard and biases the weighted
@@ -348,15 +565,25 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         # that never become deciders are vestigial but harmless — the
         # coord identifies clients by ZMQ identity at CONNECT time and
         # idle ones consume nothing.
-        shard_clients: dict = {}
+        shard_clients: Dict[int, InferenceClient] = {}
         for s in shards:
             if rank == s.rank_offset:
                 c = InferenceClient(inference_coordinator_address=unified_coord_addr)
                 c.start()
                 shard_clients[s.index] = c
         # rank 0 (which is shard 0's rank_offset by construction) holds
-        # the lifecycle client for pause / resume / shutdown.
-        lifecycle_client = shard_clients[0] if rank == 0 and 0 in shard_clients else None
+        # the lifecycle client for pause / resume / shutdown. Defend
+        # against a future shard layout where shard 0's rank_offset is
+        # not rank 0 — the lifecycle path assumes rank 0 owns the
+        # client.
+        lifecycle_client: Optional[InferenceClient] = None
+        if rank == 0:
+            assert 0 in shard_clients, (
+                "rank 0 must hold shard 0's InferenceClient (lifecycle "
+                "client); shard layout puts shard 0's rank_offset "
+                f"elsewhere (offset={shards[0].rank_offset})"
+            )
+            lifecycle_client = shard_clients[0]
 
         # --- Build OpenAI clients pointing at every shard's HTTP server ---
         # Built on every rank so any rank can drive rollouts.
@@ -426,7 +653,6 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             from .migration_policy import FirstTokenDisaggPolicy
 
             instance._disagg_rollout_pair = (src_idx_arg, dst_idx_arg)
-            instance._register_migration_pair(src_idx_arg, dst_idx_arg)
             instance.register_migration_policy(
                 FirstTokenDisaggPolicy(
                     src_shard_index=src_idx_arg, dst_shard_index=dst_idx_arg
@@ -462,7 +688,6 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             from .migration_policy import TailCutPolicy
 
             instance._tail_cut_rollout_config = (tail_dst_arg, tail_min_arg)
-            instance._register_migration_pair(dst_idx_arg, tail_dst_arg)
             instance.register_migration_policy(
                 TailCutPolicy(
                     src_shard_index=dst_idx_arg,
@@ -767,11 +992,17 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         memo. Policies are independent — first to fire on a given
         request wins, and the others see the request gone from
         ``engine.requests`` on the next tick.
+
+        Also registers the ``(src, dst)`` migration pair so the
+        engine handler is wired and ``_migration_meta`` is populated
+        on every rank — callers shouldn't have to remember to call
+        ``_register_migration_pair`` separately.
         """
         assert 0 <= policy.src_shard_index < len(self._shards)
         assert 0 <= policy.dst_shard_index < len(self._shards)
         assert policy.src_shard_index != policy.dst_shard_index
         assert policy.max_batch_size >= 1
+        self._register_migration_pair(policy.src_shard_index, policy.dst_shard_index)
         self._migration_policies.append(policy)
 
     def _register_migration_pair(
@@ -809,6 +1040,21 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             dst_layout, my_dst_head_offset = self._layout_and_head_offset(
                 dst_shard, self._my_engine, rank, participates=in_dst
             )
+            # v1 hybrid migration pairs src↔dst ranks 1:1 by local_idx,
+            # which only works when TP and PP match. Fail fast at
+            # registration so misconfiguration doesn't surface only
+            # when the first migration fires.
+            if self._my_engine.context.is_hybrid_model:
+                assert src_layout.tp_size == dst_layout.tp_size, (
+                    f"hybrid migration v1 requires matched TP between "
+                    f"shards (src={src_layout.tp_size}, "
+                    f"dst={dst_layout.tp_size})"
+                )
+                assert src_layout.pp_size == dst_layout.pp_size, (
+                    f"hybrid migration v1 requires matched PP between "
+                    f"shards (src={src_layout.pp_size}, "
+                    f"dst={dst_layout.pp_size})"
+                )
             meta.update(
                 {
                     "src_layout": src_layout,
@@ -862,6 +1108,7 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
 
         from megatron.core.inference import nvshmem_migration as _nv
         from megatron.core.inference.engines.request_migration import (
+            RequestMigrationBundle,
             _gather_kv_slice,
             _scatter_kv_slice,
             build_kv_migration_plan,
@@ -926,7 +1173,7 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         try:
             src_block_ids_to_free: List[torch.Tensor] = []
             src_mamba_state_indices: List[Optional[int]] = []
-            injected: List[Tuple[object, List[int]]] = []
+            injected: List[Tuple[RequestMigrationBundle, List[int]]] = []
             dst_mamba_state_indices: List[Optional[int]] = []
             is_hybrid = engine.context.is_hybrid_model
             if meta["in_src"]:
@@ -977,135 +1224,25 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                 )
                 all_ops_by_bundle.append(ops)
 
-            # Walk every (bundle, op) deterministically to assign slot +
-            # flag indices. Same order on src and dst → same slot/flag
-            # for each transfer.
+            # Build per-op staging-slot + flag-slot tables. Both sides
+            # walk the bundles in identical order so the choices match
+            # without coordination.
             arena = _nv.StagingArena()
-            op_meta: List[dict] = []
-            elem_size = memory_buffer.element_size()
             dtype = memory_buffer.dtype
-            # Flag slots are derived deterministically from
-            # ``(request_id, op_index_within_bundle)``: every src and
-            # dst rank looking at the same op picks the same flag,
-            # so we don't need a per-PE counter (which round-robin
-            # routing would desync, since not every dst replica
-            # participates in every batch).
-            MAX_OPS_PER_REQ = 32
-            for bundle_idx, ops in enumerate(all_ops_by_bundle):
-                req_id = parsed_bundles[bundle_idx].request_id
-                for op_idx_in_bundle, op in enumerate(ops):
-                    num_blocks = len(op.src_block_ids)
-                    layer_span = op.layer_range[1] - op.layer_range[0]
-                    head_span = op.head_range[1] - op.head_range[0]
-                    if layout.is_mla:
-                        shape = (
-                            layer_span,
-                            num_blocks,
-                            layout.block_size_tokens,
-                            head_span,
-                        )
-                    else:
-                        shape = (
-                            2,
-                            layer_span,
-                            num_blocks,
-                            layout.block_size_tokens,
-                            head_span,
-                            layout.head_dim,
-                        )
-                    nelems = 1
-                    for d in shape:
-                        nelems *= d
-                    nbytes = nelems * elem_size
-                    flag_key = req_id * MAX_OPS_PER_REQ + op_idx_in_bundle
-                    op_meta.append(
-                        {
-                            "op": op,
-                            "shape": shape,
-                            "nbytes": nbytes,
-                            "slot": arena.take(nbytes),
-                            "flag": _nv.flag_slot_for(flag_key),
-                        }
-                    )
-
-            # Mamba state ops for hybrid models: per request, one conv +
-            # one ssm transfer per (matched) src↔dst rank. v1 requires
-            # matched TP/PP between shards, so each src rank is paired
-            # with its same-(tp, pp) dst rank — local_idx in the shard's
-            # rank window is the index on both sides.
-            #
-            # Flag offsets ``MAX_OPS_PER_REQ - 2`` (conv) and
-            # ``MAX_OPS_PER_REQ - 1`` (ssm) keep mamba flags out of the
-            # KV-op range ``[0, num_kv_ops)``.
+            op_meta = _build_kv_op_meta(
+                arena, parsed_bundles, all_ops_by_bundle, layout, memory_buffer
+            )
             mamba_meta: List[dict] = []
             if is_hybrid:
-                assert src_layout.tp_size == dst_layout.tp_size, (
-                    "hybrid migration v1 requires matched TP between shards"
+                mamba_meta = _build_mamba_op_meta(
+                    arena,
+                    parsed_bundles,
+                    engine.context,
+                    meta,
+                    rank,
+                    src_root,
+                    dst_root,
                 )
-                assert src_layout.pp_size == dst_layout.pp_size, (
-                    "hybrid migration v1 requires matched PP between shards"
-                )
-                ctx = engine.context
-                conv_states = ctx.mamba_conv_states  # [layers, slots, *conv_shape]
-                ssm_states = ctx.mamba_ssm_states  # [layers, slots, *ssm_shape]
-                conv_per_slot = conv_states.shape[2:]
-                ssm_per_slot = ssm_states.shape[2:]
-                conv_dtype_local = conv_states.dtype
-                ssm_dtype_local = ssm_states.dtype
-                conv_layers = conv_states.shape[0]
-                ssm_layers = ssm_states.shape[0]
-                conv_shape = (conv_layers,) + tuple(conv_per_slot)
-                ssm_shape = (ssm_layers,) + tuple(ssm_per_slot)
-                conv_elem = torch.empty((), dtype=conv_dtype_local).element_size()
-                ssm_elem = torch.empty((), dtype=ssm_dtype_local).element_size()
-                conv_nelems = 1
-                for d in conv_shape:
-                    conv_nelems *= d
-                ssm_nelems = 1
-                for d in ssm_shape:
-                    ssm_nelems *= d
-                conv_nbytes = conv_nelems * conv_elem
-                ssm_nbytes = ssm_nelems * ssm_elem
-                # Local position of this rank within its shard. Same
-                # local_idx maps to the paired rank in the other shard
-                # under the matched-TP/PP constraint.
-                if meta["in_src"]:
-                    my_local_idx = rank - src_root
-                    paired_dst_rank = dst_root + my_local_idx
-                    paired_src_rank = rank
-                elif meta["in_dst"]:
-                    my_local_idx = rank - dst_root
-                    paired_src_rank = src_root + my_local_idx
-                    paired_dst_rank = rank
-                else:
-                    my_local_idx = -1
-                    paired_src_rank = -1
-                    paired_dst_rank = -1
-                for bundle_idx, bundle in enumerate(parsed_bundles):
-                    req_id = bundle.request_id
-                    conv_flag = _nv.flag_slot_for(
-                        req_id * MAX_OPS_PER_REQ + (MAX_OPS_PER_REQ - 2)
-                    )
-                    ssm_flag = _nv.flag_slot_for(
-                        req_id * MAX_OPS_PER_REQ + (MAX_OPS_PER_REQ - 1)
-                    )
-                    mamba_meta.append(
-                        {
-                            "bundle_idx": bundle_idx,
-                            "src_rank": paired_src_rank,
-                            "dst_rank": paired_dst_rank,
-                            "conv_slot": arena.take(conv_nbytes),
-                            "conv_flag": conv_flag,
-                            "conv_nbytes": conv_nbytes,
-                            "conv_shape": conv_shape,
-                            "conv_dtype": conv_dtype_local,
-                            "ssm_slot": arena.take(ssm_nbytes),
-                            "ssm_flag": ssm_flag,
-                            "ssm_nbytes": ssm_nbytes,
-                            "ssm_shape": ssm_shape,
-                            "ssm_dtype": ssm_dtype_local,
-                        }
-                    )
 
             # Schedule everything on the migration stream and return.
             with torch.cuda.stream(stream):
@@ -1266,47 +1403,35 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                 flags_used.append(entry["conv_flag"])
                 flags_used.append(entry["ssm_flag"])
 
-            def _poll() -> bool:
-                if not done_event.query():
-                    return False
-                for slot in flags_used:
-                    _nv.reset_flag(slot)
-                if meta["in_src"] and src_block_ids_to_free:
-                    allocator = engine.context.kv_block_allocator
-                    for blocks in src_block_ids_to_free:
-                        if blocks.numel() > 0:
-                            allocator.release_memory_blocks(blocks)
-                if meta["in_src"] and is_hybrid:
-                    for src_state_idx in src_mamba_state_indices:
-                        if src_state_idx is not None:
-                            engine.release_mamba_state_slot(src_state_idx)
-                return True
-
-            engine.push_pending_migration(_poll)
+            engine.push_pending_migration(
+                _make_migration_poll_callback(
+                    done_event,
+                    flags_used,
+                    meta,
+                    is_hybrid,
+                    src_block_ids_to_free,
+                    src_mamba_state_indices,
+                    engine,
+                )
+            )
         except BaseException:
             # Catch ``BaseException`` (not ``Exception``) so
             # ``KeyboardInterrupt`` mid-migration still triggers the
             # block-release path before propagating — otherwise an
-            # interrupt during the gather/put leaks GPU blocks.
-            # Roll back the partially-applied migration so the engine doesn't
-            # leak GPU blocks. ``release_memory_blocks`` returns the kept
-            # blocks to the allocator; ``detach_request(keep_blocks=False)``
-            # does the same for any dst requests that were injected before
-            # the failure point.
-            if src_block_ids_to_free:
-                allocator = engine.context.kv_block_allocator
-                for blocks in src_block_ids_to_free:
-                    if blocks.numel() > 0:
-                        allocator.release_memory_blocks(blocks)
-            if is_hybrid and src_mamba_state_indices:
-                for src_state_idx in src_mamba_state_indices:
-                    if src_state_idx is not None:
-                        engine.release_mamba_state_slot(src_state_idx)
+            # interrupt during the gather/put leaks GPU blocks. Roll
+            # back any partial state: src kept-blocks/slots back to
+            # allocators, dst-injected requests detached with
+            # ``keep_blocks=False`` so their dst blocks are reclaimed.
+            _release_src_state(
+                meta,
+                is_hybrid,
+                src_block_ids_to_free,
+                src_mamba_state_indices,
+                engine,
+            )
             for bundle, _ in injected:
                 if bundle.request_id in engine.requests:
-                    engine.detach_request(
-                        bundle.request_id, keep_blocks=False
-                    )
+                    engine.detach_request(bundle.request_id, keep_blocks=False)
             raise
 
     async def _pause_scheduler(self) -> None:
