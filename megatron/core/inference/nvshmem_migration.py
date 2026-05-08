@@ -52,12 +52,16 @@ _staging_slot_bytes: int = 0
 _staging_num_slots: int = 0
 
 
-# Each flag is 8 bytes, so 1<<20 slots = 8 MB per PE. Sized large enough
-# that ``flag_slot_for(req_id * MAX_OPS_PER_REQ + op_idx)`` doesn't alias
-# across the lifetime of a long run — a 4096-slot pool wraps at
-# request_id ≈ 128 with MAX_OPS_PER_REQ=32, which a real bench burns
-# through in seconds. Tunable via env.
-DEFAULT_FLAG_POOL_SIZE = 1 << 20
+# 1<<14 = 16384 slots, 128 KB per PE. Aliasing under
+# ``flag_slot_for(req_id * MAX_OPS_PER_REQ + op_idx)`` is bounded by
+# how many flags can be in-flight simultaneously — with the singleton
+# migration stream serializing migrations and at most
+# ``batch_size * MAX_OPS_PER_REQ`` flags unresolved per migration, even
+# 4096 slots have headroom. 16384 keeps a comfortable margin and
+# initializes in seconds (each flag is its own NVSHMEM symmetric
+# allocation, so a 1M pool stalled startup for minutes). Tunable via
+# env.
+DEFAULT_FLAG_POOL_SIZE = 1 << 14
 
 # NVSHMEM only tracks the full tensor handle returned by ``bytetensor`` —
 # slices with non-zero offsets aren't tracked, so we can't carve a
