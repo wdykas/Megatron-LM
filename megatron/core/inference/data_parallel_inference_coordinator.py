@@ -330,7 +330,12 @@ class DataParallelInferenceCoordinator:
                 return ident
         return None
 
-    def _register_rank_identity(self, identity, shard_index: int | None = None):
+    def _register_rank_identity(
+        self,
+        identity,
+        shard_index: int | None = None,
+        max_requests: int | None = None,
+    ):
         """Register a new rank identity in the scoring data structures.
 
         Called when a rank dynamically connects to a running coordinator
@@ -341,6 +346,10 @@ class DataParallelInferenceCoordinator:
             shard_index: Optional shard tag for this engine. When given, the
                 coord will only dispatch shard-scoped submits to engines that
                 share this index. ``None`` preserves legacy unscoped behavior.
+            max_requests: Slot-table cap for this engine, used to gate
+                MIGRATE_BATCH against the dst shard's headroom. ``None``
+                or unset means no cap (legacy behaviour — migrations
+                always forwarded).
         """
         if identity in self.identity_to_rank_index:
             # Identity already known; allow a late shard_index to attach.
@@ -352,6 +361,14 @@ class DataParallelInferenceCoordinator:
         self.identity_to_rank_index[identity] = new_idx
         self._identities_list.append(identity)
         self._pending_counts = np.append(self._pending_counts, np.int32(0))
+        # Keep ``_engine_max_requests`` in lockstep with the rank
+        # index space, otherwise the MIGRATE_BATCH capacity check
+        # indexes past the array end when a late-registered engine
+        # is the dst.
+        cap = -1 if max_requests is None else int(max_requests)
+        self._engine_max_requests = np.append(
+            self._engine_max_requests, np.int64(cap)
+        )
         self.identity_to_shard_index[identity] = shard_index
         self._invalidate_shard_cache()
         logging.info(
@@ -568,11 +585,23 @@ class DataParallelInferenceCoordinator:
 
             if header == Headers.REGISTER_DP_RANK:
                 # Engine-side shard-aware registration. Payload:
-                # [REGISTER_DP_RANK, shard_index_or_None].
+                # [REGISTER_DP_RANK, shard_index_or_None,
+                #  max_requests_or_absent]. The third field is the
+                # engine's slot-table cap, used to gate MIGRATE_BATCH
+                # against dst headroom.
                 shard_index = deserialized_payload[1] if len(deserialized_payload) > 1 else None
+                max_requests = (
+                    int(deserialized_payload[2])
+                    if len(deserialized_payload) > 2
+                    else None
+                )
                 if sender_identity not in self.identities_of_data_parallel_ranks:
                     self.identities_of_data_parallel_ranks.append(sender_identity)
-                self._register_rank_identity(sender_identity, shard_index=shard_index)
+                self._register_rank_identity(
+                    sender_identity,
+                    shard_index=shard_index,
+                    max_requests=max_requests,
+                )
                 continue
 
             if header == Headers.CONNECT:
