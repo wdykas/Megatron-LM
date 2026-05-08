@@ -52,9 +52,12 @@ _staging_slot_bytes: int = 0
 _staging_num_slots: int = 0
 
 
-# Each flag is 8 bytes, so 4096 slots = 32 KB per PE — ample for any
-# realistic batch of concurrent migrations. Tunable via env.
-DEFAULT_FLAG_POOL_SIZE = 4096
+# Each flag is 8 bytes, so 1<<20 slots = 8 MB per PE. Sized large enough
+# that ``flag_slot_for(req_id * MAX_OPS_PER_REQ + op_idx)`` doesn't alias
+# across the lifetime of a long run — a 4096-slot pool wraps at
+# request_id ≈ 128 with MAX_OPS_PER_REQ=32, which a real bench burns
+# through in seconds. Tunable via env.
+DEFAULT_FLAG_POOL_SIZE = 1 << 20
 
 # NVSHMEM only tracks the full tensor handle returned by ``bytetensor`` —
 # slices with non-zero offsets aren't tracked, so we can't carve a
@@ -215,6 +218,9 @@ def put_slot_with_signal(
     s = stream or _migration_stream
     slot = staging_slot(slot_idx)
     if nbytes is not None and nbytes < slot.numel():
+        # Offset-0 slice is fine — NVSHMEM tracks it via the underlying
+        # bytetensor handle. A non-zero-offset slice would NOT be tracked
+        # and would silently corrupt the transfer.
         slot = slot[:nbytes]
     flag_buf = flag_buffer(flag_slot)
     nvshmem.core.put_signal(
@@ -271,6 +277,15 @@ class StagingArena:
     they end up assigning the same slot index to each op without
     explicit coordination — the invariant that makes
     ``put(slot[i], slot[i], dst_pe)`` land in the right place.
+
+    Cross-migration safety relies on stream ordering: every migration
+    starts a fresh arena at slot 0, so two migrations both write into
+    slot 0 first. This is only safe because all gather-into-slot copies
+    and ``put_slot_with_signal`` calls submit on the singleton
+    :func:`migration_stream`, which serializes them GPU-side — migration
+    N's put completes before migration N+1's copy_ overwrites the slot.
+    Submitting migrations on different streams (or off-stream host-side
+    writes into the slot) would race and corrupt the transfer.
     """
 
     def __init__(self):
