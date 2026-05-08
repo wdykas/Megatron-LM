@@ -1624,8 +1624,18 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         # drops it naturally.
         migrated_ids: set = set()
 
+        # Exponential backoff on capacity rejection. Each consecutive
+        # rejection doubles the sleep up to ``MAX_BACKOFF_MULT``; one
+        # accept resets to 1×. Without this, a saturated dst shard
+        # produces a rejection on every poll tick (tens of ZMQ
+        # roundtrips/s, all useless until a decode completes); with
+        # the multiplier the decider naturally throttles to the rate
+        # at which dst frees slots.
+        backoff_mult = 1.0
+        MAX_BACKOFF_MULT = 32.0
+
         while not self._scheduler_stop:
-            await asyncio.sleep(policy.poll_interval_s)
+            await asyncio.sleep(policy.poll_interval_s * backoff_mult)
             if self._scheduler_stop:
                 return
             if not self._my_engine._state_events[EngineState.RUNNING].is_set():
@@ -1679,18 +1689,49 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                 counter = self._disagg_dst_dp_counter.get(counter_key, 0)
                 dst_dp_rank = counter % dst_dp_size
                 self._disagg_dst_dp_counter[counter_key] = counter + 1
-                client.migrate_request_batch(
+                # Two-phase commit: post the batch to the coord and
+                # await its accept/reject decision before posting the
+                # follow-up rank rewrite. Coord rejects when dst would
+                # overflow its slot table, leaving src's request live
+                # (no detach has happened yet — that fires only when
+                # the engine sees MIGRATE_BATCH from the coord).
+                ack_future = client.migrate_request_batch(
                     eligible,
                     src_shard_index,
                     dst_shard_index,
                     bundles=bundles,
                     dst_dp_rank_within_shard=dst_dp_rank,
                 )
-                client.update_request_ranks_batch(
-                    request_ids=eligible,
-                    new_shard_index=dst_shard_index,
-                    new_dp_rank_within_shard=dst_dp_rank,
-                )
+                accepted = await ack_future
+                if accepted:
+                    client.update_request_ranks_batch(
+                        request_ids=eligible,
+                        new_shard_index=dst_shard_index,
+                        new_dp_rank_within_shard=dst_dp_rank,
+                    )
+                    # Mark migrated only on accept; the engine is now
+                    # walking these ids off this rank, so the next
+                    # ``migrated_ids &= active_ids`` will drop them.
+                    migrated_ids.update(eligible)
+                    # Reset backoff on a successful migration — dst has
+                    # accepted, so the next tick should resume polling
+                    # at the policy's base cadence.
+                    backoff_mult = 1.0
+                else:
+                    # Rejected — dst was at capacity. Don't mark as
+                    # migrated; next tick will retry these ids. Double
+                    # the backoff so the decider naturally throttles
+                    # to the rate dst is freeing slots instead of
+                    # retry-storming on every base-cadence tick.
+                    backoff_mult = min(backoff_mult * 2.0, MAX_BACKOFF_MULT)
+                    logger.info(
+                        "[migration:%s] dst shard %d rejected batch of %d "
+                        "requests (capacity); will retry after %.2fs backoff",
+                        type(policy).__name__,
+                        dst_shard_index,
+                        len(eligible),
+                        policy.poll_interval_s * backoff_mult,
+                    )
             except Exception as e:
                 logger.error(
                     "[migration:%s] failed to submit migration of %d "
@@ -1701,11 +1742,8 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                     dst_shard_index,
                     e,
                 )
-            finally:
-                # Always mark the ids migrated — including on failure —
-                # so a persistent error doesn't retry-storm the same
-                # batch every poll tick. The set is pruned each tick to
-                # ids still resident on this engine, so successful
-                # migrations drop out naturally on the next pass.
+                # Hard error path (e.g., snapshot/serialize failure):
+                # mark ids migrated to avoid retry-storming the same
+                # broken batch every tick.
                 migrated_ids.update(eligible)
 

@@ -172,14 +172,19 @@ class DataParallelInferenceCoordinator:
         self.identities_of_data_parallel_ranks = deque([])
         # identity → shard_index collected during the initial barrier.
         # REGISTER_DP_RANK carries the tag; legacy empty-bytes leaves it
-        # None (unscoped, matches any target_shard_index).
+        # None (unscoped, matches any target_shard_index). The third
+        # field (max_requests) lets the coord capacity-check
+        # ``MIGRATE_BATCH`` payloads against the dst shard's slot-table
+        # before forwarding them.
         shard_tags: dict[bytes, int | None] = {}
+        engine_max_requests: dict[bytes, int | None] = {}
         for _ in range(data_parallel_size):
             identity, serialized_payload = self.router_socket.recv_multipart()
             assert identity not in self.identities_of_data_parallel_ranks
             self.identities_of_data_parallel_ranks.append(identity)
             if serialized_payload == b"":
                 shard_tags[identity] = None
+                engine_max_requests[identity] = None
                 continue
             try:
                 deserialized = msgpack.unpackb(serialized_payload, raw=False)
@@ -187,11 +192,15 @@ class DataParallelInferenceCoordinator:
                 shard_tags[identity] = (
                     deserialized[1] if len(deserialized) > 1 else None
                 )
+                engine_max_requests[identity] = (
+                    int(deserialized[2]) if len(deserialized) > 2 else None
+                )
             except Exception as e:
                 logging.warning(
                     "Coordinator: could not parse registration from %s: %s", identity, e
                 )
                 shard_tags[identity] = None
+                engine_max_requests[identity] = None
         logging.info("Inference Coordinator: Connected with data parallel ranks...")
 
         # In deterministic mode, sort identities for consistent scheduling order.
@@ -231,6 +240,20 @@ class DataParallelInferenceCoordinator:
         n_ranks = len(sorted_identities)
         self._identities_list = list(sorted_identities)  # rank_index → identity
         self._pending_counts = np.zeros(n_ranks, dtype=np.int32)
+
+        # Per-engine slot-table cap, used to gate ``MIGRATE_BATCH``
+        # against the dst shard's headroom. Engines that registered
+        # without a cap (legacy ``b""`` handshake or older
+        # ``REGISTER_DP_RANK`` payloads without the field) effectively
+        # opt out — ``-1`` is treated as "no cap" and migrations are
+        # always forwarded for those engines (legacy behaviour).
+        self._engine_max_requests = np.array(
+            [
+                engine_max_requests.get(ident) if engine_max_requests.get(ident) is not None else -1
+                for ident in sorted_identities
+            ],
+            dtype=np.int64,
+        )
 
         # Hash → {rank_idx: timestamp} dict for prefix cache affinity routing.
         # Each key is a block hash; each value maps rank indices to assignment
@@ -789,20 +812,33 @@ class DataParallelInferenceCoordinator:
                     )
 
             elif header == Headers.MIGRATE_BATCH:
-                # Payload: [MIGRATE_BATCH, request_ids, src_shard_index,
-                # dst_shard_index, bundles, dst_dp_rank]. Bundles are the
-                # per-request serialized envelopes; carried inline so
-                # engines can run async migration without a cross-shard
-                # broadcast. Coord forwards the original bytes to every
-                # rank in src + the single chosen dst dp_rank.
+                # Payload: [MIGRATE_BATCH, batch_id, request_ids,
+                # src_shard_index, dst_shard_index, bundles, dst_dp_rank].
+                # Bundles are the per-request serialized envelopes; carried
+                # inline so engines can run async migration without a
+                # cross-shard broadcast. Coord forwards the original bytes
+                # to every rank in src + the single chosen dst dp_rank
+                # **only if the dst engine has headroom for the batch**.
+                # Two-phase commit prevents data-loss when dst is at
+                # capacity: the decider's ``InferenceClient`` awaits the
+                # MIGRATE_BATCH_ACK reply before posting
+                # UPDATE_REQUEST_RANKS_BATCH, so a rejected batch leaves
+                # both src and the coord's ownership map untouched and
+                # the decider retries on a later tick.
                 if sender_identity not in known_clients:
                     logging.warning(
                         "Coordinator: ignoring MIGRATE_BATCH from unknown client."
                     )
                     continue
-                _, _, src_shard_index, dst_shard_index, _, dst_dp_rank = (
-                    deserialized_payload
-                )
+                (
+                    _,
+                    batch_id,
+                    request_ids_in_batch,
+                    src_shard_index,
+                    dst_shard_index,
+                    _,
+                    dst_dp_rank,
+                ) = deserialized_payload
                 src_targets = self._identities_for_shard(src_shard_index)
                 dst_target = self._identity_for_dp_rank(dst_shard_index, dst_dp_rank)
                 if dst_target is None:
@@ -815,10 +851,61 @@ class DataParallelInferenceCoordinator:
                         dst_shard_index,
                     )
                     if not dst_idents:
+                        # No dst engines at all — reply rejected so the
+                        # decider doesn't hang on the ack.
+                        self.router_socket.send_multipart(
+                            [
+                                sender_identity,
+                                msgpack.packb(
+                                    [Headers.MIGRATE_BATCH_ACK.value, batch_id, False],
+                                    use_bin_type=True,
+                                ),
+                            ]
+                        )
                         continue
                     dst_target = dst_idents[0]
-                for data_parallel_rank_id in [*src_targets, dst_target]:
-                    self._send_to_engine(data_parallel_rank_id, serialized_payload)
+
+                # Capacity check against the dst engine's slot-table cap.
+                # ``_engine_max_requests`` is populated from
+                # REGISTER_DP_RANK; engines that registered without a cap
+                # (-1) are treated as unconstrained for backward compat.
+                dst_idx = self.identity_to_rank_index.get(dst_target)
+                accepted = True
+                if dst_idx is not None:
+                    cap = int(self._engine_max_requests[dst_idx])
+                    if cap >= 0:
+                        in_flight = int(self._pending_counts[dst_idx])
+                        if in_flight + len(request_ids_in_batch) > cap:
+                            accepted = False
+                            logging.info(
+                                "Coordinator: rejecting MIGRATE_BATCH (batch_id=%d, "
+                                "n=%d) → shard %d dp_rank=%d: would exceed cap "
+                                "(%d in flight + %d > %d); decider will retry.",
+                                batch_id,
+                                len(request_ids_in_batch),
+                                dst_shard_index,
+                                dst_dp_rank,
+                                in_flight,
+                                len(request_ids_in_batch),
+                                cap,
+                            )
+
+                # Reply to the decider's client with the accept/reject
+                # decision before forwarding (or instead of forwarding
+                # on reject).
+                self.router_socket.send_multipart(
+                    [
+                        sender_identity,
+                        msgpack.packb(
+                            [Headers.MIGRATE_BATCH_ACK.value, batch_id, accepted],
+                            use_bin_type=True,
+                        ),
+                    ]
+                )
+
+                if accepted:
+                    for data_parallel_rank_id in [*src_targets, dst_target]:
+                        self._send_to_engine(data_parallel_rank_id, serialized_payload)
 
             elif header in (
                 Headers.UPDATE_REQUEST_RANK,

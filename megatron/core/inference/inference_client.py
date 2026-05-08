@@ -86,6 +86,13 @@ class InferenceClient:
         # that need the server id (to drive cross-shard migration of the
         # in-flight request) await `wait_for_server_id(client_request_id)`.
         self._server_id_futures = {}
+        # batch_id → asyncio.Future[bool] resolved when the coord acks a
+        # MIGRATE_BATCH with accept (True) / reject (False). Two-phase
+        # commit: the decider awaits this before posting the follow-up
+        # UPDATE_REQUEST_RANKS_BATCH so a rejected batch leaves both src
+        # and the coord's ownership map untouched.
+        self._migrate_batch_futures: dict = {}
+        self._next_migrate_batch_id: int = 0
         self.request_submission_times = {}
         self.next_request_id = 0
 
@@ -244,6 +251,11 @@ class InferenceClient:
                     fut = self._server_id_futures.get(client_request_id)
                     if fut is not None and not fut.done():
                         fut.set_result(server_request_id)
+                elif header == Headers.MIGRATE_BATCH_ACK:
+                    batch_id, accepted = data[1:]
+                    fut = self._migrate_batch_futures.pop(batch_id, None)
+                    if fut is not None and not fut.done():
+                        fut.set_result(bool(accepted))
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue
@@ -350,32 +362,48 @@ class InferenceClient:
         dst_shard_index: int,
         bundles: Optional[List[dict]] = None,
         dst_dp_rank_within_shard: int = 0,
-    ) -> None:
+    ) -> asyncio.Future:
         """Tell engines in src + dst shards to migrate ``request_ids`` from
-        src to dst. The coordinator forwards a ``MIGRATE_BATCH`` signal to
-        the named shards' engines; each engine pops the signal and runs
-        its registered migration handler.
+        src to dst, and return a future that resolves with the coord's
+        accept/reject decision.
+
+        Two-phase commit. The coord runs a capacity check against the dst
+        engine's slot-table cap before forwarding ``MIGRATE_BATCH`` to
+        engines; if dst would overflow, the coord drops the batch and
+        replies with ``accepted=False``. Callers must await the returned
+        future and only post ``update_request_ranks_batch`` (and mark the
+        ids as migrated locally) on accept — rejecting leaves the request
+        live on src for a later retry.
 
         ``bundles`` is the per-request serialized
         :class:`RequestMigrationBundle` (msgpack-compatible dict, one per
         ``request_ids`` entry). Carrying bundles inline lets engines run
         migration without a cross-shard broadcast — the dst engine has
         the metadata it needs to allocate KV blocks the moment it sees
-        the signal. Pass ``None`` only for backward-compat paths that
-        rebuild bundles via the cross-shard collective.
+        the signal.
 
-        Fire-and-forget: returns once the message is enqueued.
+        Returns:
+            ``asyncio.Future[bool]`` — resolves to ``True`` if the coord
+            accepted and forwarded the batch, ``False`` if the dst shard
+            was at capacity.
         """
         if bundles is None:
             bundles = []
+        loop = self._loop or asyncio.get_event_loop()
+        batch_id = self._next_migrate_batch_id
+        self._next_migrate_batch_id += 1
+        future: asyncio.Future = loop.create_future()
+        self._migrate_batch_futures[batch_id] = future
         self._send_signal_to_engines(
             Headers.MIGRATE_BATCH,
+            int(batch_id),
             list(request_ids),
             int(src_shard_index),
             int(dst_shard_index),
             list(bundles),
             int(dst_dp_rank_within_shard),
         )
+        return future
 
     def shutdown_coordinator(self):
         """Tells the coordinator process to exit its main loop.
@@ -403,5 +431,9 @@ class InferenceClient:
             if not future.done():
                 future.cancel()
         self._server_id_futures.clear()
+        for future in self._migrate_batch_futures.values():
+            if not future.done():
+                future.cancel()
+        self._migrate_batch_futures.clear()
         self.socket.close(linger=0)
         self.context.term()

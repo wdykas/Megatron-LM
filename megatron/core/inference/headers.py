@@ -52,11 +52,23 @@ class Headers(Enum):
     # via ``engine.set_migration_handler(...)``. The callback runs the
     # NVSHMEM one-sided ``put_signal`` / ``signal_wait`` transport on the
     # migration stream — no NCCL collective, no engine pause.
-    # Wire payload: ``[MIGRATE_BATCH, request_ids, src_shard_index,
-    # dst_shard_index, bundles, dst_dp_rank]``. ``bundles`` are the
-    # per-request serialized envelopes; carrying them inline lets the
-    # dst engine register the requests without a cross-shard broadcast.
+    # Wire payload: ``[MIGRATE_BATCH, batch_id, request_ids,
+    # src_shard_index, dst_shard_index, bundles, dst_dp_rank]``.
+    # ``batch_id`` is a monotonic counter the decider's
+    # :class:`InferenceClient` uses to match the coord's
+    # :data:`MIGRATE_BATCH_ACK` reply; ``bundles`` are the per-request
+    # serialized envelopes (carrying them inline lets the dst engine
+    # register the requests without a cross-shard broadcast).
     MIGRATE_BATCH = auto()
+    # Coordinator → decider client: acknowledges a ``MIGRATE_BATCH``
+    # after the coord has performed a capacity check against the dst
+    # shard. Two-phase commit prevents data loss when dst is at
+    # capacity — the decider only posts the follow-up
+    # :data:`UPDATE_REQUEST_RANKS_BATCH` and marks the ids as migrated
+    # if ``accepted`` is True. On rejection the coord drops the batch
+    # and the decider retries on a later tick, when dst has freed
+    # slots. Payload: ``[MIGRATE_BATCH_ACK, batch_id, accepted]``.
+    MIGRATE_BATCH_ACK = auto()
 
 
 class UnknownHeaderError(Exception):

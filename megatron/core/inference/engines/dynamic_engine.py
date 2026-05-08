@@ -648,10 +648,18 @@ class DynamicInferenceEngine(AbstractEngine):
             # Register with the coord. The legacy handshake is a single
             # empty frame (b""); when a shard index is available we use
             # REGISTER_DP_RANK instead so the coord can do shard-scoped
-            # routing for heterogeneous serving.
+            # routing for heterogeneous serving. The third field carries
+            # this engine's slot-table cap (``ctx.max_requests``) so the
+            # coord can capacity-check ``MIGRATE_BATCH`` against the dst
+            # shard before forwarding it (two-phase commit).
             if shard_index is not None:
                 registration_payload = msgpack.packb(
-                    [Headers.REGISTER_DP_RANK.value, shard_index], use_bin_type=True
+                    [
+                        Headers.REGISTER_DP_RANK.value,
+                        shard_index,
+                        int(self.context.max_requests),
+                    ],
+                    use_bin_type=True,
                 )
                 self.socket_for_receiving_requests.send(registration_payload)
             else:
@@ -2751,6 +2759,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 # broadcast. The handler is non-blocking: it kicks off
                 # the NVSHMEM transport on the migration stream and
                 # registers a poll for finalization on a later tick.
+                # ``batch_id`` (data[1]) is the coord's two-phase
+                # commit ack key — engines don't use it; the coord
+                # consumes it to route MIGRATE_BATCH_ACK back to the
+                # decider client.
                 if self._migration_handler is None:
                     logging.warning(
                         "Engine: ignoring MIGRATE_BATCH (no handler registered)"
@@ -2758,6 +2770,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 else:
                     (
                         _,
+                        _batch_id,
                         request_ids,
                         src_shard_index,
                         dst_shard_index,
