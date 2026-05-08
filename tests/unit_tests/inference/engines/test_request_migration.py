@@ -270,17 +270,37 @@ def _mamba_bundle() -> RequestMigrationBundle:
     )
 
 
-def _mamba_layouts(src_tp: int, dst_tp: int, pp_size: int = 1):
+def _mamba_layouts(
+    src_tp: int,
+    dst_tp: int,
+    pp_size: int = 1,
+    *,
+    src_pp_size: int = None,
+    dst_pp_size: int = None,
+    layer_type_list: tuple = (),
+    num_mamba_layers: int = 8,
+):
+    """Build (src, dst) MambaLayout pair for tests.
+
+    ``src_pp_size`` / ``dst_pp_size`` override ``pp_size`` on each
+    side independently; ``layer_type_list`` is required for hetero-PP
+    tests so the plan-builder can compute per-PP-rank mamba ownership.
+    """
+    src_pp = src_pp_size if src_pp_size is not None else pp_size
+    dst_pp = dst_pp_size if dst_pp_size is not None else pp_size
     base = dict(
-        pp_size=pp_size,
-        num_layers_total=8,
+        num_layers_total=num_mamba_layers,
         d_inner_total=64,
         nheads_total=16,
         d_conv=4,
         headdim=4,
         d_state=16,
+        layer_type_list=layer_type_list,
     )
-    return MambaLayout(tp_size=src_tp, **base), MambaLayout(tp_size=dst_tp, **base)
+    return (
+        MambaLayout(tp_size=src_tp, pp_size=src_pp, **base),
+        MambaLayout(tp_size=dst_tp, pp_size=dst_pp, **base),
+    )
 
 
 def _check_mamba_dst_coverage(ops, dst_layout):
@@ -379,20 +399,126 @@ def test_mamba_plan_partial_overlap():
     _check_mamba_dst_coverage(ops, dst_layout)
 
 
-def test_mamba_plan_rejects_pp_mismatch():
-    """v1 requires matched PP."""
+def test_mamba_plan_hetero_pp_reshape_up():
+    """src_pp=1 → dst_pp=2: src has 1 PP rank owning all mamba layers,
+    dst splits across 2 PP ranks. Plan emits one op per dst PP rank
+    carrying that PP rank's mamba ownership."""
     bundle = _mamba_bundle()
-    src_layout, dst_layout = _mamba_layouts(src_tp=2, dst_tp=2, pp_size=1)
-    dst_layout.pp_size = 2
-    try:
-        build_mamba_migration_plan(
-            bundle,
-            src_layout,
-            dst_layout,
-            src_global_rank_of=lambda tp, pp: tp,
-            dst_global_rank_of=lambda tp, pp: 100 + tp,
-        )
-    except AssertionError as e:
-        assert "PP" in str(e)
-    else:
-        raise AssertionError("expected PP-mismatch to be rejected")
+    # 8 transformer layers, 4 mamba (M at indices 0, 2, 4, 6).
+    # src pp=1 owns [0..8) globally → all 4 mamba indices [0,1,2,3].
+    # dst pp=2: PP rank 0 owns [0..4) → mamba indices for global 0, 2 → [0, 1].
+    # PP rank 1 owns [4..8) → mamba indices for global 4, 6 → [2, 3].
+    layer_types = ("M", "E", "M", "E", "M", "E", "M", "E")
+    src_layout, dst_layout = _mamba_layouts(
+        src_tp=2,
+        dst_tp=2,
+        src_pp_size=1,
+        dst_pp_size=2,
+        layer_type_list=layer_types,
+        num_mamba_layers=4,
+    )
+    ops = build_mamba_migration_plan(
+        bundle,
+        src_layout,
+        dst_layout,
+        # src has 1 pp rank, 2 tp ranks → ranks 0, 1
+        src_global_rank_of=lambda tp, pp: tp,
+        # dst has 2 pp ranks, 2 tp ranks → ranks 100..103 (tp-major)
+        dst_global_rank_of=lambda tp, pp: 100 + pp * 2 + tp,
+    )
+    # 1 src_pp × 2 dst_pp × 2 src_tp × 2 dst_tp matched-tp = 4 ops
+    assert len(ops) == 4
+    # Each op carries the dst_pp's mamba ownership (intersection
+    # with src's "all-4" is just dst_pp's set).
+    by_dst = {}
+    for op in ops:
+        by_dst.setdefault(op.dst_rank, []).append(op)
+    # Dst PP=0 ranks (100, 101) get mamba indices [0, 1].
+    for r in (100, 101):
+        assert len(by_dst[r]) == 1
+        assert by_dst[r][0].mamba_layer_indices == (0, 1)
+    # Dst PP=1 ranks (102, 103) get mamba indices [2, 3].
+    for r in (102, 103):
+        assert len(by_dst[r]) == 1
+        assert by_dst[r][0].mamba_layer_indices == (2, 3)
+
+
+def test_mamba_plan_hetero_pp_reshape_down():
+    """src_pp=2 → dst_pp=1: src splits across 2 PP ranks, dst owns all.
+    Plan emits ops per (src_pp × dst_pp=0) intersected with dst-owned."""
+    bundle = _mamba_bundle()
+    # 8 transformer layers, 4 mamba (M at indices 1, 3, 4, 7).
+    # src pp=2: PP rank 0 owns [0..4) → mamba indices [0, 1].
+    # PP rank 1 owns [4..8) → mamba indices [2, 3].
+    # dst pp=1: owns all 4.
+    layer_types = ("E", "M", "E", "M", "M", "E", "E", "M")
+    src_layout, dst_layout = _mamba_layouts(
+        src_tp=2,
+        dst_tp=2,
+        src_pp_size=2,
+        dst_pp_size=1,
+        layer_type_list=layer_types,
+        num_mamba_layers=4,
+    )
+    ops = build_mamba_migration_plan(
+        bundle,
+        src_layout,
+        dst_layout,
+        # src has 2 pp ranks, 2 tp ranks → ranks 0..3 (tp-major)
+        src_global_rank_of=lambda tp, pp: pp * 2 + tp,
+        # dst has 1 pp rank, 2 tp ranks → ranks 100, 101
+        dst_global_rank_of=lambda tp, pp: 100 + tp,
+    )
+    # 2 src_pp × 1 dst_pp × 2 src_tp × 2 dst_tp matched-tp = 4 ops
+    assert len(ops) == 4
+    by_src = {}
+    for op in ops:
+        by_src.setdefault(op.src_rank, []).append(op)
+    # Src PP=0 ranks (0, 1) carry mamba indices [0, 1].
+    for r in (0, 1):
+        assert len(by_src[r]) == 1
+        assert by_src[r][0].mamba_layer_indices == (0, 1)
+    # Src PP=1 ranks (2, 3) carry mamba indices [2, 3].
+    for r in (2, 3):
+        assert len(by_src[r]) == 1
+        assert by_src[r][0].mamba_layer_indices == (2, 3)
+
+
+def test_mamba_plan_hetero_tp_and_pp():
+    """src tp=2,pp=2 + dst tp=1,pp=1. Combined hetero TP and hetero PP:
+    each (src_pp × src_tp) op carries the src PP rank's mamba subset
+    and src tp's d_inner half, all going to the single dst rank."""
+    bundle = _mamba_bundle()
+    layer_types = ("M", "M", "E", "E", "M", "E", "M", "E")
+    # src pp=2: pp 0 owns [0..4) → mamba globals 0,1 → indices [0,1]
+    #          pp 1 owns [4..8) → mamba globals 4,6 → indices [2,3]
+    src_layout, dst_layout = _mamba_layouts(
+        src_tp=2,
+        dst_tp=1,
+        src_pp_size=2,
+        dst_pp_size=1,
+        layer_type_list=layer_types,
+        num_mamba_layers=4,
+    )
+    ops = build_mamba_migration_plan(
+        bundle,
+        src_layout,
+        dst_layout,
+        src_global_rank_of=lambda tp, pp: pp * 2 + tp,
+        dst_global_rank_of=lambda tp, pp: 100,
+    )
+    # 2 src_pp × 1 dst_pp × 2 src_tp × 1 dst_tp = 4 ops; dst rank
+    # collects them all.
+    assert len(ops) == 4
+    assert all(op.dst_rank == 100 for op in ops)
+    pp0_indices = [op.mamba_layer_indices for op in ops if op.src_rank in (0, 1)]
+    pp1_indices = [op.mamba_layer_indices for op in ops if op.src_rank in (2, 3)]
+    assert all(idx == (0, 1) for idx in pp0_indices)
+    assert all(idx == (2, 3) for idx in pp1_indices)
+    # TP halves on d_inner
+    by_src_tp = {(op.src_rank, op.conv_d_inner_range) for op in ops}
+    # tp_rank 0 ranks (0, 2) get d_inner [0, 32); tp_rank 1 ranks (1, 3) get [32, 64).
+    assert (0, (0, 32)) in by_src_tp
+    assert (1, (32, 64)) in by_src_tp
+    assert (2, (0, 32)) in by_src_tp
+    assert (3, (32, 64)) in by_src_tp

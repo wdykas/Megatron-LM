@@ -239,7 +239,6 @@ def _build_mamba_op_meta(
     ssm_dtype_local = ssm_states.dtype
     conv_elem = torch.empty((), dtype=conv_dtype_local).element_size()
     ssm_elem = torch.empty((), dtype=ssm_dtype_local).element_size()
-    num_layers_total = src_mamba_layout.num_layers_total
     headdim = src_mamba_layout.headdim
     d_state = src_mamba_layout.d_state
     d_conv = src_mamba_layout.d_conv
@@ -266,10 +265,14 @@ def _build_mamba_op_meta(
         for op_local_idx, op in enumerate(ops):
             conv_span = op.conv_d_inner_range[1] - op.conv_d_inner_range[0]
             ssm_span = op.ssm_nheads_range[1] - op.ssm_nheads_range[0]
-            # Per-op shape: full layer dim (matched-PP invariant, see
-            # ``build_mamba_migration_plan``) × overlap span × per-row dims.
-            conv_shape = (num_layers_total, conv_span, d_conv)
-            ssm_shape = (num_layers_total, ssm_span, headdim, d_state)
+            # Per-op shape: only the mamba layer indices owned by both
+            # PP ranks (intersection from the plan), × overlap span on
+            # the TP-shard dim × per-row dims. Sparse layer indexing
+            # under hetero PP — the staging slot holds only the
+            # transferred subset.
+            num_op_layers = len(op.mamba_layer_indices)
+            conv_shape = (num_op_layers, conv_span, d_conv)
+            ssm_shape = (num_op_layers, ssm_span, headdim, d_state)
             conv_nelems = 1
             for d in conv_shape:
                 conv_nelems *= d
@@ -983,6 +986,9 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         off the context to recover ``d_inner_total`` and ``nheads_total``
         (multiply by the shard's ``tp_size``). Whole-model dimensions
         like ``d_state`` and ``headdim`` come from the same context.
+        ``layer_type_list`` is propagated so the plan-builder can
+        compute per-PP-rank mamba ownership when src and dst use
+        different PP sizes.
         """
         from megatron.core.inference.engines.request_migration import MambaLayout
 
@@ -1002,6 +1008,7 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             d_conv=d_conv,
             headdim=headdim,
             d_state=d_state,
+            layer_type_list=tuple(getattr(ctx, "layer_type_list", ()) or ()),
         )
 
     # ---- Auto-disagg scheduler -----------------------------------------
@@ -1098,20 +1105,14 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             dst_layout, my_dst_head_offset = self._layout_and_head_offset(
                 dst_shard, self._my_engine, rank, participates=in_dst
             )
-            # Mamba state migration supports heterogeneous TP via the
-            # plan-builder in ``request_migration``. PP must still match
-            # because the per-request mamba state buffer indexes by
-            # global mamba layer (every PP rank has the full layer
-            # dim, only writes to its own); a hetero-PP migration
-            # would need to walk the layer_type_list to filter
-            # ownership-aware transfers, which v1 doesn't do.
+            # Mamba state migration supports heterogeneous TP and PP
+            # via :func:`build_mamba_migration_plan`. The plan walks
+            # ``layer_type_list`` to compute per-PP-rank mamba
+            # ownership and intersects between src and dst PP ranks,
+            # so hetero PP works as long as the model's transformer
+            # layers partition uniformly across PP (each PP rank
+            # owns a contiguous range; no custom split rank).
             if self._my_engine.context.is_hybrid_model:
-                assert src_layout.pp_size == dst_layout.pp_size, (
-                    f"hybrid migration requires matched PP between "
-                    f"shards (src={src_layout.pp_size}, "
-                    f"dst={dst_layout.pp_size}); hetero-PP is a "
-                    "future extension."
-                )
                 # Mamba layout — read off the local engine context.
                 # All ranks in a shard share the same layout (model is
                 # replicated within a shard's TP/PP block).
@@ -1382,10 +1383,13 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                         )
 
                 # Mamba state transfer — plan-driven. One op per
-                # (src_tp × dst_tp) overlap on the matched-PP diagonal.
-                # Each op carries a global ``conv_d_inner_range`` and
-                # ``ssm_nheads_range``; convert to local indices using
-                # the rank's TP offset within its shard.
+                # (src_pp × dst_pp × src_tp × dst_tp) overlap. Each
+                # op carries an explicit ``mamba_layer_indices``
+                # tuple (the buffer indices BOTH src_pp and dst_pp
+                # own) plus global ``conv_d_inner_range`` and
+                # ``ssm_nheads_range``; we convert to local indices
+                # using the rank's TP offset within its shard, and
+                # gather/scatter the layer dim via fancy indexing.
                 if is_hybrid and meta["in_src"]:
                     src_mamba_layout = meta["src_mamba_layout"]
                     my_src_tp_rank = (rank - src_root) % src_mamba_layout.tp_size
@@ -1404,8 +1408,15 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                         d_hi = op.conv_d_inner_range[1] - my_src_d_off
                         h_lo = op.ssm_nheads_range[0] - my_src_h_off
                         h_hi = op.ssm_nheads_range[1] - my_src_h_off
+                        layer_idx = torch.tensor(
+                            op.mamba_layer_indices,
+                            device=conv_states.device,
+                            dtype=torch.long,
+                        )
                         # Conv
-                        conv_send = conv_states[:, src_state_idx, d_lo:d_hi].contiguous()
+                        conv_send = conv_states[
+                            layer_idx, src_state_idx, d_lo:d_hi
+                        ].contiguous()
                         slot = _nv.staging_slot(entry["conv_slot"])
                         slot[: entry["conv_nbytes"]].view(entry["conv_dtype"]).reshape(
                             entry["conv_shape"]
@@ -1418,7 +1429,9 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                             stream=stream,
                         )
                         # SSM
-                        ssm_send = ssm_states[:, src_state_idx, h_lo:h_hi].contiguous()
+                        ssm_send = ssm_states[
+                            layer_idx, src_state_idx, h_lo:h_hi
+                        ].contiguous()
                         slot = _nv.staging_slot(entry["ssm_slot"])
                         slot[: entry["ssm_nbytes"]].view(entry["ssm_dtype"]).reshape(
                             entry["ssm_shape"]
@@ -1449,6 +1462,11 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                         d_hi = op.conv_d_inner_range[1] - my_dst_d_off
                         h_lo = op.ssm_nheads_range[0] - my_dst_h_off
                         h_hi = op.ssm_nheads_range[1] - my_dst_h_off
+                        layer_idx = torch.tensor(
+                            op.mamba_layer_indices,
+                            device=conv_states.device,
+                            dtype=torch.long,
+                        )
                         # Conv
                         _nv.wait_slot_signal(
                             entry["conv_flag"], expected_value=1, stream=stream
@@ -1459,7 +1477,7 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                             .view(entry["conv_dtype"])
                             .reshape(entry["conv_shape"])
                         )
-                        conv_states[:, dst_state_idx, d_lo:d_hi] = conv_recv
+                        conv_states[layer_idx, dst_state_idx, d_lo:d_hi] = conv_recv
                         # SSM
                         _nv.wait_slot_signal(
                             entry["ssm_flag"], expected_value=1, stream=stream
@@ -1470,7 +1488,7 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                             .view(entry["ssm_dtype"])
                             .reshape(entry["ssm_shape"])
                         )
-                        ssm_states[:, dst_state_idx, h_lo:h_hi] = ssm_recv
+                        ssm_states[layer_idx, dst_state_idx, h_lo:h_hi] = ssm_recv
 
                 # Mark the end of this migration on the stream so the
                 # tick poll can query a CUDA event.

@@ -335,9 +335,18 @@ class MambaLayout:
     d_conv: int
     headdim: int
     d_state: int
+    # Full model layer-type pattern (length = total transformer
+    # layer count). Required for hetero-PP migration because each
+    # PP rank only writes to mamba state buffer entries for the
+    # mamba layers in its transformer-layer window — with
+    # heterogeneous PP, src and dst own different mamba subsets and
+    # the plan must intersect them. Stored as a tuple of single-char
+    # symbols ('M', 'E', '*', etc. — see
+    # ``megatron.core.ssm.mamba_hybrid_layer_allocation.Symbols``).
+    layer_type_list: Tuple[str, ...] = ()
 
     def assert_divisible(self) -> None:
-        """TP divides both d_inner and nheads; PP divides layer count."""
+        """TP divides both d_inner and nheads."""
         assert self.d_inner_total % self.tp_size == 0, (
             f"d_inner_total={self.d_inner_total} must be divisible by "
             f"tp_size={self.tp_size}"
@@ -345,10 +354,6 @@ class MambaLayout:
         assert self.nheads_total % self.tp_size == 0, (
             f"nheads_total={self.nheads_total} must be divisible by "
             f"tp_size={self.tp_size}"
-        )
-        assert self.num_layers_total % self.pp_size == 0, (
-            f"num_layers_total={self.num_layers_total} must be divisible "
-            f"by pp_size={self.pp_size}"
         )
 
     @property
@@ -359,18 +364,62 @@ class MambaLayout:
     def nheads_per_tp(self) -> int:
         return self.nheads_total // self.tp_size
 
+    def mamba_indices_for_pp_rank(self, pp_rank: int) -> List[int]:
+        """Mamba-buffer indices that ``pp_rank`` of this shard owns.
+
+        Each PP rank owns a contiguous range of transformer layers
+        (uniform partition: ``[pp * L/pp_size, (pp+1) * L/pp_size)``);
+        among those, the mamba-typed ones populate the per-request
+        mamba state buffer at indices given by their position among
+        all mamba layers in the model (the mamba_layer_map). Returns
+        the buffer indices this PP rank's engine actually writes,
+        sorted ascending.
+
+        Empty ``layer_type_list`` falls back to a uniform
+        ``num_layers_total / pp_size`` slice for backward compat
+        with callers that don't propagate the layer pattern.
+        """
+        if not self.layer_type_list:
+            # Fallback: assume uniform partition of mamba layers
+            # across PP. Correct only when matched PP and mamba
+            # layers are uniformly distributed — same assumption
+            # the v1 (matched-PP-only) transport made.
+            per_pp = self.num_layers_total // self.pp_size
+            return list(range(pp_rank * per_pp, (pp_rank + 1) * per_pp))
+        n_total = len(self.layer_type_list)
+        per_pp = n_total // self.pp_size
+        lo = pp_rank * per_pp
+        hi = lo + per_pp
+        # Walk all mamba layers in document order; emit those whose
+        # global transformer index falls in this PP rank's window.
+        # Index in the buffer = position among mamba layers globally.
+        out: List[int] = []
+        mamba_count = 0
+        for g in range(n_total):
+            if self.layer_type_list[g] == "M":
+                if lo <= g < hi:
+                    out.append(mamba_count)
+                mamba_count += 1
+        return out
+
 
 @dataclass
 class MambaMigrationOp:
     """One conv+ssm tensor transfer in the Mamba migration plan.
 
     Represents "source rank ``src_rank`` sends its slice of the
-    layer ``layer_range`` mamba state — conv rows
+    mamba state at buffer indices ``mamba_layer_indices`` — conv rows
     ``conv_d_inner_range`` and ssm rows ``ssm_nheads_range`` — to dst
     rank ``dst_rank`` for request ``request_id``". A single op drives
     both conv and ssm transfers because the two share the same TP
     boundary; one (src, dst) rank pair always overlaps on both
     dimensions or neither.
+
+    ``mamba_layer_indices`` is the list of mamba-buffer indices that
+    BOTH the src PP rank and the dst PP rank own (the intersection
+    of their per-PP-rank mamba ownership). Under matched PP and
+    uniform mamba layer distribution, this collapses to a contiguous
+    slice; with heterogeneous PP it can be sparse.
     """
 
     src_rank: int
@@ -381,7 +430,7 @@ class MambaMigrationOp:
     # key budget. See ``MAX_OPS_PER_REQ`` in
     # ``megatron.rl.inference.multi_shard``.
     op_index_in_request: int
-    layer_range: Tuple[int, int]  # global layer indices, [start, end)
+    mamba_layer_indices: Tuple[int, ...]  # buffer indices along layer dim
     conv_d_inner_range: Tuple[int, int]  # conv d_inner indices, [start, end)
     ssm_nheads_range: Tuple[int, int]  # ssm nheads indices, [start, end)
 
@@ -396,42 +445,45 @@ def build_mamba_migration_plan(
     """Compute the conv + ssm transfers that move a request's mamba
     state from the source shard to the destination shard.
 
-    Heterogeneous-TP supported via the same
+    Heterogeneous TP **and** PP supported via the same
     intersection-of-overlapping-ranges pattern as
-    :func:`build_kv_migration_plan`. **PP must match** between the two
-    shards: the per-request mamba state buffer indexes by global
-    mamba layer (every PP rank holds the full layer dim, only writes
-    its own subset), so under matched PP each PP rank transfers its
-    slot's whole layer dimension to the matched dst PP rank — unused
-    entries on src equal unused entries on dst, so the transfer is
-    correct without ownership filtering. Hetero-PP would need to walk
-    the layer_type_list to filter; not implemented in v1.
+    :func:`build_kv_migration_plan`. The per-request mamba state
+    buffer indexes by *global* mamba layer (each PP rank writes only
+    to entries for the mamba layers it actually owns); under hetero
+    PP src and dst own different subsets, so for each
+    ``(src_pp, dst_pp)`` pair we intersect their mamba ownership and
+    emit ops carrying the resulting buffer indices via
+    ``MambaMigrationOp.mamba_layer_indices``. With matched PP and
+    uniform mamba distribution the intersection collapses to a
+    contiguous slice.
 
-    For each ``pp × (src_tp × dst_tp)`` triple, emit one op iff both
-    the conv ``d_inner`` ranges and the ssm ``nheads`` ranges overlap
-    on TP. The two TP-shard dims partition at the same boundaries
-    (same TP rank count), so an empty d_inner overlap implies an
-    empty nheads overlap and vice versa.
+    For each ``(src_pp × dst_pp × src_tp × dst_tp)`` quadruple, emit
+    one op iff:
+
+    - the mamba-buffer-index intersection between ``src_pp`` and
+      ``dst_pp`` is non-empty, **and**
+    - both the conv ``d_inner`` ranges and the ssm ``nheads`` ranges
+      overlap on TP. The two TP-shard dims partition at the same
+      boundaries (same TP rank count), so an empty d_inner overlap
+      implies an empty nheads overlap and vice versa.
 
     Args:
         bundle: Request envelope. Only ``request_id`` is read.
         src_layout / dst_layout: shard-level mamba layouts. Whole-model
-            invariants must match; PP sizes must match.
+            invariants must match; PP sizes may differ. Both sides must
+            populate ``layer_type_list`` for hetero-PP correctness;
+            empty ``layer_type_list`` falls back to uniform mamba
+            ownership per PP rank (legacy matched-PP behaviour).
         src_global_rank_of / dst_global_rank_of: ``(tp_rank, pp_rank)
             -> global_rank`` for each shard.
 
     Returns:
         Flat list of :class:`MambaMigrationOp`. Each op's
         ``op_index_in_request`` is its 0-based position in the
-        returned list. ``layer_range`` always spans the whole buffer
-        ``(0, num_layers_total)`` under v1's matched-PP constraint.
+        returned list.
     """
     src_layout.assert_divisible()
     dst_layout.assert_divisible()
-    assert src_layout.pp_size == dst_layout.pp_size, (
-        f"hybrid migration v1 requires matched PP "
-        f"(src={src_layout.pp_size}, dst={dst_layout.pp_size})"
-    )
     assert src_layout.num_layers_total == dst_layout.num_layers_total, (
         "num_layers_total must match across shards"
     )
@@ -446,49 +498,61 @@ def build_mamba_migration_plan(
     assert src_layout.d_conv == dst_layout.d_conv, "d_conv mismatch"
     assert src_layout.headdim == dst_layout.headdim, "headdim mismatch"
     assert src_layout.d_state == dst_layout.d_state, "d_state mismatch"
+    assert src_layout.layer_type_list == dst_layout.layer_type_list, (
+        "layer_type_list must match across shards (model invariant)"
+    )
 
-    pp_size = src_layout.pp_size
     src_d_inner = src_layout.d_inner_per_tp
     dst_d_inner = dst_layout.d_inner_per_tp
     src_nheads = src_layout.nheads_per_tp
     dst_nheads = dst_layout.nheads_per_tp
-    layer_range = (0, src_layout.num_layers_total)
+
+    # Pre-compute per-PP-rank mamba buffer ownership on each side.
+    src_pp_indices = [
+        src_layout.mamba_indices_for_pp_rank(p) for p in range(src_layout.pp_size)
+    ]
+    dst_pp_indices = [
+        dst_layout.mamba_indices_for_pp_rank(p) for p in range(dst_layout.pp_size)
+    ]
 
     ops: List[MambaMigrationOp] = []
     op_idx = 0
-    # Diagonal over PP under the matched-PP invariant: each src PP
-    # rank transfers to the dst PP rank at the same stage.
-    for pp in range(pp_size):
-        for sr in range(src_layout.tp_size):
-            src_d_lo = sr * src_d_inner
-            src_d_hi = src_d_lo + src_d_inner
-            src_h_lo = sr * src_nheads
-            src_h_hi = src_h_lo + src_nheads
-            for dr in range(dst_layout.tp_size):
-                dst_d_lo = dr * dst_d_inner
-                dst_d_hi = dst_d_lo + dst_d_inner
-                dst_h_lo = dr * dst_nheads
-                dst_h_hi = dst_h_lo + dst_nheads
-                d_lo = max(src_d_lo, dst_d_lo)
-                d_hi = min(src_d_hi, dst_d_hi)
-                h_lo = max(src_h_lo, dst_h_lo)
-                h_hi = min(src_h_hi, dst_h_hi)
-                # Both dims share the TP rank, so empty overlap on
-                # one implies empty on the other.
-                if d_lo >= d_hi:
-                    continue
-                ops.append(
-                    MambaMigrationOp(
-                        src_rank=src_global_rank_of(sr, pp),
-                        dst_rank=dst_global_rank_of(dr, pp),
-                        request_id=bundle.request_id,
-                        op_index_in_request=op_idx,
-                        layer_range=layer_range,
-                        conv_d_inner_range=(d_lo, d_hi),
-                        ssm_nheads_range=(h_lo, h_hi),
+    for src_pp in range(src_layout.pp_size):
+        src_set = set(src_pp_indices[src_pp])
+        for dst_pp in range(dst_layout.pp_size):
+            dst_set = set(dst_pp_indices[dst_pp])
+            overlap = sorted(src_set & dst_set)
+            if not overlap:
+                continue
+            overlap_t = tuple(overlap)
+            for sr in range(src_layout.tp_size):
+                src_d_lo = sr * src_d_inner
+                src_d_hi = src_d_lo + src_d_inner
+                src_h_lo = sr * src_nheads
+                src_h_hi = src_h_lo + src_nheads
+                for dr in range(dst_layout.tp_size):
+                    dst_d_lo = dr * dst_d_inner
+                    dst_d_hi = dst_d_lo + dst_d_inner
+                    dst_h_lo = dr * dst_nheads
+                    dst_h_hi = dst_h_lo + dst_nheads
+                    d_lo = max(src_d_lo, dst_d_lo)
+                    d_hi = min(src_d_hi, dst_d_hi)
+                    h_lo = max(src_h_lo, dst_h_lo)
+                    h_hi = min(src_h_hi, dst_h_hi)
+                    if d_lo >= d_hi:
+                        continue
+                    ops.append(
+                        MambaMigrationOp(
+                            src_rank=src_global_rank_of(sr, src_pp),
+                            dst_rank=dst_global_rank_of(dr, dst_pp),
+                            request_id=bundle.request_id,
+                            op_index_in_request=op_idx,
+                            mamba_layer_indices=overlap_t,
+                            conv_d_inner_range=(d_lo, d_hi),
+                            ssm_nheads_range=(h_lo, h_hi),
+                        )
                     )
-                )
-                op_idx += 1
+                    op_idx += 1
     return ops
 
 

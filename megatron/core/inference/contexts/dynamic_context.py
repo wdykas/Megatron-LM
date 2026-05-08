@@ -342,12 +342,20 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.num_attention_layers = len(attention_layer_map)
             self.num_mamba_layers = len(mamba_layer_map)
             self.layer_map = attention_layer_map | mamba_layer_map
+            # Retain the full layer-type pattern so cross-shard mamba
+            # migration can compute per-PP-rank mamba ownership when
+            # the src and dst shards use different PP sizes (each PP
+            # rank only writes to mamba state buffer entries for the
+            # mamba layers it owns; with hetero PP, src and dst own
+            # different subsets and the transport must intersect).
+            self.layer_type_list = tuple(mamba_inference_state_config.layer_type_list)
         else:
             # The layer map is the identity function for pure Transformer models.
             self.num_attention_layers = model_config.num_layers // pp_size
             self.num_mamba_layers = 0
             (self.mamba_conv_states_shape, self.mamba_ssm_states_shape) = (None, None)
             self.layer_map = {i: i for i in range(self.num_attention_layers)}
+            self.layer_type_list = ()
 
         if self.num_attention_layers == 0:
             raise NotImplementedError(
