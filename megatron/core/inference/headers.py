@@ -69,6 +69,7 @@ class Headers(Enum):
     # and the decider retries on a later tick, when dst has freed
     # slots. Payload: ``[MIGRATE_BATCH_ACK, batch_id, accepted]``.
     MIGRATE_BATCH_ACK = auto()
+    TP_BROADCAST = auto()
 
 
 class UnknownHeaderError(Exception):
