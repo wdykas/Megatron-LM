@@ -15,6 +15,7 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
+from megatron.core.inference.disagg_forward import should_stop_layer_loop
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
@@ -368,6 +369,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             ]
         )
 
+        # Active disagg dispatcher for the current forward, or None
+        # for collocated paths. See HybridStack for the matching API.
+        self._active_dispatcher = None
+
         # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
         # self.post_process and self.post_layer_norm guide this behavior
@@ -435,6 +440,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 skip_qkv_norm_and_all_gather=(i > 0),
                 fc2_next_layer_norm_weights=next_qkv_norm_weights,
             )
+
+    def set_active_dispatcher(self, dispatcher) -> None:
+        """Set (or clear with ``None``) the active disagg dispatcher
+        for the upcoming forward. Engine-only API."""
+        self._active_dispatcher = dispatcher
 
     def _get_layer(self, layer_number: int):
         return self.layers[layer_number]
@@ -802,8 +812,31 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     # No intermediate_hidden_states requested: just hidden_states
                     hidden_states = checkpointed_result
             else:
+                # Disagg routing: engine pushed the active dispatcher
+                # into the block before forward (or left it None).
+                dispatcher = self._active_dispatcher
+
+                def _run_layer_local(layer, h):
+                    # Cross-attention context isn't supported in the
+                    # disagg primary path.
+                    h_out, _ = layer(
+                        hidden_states=h,
+                        attention_mask=attention_mask,
+                        context=context,
+                        context_mask=context_mask,
+                        rotary_pos_emb=rotary_pos_emb,
+                        rotary_pos_cos=rotary_pos_cos,
+                        rotary_pos_sin=rotary_pos_sin,
+                        rotary_pos_cos_sin=rotary_pos_cos_sin,
+                        attention_bias=attention_bias,
+                        inference_context=inference_context,
+                        packed_seq_params=packed_seq_params,
+                        sequence_len_offset=sequence_len_offset,
+                        padding_mask=padding_mask,
+                    )
+                    return h_out
+
                 for l_no, layer in enumerate(self.layers):
-                    # Get appropriate inner quantization context
                     if use_inner_quantization_context:
                         if self.config.fp8:
                             inner_quantization_context = get_fp8_context(
@@ -819,21 +852,30 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         inner_quantization_context = nullcontext()
 
                     with self.offload_context, inner_quantization_context:
-                        hidden_states, context = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=attention_mask,
-                            context=context,
-                            context_mask=context_mask,
-                            rotary_pos_emb=rotary_pos_emb,
-                            rotary_pos_cos=rotary_pos_cos,
-                            rotary_pos_sin=rotary_pos_sin,
-                            rotary_pos_cos_sin=rotary_pos_cos_sin,
-                            attention_bias=attention_bias,
-                            inference_context=inference_context,
-                            packed_seq_params=packed_seq_params,
-                            sequence_len_offset=sequence_len_offset,
-                            padding_mask=padding_mask,
-                        )
+                        if dispatcher is not None:
+                            hidden_states, action = dispatcher.dispatch_layer(
+                                l_no,
+                                hidden_states,
+                                lambda h, _layer=layer: _run_layer_local(_layer, h),
+                            )
+                            if should_stop_layer_loop(action):
+                                break
+                        else:
+                            hidden_states, context = layer(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                context=context,
+                                context_mask=context_mask,
+                                rotary_pos_emb=rotary_pos_emb,
+                                rotary_pos_cos=rotary_pos_cos,
+                                rotary_pos_sin=rotary_pos_sin,
+                                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                                attention_bias=attention_bias,
+                                inference_context=inference_context,
+                                packed_seq_params=packed_seq_params,
+                                sequence_len_offset=sequence_len_offset,
+                                padding_mask=padding_mask,
+                            )
 
                     if (
                         torch.is_grad_enabled()
@@ -842,7 +884,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     ):
                         hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
 
-                    # Extract intermediate embeddings using global layer index
                     if (l_no + layer_offset) in extract_layer_indices:
                         intermediate_hidden_states.append(hidden_states)
 

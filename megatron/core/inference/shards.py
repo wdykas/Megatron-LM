@@ -24,7 +24,7 @@ explicitly.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch.distributed as dist
 
@@ -192,7 +192,7 @@ class InferenceShard:
     Attributes:
         index: Position of this shard in the shards list.
         spec: Parsed spec dict with keys ``tp``, ``pp``, ``ep``, ``expt_tp``,
-            ``dp``.
+            ``dp``, and optionally ``kinds`` (tuple of layer-kind symbols).
         rank_offset: First global rank belonging to this shard.
         world_size: Number of ranks in this shard (tp*pp*dp).
         pg_collection: The shard's ProcessGroupCollection if the current rank
@@ -202,6 +202,16 @@ class InferenceShard:
             usable handle.
         http_url: HTTP base URL of the shard's text-generation server;
             populated by a serving-layer consumer.
+        kinds: Layer-kind symbols this shard owns (from
+            :class:`megatron.core.models.hybrid.hybrid_layer_allocation.Symbols`).
+            ``None`` means this shard runs every kind in its PP rank's layer
+            range (collocated / hetero-PP back-compat). When set, this shard
+            participates in layer-kind disaggregation; see
+            :doc:`megatron/core/inference/DISAGG_DESIGN.md`.
+        layer_indices: Global layer indices this shard owns. Computed at
+            layout-build time from ``kinds`` × ``layer_type_list``. Sparse /
+            non-contiguous in general. ``None`` when ``kinds`` is ``None``
+            (the shard owns whatever its PP rank covers).
     """
 
     index: int
@@ -210,6 +220,8 @@ class InferenceShard:
     world_size: int
     pg_collection: Optional[ProcessGroupCollection]
     http_url: Optional[str] = None
+    kinds: Optional[Tuple[str, ...]] = None
+    layer_indices: Optional[Tuple[int, ...]] = None
 
     def ranks(self) -> List[int]:
         """Global ranks that are members of this shard."""
@@ -221,11 +233,25 @@ class InferenceShard:
             rank = dist.get_rank()
         return self.rank_offset <= rank < self.rank_offset + self.world_size
 
+    def owns_layer(self, layer_idx: int) -> bool:
+        """Whether this shard runs the block at the given global layer index.
+
+        Returns ``True`` for shards without an explicit kinds restriction
+        (collocated / hetero-PP shards run every kind their PP rank covers,
+        and PP-rank ownership is enforced separately by the model's
+        layer_type_list partition). For disagg shards (``kinds`` is set),
+        returns whether ``layer_idx`` is in :attr:`layer_indices`.
+        """
+        if self.layer_indices is None:
+            return True
+        return layer_idx in self.layer_indices
+
 
 def build_inference_pg_collections_for_shards(
     total_world_size: int,
     shards: List[dict],
     use_tp_pp_dp_mapping: bool = False,
+    layer_type_list: Optional[Tuple[str, ...]] = None,
 ) -> List[InferenceShard]:
     """Build one ProcessGroupCollection per heterogeneous inference shard.
 
@@ -241,13 +267,26 @@ def build_inference_pg_collections_for_shards(
     Args:
         total_world_size: Full world size across training + all inference
             shards.
-        shards: Parsed shard specs (each a dict with tp/pp/ep/expt_tp/dp keys).
+        shards: Parsed shard specs (each a dict with tp/pp/ep/expt_tp/dp keys;
+            optionally a ``kinds`` tuple for layer-kind disaggregation).
         use_tp_pp_dp_mapping: Passed through to ``build_inference_pg_collection``.
+        layer_type_list: Per-block kind symbols for the model. Required when
+            any shard spec carries a ``kinds`` key (used to compute that
+            shard's :attr:`InferenceShard.layer_indices`); ignored when no
+            shard declares disagg.
 
     Returns:
         List of :class:`InferenceShard`, one per input spec.
     """
     rank = dist.get_rank()
+    has_kinds = any("kinds" in s for s in shards)
+    if has_kinds and layer_type_list is None:
+        raise AssertionError(
+            "At least one shard spec declares 'kinds=' for layer-kind "
+            "disaggregation, but layer_type_list was not provided to "
+            "build_inference_pg_collections_for_shards. Pass the "
+            "model's layer_type_list so layer_indices can be computed."
+        )
     results: List[InferenceShard] = []
     offset = 0
     for i, spec in enumerate(shards):
@@ -269,6 +308,16 @@ def build_inference_pg_collections_for_shards(
             rank_offset=offset,
         )
         in_shard = offset <= rank < offset + shard_world
+        kinds_field: Optional[Tuple[str, ...]] = None
+        layer_indices: Optional[Tuple[int, ...]] = None
+        if "kinds" in spec:
+            from megatron.rl.inference.shards_spec import compute_layer_indices_for_kinds
+
+            kinds_field = tuple(spec["kinds"])
+            assert layer_type_list is not None  # guarded above
+            layer_indices = compute_layer_indices_for_kinds(
+                kinds_field, layer_type_list
+            )
         results.append(
             InferenceShard(
                 index=i,
@@ -276,6 +325,8 @@ def build_inference_pg_collections_for_shards(
                 rank_offset=offset,
                 world_size=shard_world,
                 pg_collection=pgc if in_shard else None,
+                kinds=kinds_field,
+                layer_indices=layer_indices,
             )
         )
         offset += shard_world

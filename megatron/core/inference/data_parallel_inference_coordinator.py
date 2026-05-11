@@ -936,6 +936,51 @@ class DataParallelInferenceCoordinator:
                     for data_parallel_rank_id in [*src_targets, dst_target]:
                         self._send_to_engine(data_parallel_rank_id, serialized_payload)
 
+            elif header == Headers.ROUTE_REQUEST:
+                # Layer-kind disagg: ship a per-request route plan to
+                # every shard the request will visit. Payload:
+                # [ROUTE_REQUEST, request_id, route_hops, bundle_dict,
+                #  exit_shard_idx]. Unlike MIGRATE_BATCH there's no
+                # two-phase commit — disagg shards are forced
+                # participants in the request's forward pass, so the
+                # coord just fans out and tracks the request's
+                # multi-shard ownership for ENGINE_REPLY dispatch.
+                if sender_identity not in known_clients:
+                    logging.warning(
+                        "Coordinator: ignoring ROUTE_REQUEST from unknown client."
+                    )
+                    continue
+                (
+                    _,
+                    route_request_id,
+                    route_hops,
+                    _bundle_dict,
+                    exit_shard_idx,
+                ) = deserialized_payload
+                # Determine participating shards from the hops (de-duped).
+                participating_shards = {h[0] for h in route_hops}
+                # Fan out to every engine in every participating shard.
+                # Reuse the same serialized payload — engines decode
+                # the route themselves, picking out their own hops.
+                for shard_idx in sorted(participating_shards):
+                    for ident in self._identities_for_shard(shard_idx):
+                        self._send_to_engine(ident, serialized_payload)
+                # Track the exit shard for this request so subsequent
+                # ENGINE_REPLY traffic routes back to the right client.
+                # Reuse the existing ``_pending_counts`` mechanism on
+                # the entry shard for capacity accounting; non-entry
+                # shards are forced participants without a per-request
+                # quota.
+                entry_shard_idx = route_hops[0][0] if route_hops else exit_shard_idx
+                logging.debug(
+                    "Coordinator: ROUTE_REQUEST request_id=%d entry=%d exit=%d "
+                    "shards=%s",
+                    route_request_id,
+                    entry_shard_idx,
+                    exit_shard_idx,
+                    sorted(participating_shards),
+                )
+
             elif header in (
                 Headers.UPDATE_REQUEST_RANK,
                 Headers.UPDATE_REQUEST_RANKS_BATCH,

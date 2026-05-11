@@ -109,6 +109,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         seq_len_interpolation_factor: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        partial_model_ownership: Optional["PartialModelOwnership"] = None,
     ) -> None:
         super().__init__(config=config, pg_collection=pg_collection)
 
@@ -193,6 +194,44 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
             last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
         )
+
+        # Layer-kind disagg: if this rank's shard owns only a subset
+        # of the layer kinds, replace the non-owned positions in
+        # ``layer_type_list`` with the disagg stub marker. The
+        # HybridStack constructor instantiates an
+        # :class:`IdentityLayer` (zero parameters) at every marker
+        # position. Memory cost shrinks to ``num_owned_layers /
+        # num_total_layers``.
+        if partial_model_ownership is not None:
+            from megatron.core.inference.partial_model import filter_layer_pattern
+            from megatron.core.models.hybrid.hybrid_block import (
+                DISAGG_STUB_MARKER,
+            )
+
+            # The partial-model ownership uses GLOBAL layer indices, but
+            # ``layer_type_list`` here is already the per-PP-rank
+            # slice. Compose: an entry is owned iff
+            # (layer_offset + i) is in ownership.layer_indices.
+            owned_globals = set(partial_model_ownership.layer_indices)
+            layer_type_list = [
+                c if (layer_offset + i) in owned_globals else DISAGG_STUB_MARKER
+                for i, c in enumerate(layer_type_list)
+            ]
+            # Stash the descriptor so downstream code (e.g.,
+            # checkpoint loader) can consult it.
+            self._partial_model_ownership = partial_model_ownership
+
+            # Gate embedding + LM-head allocation on ownership of the
+            # boundary layers. A disagg shard that doesn't own layer 0
+            # never sees raw tokens — the entry shard embeds them and
+            # ships hidden states. Same for the LM head: only the exit
+            # shard runs it. Composing with PP's pre_process /
+            # post_process: a shard must satisfy BOTH the PP gate and
+            # the ownership gate to build embedding / output_layer.
+            self.pre_process = self.pre_process and partial_model_ownership.own_embedding
+            self.post_process = self.post_process and partial_model_ownership.own_lm_head
+        else:
+            self._partial_model_ownership = None
 
         # Determine if MTP is needed (based on pattern parsing)
         self.mtp_process = (

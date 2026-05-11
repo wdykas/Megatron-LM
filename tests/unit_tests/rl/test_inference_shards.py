@@ -101,6 +101,179 @@ def test_parse_rl_inference_shards_string():
         parse_inference_shards_spec("tp=2,nope=1", world_size=2)
 
 
+# ---- Layer-kind disaggregation (non-distributed) ----------------------------
+
+
+def test_parse_kinds_basic():
+    """``kinds=`` is parsed into a deduplicated tuple of single-char symbols."""
+    from megatron.rl.inference.shards_spec import parse_inference_shards_spec
+
+    # Three disagg shards: mamba / attention-and-MLP / experts.
+    parsed = parse_inference_shards_spec(
+        "tp=4,kinds=M+tp=4,kinds=*D-+tp=4,kinds=E", world_size=12
+    )
+    assert len(parsed) == 3
+    assert parsed[0]["kinds"] == ("M",)
+    assert parsed[1]["kinds"] == ("*", "D", "-")
+    assert parsed[2]["kinds"] == ("E",)
+    # Other keys still default normally.
+    assert parsed[0]["tp"] == 4 and parsed[0]["dp"] == 1
+
+
+def test_parse_kinds_dedup_and_whitespace():
+    """Repeated symbols are deduplicated (order preserved); whitespace ignored."""
+    from megatron.rl.inference.shards_spec import parse_inference_shards_spec
+
+    parsed = parse_inference_shards_spec("tp=1,kinds=*D *", world_size=1)
+    # ``*D *`` -> ``*`` then ``D`` then dedup of repeat ``*`` and skip space
+    assert parsed[0]["kinds"] == ("*", "D")
+
+
+def test_parse_kinds_rejects_unknown_symbol():
+    from megatron.rl.inference.shards_spec import parse_inference_shards_spec
+
+    with pytest.raises(AssertionError, match="Unknown kind symbol"):
+        parse_inference_shards_spec("tp=1,kinds=Z", world_size=1)
+
+
+def test_parse_kinds_rejects_empty():
+    from megatron.rl.inference.shards_spec import parse_inference_shards_spec
+
+    with pytest.raises(AssertionError, match="kinds= cannot be empty"):
+        parse_inference_shards_spec("tp=1,kinds=", world_size=1)
+
+
+def test_parse_kinds_symbol_set_matches_megatron_symbols():
+    """The inline VALID_KIND_SYMBOLS list must stay in sync with the
+    canonical Symbols.VALID_LAYERS to avoid silent skew if hybrid layer
+    allocation grows a new symbol."""
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+    from megatron.rl.inference.shards_spec import VALID_KIND_SYMBOLS
+
+    assert set(VALID_KIND_SYMBOLS) == set(Symbols.VALID_LAYERS), (
+        f"Drift detected: shards_spec accepts {set(VALID_KIND_SYMBOLS)} "
+        f"but Symbols.VALID_LAYERS = {set(Symbols.VALID_LAYERS)}. Update "
+        "VALID_KIND_SYMBOLS or extend Symbols accordingly."
+    )
+
+
+def test_assert_kinds_partition_layers_clean():
+    """Every block is owned by exactly one shard."""
+    from megatron.rl.inference.shards_spec import (
+        assert_kinds_partition_layers,
+        parse_inference_shards_spec,
+    )
+
+    specs = parse_inference_shards_spec(
+        "tp=2,kinds=M+tp=2,kinds=*+tp=2,kinds=E", world_size=6
+    )
+    layer_types = ("M", "*", "E", "M", "*", "E")
+    # Should not raise.
+    assert_kinds_partition_layers(specs, layer_types)
+
+
+def test_assert_kinds_partition_layers_uncovered_block():
+    from megatron.rl.inference.shards_spec import (
+        assert_kinds_partition_layers,
+        parse_inference_shards_spec,
+    )
+
+    specs = parse_inference_shards_spec("tp=2,kinds=M+tp=2,kinds=*", world_size=4)
+    # Has an "E" block that no shard claims.
+    layer_types = ("M", "*", "E", "M")
+    with pytest.raises(AssertionError, match="have no owning shard"):
+        assert_kinds_partition_layers(specs, layer_types)
+
+
+def test_assert_kinds_partition_layers_double_claim():
+    from megatron.rl.inference.shards_spec import (
+        assert_kinds_partition_layers,
+        parse_inference_shards_spec,
+    )
+
+    # Two shards both claim "M" — overlapping ownership.
+    specs = parse_inference_shards_spec("tp=2,kinds=M+tp=2,kinds=M*", world_size=4)
+    layer_types = ("M", "*", "M")
+    with pytest.raises(AssertionError, match="claimed by both"):
+        assert_kinds_partition_layers(specs, layer_types)
+
+
+def test_assert_kinds_partition_layers_mixed_layout_rejected():
+    """Mixed layouts (some shards with kinds=, others without) are not
+    supported in v1: the kinds-less shard would silently cover blocks the
+    kinds-restricted shard expected to migrate to."""
+    from megatron.rl.inference.shards_spec import (
+        assert_kinds_partition_layers,
+        parse_inference_shards_spec,
+    )
+
+    specs = parse_inference_shards_spec("tp=2,kinds=M+tp=2", world_size=4)
+    layer_types = ("M", "*", "M", "*")
+    with pytest.raises(AssertionError, match="Mixed layouts"):
+        assert_kinds_partition_layers(specs, layer_types)
+
+
+def test_assert_kinds_partition_layers_noop_without_kinds():
+    """Layouts where no shard declares kinds= are unaffected (validator
+    is a no-op for back-compat layouts)."""
+    from megatron.rl.inference.shards_spec import (
+        assert_kinds_partition_layers,
+        parse_inference_shards_spec,
+    )
+
+    specs = parse_inference_shards_spec("tp=2+tp=2", world_size=4)
+    # layer_type_list doesn't matter when no shard declares kinds=.
+    assert_kinds_partition_layers(specs, ("*", "M", "*", "E"))
+
+
+def test_compute_layer_indices_for_kinds():
+    """Per-shard layer-index computation from kinds × layer_type_list."""
+    from megatron.rl.inference.shards_spec import compute_layer_indices_for_kinds
+
+    layer_types = ("M", "*", "M", "E", "*", "M", "E", "-")
+    # Mamba shard owns indices [0, 2, 5]
+    assert compute_layer_indices_for_kinds(("M",), layer_types) == (0, 2, 5)
+    # Attention+MLP shard owns [1, 4, 7]
+    assert compute_layer_indices_for_kinds(("*", "-"), layer_types) == (1, 4, 7)
+    # MoE shard owns [3, 6]
+    assert compute_layer_indices_for_kinds(("E",), layer_types) == (3, 6)
+    # Kind not present in pattern -> empty.
+    assert compute_layer_indices_for_kinds(("G",), layer_types) == ()
+
+
+def test_inference_shard_owns_layer_kind_restricted():
+    """``InferenceShard.owns_layer`` consults layer_indices when kinds are set,
+    and is open by default otherwise."""
+    from megatron.core.inference.shards import InferenceShard
+
+    # No kinds declared: every layer counted as owned (back-compat).
+    s = InferenceShard(
+        index=0,
+        spec={"tp": 2, "pp": 1, "ep": 1, "expt_tp": 2, "dp": 1},
+        rank_offset=0,
+        world_size=2,
+        pg_collection=None,
+    )
+    assert s.owns_layer(0)
+    assert s.owns_layer(99)
+
+    # Disagg shard: only specific indices owned.
+    s2 = InferenceShard(
+        index=1,
+        spec={"tp": 2, "pp": 1, "ep": 1, "expt_tp": 2, "dp": 1, "kinds": ("M",)},
+        rank_offset=2,
+        world_size=2,
+        pg_collection=None,
+        kinds=("M",),
+        layer_indices=(0, 2, 5),
+    )
+    assert s2.owns_layer(0)
+    assert s2.owns_layer(2)
+    assert s2.owns_layer(5)
+    assert not s2.owns_layer(1)
+    assert not s2.owns_layer(99)
+
+
 @pytest.mark.skipif(
     torch.cuda.device_count() < 4, reason="need >=4 GPUs for heterogeneous shard test"
 )

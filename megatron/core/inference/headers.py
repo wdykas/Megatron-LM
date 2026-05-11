@@ -69,6 +69,18 @@ class Headers(Enum):
     # and the decider retries on a later tick, when dst has freed
     # slots. Payload: ``[MIGRATE_BATCH_ACK, batch_id, accepted]``.
     MIGRATE_BATCH_ACK = auto()
+    # Coord → all participating shards' engines: ship a per-request
+    # route plan for layer-kind-disaggregated forward passes. The
+    # request's forward pass visits multiple shards; this header pre-
+    # registers the route on every shard so the engine knows which
+    # layers it owns for this request and which inter-shard activation
+    # hops to expect. See megatron/core/inference/DISAGG_DESIGN.md.
+    # Wire payload:
+    #   [ROUTE_REQUEST, request_id, route_hops, bundle, exit_shard_idx].
+    # ``route_hops`` is a serialized list of (shard_idx, layer_indices,
+    # src_shard) triples — the wire form of
+    # :class:`megatron.rl.inference.route_planner.RouteHop`.
+    ROUTE_REQUEST = auto()
     TP_BROADCAST = auto()
 
 

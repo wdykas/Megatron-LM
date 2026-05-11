@@ -1162,6 +1162,81 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         ) is None:
             self._my_engine.set_migration_handler(self._on_migrate_batch_signal)
 
+        # Layer-kind disaggregation: register the route handler if it
+        # hasn't been bound yet. The handler builds a
+        # :class:`RouteDispatcher` for each ROUTE_REQUEST and registers
+        # it on the engine so the model.forward can consult it
+        # per-layer. Mirrors the migration-handler pattern above —
+        # one-shot wiring at first call.
+        if self._my_engine is not None and getattr(
+            self._my_engine, '_route_handler', None
+        ) is None and hasattr(self._my_engine, 'set_route_handler'):
+            self._my_engine.set_route_handler(self._on_route_request_signal)
+
+    def _on_route_request_signal(self, request_id: int, route) -> None:
+        """Engine-side ROUTE_REQUEST handler.
+
+        Builds a :class:`RouteDispatcher` for the (request_id, route)
+        pair and registers it on the engine so the model's forward
+        pass can consult it at each layer. Also attaches the engine
+        to the model's :class:`HybridStack` so it has a reference
+        to look up dispatchers.
+
+        Called by :meth:`DynamicInferenceEngine.async_step` when a
+        ``Headers.ROUTE_REQUEST`` arrives from the coordinator.
+        """
+        from megatron.core.inference.route_dispatcher import RouteDispatcher
+
+        if self._my_engine is None or self._my_shard_index is None:
+            # Not a participating engine; nothing to do. (The coord
+            # shouldn't fan to non-participating ranks but be defensive.)
+            return
+        if not route.visits(self._my_shard_index):
+            # This shard isn't on this request's route — skip.
+            return
+
+        # Hidden-state shape + dtype come from the model's config. For
+        # disagg, every shard agrees on the hidden dim (per the
+        # ownership invariant); batch is the engine's per-step max.
+        cfg = self._my_engine.controller.inference_wrapped_model.model.config
+        # Use a generous upper bound on batch size; the dispatcher's
+        # nbytes is computed from this and used to size the
+        # NVSHMEM put.
+        max_batch = getattr(self._my_engine, "max_requests", 64)
+        hidden_dim = int(cfg.hidden_size)
+        hidden_dtype = getattr(cfg, "params_dtype", None) or getattr(
+            cfg, "pipeline_dtype", None
+        )
+        if hidden_dtype is None:
+            import torch as _torch
+            hidden_dtype = _torch.bfloat16
+
+        # Map shard_idx → NVSHMEM PE. PE id equals global rank in
+        # NVSHMEM's standard init. For matched-TP layouts (the common
+        # disagg case) we pair the same tp_offset across shards: my
+        # tp_offset within my shard maps to the same tp_offset on
+        # every peer shard. Hetero-TP between disagg shards would
+        # need a more elaborate routing table — deferred.
+        import torch.distributed as _dist
+
+        my_shard = self._shards[self._my_shard_index]
+        global_rank = _dist.get_rank() if _dist.is_initialized() else 0
+        tp_offset = global_rank - my_shard.rank_offset
+
+        def shard_to_pe(shard_idx: int) -> int:
+            target_shard = self._shards[shard_idx]
+            return target_shard.rank_offset + tp_offset
+
+        dispatcher = RouteDispatcher(
+            route=route,
+            my_shard_idx=self._my_shard_index,
+            my_pe=global_rank,
+            shard_to_pe=shard_to_pe,
+            hidden_shape=(max_batch, hidden_dim),
+            hidden_dtype=hidden_dtype,
+        )
+        self._my_engine.register_route_dispatcher(request_id, dispatcher)
+
     def _on_migrate_batch_signal(
         self,
         request_ids: List[int],

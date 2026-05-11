@@ -19,6 +19,11 @@ from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.disagg_forward import (
+    maybe_dispatch_layer,
+    should_stop_layer_loop,
+)
+from megatron.core.inference.partial_model import IdentityLayer, STUB_MARKER as DISAGG_STUB_MARKER
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -92,6 +97,13 @@ class HybridStack(MegatronModule):
         self.post_process = post_process
         self.is_mtp_layer = is_mtp_layer
 
+        # Active disagg dispatcher for the request currently being
+        # forwarded. ``None`` on collocated paths. The engine sets
+        # this directly via ``set_active_dispatcher`` before each
+        # forward when one disagg request is in flight; the forward
+        # loop consults it once and uses it for every layer.
+        self._active_dispatcher = None
+
         assert pg_collection is not None, "pg_collection must be provided for HybridStack"
 
         self.pp_group = pg_collection.pp
@@ -118,7 +130,11 @@ class HybridStack(MegatronModule):
             else:
                 quant_init_context = nullcontext()
             with quant_init_context:
-                if layer_type == LayerSymbols.MAMBA:
+                if layer_type == DISAGG_STUB_MARKER:
+                    # Zero-parameter placeholder for a position owned
+                    # by another shard; keeps ModuleList indexing dense.
+                    layer = IdentityLayer()
+                elif layer_type == LayerSymbols.MAMBA:
                     layer = build_module(
                         submodules.mamba_layer,
                         config=self.config,
@@ -195,6 +211,14 @@ class HybridStack(MegatronModule):
         used by internal code to bypass the input provided by the
         forward_step_func"""
         self.input_tensor = input_tensor
+
+    def set_active_dispatcher(self, dispatcher) -> None:
+        """Set (or clear with ``None``) the :class:`RouteDispatcher`
+        the forward loop consults for the upcoming forward pass. The
+        engine looks up the right dispatcher for the active disagg
+        request and pushes it in; ``None`` restores collocated behavior.
+        See ``megatron/core/inference/DISAGG_DESIGN.md``."""
+        self._active_dispatcher = dispatcher
 
     def mamba_state_shapes_per_request(self) -> Optional[Tuple[Tuple[int], Tuple[int]]]:
         """
@@ -298,32 +322,50 @@ class HybridStack(MegatronModule):
             def get_inner_quant_context(config, layer_number):
                 return nullcontext()
 
-        with outer_fp8_context:
-            for layer in self.layers:
-                # Layers have 1-indexed layer numbers attribute.
-                inner_quant_context = get_inner_quant_context(self.config, layer.layer_number - 1)
-                with inner_quant_context:
-                    if isinstance(layer, TransformerLayer):
-                        hidden_states, _ = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=attention_mask,
-                            inference_context=inference_context,
-                            rotary_pos_emb=rotary_pos_emb,
-                            sequence_len_offset=sequence_len_offset,
-                            packed_seq_params=packed_seq_params,
-                            padding_mask=padding_mask,
-                        )
-                    else:  # MambaLayer, Expert, or MLP
-                        hidden_states = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=attention_mask,
-                            inference_context=inference_context,
-                            packed_seq_params=packed_seq_params,
-                        )
+        # Disagg routing: the engine pushed the active dispatcher
+        # into this stack before forward (or left it None for
+        # collocated paths).
+        dispatcher = self._active_dispatcher
 
-                # The attention layer (currently a simplified transformer layer)
-                # outputs a tuple of (hidden_states, context). Context is intended
-                # for cross-attention, and is not needed in our model.
+        def _run_layer_local(layer, h):
+            if isinstance(layer, TransformerLayer):
+                out, _ = layer(
+                    hidden_states=h,
+                    attention_mask=attention_mask,
+                    inference_context=inference_context,
+                    rotary_pos_emb=rotary_pos_emb,
+                    sequence_len_offset=sequence_len_offset,
+                    packed_seq_params=packed_seq_params,
+                    padding_mask=padding_mask,
+                )
+                return out
+            return layer(
+                hidden_states=h,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+            )
+
+        with outer_fp8_context:
+            for layer_idx, layer in enumerate(self.layers):
+                inner_quant_context = get_inner_quant_context(
+                    self.config, layer.layer_number - 1
+                    if hasattr(layer, "layer_number") else layer_idx
+                )
+                with inner_quant_context:
+                    if dispatcher is not None:
+                        hidden_states, action = dispatcher.dispatch_layer(
+                            layer_idx,
+                            hidden_states,
+                            lambda h, _layer=layer: _run_layer_local(_layer, h),
+                        )
+                        if should_stop_layer_loop(action):
+                            break
+                    else:
+                        hidden_states = _run_layer_local(layer, hidden_states)
+
+                # Attention layers return (hidden_states, context); we
+                # discard context (no cross-attention in this model).
                 if isinstance(hidden_states, tuple):
                     hidden_states = hidden_states[0]
 
@@ -365,6 +407,19 @@ class HybridStack(MegatronModule):
         layer_prefix = f'{prefix}layers.'
 
         for local_layer_idx, layer in enumerate(self.layers):
+            # Disagg stub: zero-parameter placeholder for a layer this
+            # shard doesn't own. Skip it entirely — there's no state
+            # to checkpoint, and the stub has no ``layer_number`` we
+            # could use to compute the global offset anyway. The
+            # checkpoint on disk DOES carry weights for the stubbed
+            # position, but the loader should be configured with
+            # ``dist_ckpt_strictness="ignore"`` (or
+            # ``"log_unexpected"``) so those keys are dropped on load
+            # without erroring.
+            if isinstance(layer, IdentityLayer) or getattr(
+                layer, "_is_identity_stub", False
+            ):
+                continue
 
             global_layer_offset = layer.layer_number - 1  # self.layer_number starts at 1
             state_dict_prefix = (

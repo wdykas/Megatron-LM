@@ -307,6 +307,19 @@ class DynamicInferenceEngine(AbstractEngine):
         # engine-side cleanup has run.
         self._pending_migrations: List[Callable[[], bool]] = []
 
+        # Cross-shard layer-kind disaggregation: per-request route
+        # plans + their associated :class:`RouteDispatcher`. Populated
+        # by a handler the inference interface registers via
+        # :meth:`set_route_handler` when a ``Headers.ROUTE_REQUEST``
+        # arrives. Consumed by the forward-pass router (in the
+        # controller / model) to decide LOCAL vs SEND vs RECEIVE for
+        # each layer on each in-flight disagg request. See
+        # ``megatron/core/inference/DISAGG_DESIGN.md``.
+        self._route_handler: Optional[
+            Callable[[int, "Route"], None]
+        ] = None
+        self._route_dispatchers: dict = {}
+
         self.resume_request_ids = None
 
         # Speculative decoding acceptance tracking.
@@ -490,6 +503,56 @@ class DynamicInferenceEngine(AbstractEngine):
         (e.g. ``release_memory_blocks`` on src) has run.
         """
         self._pending_migrations.append(poll)
+
+    def set_route_handler(
+        self,
+        handler: Optional[Callable[[int, "Route"], None]],
+    ) -> None:
+        """Register the layer-kind-disaggregation route handler.
+
+        Invoked when a ``Headers.ROUTE_REQUEST`` arrives. The handler
+        constructs a :class:`RouteDispatcher` for the request and
+        registers it via :meth:`register_route_dispatcher`. The forward
+        pass then consults the dispatcher at each layer for LOCAL /
+        SEND / RECEIVE decisions. See
+        ``megatron/core/inference/DISAGG_DESIGN.md``.
+        """
+        self._route_handler = handler
+
+    def register_route_dispatcher(
+        self, request_id: int, dispatcher
+    ) -> None:
+        """Bind a :class:`RouteDispatcher` to a request_id so the
+        forward pass can look it up while iterating layers."""
+        self._route_dispatchers[request_id] = dispatcher
+
+    def get_route_dispatcher(self, request_id: int):
+        """Return the active route dispatcher for the request, or
+        ``None`` if the request is collocated (no disagg)."""
+        return self._route_dispatchers.get(request_id)
+
+    def release_route_dispatcher(self, request_id: int) -> None:
+        """Drop the dispatcher for a finished or migrated request.
+        Safe to call on a request that never had one."""
+        self._route_dispatchers.pop(request_id, None)
+
+    def activate_disagg_request(self, request_id: Optional[int]) -> None:
+        """Resolve the active disagg request's :class:`RouteDispatcher`
+        and push it directly into the model's decoder. ``None`` clears
+        the dispatcher (collocated path). Safe no-op when the model
+        has no disagg-aware decoder."""
+        try:
+            decoder = self.controller.inference_wrapped_model.model.decoder
+        except AttributeError:
+            return
+        if not hasattr(decoder, "set_active_dispatcher"):
+            return
+        dispatcher = (
+            self._route_dispatchers.get(request_id)
+            if request_id is not None
+            else None
+        )
+        decoder.set_active_dispatcher(dispatcher)
 
     def _poll_pending_migrations(self) -> None:
         """Poll every pending migration; drop those that report done.
@@ -1279,6 +1342,7 @@ class DynamicInferenceEngine(AbstractEngine):
             ctx.mamba_metadata.request_to_mamba_state_idx[last_active] = -1
 
         del self.requests[request_id]
+        self.release_route_dispatcher(request_id)
 
         if not keep_blocks and block_count > 0:
             ctx.kv_block_allocator.release_memory_blocks(block_ids)
@@ -1466,6 +1530,7 @@ class DynamicInferenceEngine(AbstractEngine):
             if mamba_state_idx is None:
                 ctx.kv_block_allocator.release_memory_blocks(block_ids)
                 del self.requests[bundle.request_id]
+                self.release_route_dispatcher(bundle.request_id)
                 raise BlockOverflowError(bundle.request_id)
             ctx.mamba_metadata.request_to_mamba_state_idx[slot_idx] = mamba_state_idx
 
@@ -1826,6 +1891,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     request.status = Status.COMPLETED
                     request.add_event_finish()
                     finished_entry = self.requests.pop(request_id)
+                    self.release_route_dispatcher(request_id)
                     finished_request = finished_entry.record[-1]
                     finished_request.generated_length = len(finished_request.generated_tokens)
                     finished_request_records.append(finished_entry.record)
@@ -2301,7 +2367,27 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if will_log_this_step:
             self.step_start_event.record()
-        result = await self.controller.async_generate_output_tokens_dynamic_batch()
+        # Disagg routing: only walk to the decoder when at least one
+        # request in this batch has a registered dispatcher.
+        # Single-disagg-request-per-batch only; mixed batches need a
+        # deeper per-request forward refactor.
+        if self._route_dispatchers:
+            in_flight_with_dispatcher = [
+                rid for rid in self._route_dispatchers
+                if rid in self.requests
+            ]
+            single_disagg_request_id = (
+                in_flight_with_dispatcher[0]
+                if len(in_flight_with_dispatcher) == 1
+                else None
+            )
+            self.activate_disagg_request(single_disagg_request_id)
+            try:
+                result = await self.controller.async_generate_output_tokens_dynamic_batch()
+            finally:
+                self.activate_disagg_request(None)
+        else:
+            result = await self.controller.async_generate_output_tokens_dynamic_batch()
         if will_log_this_step:
             self.step_end_event.record()
             self.step_end_event.synchronize()
@@ -2836,6 +2922,47 @@ class DynamicInferenceEngine(AbstractEngine):
                     except Exception as e:
                         logging.error(
                             "Engine: MIGRATE_BATCH handler raised %s — "
+                            "continuing run loop", e,
+                        )
+
+            elif header == Headers.ROUTE_REQUEST:
+                # Layer-kind disaggregation: the coord shipped a per-
+                # request route plan. Deserialize, ask the handler to
+                # build a :class:`RouteDispatcher`, and register it on
+                # the engine so the forward pass can consult it at
+                # each layer. The dispatcher's NVSHMEM ops run on the
+                # activation stream; the engine's compute stream
+                # composes with them in the model forward.
+                if self._route_handler is None:
+                    logging.warning(
+                        "Engine: ignoring ROUTE_REQUEST (no handler registered)"
+                    )
+                else:
+                    from megatron.core.inference.disagg_request import (
+                        DisaggRequestBundle,
+                    )
+
+                    # Wire payload (see Headers.ROUTE_REQUEST docs):
+                    # [ROUTE_REQUEST, request_id, route_hops, bundle_dict, exit_shard_idx]
+                    (
+                        _,
+                        request_id,
+                        route_hops,
+                        bundle_dict,
+                        _exit_shard,
+                    ) = data
+                    try:
+                        bundle = DisaggRequestBundle.from_wire(
+                            {
+                                "request_id": request_id,
+                                "route": route_hops,
+                                **bundle_dict,
+                            }
+                        )
+                        self._route_handler(request_id, bundle.route)
+                    except Exception as e:
+                        logging.error(
+                            "Engine: ROUTE_REQUEST handler raised %s — "
                             "continuing run loop", e,
                         )
 
