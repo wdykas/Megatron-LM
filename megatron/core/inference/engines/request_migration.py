@@ -37,7 +37,7 @@ Engine-side surgery (``snapshot_request`` / ``detach_request`` /
 """
 
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, ClassVar, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -323,15 +323,27 @@ class MambaLayout:
     invariants and must match between src and dst layouts. Mirrors
     :class:`KVLayout` for the SSM/conv state buffers a hybrid model
     keeps per-request.
+
+    The conv state's first dim packs three TP-sharded blocks
+    ``[x, B, C]`` per rank with per-rank sizes
+    ``[d_inner/tp, ngroups*d_state/tp, ngroups*d_state/tp]``. Each
+    block shards INDEPENDENTLY across TP, so hetero-TP migration
+    has to plan transfers block-by-block (a single LCM tile on the
+    packed dim would silently mis-route data). The SSM state's
+    first dim is a single TP-sharded block on ``nheads``.
     """
 
     tp_size: int
     pp_size: int
     num_layers_total: int
-    # ``d_inner_total`` shards across TP for the conv state.
+    # ``d_inner_total = nheads_total * headdim`` shards across TP for
+    # the conv state's x block.
     d_inner_total: int
     # ``nheads_total`` shards across TP for the SSM state.
     nheads_total: int
+    # ``ngroups_total`` shards across TP for the conv state's B and C
+    # blocks (each contributes ``ngroups/tp * d_state`` rows per rank).
+    ngroups_total: int
     d_conv: int
     headdim: int
     d_state: int
@@ -345,14 +357,24 @@ class MambaLayout:
     # ``megatron.core.ssm.mamba_hybrid_layer_allocation.Symbols``).
     layer_type_list: Tuple[str, ...] = ()
 
+    # Conv-state block kinds, in the packing order used by the
+    # mamba mixer's conv1d. ``CONV_BLOCKS[i]`` is at local conv_dim
+    # offset ``sum(local_size(CONV_BLOCKS[j]) for j < i)``.
+    CONV_BLOCKS: ClassVar[Tuple[str, ...]] = ("conv_x", "conv_B", "conv_C")
+    BLOCK_KINDS: ClassVar[Tuple[str, ...]] = ("conv_x", "conv_B", "conv_C", "ssm")
+
     def assert_divisible(self) -> None:
-        """TP divides both d_inner and nheads."""
+        """TP divides d_inner, nheads, and ngroups."""
         assert self.d_inner_total % self.tp_size == 0, (
             f"d_inner_total={self.d_inner_total} must be divisible by "
             f"tp_size={self.tp_size}"
         )
         assert self.nheads_total % self.tp_size == 0, (
             f"nheads_total={self.nheads_total} must be divisible by "
+            f"tp_size={self.tp_size}"
+        )
+        assert self.ngroups_total % self.tp_size == 0, (
+            f"ngroups_total={self.ngroups_total} must be divisible by "
             f"tp_size={self.tp_size}"
         )
 
@@ -363,6 +385,45 @@ class MambaLayout:
     @property
     def nheads_per_tp(self) -> int:
         return self.nheads_total // self.tp_size
+
+    @property
+    def ngroups_per_tp(self) -> int:
+        return self.ngroups_total // self.tp_size
+
+    def block_global_size(self, kind: str) -> int:
+        """Global size (across all TP ranks) of the given block.
+
+        Block sharding is INDEPENDENT per kind: each block partitions
+        its global size evenly across ``tp_size`` and the per-rank
+        slices sit at fixed local offsets within their respective
+        buffer's dim 0 (conv_dim for x/B/C, nheads for ssm).
+        """
+        if kind == "conv_x":
+            return self.d_inner_total
+        if kind in ("conv_B", "conv_C"):
+            return self.ngroups_total * self.d_state
+        if kind == "ssm":
+            return self.nheads_total
+        raise ValueError(f"unknown mamba block kind: {kind}")
+
+    def block_local_size(self, kind: str) -> int:
+        """Per-TP-rank size of the given block (global // tp_size)."""
+        return self.block_global_size(kind) // self.tp_size
+
+    def block_local_offset(self, kind: str) -> int:
+        """Offset of the given conv-state block within a rank's local
+        conv_dim. SSM is on a separate buffer (its own dim 0), so its
+        offset is always 0.
+        """
+        if kind == "ssm":
+            return 0
+        # Cumulative local sizes of preceding conv blocks.
+        off = 0
+        for prev in self.CONV_BLOCKS:
+            if prev == kind:
+                return off
+            off += self.block_local_size(prev)
+        raise ValueError(f"unknown conv block kind: {kind}")
 
     def mamba_indices_for_pp_rank(self, pp_rank: int) -> List[int]:
         """Mamba-buffer indices that ``pp_rank`` of this shard owns.
@@ -403,23 +464,46 @@ class MambaLayout:
         return out
 
 
+@dataclass(frozen=True)
+class MambaBlockRange:
+    """One block-kind transfer within a per-(src_rank, dst_rank) overlap.
+
+    Each block kind (``conv_x`` / ``conv_B`` / ``conv_C`` / ``ssm``)
+    shards INDEPENDENTLY across TP, so under hetero TP the per-rank
+    local offsets and slice lengths differ between kinds. A single
+    :class:`MambaMigrationOp` carries one of these per non-empty
+    kind, all packed into the same NVSHMEM staging slot.
+
+    ``src_local_range`` / ``dst_local_range`` are local-buffer
+    indices: into ``conv_dim`` for the three conv kinds
+    (``block_local_offset`` already added) or into
+    ``nheads_local_tp`` for ``ssm``. Slice length is equal on both
+    sides by construction.
+    """
+
+    kind: str  # one of MambaLayout.BLOCK_KINDS
+    src_local_range: Tuple[int, int]
+    dst_local_range: Tuple[int, int]
+
+
 @dataclass
 class MambaMigrationOp:
-    """One conv+ssm tensor transfer in the Mamba migration plan.
+    """One per-``(src_rank, dst_rank)`` mamba transfer.
 
-    Represents "source rank ``src_rank`` sends its slice of the
-    mamba state at buffer indices ``mamba_layer_indices`` — conv rows
-    ``conv_d_inner_range`` and ssm rows ``ssm_nheads_range`` — to dst
-    rank ``dst_rank`` for request ``request_id``". A single op drives
-    both conv and ssm transfers because the two share the same TP
-    boundary; one (src, dst) rank pair always overlaps on both
-    dimensions or neither.
+    Bundles every block kind (``conv_x`` / ``conv_B`` / ``conv_C`` /
+    ``ssm``) for the overlap into a single NVSHMEM put + flag — each
+    block is gathered into a distinct byte offset within one staging
+    slot and the destination scatters them out by offset. Per-kind
+    TP sharding is still respected (independent ranges in
+    :class:`MambaBlockRange`) but slot pressure now scales as
+    ``num_overlap_pairs × batch`` instead of
+    ``4 × num_overlap_pairs × batch``.
 
-    ``mamba_layer_indices`` is the list of mamba-buffer indices that
-    BOTH the src PP rank and the dst PP rank own (the intersection
-    of their per-PP-rank mamba ownership). Under matched PP and
-    uniform mamba layer distribution, this collapses to a contiguous
-    slice; with heterogeneous PP it can be sparse.
+    ``mamba_layer_indices`` is the intersection of the src PP rank's
+    and dst PP rank's mamba-buffer ownership — same for every block
+    in the op. Under matched PP and uniform mamba layer distribution
+    this collapses to a contiguous slice; under hetero PP it can be
+    sparse.
     """
 
     src_rank: int
@@ -430,9 +514,16 @@ class MambaMigrationOp:
     # key budget. See ``MAX_OPS_PER_REQ`` in
     # ``megatron.rl.inference.multi_shard``.
     op_index_in_request: int
-    mamba_layer_indices: Tuple[int, ...]  # buffer indices along layer dim
-    conv_d_inner_range: Tuple[int, int]  # conv d_inner indices, [start, end)
-    ssm_nheads_range: Tuple[int, int]  # ssm nheads indices, [start, end)
+    # Mamba-buffer indices along the layer dim. Same on both sides
+    # (mamba_layer_map is a model invariant).
+    mamba_layer_indices: Tuple[int, ...]
+    # One entry per block kind with non-empty overlap on this
+    # ``(src_rank, dst_rank)`` pair (kinds with empty overlap are
+    # omitted). At least one entry is present (otherwise the op is
+    # not emitted). Order matches ``MambaLayout.BLOCK_KINDS`` so
+    # both sides agree on the packed slot layout without
+    # coordination.
+    blocks: Tuple[MambaBlockRange, ...]
 
 
 def build_mamba_migration_plan(
@@ -445,40 +536,39 @@ def build_mamba_migration_plan(
     """Compute the conv + ssm transfers that move a request's mamba
     state from the source shard to the destination shard.
 
-    Heterogeneous TP **and** PP supported via the same
-    intersection-of-overlapping-ranges pattern as
-    :func:`build_kv_migration_plan`. The per-request mamba state
-    buffer indexes by *global* mamba layer (each PP rank writes only
-    to entries for the mamba layers it actually owns); under hetero
-    PP src and dst own different subsets, so for each
-    ``(src_pp, dst_pp)`` pair we intersect their mamba ownership and
-    emit ops carrying the resulting buffer indices via
-    ``MambaMigrationOp.mamba_layer_indices``. With matched PP and
-    uniform mamba distribution the intersection collapses to a
-    contiguous slice.
+    Heterogeneous TP and PP both supported. The plan emits **one op
+    per ``(src_pp × dst_pp × src_tp × dst_tp)`` overlap**; each op's
+    :attr:`MambaMigrationOp.blocks` list carries one
+    :class:`MambaBlockRange` per block kind (``conv_x`` / ``conv_B`` /
+    ``conv_C`` / ``ssm``) that has non-empty TP overlap on that
+    ``(src_rank, dst_rank)`` pair. Per-kind sharding is still computed
+    independently (the conv state's three packed blocks have different
+    global sizes and TP boundaries), but all kinds for a given rank
+    pair share one NVSHMEM staging slot and one flag, packing
+    block-by-block in :attr:`MambaLayout.BLOCK_KINDS` order. This
+    keeps slot-pool pressure at ``num_overlap_pairs × batch`` instead
+    of ``4 × num_overlap_pairs × batch``.
 
-    For each ``(src_pp × dst_pp × src_tp × dst_tp)`` quadruple, emit
-    one op iff:
-
-    - the mamba-buffer-index intersection between ``src_pp`` and
-      ``dst_pp`` is non-empty, **and**
-    - both the conv ``d_inner`` ranges and the ssm ``nheads`` ranges
-      overlap on TP. The two TP-shard dims partition at the same
-      boundaries (same TP rank count), so an empty d_inner overlap
-      implies an empty nheads overlap and vice versa.
+    Hetero PP works the same way as for KV: the per-request mamba
+    state buffer indexes by *global* mamba layer (each PP rank
+    writes only to entries for the mamba layers it actually owns).
+    For each ``(src_pp, dst_pp)`` pair we intersect their mamba
+    ownership (from ``mamba_indices_for_pp_rank``) and emit ops
+    carrying the resulting buffer indices.
 
     Args:
         bundle: Request envelope. Only ``request_id`` is read.
         src_layout / dst_layout: shard-level mamba layouts. Whole-model
-            invariants must match; PP sizes may differ. Both sides must
-            populate ``layer_type_list`` for hetero-PP correctness;
-            empty ``layer_type_list`` falls back to uniform mamba
-            ownership per PP rank (legacy matched-PP behaviour).
+            invariants must match; TP and PP sizes may differ. Both
+            sides must populate ``layer_type_list`` for hetero-PP
+            correctness; empty ``layer_type_list`` falls back to
+            uniform mamba ownership per PP rank.
         src_global_rank_of / dst_global_rank_of: ``(tp_rank, pp_rank)
             -> global_rank`` for each shard.
 
     Returns:
-        Flat list of :class:`MambaMigrationOp`. Each op's
+        Flat list of :class:`MambaMigrationOp`, one per non-empty
+        ``(src_pp × dst_pp × src_tp × dst_tp)`` overlap. Each op's
         ``op_index_in_request`` is its 0-based position in the
         returned list.
     """
@@ -495,17 +585,16 @@ def build_mamba_migration_plan(
         f"nheads_total must match: src={src_layout.nheads_total}, "
         f"dst={dst_layout.nheads_total}"
     )
+    assert src_layout.ngroups_total == dst_layout.ngroups_total, (
+        f"ngroups_total must match: src={src_layout.ngroups_total}, "
+        f"dst={dst_layout.ngroups_total}"
+    )
     assert src_layout.d_conv == dst_layout.d_conv, "d_conv mismatch"
     assert src_layout.headdim == dst_layout.headdim, "headdim mismatch"
     assert src_layout.d_state == dst_layout.d_state, "d_state mismatch"
     assert src_layout.layer_type_list == dst_layout.layer_type_list, (
         "layer_type_list must match across shards (model invariant)"
     )
-
-    src_d_inner = src_layout.d_inner_per_tp
-    dst_d_inner = dst_layout.d_inner_per_tp
-    src_nheads = src_layout.nheads_per_tp
-    dst_nheads = dst_layout.nheads_per_tp
 
     # Pre-compute per-PP-rank mamba buffer ownership on each side.
     src_pp_indices = [
@@ -526,20 +615,45 @@ def build_mamba_migration_plan(
                 continue
             overlap_t = tuple(overlap)
             for sr in range(src_layout.tp_size):
-                src_d_lo = sr * src_d_inner
-                src_d_hi = src_d_lo + src_d_inner
-                src_h_lo = sr * src_nheads
-                src_h_hi = src_h_lo + src_nheads
                 for dr in range(dst_layout.tp_size):
-                    dst_d_lo = dr * dst_d_inner
-                    dst_d_hi = dst_d_lo + dst_d_inner
-                    dst_h_lo = dr * dst_nheads
-                    dst_h_hi = dst_h_lo + dst_nheads
-                    d_lo = max(src_d_lo, dst_d_lo)
-                    d_hi = min(src_d_hi, dst_d_hi)
-                    h_lo = max(src_h_lo, dst_h_lo)
-                    h_hi = min(src_h_hi, dst_h_hi)
-                    if d_lo >= d_hi:
+                    # Collect every block kind with non-empty TP
+                    # overlap on this (src_rank, dst_rank) pair.
+                    # Per-kind ranges are computed independently
+                    # since each block has its own global size and
+                    # TP boundary; the order tracks
+                    # ``BLOCK_KINDS`` so both sides agree on the
+                    # packed slot layout.
+                    blocks: List[MambaBlockRange] = []
+                    for kind in MambaLayout.BLOCK_KINDS:
+                        src_block = src_layout.block_local_size(kind)
+                        dst_block = dst_layout.block_local_size(kind)
+                        src_off = src_layout.block_local_offset(kind)
+                        dst_off = dst_layout.block_local_offset(kind)
+                        src_lo_g = sr * src_block
+                        src_hi_g = src_lo_g + src_block
+                        dst_lo_g = dr * dst_block
+                        dst_hi_g = dst_lo_g + dst_block
+                        lo = max(src_lo_g, dst_lo_g)
+                        hi = min(src_hi_g, dst_hi_g)
+                        if lo >= hi:
+                            continue
+                        # Convert global overlap to each side's
+                        # local buffer indices. For conv kinds the
+                        # local index is the block's local offset
+                        # plus the rank-relative position; ssm's
+                        # block-local offset is 0 (its own buffer).
+                        src_local_lo = src_off + (lo - src_lo_g)
+                        src_local_hi = src_local_lo + (hi - lo)
+                        dst_local_lo = dst_off + (lo - dst_lo_g)
+                        dst_local_hi = dst_local_lo + (hi - lo)
+                        blocks.append(
+                            MambaBlockRange(
+                                kind=kind,
+                                src_local_range=(src_local_lo, src_local_hi),
+                                dst_local_range=(dst_local_lo, dst_local_hi),
+                            )
+                        )
+                    if not blocks:
                         continue
                     ops.append(
                         MambaMigrationOp(
@@ -548,8 +662,7 @@ def build_mamba_migration_plan(
                             request_id=bundle.request_id,
                             op_index_in_request=op_idx,
                             mamba_layer_indices=overlap_t,
-                            conv_d_inner_range=(d_lo, d_hi),
-                            ssm_nheads_range=(h_lo, h_hi),
+                            blocks=tuple(blocks),
                         )
                     )
                     op_idx += 1

@@ -13,6 +13,7 @@ Runs non-distributed. Exercises:
 """
 from megatron.core.inference.engines.request_migration import (
     KVLayout,
+    MambaBlockRange,
     MambaLayout,
     RequestMigrationBundle,
     build_kv_migration_plan,
@@ -282,9 +283,12 @@ def _mamba_layouts(
 ):
     """Build (src, dst) MambaLayout pair for tests.
 
-    ``src_pp_size`` / ``dst_pp_size`` override ``pp_size`` on each
-    side independently; ``layer_type_list`` is required for hetero-PP
-    tests so the plan-builder can compute per-PP-rank mamba ownership.
+    Fixed model dims (model invariants — same on both sides):
+      d_inner_total=64, nheads_total=16, ngroups_total=8, d_state=16,
+      headdim=4, d_conv=4. Block global sizes:
+      - conv_x: d_inner_total = 64
+      - conv_B / conv_C: ngroups_total * d_state = 8 * 16 = 128
+      - ssm: nheads_total = 16
     """
     src_pp = src_pp_size if src_pp_size is not None else pp_size
     dst_pp = dst_pp_size if dst_pp_size is not None else pp_size
@@ -292,6 +296,7 @@ def _mamba_layouts(
         num_layers_total=num_mamba_layers,
         d_inner_total=64,
         nheads_total=16,
+        ngroups_total=8,
         d_conv=4,
         headdim=4,
         d_state=16,
@@ -303,22 +308,50 @@ def _mamba_layouts(
     )
 
 
-def _check_mamba_dst_coverage(ops, dst_layout):
-    """Each dst rank's d_inner / nheads ranges are tiled exactly once."""
-    expected_d = dst_layout.d_inner_per_tp
-    expected_h = dst_layout.nheads_per_tp
-    by_dst: dict = {}
+def _assert_kind_tiles_per_rank(ops, src_layout, dst_layout):
+    """Per-kind sanity: for each dst rank, the union of dst_local_range
+    across all blocks of that kind (across every op reaching the
+    rank) exactly tiles that rank's local block
+    (size = block_local_size(kind)). Verifies the plan doesn't leave
+    any rank's block under- or double-covered. Each op may carry up
+    to 4 blocks (one per kind), so iterate ``op.blocks``.
+    """
+    expected_local = {k: dst_layout.block_local_size(k) for k in dst_layout.BLOCK_KINDS}
+    by_rank_kind: dict = {}
     for op in ops:
-        by_dst.setdefault(op.dst_rank, []).append(op)
-    for dst_rank, dst_ops in by_dst.items():
-        d_total = sum(hi - lo for lo, hi in (op.conv_d_inner_range for op in dst_ops))
-        h_total = sum(hi - lo for lo, hi in (op.ssm_nheads_range for op in dst_ops))
-        assert d_total == expected_d, f"dst {dst_rank} d_inner {d_total} != {expected_d}"
-        assert h_total == expected_h, f"dst {dst_rank} nheads {h_total} != {expected_h}"
+        for block in op.blocks:
+            by_rank_kind.setdefault((op.dst_rank, block.kind), []).append(block)
+    for (dst_rank, kind), kind_blocks in by_rank_kind.items():
+        spans = sorted(b.dst_local_range for b in kind_blocks)
+        # Translate to local-block coords (subtract block_local_offset).
+        off = dst_layout.block_local_offset(kind)
+        local = [(lo - off, hi - off) for lo, hi in spans]
+        total = sum(hi - lo for lo, hi in local)
+        assert total == expected_local[kind], (
+            f"dst rank {dst_rank} kind {kind} covered {total} != "
+            f"expected {expected_local[kind]} (spans {local})"
+        )
+        for (lo1, hi1), (lo2, _) in zip(local, local[1:]):
+            assert hi1 <= lo2, (
+                f"dst rank {dst_rank} kind {kind} overlapping ranges {local}"
+            )
+
+
+def _kinds_per_overlap(ops, dst_rank):
+    """All kinds emitted to a given dst rank (across every op's blocks)."""
+    kinds = set()
+    for op in ops:
+        if op.dst_rank != dst_rank:
+            continue
+        for block in op.blocks:
+            kinds.add(block.kind)
+    return sorted(kinds)
 
 
 def test_mamba_plan_matched_tp():
-    """src_tp == dst_tp → one op per matched rank, no reshape."""
+    """src_tp == dst_tp: one op per matched rank pair carrying every
+    block kind packed together. All blocks fully covered on src and
+    dst."""
     bundle = _mamba_bundle()
     src_layout, dst_layout = _mamba_layouts(src_tp=4, dst_tp=4)
     ops = build_mamba_migration_plan(
@@ -328,17 +361,27 @@ def test_mamba_plan_matched_tp():
         src_global_rank_of=lambda tp, pp: tp,
         dst_global_rank_of=lambda tp, pp: 100 + tp,
     )
+    # 4 matched-tp pairs × 1 pp pair = 4 ops; each carries all 4
+    # block kinds.
     assert len(ops) == 4
-    for i, op in enumerate(ops):
-        assert op.src_rank == i
-        assert op.dst_rank == 100 + i
-        assert op.conv_d_inner_range == (i * 16, (i + 1) * 16)
-        assert op.ssm_nheads_range == (i * 4, (i + 1) * 4)
-    _check_mamba_dst_coverage(ops, dst_layout)
+    for op in ops:
+        # Matched TP → diagonal rank pairing.
+        assert op.src_rank + 100 == op.dst_rank
+        # Every op should bundle all four kinds, in BLOCK_KINDS order.
+        assert tuple(b.kind for b in op.blocks) == src_layout.BLOCK_KINDS
+        for b in op.blocks:
+            # Matched TP also means src and dst have identical local
+            # offsets and block sizes, so the ranges coincide.
+            assert b.src_local_range == b.dst_local_range
+    for r in range(100, 104):
+        assert _kinds_per_overlap(ops, r) == sorted(src_layout.BLOCK_KINDS)
+    _assert_kind_tiles_per_rank(ops, src_layout, dst_layout)
 
 
-def test_mamba_plan_reshape_up():
-    """src_tp=1 → dst_tp=4: one src rank fans out to 4 dst ranks."""
+def test_mamba_plan_reshape_up_per_block():
+    """src_tp=1 → dst_tp=4: each block's global range fans out across
+    4 dst tp ranks. One op per dst rank — 4 ops — each carrying all
+    4 block kinds, all from src rank 0."""
     bundle = _mamba_bundle()
     src_layout, dst_layout = _mamba_layouts(src_tp=1, dst_tp=4)
     ops = build_mamba_migration_plan(
@@ -349,17 +392,18 @@ def test_mamba_plan_reshape_up():
         dst_global_rank_of=lambda tp, pp: 100 + tp,
     )
     assert len(ops) == 4
-    for i, op in enumerate(ops):
-        assert op.src_rank == 0
-        assert op.dst_rank == 100 + i
-        # Each dst rank receives 1/4 of the d_inner / nheads dim
-        assert op.conv_d_inner_range == (i * 16, (i + 1) * 16)
-        assert op.ssm_nheads_range == (i * 4, (i + 1) * 4)
-    _check_mamba_dst_coverage(ops, dst_layout)
+    assert all(op.src_rank == 0 for op in ops)
+    for op in ops:
+        assert tuple(b.kind for b in op.blocks) == src_layout.BLOCK_KINDS
+    for r in range(100, 104):
+        assert _kinds_per_overlap(ops, r) == sorted(src_layout.BLOCK_KINDS)
+    _assert_kind_tiles_per_rank(ops, src_layout, dst_layout)
 
 
-def test_mamba_plan_reshape_down():
-    """src_tp=4 → dst_tp=1: 4 src ranks merge into one dst rank."""
+def test_mamba_plan_reshape_down_per_block():
+    """src_tp=4 → dst_tp=1: 4 src ranks merge into 1 dst rank. One op
+    per src rank — 4 ops — each carrying all 4 block kinds; their
+    union tiles the dst's full local block per kind."""
     bundle = _mamba_bundle()
     src_layout, dst_layout = _mamba_layouts(src_tp=4, dst_tp=1)
     ops = build_mamba_migration_plan(
@@ -369,17 +413,17 @@ def test_mamba_plan_reshape_down():
         src_global_rank_of=lambda tp, pp: tp,
         dst_global_rank_of=lambda tp, pp: 100,
     )
-    assert len(ops) == 4
-    for i, op in enumerate(ops):
-        assert op.src_rank == i
-        assert op.dst_rank == 100
-        assert op.conv_d_inner_range == (i * 16, (i + 1) * 16)
-        assert op.ssm_nheads_range == (i * 4, (i + 1) * 4)
-    _check_mamba_dst_coverage(ops, dst_layout)
+    assert len(ops) == 4  # one per src tp rank
+    assert all(op.dst_rank == 100 for op in ops)
+    for op in ops:
+        assert tuple(b.kind for b in op.blocks) == src_layout.BLOCK_KINDS
+    _assert_kind_tiles_per_rank(ops, src_layout, dst_layout)
 
 
-def test_mamba_plan_partial_overlap():
-    """src_tp=2 → dst_tp=4: overlapping ranges produce 4 ops, dst tiled."""
+def test_mamba_plan_partial_overlap_per_block():
+    """src_tp=2 → dst_tp=4: each src rank covers 2 dst ranks per
+    block. 2 src × 2 dst per src = 4 ops total, each carrying all 4
+    block kinds."""
     bundle = _mamba_bundle()
     src_layout, dst_layout = _mamba_layouts(src_tp=2, dst_tp=4)
     ops = build_mamba_migration_plan(
@@ -389,25 +433,23 @@ def test_mamba_plan_partial_overlap():
         src_global_rank_of=lambda tp, pp: tp,
         dst_global_rank_of=lambda tp, pp: 100 + tp,
     )
-    # src rank 0 owns [0,32) d_inner, dst ranks 0+1 own [0,16) and [16,32)
-    # → 2 ops from src 0; src rank 1 covers dst 2+3 → 2 ops. Total 4.
     assert len(ops) == 4
+    for op in ops:
+        assert tuple(b.kind for b in op.blocks) == src_layout.BLOCK_KINDS
+    # src rank 0 → dst {100, 101}, src rank 1 → dst {102, 103}.
     src_to_dsts: dict = {}
     for op in ops:
-        src_to_dsts.setdefault(op.src_rank, []).append(op.dst_rank)
-    assert src_to_dsts == {0: [100, 101], 1: [102, 103]}
-    _check_mamba_dst_coverage(ops, dst_layout)
+        src_to_dsts.setdefault(op.src_rank, set()).add(op.dst_rank)
+    assert src_to_dsts == {0: {100, 101}, 1: {102, 103}}
+    _assert_kind_tiles_per_rank(ops, src_layout, dst_layout)
 
 
 def test_mamba_plan_hetero_pp_reshape_up():
     """src_pp=1 → dst_pp=2: src has 1 PP rank owning all mamba layers,
-    dst splits across 2 PP ranks. Plan emits one op per dst PP rank
-    carrying that PP rank's mamba ownership."""
+    dst splits across 2 PP ranks. Each dst PP rank receives ops with
+    its own mamba subset."""
     bundle = _mamba_bundle()
     # 8 transformer layers, 4 mamba (M at indices 0, 2, 4, 6).
-    # src pp=1 owns [0..8) globally → all 4 mamba indices [0,1,2,3].
-    # dst pp=2: PP rank 0 owns [0..4) → mamba indices for global 0, 2 → [0, 1].
-    # PP rank 1 owns [4..8) → mamba indices for global 4, 6 → [2, 3].
     layer_types = ("M", "E", "M", "E", "M", "E", "M", "E")
     src_layout, dst_layout = _mamba_layouts(
         src_tp=2,
@@ -421,36 +463,27 @@ def test_mamba_plan_hetero_pp_reshape_up():
         bundle,
         src_layout,
         dst_layout,
-        # src has 1 pp rank, 2 tp ranks → ranks 0, 1
         src_global_rank_of=lambda tp, pp: tp,
-        # dst has 2 pp ranks, 2 tp ranks → ranks 100..103 (tp-major)
         dst_global_rank_of=lambda tp, pp: 100 + pp * 2 + tp,
     )
-    # 1 src_pp × 2 dst_pp × 2 src_tp × 2 dst_tp matched-tp = 4 ops
+    # 1 src_pp × 2 dst_pp × 2 matched-tp = 4 ops; each packs 4 kinds.
     assert len(ops) == 4
-    # Each op carries the dst_pp's mamba ownership (intersection
-    # with src's "all-4" is just dst_pp's set).
-    by_dst = {}
+    for op in ops:
+        assert tuple(b.kind for b in op.blocks) == src_layout.BLOCK_KINDS
+    # Dst PP=0 ranks get mamba indices (0, 1); dst PP=1 ranks get (2, 3).
+    by_dst: dict = {}
     for op in ops:
         by_dst.setdefault(op.dst_rank, []).append(op)
-    # Dst PP=0 ranks (100, 101) get mamba indices [0, 1].
     for r in (100, 101):
-        assert len(by_dst[r]) == 1
-        assert by_dst[r][0].mamba_layer_indices == (0, 1)
-    # Dst PP=1 ranks (102, 103) get mamba indices [2, 3].
+        assert all(op.mamba_layer_indices == (0, 1) for op in by_dst[r])
     for r in (102, 103):
-        assert len(by_dst[r]) == 1
-        assert by_dst[r][0].mamba_layer_indices == (2, 3)
+        assert all(op.mamba_layer_indices == (2, 3) for op in by_dst[r])
 
 
 def test_mamba_plan_hetero_pp_reshape_down():
-    """src_pp=2 → dst_pp=1: src splits across 2 PP ranks, dst owns all.
-    Plan emits ops per (src_pp × dst_pp=0) intersected with dst-owned."""
+    """src_pp=2 → dst_pp=1: src splits, dst owns all. Each src PP rank
+    contributes its mamba subset to the (single) dst PP rank."""
     bundle = _mamba_bundle()
-    # 8 transformer layers, 4 mamba (M at indices 1, 3, 4, 7).
-    # src pp=2: PP rank 0 owns [0..4) → mamba indices [0, 1].
-    # PP rank 1 owns [4..8) → mamba indices [2, 3].
-    # dst pp=1: owns all 4.
     layer_types = ("E", "M", "E", "M", "M", "E", "E", "M")
     src_layout, dst_layout = _mamba_layouts(
         src_tp=2,
@@ -464,34 +497,78 @@ def test_mamba_plan_hetero_pp_reshape_down():
         bundle,
         src_layout,
         dst_layout,
-        # src has 2 pp ranks, 2 tp ranks → ranks 0..3 (tp-major)
         src_global_rank_of=lambda tp, pp: pp * 2 + tp,
-        # dst has 1 pp rank, 2 tp ranks → ranks 100, 101
         dst_global_rank_of=lambda tp, pp: 100 + tp,
     )
-    # 2 src_pp × 1 dst_pp × 2 src_tp × 2 dst_tp matched-tp = 4 ops
+    # 2 src_pp × 1 dst_pp × 2 matched-tp = 4 ops; each packs 4 kinds.
     assert len(ops) == 4
-    by_src = {}
+    for op in ops:
+        assert tuple(b.kind for b in op.blocks) == src_layout.BLOCK_KINDS
+    by_src: dict = {}
     for op in ops:
         by_src.setdefault(op.src_rank, []).append(op)
-    # Src PP=0 ranks (0, 1) carry mamba indices [0, 1].
+    # Src PP=0 ranks carry mamba indices (0, 1).
     for r in (0, 1):
-        assert len(by_src[r]) == 1
-        assert by_src[r][0].mamba_layer_indices == (0, 1)
-    # Src PP=1 ranks (2, 3) carry mamba indices [2, 3].
+        assert all(op.mamba_layer_indices == (0, 1) for op in by_src[r])
+    # Src PP=1 ranks carry mamba indices (2, 3).
     for r in (2, 3):
-        assert len(by_src[r]) == 1
-        assert by_src[r][0].mamba_layer_indices == (2, 3)
+        assert all(op.mamba_layer_indices == (2, 3) for op in by_src[r])
+
+
+def test_mamba_plan_hetero_tp_block_local_offsets():
+    """src_tp=2 → dst_tp=1, hybrid model with conv state packing
+    (x, B, C): verify each block routes to its own local offset on
+    both sides, and the offsets DIFFER between src and dst because
+    block-local sizes differ per TP. With kinds packed into one op
+    per (src_rank, dst_rank) pair, each op carries 4
+    :class:`MambaBlockRange` entries — one per kind — that must each
+    address the right packed-conv offset."""
+    bundle = _mamba_bundle()
+    src_layout, dst_layout = _mamba_layouts(src_tp=2, dst_tp=1)
+
+    # Sanity: block_local_offset differs between src (tp=2) and dst (tp=1).
+    # conv_x at offset 0 on both. conv_B at d_inner_local_tp = 32 (src) vs 64 (dst).
+    assert src_layout.block_local_offset("conv_x") == 0
+    assert src_layout.block_local_offset("conv_B") == 32
+    assert dst_layout.block_local_offset("conv_x") == 0
+    assert dst_layout.block_local_offset("conv_B") == 64
+    assert dst_layout.block_local_offset("conv_C") == 64 + 128
+
+    ops = build_mamba_migration_plan(
+        bundle,
+        src_layout,
+        dst_layout,
+        src_global_rank_of=lambda tp, pp: tp,
+        dst_global_rank_of=lambda tp, pp: 100,
+    )
+    # 2 src_tp × 1 dst_tp = 2 ops; each carries 4 block kinds packed.
+    assert len(ops) == 2
+    for op in ops:
+        assert tuple(b.kind for b in op.blocks) == src_layout.BLOCK_KINDS
+        for block in op.blocks:
+            src_lo, _ = block.src_local_range
+            dst_lo, _ = block.dst_local_range
+            src_block_off = src_layout.block_local_offset(block.kind)
+            dst_block_off = dst_layout.block_local_offset(block.kind)
+            # Each src tp_rank views its own block-local at offset 0
+            # within the kind's block; src_lo equals just the kind's
+            # block_local_offset on the src side.
+            assert src_lo == src_block_off
+            if op.src_rank == 0:
+                # First half → dst_lo = dst_block_off + 0
+                assert dst_lo == dst_block_off
+            else:
+                # Second half → dst_lo = dst_block_off + src_block_size
+                assert dst_lo == dst_block_off + src_layout.block_local_size(
+                    block.kind
+                )
+    _assert_kind_tiles_per_rank(ops, src_layout, dst_layout)
 
 
 def test_mamba_plan_hetero_tp_and_pp():
-    """src tp=2,pp=2 + dst tp=1,pp=1. Combined hetero TP and hetero PP:
-    each (src_pp × src_tp) op carries the src PP rank's mamba subset
-    and src tp's d_inner half, all going to the single dst rank."""
+    """src tp=2,pp=2 + dst tp=1,pp=1: combined hetero TP and hetero PP."""
     bundle = _mamba_bundle()
     layer_types = ("M", "M", "E", "E", "M", "E", "M", "E")
-    # src pp=2: pp 0 owns [0..4) → mamba globals 0,1 → indices [0,1]
-    #          pp 1 owns [4..8) → mamba globals 4,6 → indices [2,3]
     src_layout, dst_layout = _mamba_layouts(
         src_tp=2,
         dst_tp=1,
@@ -507,18 +584,13 @@ def test_mamba_plan_hetero_tp_and_pp():
         src_global_rank_of=lambda tp, pp: pp * 2 + tp,
         dst_global_rank_of=lambda tp, pp: 100,
     )
-    # 2 src_pp × 1 dst_pp × 2 src_tp × 1 dst_tp = 4 ops; dst rank
-    # collects them all.
+    # 2 src_pp × 1 dst_pp × 2 src_tp × 1 dst_tp = 4 ops; each packs 4 kinds.
     assert len(ops) == 4
     assert all(op.dst_rank == 100 for op in ops)
-    pp0_indices = [op.mamba_layer_indices for op in ops if op.src_rank in (0, 1)]
-    pp1_indices = [op.mamba_layer_indices for op in ops if op.src_rank in (2, 3)]
-    assert all(idx == (0, 1) for idx in pp0_indices)
-    assert all(idx == (2, 3) for idx in pp1_indices)
-    # TP halves on d_inner
-    by_src_tp = {(op.src_rank, op.conv_d_inner_range) for op in ops}
-    # tp_rank 0 ranks (0, 2) get d_inner [0, 32); tp_rank 1 ranks (1, 3) get [32, 64).
-    assert (0, (0, 32)) in by_src_tp
-    assert (1, (32, 64)) in by_src_tp
-    assert (2, (0, 32)) in by_src_tp
-    assert (3, (32, 64)) in by_src_tp
+    for op in ops:
+        assert tuple(b.kind for b in op.blocks) == src_layout.BLOCK_KINDS
+    # PP-0 src ranks (0, 1) carry mamba indices (0, 1); PP-1 (2, 3) carry (2, 3).
+    pp0_idx = {op.mamba_layer_indices for op in ops if op.src_rank in (0, 1)}
+    pp1_idx = {op.mamba_layer_indices for op in ops if op.src_rank in (2, 3)}
+    assert pp0_idx == {(0, 1)}
+    assert pp1_idx == {(2, 3)}

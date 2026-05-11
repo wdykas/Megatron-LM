@@ -67,8 +67,25 @@ DEFAULT_FLAG_POOL_SIZE = 1 << 14
 # slices with non-zero offsets aren't tracked, so we can't carve a
 # single big buffer into arbitrary ranges. Pre-allocate a fixed pool of
 # independently-tracked slot tensors and hand them out per-op.
+# Per-slot capacity is sized for the biggest single op we'd
+# realistically issue (a full layer's worth of KV blocks for one
+# request, or all four mamba block kinds for one overlap packed
+# together). Slot count scales with ``batch × overlap_pairs`` for both
+# KV and mamba — mamba's four block kinds (conv_x/B/C, ssm) are packed
+# into a single slot per overlap by the migration handler so they
+# don't multiply the cap. 256 leaves ~4× headroom on Nano-class
+# hetero-TP=2 batch=16 (8 KV + 32 mamba ≈ 64 slots used) at 4 GB
+# symmetric per PE.
+#
+# This pool sizing scales linearly with batch and overlap pairs;
+# very large configs (batch 128+, TP×PP product 32+) will eventually
+# need ring-buffer slot recycling — bounded pipeline depth + a back-
+# signal from dst→src so a slot can be reused once its scatter
+# completes. That's a separate follow-up since it changes the
+# synchronization model (adds an ack flag pool and credit-gated
+# gathers).
 DEFAULT_STAGING_SLOT_BYTES = 16 * 1024 * 1024  # 16 MB per slot
-DEFAULT_STAGING_NUM_SLOTS = 128  # 2 GB total per PE
+DEFAULT_STAGING_NUM_SLOTS = 256  # 4 GB total per PE
 
 
 def migration_stream() -> torch.cuda.Stream:
