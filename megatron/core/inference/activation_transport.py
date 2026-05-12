@@ -5,9 +5,10 @@
 Activations flow between shards in the layer-kind-disaggregated forward
 pass; this module is the on-the-wire mechanism.
 
-Reuses the NVSHMEM init machinery from :mod:`nvshmem_migration` (one PE
-identity per process, etc.) but allocates its own symmetric pools — slot
-sizing and lifecycle differ from migration's:
+Reuses the NVSHMEM runtime primitives from :mod:`nvshmem_migration` (one
+PE identity per process, shared pool builders and put/signal wrappers)
+but allocates its own symmetric pools — slot sizing and lifecycle differ
+from migration's:
 
 - Migration: per-request handoff, ~MB per op, dozens of ops per second.
   Slots are claimed for the duration of one migration then implicitly
@@ -57,14 +58,6 @@ import torch.distributed as dist
 from megatron.core.inference import nvshmem_migration as _nv
 
 logger = logging.getLogger(__name__)
-
-
-try:
-    import nvshmem.core  # type: ignore
-
-    _HAVE_NVSHMEM = True
-except ImportError:  # pragma: no cover
-    _HAVE_NVSHMEM = False
 
 
 # Module-level state. All `_a_*` names belong to activation transport;
@@ -158,12 +151,9 @@ def maybe_init_activation_transport(
 
     if _initialized:
         return
-    if not _HAVE_NVSHMEM:
-        raise RuntimeError(
-            "nvshmem.core is not importable but is required for "
-            "activation transport. Install nvidia-nvshmem-cu12>=3.6.5."
-        )
 
+    # NVSHMEM availability + version are checked inside maybe_init_nvshmem;
+    # it raises with a clear message if either is missing.
     _nv.maybe_init_nvshmem(group=group)
 
     _a_max_pes = int(
@@ -202,38 +192,17 @@ def maybe_init_activation_transport(
     _activation_stream = torch.cuda.Stream()
 
     n_slots = _a_num_lanes * _a_pool_depth
-    _a_slots = []
-    for _ in range(n_slots):
-        s = nvshmem.core.interop.torch.bytetensor(
-            (_a_slot_bytes,), dtype=torch.uint8
-        )
-        _a_slots.append(s)
+    _a_slots = _nv.allocate_slot_pool(n_slots, _a_slot_bytes)
 
-    # Two flag pools: fwd (src signals dst that data has landed) and
-    # ack (dst signals src that scatter is done and slot is free for
-    # reuse). Each flag is its own 8-byte symmetric allocation, mirroring
-    # the migration pool. ack flags initialize to 1 ("first use is free")
-    # so the first round-trip on each slot doesn't deadlock on a
+    # Two flag pools paired 1-to-1 with slots: fwd (src signals dst that
+    # data has landed) and ack (dst signals src that scatter is done and
+    # slot is free for reuse). ack flags initialize to 1 ("first use is
+    # free") so the first round-trip on each slot doesn't deadlock on a
     # never-issued ack.
-    _a_fwd_flags = []
-    _a_fwd_flag_bufs = []
-    _a_ack_flags = []
-    _a_ack_flag_bufs = []
-    for _ in range(n_slots):
-        fwd = nvshmem.core.interop.torch.bytetensor((8,), dtype=torch.uint8)
-        fwd.zero_()
-        fwd_buf, _, _ = nvshmem.core.tensor_get_buffer(fwd)
-        _a_fwd_flags.append(fwd)
-        _a_fwd_flag_bufs.append(fwd_buf)
-
-        ack = nvshmem.core.interop.torch.bytetensor((8,), dtype=torch.uint8)
-        # Pre-credit first use of each slot: src waits for ack==1 before
-        # writing, so the very first put on a slot must already see ack=1.
-        ack.zero_()
-        ack[0] = 1
-        ack_buf, _, _ = nvshmem.core.tensor_get_buffer(ack)
-        _a_ack_flags.append(ack)
-        _a_ack_flag_bufs.append(ack_buf)
+    _a_fwd_flags, _a_fwd_flag_bufs = _nv.allocate_flag_pool(n_slots)
+    _a_ack_flags, _a_ack_flag_bufs = _nv.allocate_flag_pool(
+        n_slots, initial_value=1
+    )
 
     _lane_send_counter = [0] * _a_num_lanes
     _lane_recv_counter = [0] * _a_num_lanes
@@ -242,13 +211,10 @@ def maybe_init_activation_transport(
     # _a_ack_payload at module top for why this can't be a slice of a
     # real slot.
     global _a_ack_payload
-    _a_ack_payload = nvshmem.core.interop.torch.bytetensor(
-        (1,), dtype=torch.uint8
-    )
+    _a_ack_payload = _nv.allocate_slot_pool(1, 1)[0]
     _a_ack_payload.zero_()
 
-    nvshmem.core.barrier_all(stream=torch.cuda.current_stream())
-    torch.cuda.synchronize()
+    _nv.barrier_all_and_sync()
     _initialized = True
     logger.info(
         "[activation-transport] initialized: lanes=%d, depth=%d, "
@@ -345,15 +311,9 @@ def put_activation(
     assert _initialized
     s = stream or _activation_stream
 
-    # Step 1: wait until the prior user of this slot acked.
-    # Pre-credited at init (ack=1) so the very first put doesn't block.
-    ack_buf = _a_ack_flag_bufs[slot_idx]
-    nvshmem.core.signal_wait(
-        ack_buf,
-        1,
-        nvshmem.core.ComparisonType.CMP_EQ,
-        stream=s,
-    )
+    # Wait until the prior user of this slot acked. Pre-credited at
+    # init (ack=1) so the very first put doesn't block.
+    _nv.signal_wait(_a_ack_flag_bufs[slot_idx], stream=s)
     # Reset the ack so the next round-trip can re-trigger. The reset
     # MUST run on the activation stream — without the explicit
     # ``with torch.cuda.stream`` context, ``.zero_()`` falls back to
@@ -361,20 +321,12 @@ def put_activation(
     with torch.cuda.stream(s):
         _a_ack_flags[slot_idx].zero_()
 
-    # Step 2: put data + signal fwd on dst.
-    slot = _a_slots[slot_idx]
-    if nbytes < slot.numel():
-        slot_view = slot[:nbytes]
-    else:
-        slot_view = slot
-    fwd_buf = _a_fwd_flag_bufs[slot_idx]
-    nvshmem.core.put_signal(
-        slot_view,
-        slot_view,
-        fwd_buf,
-        1,
-        nvshmem.core.SignalOp.SIGNAL_SET,
+    # Put data + signal fwd on dst.
+    _nv.put_signal(
+        _a_slots[slot_idx],
+        _a_fwd_flag_bufs[slot_idx],
         dst_pe,
+        nbytes=nbytes,
         stream=s,
     )
 
@@ -395,13 +347,7 @@ def wait_activation(
     """
     assert _initialized
     s = stream or _activation_stream
-    fwd_buf = _a_fwd_flag_bufs[slot_idx]
-    nvshmem.core.signal_wait(
-        fwd_buf,
-        1,
-        nvshmem.core.ComparisonType.CMP_EQ,
-        stream=s,
-    )
+    _nv.signal_wait(_a_fwd_flag_bufs[slot_idx], stream=s)
     # The reset must be stream-ordered after the signal_wait so the
     # next round's put_signal sees a clean 0 → 1 transition. Without
     # the stream context, ``.zero_()`` runs on the default stream and
@@ -420,28 +366,16 @@ def ack_activation(
     safe to reuse. Issued after the destination has scattered the
     activation out of the slot.
 
-    Mechanism: a zero-byte ``put_signal`` aimed at the source's ack
-    flag. The signal-only variant would avoid the no-op data transfer,
-    but ``put_signal`` is the only public NVSHMEM API the wrapper
-    currently exposes, and a 0-byte put has negligible cost on the
-    wire.
+    Uses a dedicated 1-byte payload (``_a_ack_payload``), never a slice
+    of the data slot: a slice would race with the source's pending fill
+    / put_signal on the same slot and corrupt the data.
     """
     assert _initialized
-    s = stream or _activation_stream
-    # Use the dedicated 1-byte ack payload, never the slot itself: a
-    # slice of the slot would race with the source's pending fill_ /
-    # put_signal on the same slot and corrupt the data. See the
-    # comment on _a_ack_payload.
-    payload = _a_ack_payload
-    ack_buf = _a_ack_flag_bufs[slot_idx]
-    nvshmem.core.put_signal(
-        payload,
-        payload,
-        ack_buf,
-        1,
-        nvshmem.core.SignalOp.SIGNAL_SET,
+    _nv.put_signal(
+        _a_ack_payload,
+        _a_ack_flag_bufs[slot_idx],
         src_pe,
-        stream=s,
+        stream=stream or _activation_stream,
     )
 
 

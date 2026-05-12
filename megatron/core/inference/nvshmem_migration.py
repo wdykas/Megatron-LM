@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import os
 from importlib import metadata
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -78,6 +78,120 @@ def migration_stream() -> torch.cuda.Stream:
     assert _initialized, "NVSHMEM not initialized"
     assert _migration_stream is not None
     return _migration_stream
+
+
+# ---- Shared runtime primitives ---------------------------------------------
+#
+# Both `nvshmem_migration` and `activation_transport` build symmetric flag
+# pools, slot pools, and call `put_signal` / `signal_wait` on the same
+# underlying NVSHMEM API. These helpers factor out the duplication so each
+# transport module only owns its policy code (slot indexing, recycling,
+# ack flow), not the NVSHMEM call boilerplate.
+
+
+def allocate_flag_pool(
+    n_flags: int, *, initial_value: int = 0
+) -> Tuple[List[torch.Tensor], List[object]]:
+    """Allocate ``n_flags`` independently-tracked 8-byte symmetric flag
+    tensors. NVSHMEM ``put_signal`` / ``signal_wait`` require Buffer ≥ 8
+    bytes, and slices with non-zero offsets aren't tracked, so each flag
+    has to be its own root allocation.
+
+    Returns parallel ``(tensors, cuda.core Buffers)`` lists — the tensor
+    for local zero/read, the Buffer for the NVSHMEM call.
+
+    ``initial_value`` (0 or 1) seeds the local flag; use ``1`` for
+    pre-credited "first use is free" slots (e.g., the ack pool in the
+    activation ring buffer).
+    """
+    assert _initialized, "NVSHMEM not initialized"
+    tensors: List[torch.Tensor] = []
+    buffers: List[object] = []
+    for _ in range(n_flags):
+        f = nvshmem.core.interop.torch.bytetensor((8,), dtype=torch.uint8)
+        f.zero_()
+        if initial_value:
+            f[0] = initial_value
+        buf, _, _ = nvshmem.core.tensor_get_buffer(f)
+        tensors.append(f)
+        buffers.append(buf)
+    return tensors, buffers
+
+
+def allocate_slot_pool(n_slots: int, slot_bytes: int) -> List[torch.Tensor]:
+    """Allocate ``n_slots`` independently-tracked symmetric uint8 slot
+    tensors. Each slot is its own bytetensor — NVSHMEM tracks slots by
+    their root handle, and non-zero-offset slices would silently corrupt
+    the transfer.
+    """
+    assert _initialized, "NVSHMEM not initialized"
+    return [
+        nvshmem.core.interop.torch.bytetensor((slot_bytes,), dtype=torch.uint8)
+        for _ in range(n_slots)
+    ]
+
+
+def barrier_all_and_sync() -> None:
+    """Stream-ordered cross-PE barrier + host sync. Call once after all
+    symmetric allocations land so every PE sees a consistent state
+    before the first put/wait.
+    """
+    assert _initialized
+    nvshmem.core.barrier_all(stream=torch.cuda.current_stream())
+    torch.cuda.synchronize()
+
+
+def put_signal(
+    slot: torch.Tensor,
+    flag_buf: object,
+    dst_pe: int,
+    *,
+    signal_value: int = 1,
+    nbytes: Optional[int] = None,
+    stream: Optional[torch.cuda.Stream] = None,
+) -> None:
+    """Stream-ordered NVSHMEM ``put_signal``: copies ``slot`` (or its
+    first ``nbytes``) from this PE to the same symmetric tensor on
+    ``dst_pe``, then atomically sets the flag at ``flag_buf`` on
+    ``dst_pe`` to ``signal_value``. The signal lands strictly after the
+    data, so a ``signal_wait`` on the same flag implies all bytes have
+    arrived.
+
+    The same tensor is passed for src and dst because NVSHMEM addresses
+    symmetric memory by handle; non-zero-offset slices of a slot would
+    not be tracked.
+    """
+    assert _initialized
+    if nbytes is not None and nbytes < slot.numel():
+        slot = slot[:nbytes]
+    nvshmem.core.put_signal(
+        slot,
+        slot,
+        flag_buf,
+        signal_value,
+        nvshmem.core.SignalOp.SIGNAL_SET,
+        dst_pe,
+        stream=stream,
+    )
+
+
+def signal_wait(
+    flag_buf: object,
+    *,
+    expected_value: int = 1,
+    stream: Optional[torch.cuda.Stream] = None,
+) -> None:
+    """Stream-ordered NVSHMEM ``signal_wait``: blocks ``stream``
+    (GPU-side) until the local flag at ``flag_buf`` reaches
+    ``expected_value``. Pair with :func:`put_signal` on the sender.
+    """
+    assert _initialized
+    nvshmem.core.signal_wait(
+        flag_buf,
+        expected_value,
+        nvshmem.core.ComparisonType.CMP_EQ,
+        stream=stream,
+    )
 
 
 def maybe_init_nvshmem(group: Optional[dist.ProcessGroup] = None) -> None:
@@ -154,14 +268,7 @@ def maybe_init_nvshmem(group: Optional[dist.ProcessGroup] = None) -> None:
 
     global _flag_pool, _flag_pool_buffers
     _flag_pool_size = int(os.environ.get("MIGRATION_FLAG_POOL_SIZE", DEFAULT_FLAG_POOL_SIZE))
-    _flag_pool = []
-    _flag_pool_buffers = []
-    for _ in range(_flag_pool_size):
-        flag = nvshmem.core.interop.torch.bytetensor((8,), dtype=torch.uint8)
-        flag.zero_()
-        buf, _, _ = nvshmem.core.tensor_get_buffer(flag)
-        _flag_pool.append(flag)
-        _flag_pool_buffers.append(buf)
+    _flag_pool, _flag_pool_buffers = allocate_flag_pool(_flag_pool_size)
 
     global _staging_slots, _staging_slot_bytes, _staging_num_slots
     _staging_slot_bytes = int(
@@ -170,15 +277,9 @@ def maybe_init_nvshmem(group: Optional[dist.ProcessGroup] = None) -> None:
     _staging_num_slots = int(
         os.environ.get("MIGRATION_STAGING_NUM_SLOTS", DEFAULT_STAGING_NUM_SLOTS)
     )
-    _staging_slots = []
-    for _ in range(_staging_num_slots):
-        slot = nvshmem.core.interop.torch.bytetensor(
-            (_staging_slot_bytes,), dtype=torch.uint8
-        )
-        _staging_slots.append(slot)
+    _staging_slots = allocate_slot_pool(_staging_num_slots, _staging_slot_bytes)
 
-    nvshmem.core.barrier_all(stream=torch.cuda.current_stream())
-    torch.cuda.synchronize()
+    barrier_all_and_sync()
     logger.info(
         "[nvshmem-migration] initialized: PE %d/%d, flag_pool_size=%d",
         _my_pe,
@@ -223,23 +324,13 @@ def put_slot_with_signal(
     ordered NVSHMEM op. The signal arrives strictly after the data, so
     a ``signal_wait`` on the same flag implies all bytes have landed.
     """
-    assert _initialized
-    s = stream or _migration_stream
-    slot = staging_slot(slot_idx)
-    if nbytes is not None and nbytes < slot.numel():
-        # Offset-0 slice is fine — NVSHMEM tracks it via the underlying
-        # bytetensor handle. A non-zero-offset slice would NOT be tracked
-        # and would silently corrupt the transfer.
-        slot = slot[:nbytes]
-    flag_buf = flag_buffer(flag_slot)
-    nvshmem.core.put_signal(
-        slot,
-        slot,
-        flag_buf,
-        signal_value,
-        nvshmem.core.SignalOp.SIGNAL_SET,
+    put_signal(
+        staging_slot(slot_idx),
+        flag_buffer(flag_slot),
         dst_pe,
-        stream=s,
+        signal_value=signal_value,
+        nbytes=nbytes,
+        stream=stream or _migration_stream,
     )
 
 
@@ -253,14 +344,10 @@ def wait_slot_signal(
     the local flag reaches ``expected_value``. Pair with
     :func:`put_slot_with_signal` on src.
     """
-    assert _initialized
-    s = stream or _migration_stream
-    flag_buf = flag_buffer(flag_slot)
-    nvshmem.core.signal_wait(
-        flag_buf,
-        expected_value,
-        nvshmem.core.ComparisonType.CMP_EQ,
-        stream=s,
+    signal_wait(
+        flag_buffer(flag_slot),
+        expected_value=expected_value,
+        stream=stream or _migration_stream,
     )
 
 
