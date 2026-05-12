@@ -35,14 +35,14 @@ class RouteHop:
         layer_indices: Consecutive global layer indices this shard runs
             during this hop. Always non-empty; always a strict ascending
             sub-range of the layer space.
-        src_shard: Index of the shard that produced this hop's input
-            activation, or ``None`` for the entry hop (input from the
-            embedding layer / token ids, not from another shard).
+
+    The previous-hop shard (source of the inbound activation) is
+    derivable from the hop's position in :attr:`Route.hops` — see
+    :meth:`Route.src_of`.
     """
 
     shard_idx: int
     layer_indices: Tuple[int, ...]
-    src_shard: Optional[int]
 
 
 @dataclass(frozen=True)
@@ -53,27 +53,28 @@ class Route:
         hops: Ordered tuple of :class:`RouteHop`. Length-1 routes
             correspond to "no disaggregation; this request runs entirely
             on one shard" — back-compat with collocated requests.
-        entry_shard: Shard the request is submitted to (== ``hops[0].shard_idx``).
-        exit_shard: Shard that produces the final logits and the next
-            token (== ``hops[-1].shard_idx``). The coord routes
-            ``ENGINE_REPLY`` from this shard.
     """
 
     hops: Tuple[RouteHop, ...]
-    entry_shard: int
-    exit_shard: int
 
-    def num_hops(self) -> int:
-        return len(self.hops)
+    @property
+    def entry_shard(self) -> int:
+        """Shard the request is submitted to (== ``hops[0].shard_idx``)."""
+        return self.hops[0].shard_idx
 
-    def hops_through(self, shard_idx: int) -> Tuple[RouteHop, ...]:
-        """All hops where ``shard_idx`` is the running shard. Typically
-        length 0 or 1; length > 1 happens when a request bounces back
-        through a shard (e.g., dense MLP after an MoE detour)."""
-        return tuple(h for h in self.hops if h.shard_idx == shard_idx)
+    @property
+    def exit_shard(self) -> int:
+        """Shard producing the final logits and next token; coord routes
+        ``ENGINE_REPLY`` from here (== ``hops[-1].shard_idx``)."""
+        return self.hops[-1].shard_idx
 
     def visits(self, shard_idx: int) -> bool:
         return any(h.shard_idx == shard_idx for h in self.hops)
+
+    def src_of(self, hop_pos: int) -> Optional[int]:
+        """Shard that produced the inbound activation for ``hops[hop_pos]``,
+        or ``None`` for the entry hop (input is from the embedding)."""
+        return self.hops[hop_pos - 1].shard_idx if hop_pos > 0 else None
 
 
 def _build_ownership_map(
@@ -132,8 +133,6 @@ def _build_ownership_map(
 def plan_route(
     shards: List[InferenceShard],
     layer_type_list: Tuple[str, ...],
-    *,
-    entry_shard: Optional[int] = None,
 ) -> Route:
     """Compute the route a request takes through a disaggregated layout.
 
@@ -146,13 +145,6 @@ def plan_route(
         shards: List of shards in the layout. Order = shard index.
         layer_type_list: Per-block kind symbols (length = total layer
             count).
-        entry_shard: Optional override for the request's entry shard.
-            If given, the route MUST start with this shard — otherwise
-            an ``AssertionError`` is raised. Used when the submitter is
-            pinned to a specific shard (e.g., a sticky routing policy)
-            and wants the planner to validate compatibility rather than
-            silently pick another entry. ``None`` means "use whatever
-            shard owns layer 0."
 
     Returns:
         :class:`Route` with at least one hop. For non-disagg layouts
@@ -165,41 +157,17 @@ def plan_route(
     hops: List[RouteHop] = []
     current_shard: Optional[int] = None
     current_layers: List[int] = []
-    prev_shard: Optional[int] = None
     for li, shard_idx in enumerate(owner_by_layer):
         if shard_idx == current_shard:
             current_layers.append(li)
             continue
         if current_shard is not None:
-            hops.append(
-                RouteHop(
-                    shard_idx=current_shard,
-                    layer_indices=tuple(current_layers),
-                    src_shard=prev_shard,
-                )
-            )
-            prev_shard = current_shard
+            hops.append(RouteHop(current_shard, tuple(current_layers)))
         current_shard = shard_idx
         current_layers = [li]
     assert current_shard is not None  # layer_type_list non-empty
-    hops.append(
-        RouteHop(
-            shard_idx=current_shard,
-            layer_indices=tuple(current_layers),
-            src_shard=prev_shard,
-        )
-    )
-
-    entry = hops[0].shard_idx
-    if entry_shard is not None:
-        assert entry == entry_shard, (
-            f"Caller pinned entry_shard={entry_shard} but layer 0 is "
-            f"owned by shard {entry}. Either re-submit to shard {entry} "
-            f"or extend shard {entry_shard}'s kinds to include the "
-            f"first layer's kind ({layer_type_list[0]!r})."
-        )
-    exit_ = hops[-1].shard_idx
-    return Route(hops=tuple(hops), entry_shard=entry, exit_shard=exit_)
+    hops.append(RouteHop(current_shard, tuple(current_layers)))
+    return Route(hops=tuple(hops))
 
 
 def serialize_route(route: Route) -> list:
@@ -207,15 +175,12 @@ def serialize_route(route: Route) -> list:
 
     Wire form (one entry per hop):
 
-        [[shard_idx, [layer_idx, ...], src_shard_or_None], ...]
+        [[shard_idx, [layer_idx, ...]], ...]
 
-    ``entry_shard`` and ``exit_shard`` are derivable from the hops
-    themselves so they're not on the wire.
+    The inbound src shard for each hop is derivable from the hop's
+    position (``hops[i-1].shard_idx``), so it's not on the wire.
     """
-    return [
-        [h.shard_idx, list(h.layer_indices), h.src_shard]
-        for h in route.hops
-    ]
+    return [[h.shard_idx, list(h.layer_indices)] for h in route.hops]
 
 
 def deserialize_route(obj: list) -> Route:
@@ -225,11 +190,11 @@ def deserialize_route(obj: list) -> Route:
     assert obj, "deserialize_route: empty hop list."
     hops: List[RouteHop] = []
     for i, h in enumerate(obj):
-        assert len(h) == 3, (
+        assert len(h) == 2, (
             f"deserialize_route: hop {i} must be "
-            f"[shard_idx, layer_indices, src_shard], got {h!r}."
+            f"[shard_idx, layer_indices], got {h!r}."
         )
-        shard_idx, layer_indices, src_shard = h
+        shard_idx, layer_indices = h
         assert layer_indices, (
             f"deserialize_route: hop {i} has empty layer_indices."
         )
@@ -237,29 +202,8 @@ def deserialize_route(obj: list) -> Route:
             RouteHop(
                 shard_idx=int(shard_idx),
                 layer_indices=tuple(int(li) for li in layer_indices),
-                src_shard=None if src_shard is None else int(src_shard),
             )
         )
-    return Route(
-        hops=tuple(hops),
-        entry_shard=hops[0].shard_idx,
-        exit_shard=hops[-1].shard_idx,
-    )
+    return Route(hops=tuple(hops))
 
 
-def explain_route(route: Route, layer_type_list: Tuple[str, ...]) -> str:
-    """Human-readable rendering of a route. Useful in logs + tests.
-
-    Example output::
-
-        Route(entry=0, exit=2): 0[M:0,2,4] -> 1[*:1,3] -> 2[E:5,6,7]
-    """
-    parts: List[str] = []
-    for h in route.hops:
-        kinds = "".join(layer_type_list[i] for i in h.layer_indices)
-        layers = ",".join(str(i) for i in h.layer_indices)
-        parts.append(f"{h.shard_idx}[{kinds}:{layers}]")
-    return (
-        f"Route(entry={route.entry_shard}, exit={route.exit_shard}): "
-        + " -> ".join(parts)
-    )

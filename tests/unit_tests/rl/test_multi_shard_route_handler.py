@@ -22,12 +22,11 @@ from megatron.rl.inference.route_planner import Route, RouteHop
 
 def _route_visiting(*shards) -> Route:
     """Build a simple linear route visiting the given shard indices."""
-    hops = []
-    prev = None
-    for i, s in enumerate(shards):
-        hops.append(RouteHop(shard_idx=s, layer_indices=(i,), src_shard=prev))
-        prev = s
-    return Route(hops=tuple(hops), entry_shard=hops[0].shard_idx, exit_shard=hops[-1].shard_idx)
+    hops = tuple(
+        RouteHop(shard_idx=s, layer_indices=(i,))
+        for i, s in enumerate(shards)
+    )
+    return Route(hops=hops)
 
 
 @pytest.fixture

@@ -15,7 +15,6 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
-from megatron.core.inference.disagg_forward import should_stop_layer_loop
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
@@ -853,13 +852,14 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
                     with self.offload_context, inner_quantization_context:
                         if dispatcher is not None:
-                            hidden_states, action = dispatcher.dispatch_layer(
+                            # ``hidden_states`` may be None between SEND
+                            # and the next RECEIVE; NOT_MY_REQUEST flows
+                            # None through unchanged until the next hop.
+                            hidden_states, _ = dispatcher.dispatch_layer(
                                 l_no,
                                 hidden_states,
                                 lambda h, _layer=layer: _run_layer_local(_layer, h),
                             )
-                            if should_stop_layer_loop(action):
-                                break
                         else:
                             hidden_states, context = layer(
                                 hidden_states=hidden_states,

@@ -118,7 +118,11 @@ def maybe_init_nvshmem(group: Optional[dist.ProcessGroup] = None) -> None:
     if not dist.is_initialized():
         raise RuntimeError("torch.distributed must be initialized before NVSHMEM init")
 
-    from cuda.core.experimental import Device  # type: ignore
+    try:
+        from cuda.core import Device  # type: ignore
+    except ImportError:
+        # cuda-core <0.x kept Device under the experimental namespace.
+        from cuda.core.experimental import Device  # type: ignore
 
     local_rank = torch.cuda.current_device()
     device = Device(local_rank)

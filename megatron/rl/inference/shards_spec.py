@@ -34,7 +34,7 @@ Examples for a 4-rank world:
     "tp=4,dp=1"               -> single shard over all 4 ranks
 """
 
-from typing import List, Optional
+from typing import List
 
 # Integer-valued shard keys. ``kinds`` is a string and handled separately.
 VALID_INT_KEYS = ("tp", "pp", "ep", "expt_tp", "dp")
@@ -51,19 +51,15 @@ def _parse_kinds(value: str) -> tuple:
     """Parse a ``kinds=`` value into a deduplicated tuple of symbols.
 
     The value is a string of single-char symbols (e.g., ``"*D-"`` for
-    attention + DS-attention + MLP). Empty / whitespace-only is rejected
-    — a ``kinds`` key with no symbols is almost certainly a typo and
-    silently swallowing it would route every block away from the shard.
+    attention + DS-attention + MLP). Empty is rejected — a ``kinds``
+    key with no symbols is almost certainly a typo and silently
+    swallowing it would route every block away from the shard.
     """
     cleaned = value.strip()
     assert cleaned, "kinds= cannot be empty; omit the key for 'all kinds'."
     seen: list = []
     for ch in cleaned:
-        if ch == ",":
-            # Commas are the inter-key separator; reaching this code path
-            # means the parser already split on them. Defense in depth.
-            continue
-        if ch in (" ", "\t"):
+        if ch.isspace():
             continue
         if ch not in VALID_KIND_SYMBOLS:
             raise AssertionError(

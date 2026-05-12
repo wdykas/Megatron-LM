@@ -233,19 +233,6 @@ class InferenceShard:
             rank = dist.get_rank()
         return self.rank_offset <= rank < self.rank_offset + self.world_size
 
-    def owns_layer(self, layer_idx: int) -> bool:
-        """Whether this shard runs the block at the given global layer index.
-
-        Returns ``True`` for shards without an explicit kinds restriction
-        (collocated / hetero-PP shards run every kind their PP rank covers,
-        and PP-rank ownership is enforced separately by the model's
-        layer_type_list partition). For disagg shards (``kinds`` is set),
-        returns whether ``layer_idx`` is in :attr:`layer_indices`.
-        """
-        if self.layer_indices is None:
-            return True
-        return layer_idx in self.layer_indices
-
 
 def build_inference_pg_collections_for_shards(
     total_world_size: int,

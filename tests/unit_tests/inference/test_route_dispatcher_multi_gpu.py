@@ -14,7 +14,7 @@ import torch.distributed as dist
 
 from megatron.core.inference import activation_transport as at
 from megatron.core.inference.route_dispatcher import RouteDispatcher
-from megatron.core.inference.route_walker import LayerAction
+from megatron.core.inference.route_dispatcher import LayerAction
 from megatron.rl.inference.route_planner import Route, RouteHop
 
 
@@ -72,13 +72,11 @@ def test_dispatcher_drives_disagg_forward(_dist_world):
     # Disagg route: shard 0 → 1 → 0 → 1.
     route = Route(
         hops=(
-            RouteHop(shard_idx=0, layer_indices=(0,), src_shard=None),
-            RouteHop(shard_idx=1, layer_indices=(1,), src_shard=0),
-            RouteHop(shard_idx=0, layer_indices=(2,), src_shard=1),
-            RouteHop(shard_idx=1, layer_indices=(3,), src_shard=0),
+            RouteHop(shard_idx=0, layer_indices=(0,)),
+            RouteHop(shard_idx=1, layer_indices=(1,)),
+            RouteHop(shard_idx=0, layer_indices=(2,)),
+            RouteHop(shard_idx=1, layer_indices=(3,)),
         ),
-        entry_shard=0,
-        exit_shard=1,
     )
 
     dispatcher = RouteDispatcher(
@@ -90,20 +88,15 @@ def test_dispatcher_drives_disagg_forward(_dist_world):
         hidden_dtype=torch.float32,
     )
 
-    # Forward pass driven by the dispatcher.
+    # Forward pass driven by the dispatcher. The loop runs every
+    # layer; the dispatcher decides per-layer whether to run locally,
+    # send + clear hidden, or thread None through NOT_MY_REQUEST until
+    # the next RECEIVE.
     hidden = initial_hidden if dispatcher.is_entry_shard() else None
     for li in range(num_layers):
-        hidden, action = dispatcher.dispatch_layer(
+        hidden, _ = dispatcher.dispatch_layer(
             li, hidden, lambda h, i=li: apply_layer(i, h)
         )
-        if action is LayerAction.SEND:
-            hidden = None  # request suspended; await re-entry via RECEIVE
-        if action is LayerAction.DONE:
-            break
-    # Terminal send from non-exit shards: after the last layer, if the
-    # walker still owes a SEND, do it now.
-    if not dispatcher.is_done():
-        dispatcher.maybe_send_final(hidden, num_layers)
 
     at.activation_stream().synchronize()
 

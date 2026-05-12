@@ -2926,40 +2926,22 @@ class DynamicInferenceEngine(AbstractEngine):
                         )
 
             elif header == Headers.ROUTE_REQUEST:
-                # Layer-kind disaggregation: the coord shipped a per-
-                # request route plan. Deserialize, ask the handler to
-                # build a :class:`RouteDispatcher`, and register it on
-                # the engine so the forward pass can consult it at
-                # each layer. The dispatcher's NVSHMEM ops run on the
-                # activation stream; the engine's compute stream
-                # composes with them in the model forward.
+                # Layer-kind disagg: the coord shipped a per-request
+                # route plan. Deserialize and hand to the handler,
+                # which builds a :class:`RouteDispatcher` and
+                # registers it on the engine for the forward pass.
+                # Wire payload: [ROUTE_REQUEST, request_id, route_hops].
                 if self._route_handler is None:
                     logging.warning(
                         "Engine: ignoring ROUTE_REQUEST (no handler registered)"
                     )
                 else:
-                    from megatron.core.inference.disagg_request import (
-                        DisaggRequestBundle,
+                    from megatron.rl.inference.route_planner import (
+                        deserialize_route,
                     )
-
-                    # Wire payload (see Headers.ROUTE_REQUEST docs):
-                    # [ROUTE_REQUEST, request_id, route_hops, bundle_dict, exit_shard_idx]
-                    (
-                        _,
-                        request_id,
-                        route_hops,
-                        bundle_dict,
-                        _exit_shard,
-                    ) = data
+                    _, request_id, route_hops = data
                     try:
-                        bundle = DisaggRequestBundle.from_wire(
-                            {
-                                "request_id": request_id,
-                                "route": route_hops,
-                                **bundle_dict,
-                            }
-                        )
-                        self._route_handler(request_id, bundle.route)
+                        self._route_handler(request_id, deserialize_route(route_hops))
                     except Exception as e:
                         logging.error(
                             "Engine: ROUTE_REQUEST handler raised %s — "

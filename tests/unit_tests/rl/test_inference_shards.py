@@ -241,39 +241,6 @@ def test_compute_layer_indices_for_kinds():
     assert compute_layer_indices_for_kinds(("G",), layer_types) == ()
 
 
-def test_inference_shard_owns_layer_kind_restricted():
-    """``InferenceShard.owns_layer`` consults layer_indices when kinds are set,
-    and is open by default otherwise."""
-    from megatron.core.inference.shards import InferenceShard
-
-    # No kinds declared: every layer counted as owned (back-compat).
-    s = InferenceShard(
-        index=0,
-        spec={"tp": 2, "pp": 1, "ep": 1, "expt_tp": 2, "dp": 1},
-        rank_offset=0,
-        world_size=2,
-        pg_collection=None,
-    )
-    assert s.owns_layer(0)
-    assert s.owns_layer(99)
-
-    # Disagg shard: only specific indices owned.
-    s2 = InferenceShard(
-        index=1,
-        spec={"tp": 2, "pp": 1, "ep": 1, "expt_tp": 2, "dp": 1, "kinds": ("M",)},
-        rank_offset=2,
-        world_size=2,
-        pg_collection=None,
-        kinds=("M",),
-        layer_indices=(0, 2, 5),
-    )
-    assert s2.owns_layer(0)
-    assert s2.owns_layer(2)
-    assert s2.owns_layer(5)
-    assert not s2.owns_layer(1)
-    assert not s2.owns_layer(99)
-
-
 @pytest.mark.skipif(
     torch.cuda.device_count() < 4, reason="need >=4 GPUs for heterogeneous shard test"
 )

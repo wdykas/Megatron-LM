@@ -1,69 +1,79 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""High-level disagg forward-pass dispatcher.
+"""Per-layer dispatcher for layer-kind-disaggregated forward passes.
 
-Combines :class:`route_walker.RouteWalker` with the
-:mod:`activation_transport` primitives so the model's forward pass
-becomes a thin per-layer call:
+Combines :class:`Route` with the :mod:`activation_transport`
+primitives. The model's forward loop calls
+:meth:`RouteDispatcher.dispatch_layer` once per layer; the dispatcher
+decides whether to run the layer locally, receive an activation from
+a peer shard, or send an outgoing activation.
 
-.. code-block:: python
-
-    for li, layer in enumerate(self.layers):
-        hidden, action = dispatcher.dispatch_layer(li, hidden, layer.forward)
-        if action is LayerAction.SEND:
-            break  # request suspends; resumes later when activation returns
-        if action is LayerAction.DONE:
-            break
-
-The dispatcher owns:
-
-- The :class:`RouteWalker` (per-request state).
-- The lane assignment (which NVSHMEM lane to use for each peer shard).
-- The gather/scatter of the activation tensor into the symmetric slot.
-
-Everything that's NOT the model's per-layer compute lives here, so the
-model.forward integration is a single conditional + call.
+Dispatch is **stateless** given ``(route, my_shard_idx, layer_idx)``
+— the dispatcher is just an indexed query plus the I/O calls. There
+is no walker / cursor.
 """
 
 from __future__ import annotations
 
+from enum import Enum, auto
 from typing import Callable, Optional, Tuple
 
 import torch
 
 from megatron.core.inference import activation_transport as at
-from megatron.core.inference.route_walker import (
-    LayerAction,
-    LayerDecision,
-    RouteWalker,
-)
 from megatron.rl.inference.route_planner import Route
 
 
-class RouteDispatcher:
-    """Per-request forward-pass driver.
+class LayerAction(Enum):
+    """What happened at a layer this shard dispatched on.
 
-    One instance per in-flight request. Reads the route, walks through
-    layers, and at each layer either runs it locally, sends the hidden
-    state, or waits for an inbound activation.
+    Returned for caller introspection / tests. The model's forward
+    loop does not need to branch on the action — it just threads
+    ``hidden`` through every layer (``None`` between a SEND and the
+    next RECEIVE is handled automatically by NOT_MY_REQUEST
+    pass-through). The shard's ``post_process`` flag (gated on
+    ``own_lm_head`` via partial-model construction) decides whether
+    the final LM head runs.
+    """
+
+    # Layer ran locally, possibly after receiving an inbound activation.
+    LOCAL = auto()
+    # Activation sent to peer shard. ``hidden`` returned as ``None``;
+    # the loop continues with NOT_MY_REQUEST until the next hop where
+    # this shard RECEIVEs again (or until the loop ends).
+    SEND = auto()
+    # Past the end of the request's route (rare during a normal
+    # forward pass since the loop only iterates ``num_layers``).
+    DONE = auto()
+    # This layer's hop belongs to another shard; ``hidden`` flows
+    # through unchanged.
+    NOT_MY_REQUEST = auto()
+
+
+class RouteDispatcher:
+    """Stateless per-layer router for disaggregated forward passes.
+
+    One instance per in-flight disagg request. The dispatcher owns:
+
+    - The :class:`Route` (read-only).
+    - A precomputed ``layer_idx → RouteHop`` index so each
+      ``dispatch_layer`` call is O(1).
+    - The activation transport configuration (lane assignment,
+      payload size).
+
+    No per-layer cursor or "inside hop" flag — every call to
+    :meth:`dispatch_layer` reads the action straight from the route.
 
     Arguments:
         route: The request's pre-computed route plan.
         my_shard_idx: The current shard's index in the layout.
         my_pe: This shard's NVSHMEM PE id.
-        shard_to_pe: Function ``shard_idx -> pe_id`` resolving a peer
-            shard to its NVSHMEM PE (needed for the lane lookup).
-        hidden_shape: Expected ``(batch, hidden_dim)`` (or equivalent)
-            shape of the activation tensor that flows between shards.
-            Used to compute the per-op byte count and reshape the
-            scattered tensor on the receive side.
-        hidden_dtype: dtype of the activation tensor (so the symmetric
-            slot's ``uint8`` view can be reinterpreted correctly).
+        shard_to_pe: Function ``shard_idx → pe_id`` resolving a peer
+            shard to its NVSHMEM PE.
+        hidden_shape: Activation tensor shape (e.g., ``(batch, hidden)``).
+        hidden_dtype: dtype of the activation tensor.
         stream: Optional CUDA stream override; defaults to
             :func:`activation_transport.activation_stream`.
-
-    The dispatcher does not own the model or any per-layer state — it
-    only mediates between the walker's decision and the NVSHMEM ops.
     """
 
     def __init__(
@@ -77,110 +87,76 @@ class RouteDispatcher:
         *,
         stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
-        self._walker = RouteWalker(route, my_shard_idx=my_shard_idx)
+        self._route = route
+        self._my_shard = my_shard_idx
         self._my_pe = my_pe
         self._shard_to_pe = shard_to_pe
         self._hidden_shape = tuple(hidden_shape)
         self._hidden_dtype = hidden_dtype
-        # Bytes-per-activation = product(shape) * elem_size.
         nelem = 1
         for d in self._hidden_shape:
             nelem *= d
         self._payload_nbytes = nelem * torch.empty((), dtype=hidden_dtype).element_size()
         self._stream = stream
 
+        # Precompute layer_idx → (hop, hop_position) so dispatch_layer is
+        # an O(1) dict lookup instead of an O(num_hops) linear scan.
+        self._layer_to_hop: dict = {}
+        for hop_pos, hop in enumerate(route.hops):
+            for li in hop.layer_indices:
+                self._layer_to_hop[li] = (hop, hop_pos)
+        self._last_hop_pos = len(route.hops) - 1
+
     # ---- public API -------------------------------------------------------
 
-    def is_done(self) -> bool:
-        return self._walker.is_done()
-
     def is_entry_shard(self) -> bool:
-        return self._walker.is_entry()
+        return self._route.entry_shard == self._my_shard
 
     def is_exit_shard(self) -> bool:
-        return self._walker.is_exit()
+        return self._route.exit_shard == self._my_shard
 
     def dispatch_layer(
         self,
         layer_idx: int,
         hidden: Optional[torch.Tensor],
-        run_local_layer: Callable[[torch.Tensor], torch.Tensor],
+        run_local: Callable[[torch.Tensor], torch.Tensor],
     ) -> Tuple[Optional[torch.Tensor], LayerAction]:
-        """Make progress on the request at ``layer_idx``.
+        """Make progress on ``layer_idx`` for this request.
 
-        Args:
-            layer_idx: The model's current layer index.
-            hidden: Current hidden state on this shard, or ``None`` if
-                this shard has not yet received an activation.
-            run_local_layer: Function applied for LOCAL layers; called
-                with ``hidden`` and expected to return the post-layer
-                hidden state. Typically ``self.layers[layer_idx].forward``.
-
-        Returns:
-            Tuple ``(hidden_out, action)`` where ``action`` is the
-            :class:`LayerAction` the walker emitted. Callers should:
-
-            - ``LOCAL`` / ``RECEIVE`` then LOCAL: take ``hidden_out``
-              and proceed.
-            - ``SEND``: request has been suspended; ``hidden_out`` is
-              ``None``. Break out of the per-layer loop on this shard.
-            - ``DONE``: route exhausted; for the exit shard, the
-              caller should now run the LM head on the final
-              ``hidden_out``.
-            - ``NOT_MY_REQUEST``: skip layer; ``hidden_out`` unchanged.
+        Returns ``(hidden_out, action)``. The model's forward loop
+        threads ``hidden_out`` (possibly ``None`` between SEND and
+        the next RECEIVE) through every layer; no caller-side branch
+        on action is needed.
         """
-        dec = self._walker.before_layer(layer_idx)
-
-        if dec.action is LayerAction.LOCAL:
-            assert hidden is not None, (
-                f"layer {layer_idx} LOCAL but no inbound hidden state — "
-                "did dispatcher miss a RECEIVE?"
-            )
-            return run_local_layer(hidden), LayerAction.LOCAL
-
-        if dec.action is LayerAction.RECEIVE:
-            received = self._receive(dec.peer_shard)
-            self._walker.after_receive()
-            # Now run the actual layer compute locally on the received
-            # activation.
-            return run_local_layer(received), LayerAction.RECEIVE
-
-        if dec.action is LayerAction.SEND:
-            assert hidden is not None, (
-                f"layer {layer_idx} SEND but no hidden state to send"
-            )
-            self._send(dec.peer_shard, hidden)
-            self._walker.after_send()
-            return None, LayerAction.SEND
-
-        if dec.action is LayerAction.DONE:
+        entry = self._layer_to_hop.get(layer_idx)
+        if entry is None:
+            # Past the route's last layer (or before its first, which
+            # only happens on degenerate layouts).
             return hidden, LayerAction.DONE
 
-        # NOT_MY_REQUEST
-        return hidden, LayerAction.NOT_MY_REQUEST
+        hop, hop_pos = entry
+        if hop.shard_idx != self._my_shard:
+            return hidden, LayerAction.NOT_MY_REQUEST
 
-    def maybe_send_final(
-        self, hidden: torch.Tensor, final_layer_idx: int
-    ) -> bool:
-        """After the model's last real layer, the walker may still owe a
-        terminal SEND if this shard's last hop ended at the final layer
-        and the next hop is on another shard.
+        # I own this layer. RECEIVE first if this is the hop's entry
+        # layer AND the hop has a predecessor shard.
+        if layer_idx == hop.layer_indices[0] and hop_pos > 0:
+            hidden = self._receive(self._route.hops[hop_pos - 1].shard_idx)
 
-        Call this after the per-layer loop with ``layer_idx ==
-        num_layers``; returns ``True`` if a send happened (request now
-        suspended), ``False`` if the walker is already done."""
-        dec = self._walker.before_layer(final_layer_idx)
-        if dec.action is LayerAction.SEND:
-            self._send(dec.peer_shard, hidden)
-            self._walker.after_send()
-            return True
-        return False
+        hidden = run_local(hidden)
 
-    # ---- internals --------------------------------------------------------
+        # SEND if this is the hop's exit layer AND another hop follows
+        # (on any shard — for revisits to the same shard we still send).
+        if layer_idx == hop.layer_indices[-1] and hop_pos < self._last_hop_pos:
+            next_hop = self._route.hops[hop_pos + 1]
+            self._send(next_hop.shard_idx, hidden)
+            return None, LayerAction.SEND
+
+        return hidden, LayerAction.LOCAL
+
+    # ---- transport internals ----------------------------------------------
 
     def _send(self, dst_shard: int, hidden: torch.Tensor) -> None:
-        """Gather ``hidden`` into the next available slot for this
-        shard→dst_shard lane and put + signal it onto the destination."""
         dst_pe = self._shard_to_pe(dst_shard)
         lane = at.lane_for(self._my_pe, dst_pe)
         slot = at.next_send_slot(lane)
@@ -198,10 +174,6 @@ class RouteDispatcher:
         )
 
     def _receive(self, src_shard: int) -> torch.Tensor:
-        """Wait for the next inbound activation from ``src_shard`` on
-        the lane, scatter it into a fresh tensor, ack back, and return
-        the activation. Stream-synchronous on the activation stream
-        before returning so callers see a host-visible tensor."""
         src_pe = self._shard_to_pe(src_shard)
         lane = at.lane_for(src_pe, self._my_pe)
         slot = at.next_recv_slot(lane)

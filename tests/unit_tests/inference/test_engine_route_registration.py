@@ -20,12 +20,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from megatron.core.inference.disagg_request import DisaggRequestBundle
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.headers import Headers
 from megatron.rl.inference.route_planner import (
     Route,
     RouteHop,
+    deserialize_route,
     serialize_route,
 )
 
@@ -44,11 +44,9 @@ def _bare_engine():
 def _sample_route() -> Route:
     return Route(
         hops=(
-            RouteHop(shard_idx=0, layer_indices=(0, 1), src_shard=None),
-            RouteHop(shard_idx=1, layer_indices=(2, 3), src_shard=0),
+            RouteHop(shard_idx=0, layer_indices=(0, 1)),
+            RouteHop(shard_idx=1, layer_indices=(2, 3)),
         ),
-        entry_shard=0,
-        exit_shard=1,
     )
 
 
@@ -84,47 +82,19 @@ def test_release_route_dispatcher_drops_entry():
 
 def test_route_request_signal_invokes_handler_with_route():
     """When the engine's dispatcher receives a ROUTE_REQUEST payload,
-    it deserializes the bundle and calls ``_route_handler(request_id,
-    route)``. This is the actual hook the live engine uses; we drive
-    it directly here without spinning up ZMQ.
-
-    The signal-dispatch loop lives inside ``async_step``, but the
-    ROUTE_REQUEST branch is self-contained — we replay the same
-    decode + dispatch logic from the engine code path.
-    """
+    it deserializes the route and calls ``_route_handler(request_id,
+    route)``."""
     eng = _bare_engine()
     handler = MagicMock()
     eng.set_route_handler(handler)
 
     route = _sample_route()
-    bundle = DisaggRequestBundle(
-        request_id=42,
-        route=route,
-        prompt_tokens=[1, 2, 3],
-        sampling_params={"temperature": 0.7},
-    )
+    # Wire payload: [ROUTE_REQUEST, request_id, route_hops]
+    data = [Headers.ROUTE_REQUEST.value, 42, serialize_route(route)]
 
-    # Wire payload mirrors what the engine receives over ZMQ:
-    # [ROUTE_REQUEST, request_id, route_hops, bundle_dict_minus_routeid,
-    #  exit_shard_idx]
-    bundle_wire = bundle.to_wire()
-    request_id = bundle_wire["request_id"]
-    route_hops = bundle_wire["route"]
-    rest = {k: v for k, v in bundle_wire.items() if k not in ("request_id", "route")}
-    data = [Headers.ROUTE_REQUEST.value, request_id, route_hops, rest, route.exit_shard]
-
-    # Replay the engine's ROUTE_REQUEST branch (same decode + call).
-    (
-        _,
-        rid,
-        hops_wire,
-        bundle_dict,
-        _exit,
-    ) = data
-    bundle_back = DisaggRequestBundle.from_wire(
-        {"request_id": rid, "route": hops_wire, **bundle_dict}
-    )
-    eng._route_handler(rid, bundle_back.route)
+    # Replay the engine's ROUTE_REQUEST branch.
+    _, rid, hops_wire = data
+    eng._route_handler(rid, deserialize_route(hops_wire))
 
     handler.assert_called_once()
     called_rid, called_route = handler.call_args[0]

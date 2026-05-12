@@ -19,11 +19,6 @@ from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.inference.disagg_forward import (
-    maybe_dispatch_layer,
-    should_stop_layer_loop,
-)
-from megatron.core.inference.partial_model import IdentityLayer, STUB_MARKER as DISAGG_STUB_MARKER
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -35,6 +30,29 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
+
+
+# Single-char marker placed in ``layer_type_list`` at positions a
+# disagg shard does not own. Disjoint from every entry in
+# ``LayerSymbols.VALID_LAYERS`` so the factory loop distinguishes a
+# stub from a real layer kind.
+DISAGG_STUB_MARKER = "_"
+
+
+class IdentityLayer(nn.Module):
+    """Zero-parameter pass-through used in place of non-owned layers.
+
+    Disagg shards replace each ``DISAGG_STUB_MARKER`` position in the
+    layer pattern with an ``IdentityLayer`` so the ``ModuleList``
+    indexing stays valid. The route dispatcher short-circuits to
+    activation transport before the stub is called; the pass-through
+    is defensive — if anything else does call the stub (e.g., a
+    unit test on the bare module), the hidden state propagates
+    unchanged.
+    """
+
+    def forward(self, hidden_states, *args, **kwargs):
+        return hidden_states
 
 
 @dataclass
@@ -354,18 +372,25 @@ class HybridStack(MegatronModule):
                 )
                 with inner_quant_context:
                     if dispatcher is not None:
-                        hidden_states, action = dispatcher.dispatch_layer(
+                        # SEND clears hidden_states to None; subsequent
+                        # NOT_MY_REQUEST layers flow it through unchanged
+                        # until the next RECEIVE re-establishes it.
+                        # The LM-head guard (``post_process``) is gated
+                        # on ``own_lm_head`` so non-exit shards never
+                        # consume a possibly-None final hidden state.
+                        hidden_states, _ = dispatcher.dispatch_layer(
                             layer_idx,
                             hidden_states,
                             lambda h, _layer=layer: _run_layer_local(_layer, h),
                         )
-                        if should_stop_layer_loop(action):
-                            break
                     else:
                         hidden_states = _run_layer_local(layer, hidden_states)
 
                 # Attention layers return (hidden_states, context); we
                 # discard context (no cross-attention in this model).
+                # ``hidden_states`` is None between a SEND and the next
+                # RECEIVE — skip both the tuple unpack and the post-loop
+                # final_norm in that window.
                 if isinstance(hidden_states, tuple):
                     hidden_states = hidden_states[0]
 
@@ -416,9 +441,7 @@ class HybridStack(MegatronModule):
             # ``dist_ckpt_strictness="ignore"`` (or
             # ``"log_unexpected"``) so those keys are dropped on load
             # without erroring.
-            if isinstance(layer, IdentityLayer) or getattr(
-                layer, "_is_identity_stub", False
-            ):
+            if isinstance(layer, IdentityLayer):
                 continue
 
             global_layer_offset = layer.layer_number - 1  # self.layer_number starts at 1
