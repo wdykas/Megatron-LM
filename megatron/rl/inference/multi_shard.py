@@ -18,6 +18,7 @@ import asyncio
 import logging
 import time
 from collections import deque
+from dataclasses import dataclass
 from typing import Callable, Deque, Dict, List, Optional, Tuple
 
 import httpx
@@ -64,6 +65,30 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 # handler) — bump this if a future migration grows the per-bundle
 # op fanout.
 MAX_OPS_PER_REQ = 32
+
+
+@dataclass
+class MigrationMeta:
+    """Per-(src_shard, dst_shard) snapshot of everything the migration
+    handler needs to schedule transfers. Built once when a migration
+    pair is registered (or its first policy lands); read on every
+    ``Headers.MIGRATE_BATCH`` for that pair.
+
+    Layout / head-offset fields are populated only on ranks that
+    participate (``in_src or in_dst``). Mamba-layout fields are
+    populated only on hybrid models.
+    """
+
+    src_shard: InferenceShard
+    dst_shard: InferenceShard
+    in_src: bool
+    in_dst: bool
+    src_layout: Optional[object] = None
+    dst_layout: Optional[object] = None
+    my_src_head_offset: int = 0
+    my_dst_head_offset: int = 0
+    src_mamba_layout: Optional[object] = None
+    dst_mamba_layout: Optional[object] = None
 
 
 async def _spawn_unified_coord(
@@ -512,7 +537,7 @@ def _execute_mamba_dst_side(
 
 
 def _release_src_state(
-    meta: dict,
+    meta: "MigrationMeta",
     is_hybrid: bool,
     src_block_ids_to_free: List[torch.Tensor],
     src_mamba_state_indices: List[Optional[int]],
@@ -524,12 +549,12 @@ def _release_src_state(
     in the migration handler. Rank-local — only acts when this rank
     actually held src state.
     """
-    if meta["in_src"] and src_block_ids_to_free:
+    if meta.in_src and src_block_ids_to_free:
         allocator = engine.context.kv_block_allocator
         for blocks in src_block_ids_to_free:
             if blocks.numel() > 0:
                 allocator.release_memory_blocks(blocks)
-    if meta["in_src"] and is_hybrid:
+    if meta.in_src and is_hybrid:
         for src_state_idx in src_mamba_state_indices:
             if src_state_idx is not None:
                 engine.release_mamba_state_slot(src_state_idx)
@@ -538,7 +563,7 @@ def _release_src_state(
 def _make_migration_poll_callback(
     done_event: torch.cuda.Event,
     flags_used: List[int],
-    meta: dict,
+    meta: "MigrationMeta",
     is_hybrid: bool,
     src_block_ids_to_free: List[torch.Tensor],
     src_mamba_state_indices: List[Optional[int]],
@@ -622,7 +647,7 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
     # ``(src_shard_index, dst_shard_index)`` → dict with the src/dst
     # layouts and head offsets the engine handler needs. Pre-computing
     # avoids paying the layout-build cost on every migration.
-    _migration_meta: Dict[Tuple[int, int], dict] = PrivateAttr(default_factory=dict)
+    _migration_meta: Dict[Tuple[int, int], MigrationMeta] = PrivateAttr(default_factory=dict)
     # Round-robin counter used by the migration scheduler to spread
     # batches across the destination shard's DP replicas (keyed by
     # ``(src_shard, dst_shard)``). Lives on every rank but only the
@@ -1307,61 +1332,40 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         in_src = src_shard.owns_rank(rank)
         in_dst = dst_shard.owns_rank(rank)
 
-        meta = {
-            "src_shard": src_shard,
-            "dst_shard": dst_shard,
-            "in_src": in_src,
-            "in_dst": in_dst,
-        }
+        meta = MigrationMeta(
+            src_shard=src_shard,
+            dst_shard=dst_shard,
+            in_src=in_src,
+            in_dst=in_dst,
+        )
         if in_src or in_dst:
             assert self._my_engine is not None
-            src_layout, my_src_head_offset = self._layout_and_head_offset(
+            meta.src_layout, meta.my_src_head_offset = self._layout_and_head_offset(
                 src_shard, self._my_engine, rank, participates=in_src
             )
-            dst_layout, my_dst_head_offset = self._layout_and_head_offset(
+            meta.dst_layout, meta.my_dst_head_offset = self._layout_and_head_offset(
                 dst_shard, self._my_engine, rank, participates=in_dst
             )
             # Mamba state migration supports heterogeneous TP and PP
             # via :func:`build_mamba_migration_plan`. The plan walks
-            # ``layer_type_list`` to compute per-PP-rank mamba
-            # ownership and intersects between src and dst PP ranks,
-            # so hetero PP works as long as the model's transformer
-            # layers partition uniformly across PP (each PP rank
-            # owns a contiguous range; no custom split rank).
+            # ``layer_type_list`` to compute per-PP-rank mamba ownership
+            # and intersects between src and dst PP ranks, so hetero PP
+            # works as long as the model's transformer layers partition
+            # uniformly across PP. All ranks in a shard share the same
+            # layout (model is replicated within a shard's TP/PP block).
             if self._my_engine.context.is_hybrid_model:
-                # Mamba layout — read off the local engine context.
-                # All ranks in a shard share the same layout (model is
-                # replicated within a shard's TP/PP block).
-                src_mamba_layout = self._mamba_layout_for(src_shard)
-                dst_mamba_layout = self._mamba_layout_for(dst_shard)
-                meta["src_mamba_layout"] = src_mamba_layout
-                meta["dst_mamba_layout"] = dst_mamba_layout
-            meta.update(
-                {
-                    "src_layout": src_layout,
-                    "dst_layout": dst_layout,
-                    "my_src_head_offset": my_src_head_offset,
-                    "my_dst_head_offset": my_dst_head_offset,
-                }
-            )
+                meta.src_mamba_layout = self._mamba_layout_for(src_shard)
+                meta.dst_mamba_layout = self._mamba_layout_for(dst_shard)
         self._migration_meta[key] = meta
 
         # Wire the engine handler once. Subsequent pairs share it.
-        if self._my_engine is not None and getattr(
-            self._my_engine, '_migration_handler', None
-        ) is None:
-            self._my_engine.set_migration_handler(self._on_migrate_batch_signal)
-
-        # Layer-kind disaggregation: register the route handler if it
-        # hasn't been bound yet. The handler builds a
-        # :class:`RouteDispatcher` for each ROUTE_REQUEST and registers
-        # it on the engine so the model.forward can consult it
-        # per-layer. Mirrors the migration-handler pattern above —
-        # one-shot wiring at first call.
-        if self._my_engine is not None and getattr(
-            self._my_engine, '_route_handler', None
-        ) is None and hasattr(self._my_engine, 'set_route_handler'):
-            self._my_engine.set_route_handler(self._on_route_request_signal)
+        # Engine guarantees both attributes exist (set to None in __init__);
+        # _route_handler binding mirrors the migration-handler pattern.
+        if self._my_engine is not None:
+            if self._my_engine._migration_handler is None:
+                self._my_engine.set_migration_handler(self._on_migrate_batch_signal)
+            if self._my_engine._route_handler is None:
+                self._my_engine.set_route_handler(self._on_route_request_signal)
 
     def _on_route_request_signal(self, request_id: int, route) -> None:
         """Engine-side ROUTE_REQUEST handler.
@@ -1388,18 +1392,15 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         # Hidden-state shape + dtype come from the model's config. For
         # disagg, every shard agrees on the hidden dim (per the
         # ownership invariant); batch is the engine's per-step max.
+        # ``max_requests`` is set by the engine config; nbytes is sized
+        # for this upper bound so a put never overruns the slot.
         cfg = self._my_engine.controller.inference_wrapped_model.model.config
-        # Use a generous upper bound on batch size; the dispatcher's
-        # nbytes is computed from this and used to size the
-        # NVSHMEM put.
-        max_batch = getattr(self._my_engine, "max_requests", 64)
         hidden_dim = int(cfg.hidden_size)
-        hidden_dtype = getattr(cfg, "params_dtype", None) or getattr(
-            cfg, "pipeline_dtype", None
+        hidden_dtype = (
+            getattr(cfg, "params_dtype", None)
+            or getattr(cfg, "pipeline_dtype", None)
+            or torch.bfloat16
         )
-        if hidden_dtype is None:
-            import torch as _torch
-            hidden_dtype = _torch.bfloat16
 
         # Map shard_idx → NVSHMEM PE. PE id equals global rank in
         # NVSHMEM's standard init. For matched-TP layouts (the common
@@ -1407,22 +1408,19 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         # tp_offset within my shard maps to the same tp_offset on
         # every peer shard. Hetero-TP between disagg shards would
         # need a more elaborate routing table — deferred.
-        import torch.distributed as _dist
-
         my_shard = self._shards[self._my_shard_index]
-        global_rank = _dist.get_rank() if _dist.is_initialized() else 0
+        global_rank = dist.get_rank() if dist.is_initialized() else 0
         tp_offset = global_rank - my_shard.rank_offset
 
         def shard_to_pe(shard_idx: int) -> int:
-            target_shard = self._shards[shard_idx]
-            return target_shard.rank_offset + tp_offset
+            return self._shards[shard_idx].rank_offset + tp_offset
 
         dispatcher = RouteDispatcher(
             route=route,
             my_shard_idx=self._my_shard_index,
             my_pe=global_rank,
             shard_to_pe=shard_to_pe,
-            hidden_shape=(max_batch, hidden_dim),
+            hidden_shape=(self._my_engine.max_requests, hidden_dim),
             hidden_dtype=hidden_dtype,
         )
         self._my_engine.register_route_dispatcher(request_id, dispatcher)
@@ -1459,7 +1457,7 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                 list(self._migration_meta.keys()),
             )
             return
-        if not (meta["in_src"] or meta["in_dst"]):
+        if not (meta.in_src or meta.in_dst):
             return  # bystander; coord shouldn't forward to us anyway
 
         from megatron.core.inference import nvshmem_migration as _nv
@@ -1469,10 +1467,10 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             deserialize_bundle,
         )
 
-        src_shard = meta["src_shard"]
-        dst_shard = meta["dst_shard"]
-        src_layout = meta["src_layout"]
-        dst_layout = meta["dst_layout"]
+        src_shard = meta.src_shard
+        dst_shard = meta.dst_shard
+        src_layout = meta.src_layout
+        dst_layout = meta.dst_layout
         src_root = src_shard.ranks()[0]
         # Within a shard, ranks are laid out TP-major:
         # ``rank_offset + dp * tp_size + tp``. ``dst_root`` is TP-0 of
@@ -1496,23 +1494,23 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             b.dst_layout = dst_layout
         engine = self._my_engine
         memory_buffer = engine.context.memory_buffer
-        layout = src_layout if meta["in_src"] else dst_layout
+        layout = src_layout if meta.in_src else dst_layout
 
         # Per-rank PP layer offsets for the migration plan's local
         # head/layer slicing.
         rank = dist.get_rank()
         my_src_pp_stage = (
-            (rank - src_root) // src_layout.tp_size if meta["in_src"] else 0
+            (rank - src_root) // src_layout.tp_size if meta.in_src else 0
         )
         my_dst_pp_stage = (
-            (rank - dst_root) // dst_layout.tp_size if meta["in_dst"] else 0
+            (rank - dst_root) // dst_layout.tp_size if meta.in_dst else 0
         )
         src_layers_per_pp = src_layout.num_layers_total // src_layout.pp_size
         dst_layers_per_pp = dst_layout.num_layers_total // dst_layout.pp_size
         my_src_pp_layer_offset = my_src_pp_stage * src_layers_per_pp
         my_dst_pp_layer_offset = my_dst_pp_stage * dst_layers_per_pp
-        my_src_head_offset = meta["my_src_head_offset"]
-        my_dst_head_offset = meta["my_dst_head_offset"]
+        my_src_head_offset = meta.my_src_head_offset
+        my_dst_head_offset = meta.my_dst_head_offset
 
         stream = _nv.migration_stream()
 
@@ -1530,7 +1528,7 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             injected: List[Tuple[RequestMigrationBundle, List[int]]] = []
             dst_mamba_state_indices: List[Optional[int]] = []
             is_hybrid = engine.context.is_hybrid_model
-            if meta["in_src"]:
+            if meta.in_src:
                 for req_id in request_ids:
                     if req_id in engine.requests:
                         # Capture mamba state idx BEFORE detach — even
@@ -1554,7 +1552,7 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             # Dst injects each bundle (allocates dst blocks + a fresh
             # mamba state slot on hybrid models) and accumulates the
             # (bundle, dst_blocks) pairs.
-            if meta["in_dst"]:
+            if meta.in_dst:
                 for bundle in parsed_bundles:
                     dst_blocks = engine.inject_request(bundle).tolist()
                     injected.append((bundle, dst_blocks))
@@ -1569,7 +1567,7 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             # left to the plan helper to fill.
             all_ops_by_bundle: List[List] = []
             for i, bundle in enumerate(parsed_bundles):
-                dst_blocks = injected[i][1] if meta["in_dst"] else None
+                dst_blocks = injected[i][1] if meta.in_dst else None
                 ops = build_kv_migration_plan(
                     bundle,
                     src_global_rank_of=_src_rank_of,
@@ -1592,8 +1590,8 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                     arena,
                     parsed_bundles,
                     engine.context,
-                    meta["src_mamba_layout"],
-                    meta["dst_mamba_layout"],
+                    meta.src_mamba_layout,
+                    meta.dst_mamba_layout,
                     _src_rank_of,
                     _dst_rank_of,
                 )
@@ -1604,25 +1602,25 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             # mutually exclusive. Mamba transfers piggyback on the same
             # stream after KV so the done_event covers both.
             with torch.cuda.stream(stream):
-                if meta["in_src"]:
+                if meta.in_src:
                     _execute_kv_src_side(
                         rank, op_meta, memory_buffer, dtype, layout,
                         my_src_head_offset, my_src_pp_layer_offset, stream,
                     )
-                if meta["in_dst"]:
+                if meta.in_dst:
                     _execute_kv_dst_side(
                         rank, op_meta, memory_buffer, dtype, layout,
                         my_dst_head_offset, my_dst_pp_layer_offset, stream,
                     )
-                if is_hybrid and (meta["in_src"] or meta["in_dst"]):
+                if is_hybrid and (meta.in_src or meta.in_dst):
                     conv_states = engine.context.mamba_conv_states
                     ssm_states = engine.context.mamba_ssm_states
-                    if meta["in_src"]:
+                    if meta.in_src:
                         _execute_mamba_src_side(
                             rank, mamba_meta, conv_states, ssm_states,
                             src_mamba_state_indices, stream,
                         )
-                    if meta["in_dst"]:
+                    if meta.in_dst:
                         _execute_mamba_dst_side(
                             rank, mamba_meta, conv_states, ssm_states,
                             dst_mamba_state_indices, stream,
