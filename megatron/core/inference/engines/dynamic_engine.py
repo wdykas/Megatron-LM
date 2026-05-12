@@ -540,19 +540,18 @@ class DynamicInferenceEngine(AbstractEngine):
         """Resolve the active disagg request's :class:`RouteDispatcher`
         and push it directly into the model's decoder. ``None`` clears
         the dispatcher (collocated path). Safe no-op when the model
-        has no disagg-aware decoder."""
+        has no decoder. The decoder's forward reads the attribute via
+        ``getattr(..., None)`` so any nn.Module accepts the assignment
+        without needing a disagg-aware setter."""
         try:
             decoder = self.controller.inference_wrapped_model.model.decoder
         except AttributeError:
             return
-        if not hasattr(decoder, "set_active_dispatcher"):
-            return
-        dispatcher = (
+        decoder._active_dispatcher = (
             self._route_dispatchers.get(request_id)
             if request_id is not None
             else None
         )
-        decoder.set_active_dispatcher(dispatcher)
 
     def _poll_pending_migrations(self) -> None:
         """Poll every pending migration; drop those that report done.

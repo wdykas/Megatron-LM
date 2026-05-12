@@ -27,32 +27,10 @@ from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.inference.disagg_stub import DISAGG_STUB_MARKER, IdentityLayer
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
-
-
-# Single-char marker placed in ``layer_type_list`` at positions a
-# disagg shard does not own. Disjoint from every entry in
-# ``LayerSymbols.VALID_LAYERS`` so the factory loop distinguishes a
-# stub from a real layer kind.
-DISAGG_STUB_MARKER = "_"
-
-
-class IdentityLayer(nn.Module):
-    """Zero-parameter pass-through used in place of non-owned layers.
-
-    Disagg shards replace each ``DISAGG_STUB_MARKER`` position in the
-    layer pattern with an ``IdentityLayer`` so the ``ModuleList``
-    indexing stays valid. The route dispatcher short-circuits to
-    activation transport before the stub is called; the pass-through
-    is defensive — if anything else does call the stub (e.g., a
-    unit test on the bare module), the hidden state propagates
-    unchanged.
-    """
-
-    def forward(self, hidden_states, *args, **kwargs):
-        return hidden_states
 
 
 @dataclass
@@ -114,13 +92,6 @@ class HybridStack(MegatronModule):
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
         self.is_mtp_layer = is_mtp_layer
-
-        # Active disagg dispatcher for the request currently being
-        # forwarded. ``None`` on collocated paths. The engine sets
-        # this directly via ``set_active_dispatcher`` before each
-        # forward when one disagg request is in flight; the forward
-        # loop consults it once and uses it for every layer.
-        self._active_dispatcher = None
 
         assert pg_collection is not None, "pg_collection must be provided for HybridStack"
 
@@ -230,14 +201,6 @@ class HybridStack(MegatronModule):
         forward_step_func"""
         self.input_tensor = input_tensor
 
-    def set_active_dispatcher(self, dispatcher) -> None:
-        """Set (or clear with ``None``) the :class:`RouteDispatcher`
-        the forward loop consults for the upcoming forward pass. The
-        engine looks up the right dispatcher for the active disagg
-        request and pushes it in; ``None`` restores collocated behavior.
-        See ``megatron/core/inference/DISAGG_DESIGN.md``."""
-        self._active_dispatcher = dispatcher
-
     def mamba_state_shapes_per_request(self) -> Optional[Tuple[Tuple[int], Tuple[int]]]:
         """
         Returns the Mamba conv and ssm states shapes per input sequence
@@ -340,10 +303,10 @@ class HybridStack(MegatronModule):
             def get_inner_quant_context(config, layer_number):
                 return nullcontext()
 
-        # Disagg routing: the engine pushed the active dispatcher
-        # into this stack before forward (or left it None for
-        # collocated paths).
-        dispatcher = self._active_dispatcher
+        # Disagg routing: inference engine sets ``self._active_dispatcher``
+        # directly before forward when a disagg request is in flight.
+        # Absent during training and on collocated inference paths.
+        dispatcher = getattr(self, "_active_dispatcher", None)
 
         def _run_layer_local(layer, h):
             if isinstance(layer, TransformerLayer):

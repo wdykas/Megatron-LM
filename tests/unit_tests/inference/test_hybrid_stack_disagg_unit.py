@@ -15,7 +15,7 @@ import pytest
 import torch
 
 from megatron.core.inference.route_dispatcher import LayerAction
-from megatron.core.models.hybrid.hybrid_block import DISAGG_STUB_MARKER
+from megatron.core.inference.disagg_stub import DISAGG_STUB_MARKER
 
 
 class _ScriptedDispatcher:

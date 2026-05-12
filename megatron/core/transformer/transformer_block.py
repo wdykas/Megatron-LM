@@ -368,10 +368,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             ]
         )
 
-        # Active disagg dispatcher for the current forward, or None
-        # for collocated paths. See HybridStack for the matching API.
-        self._active_dispatcher = None
-
         # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
         # self.post_process and self.post_layer_norm guide this behavior
@@ -439,11 +435,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 skip_qkv_norm_and_all_gather=(i > 0),
                 fc2_next_layer_norm_weights=next_qkv_norm_weights,
             )
-
-    def set_active_dispatcher(self, dispatcher) -> None:
-        """Set (or clear with ``None``) the active disagg dispatcher
-        for the upcoming forward. Engine-only API."""
-        self._active_dispatcher = dispatcher
 
     def _get_layer(self, layer_number: int):
         return self.layers[layer_number]
@@ -811,9 +802,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     # No intermediate_hidden_states requested: just hidden_states
                     hidden_states = checkpointed_result
             else:
-                # Disagg routing: engine pushed the active dispatcher
-                # into the block before forward (or left it None).
-                dispatcher = self._active_dispatcher
+                # Disagg routing: inference engine sets
+                # ``self._active_dispatcher`` directly before forward when
+                # a disagg request is in flight. Absent during training
+                # and on collocated inference paths.
+                dispatcher = getattr(self, "_active_dispatcher", None)
 
                 def _run_layer_local(layer, h):
                     # Cross-attention context isn't supported in the

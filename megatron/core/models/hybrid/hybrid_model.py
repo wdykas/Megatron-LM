@@ -203,7 +203,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # layers — only the entry shard embeds tokens and only the
         # exit shard runs the LM head.
         if partial_model_shard is not None and partial_model_shard.layer_indices is not None:
-            from megatron.core.models.hybrid.hybrid_block import DISAGG_STUB_MARKER
+            from megatron.core.inference.disagg_stub import DISAGG_STUB_MARKER
 
             owned_globals = set(partial_model_shard.layer_indices)
             layer_type_list = [
