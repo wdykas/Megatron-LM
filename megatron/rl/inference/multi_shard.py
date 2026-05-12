@@ -324,6 +324,193 @@ def _build_mamba_op_meta(
     return mamba_meta
 
 
+def _execute_kv_src_side(
+    rank: int,
+    op_meta: List[dict],
+    memory_buffer: torch.Tensor,
+    dtype: torch.dtype,
+    layout,
+    my_head_offset: int,
+    my_pp_layer_offset: int,
+    stream: torch.cuda.Stream,
+) -> None:
+    """Src side of KV migration: for each KV op where ``rank`` is the src
+    rank, gather the local KV slice into a staging slot and issue a
+    ``put_signal`` to the dst rank. Stream-ordered."""
+    from megatron.core.inference import nvshmem_migration as _nv
+    from megatron.core.inference.engines.request_migration import _gather_kv_slice
+
+    for entry in op_meta:
+        op = entry["op"]
+        if rank != op.src_rank:
+            continue
+        src_blocks = torch.as_tensor(
+            op.src_block_ids, device=memory_buffer.device, dtype=torch.long
+        )
+        local_head_range = (
+            op.head_range[0] - my_head_offset,
+            op.head_range[1] - my_head_offset,
+        )
+        local_layer_range = (
+            op.layer_range[0] - my_pp_layer_offset,
+            op.layer_range[1] - my_pp_layer_offset,
+        )
+        send_tensor = _gather_kv_slice(
+            memory_buffer,
+            local_layer_range,
+            src_blocks,
+            local_head_range,
+            layout.is_mla,
+        )
+        slot = _nv.staging_slot(entry["slot"])
+        slot[: entry["nbytes"]].view(dtype).reshape(entry["shape"]).copy_(
+            send_tensor, non_blocking=True
+        )
+        _nv.put_slot_with_signal(
+            entry["slot"],
+            entry["flag"],
+            op.dst_rank,
+            nbytes=entry["nbytes"],
+            stream=stream,
+        )
+
+
+def _execute_kv_dst_side(
+    rank: int,
+    op_meta: List[dict],
+    memory_buffer: torch.Tensor,
+    dtype: torch.dtype,
+    layout,
+    my_head_offset: int,
+    my_pp_layer_offset: int,
+    stream: torch.cuda.Stream,
+) -> None:
+    """Dst side of KV migration: for each KV op where ``rank`` is the dst
+    rank, ``signal_wait`` and scatter the received slot into the local KV
+    buffer. Stream-ordered."""
+    from megatron.core.inference import nvshmem_migration as _nv
+    from megatron.core.inference.engines.request_migration import _scatter_kv_slice
+
+    for entry in op_meta:
+        op = entry["op"]
+        if rank != op.dst_rank:
+            continue
+        _nv.wait_slot_signal(entry["flag"], expected_value=1, stream=stream)
+        dst_blocks = torch.as_tensor(
+            op.dst_block_ids, device=memory_buffer.device, dtype=torch.long
+        )
+        local_head_range = (
+            op.head_range[0] - my_head_offset,
+            op.head_range[1] - my_head_offset,
+        )
+        local_layer_range = (
+            op.layer_range[0] - my_pp_layer_offset,
+            op.layer_range[1] - my_pp_layer_offset,
+        )
+        slot = _nv.staging_slot(entry["slot"])
+        recv_view = slot[: entry["nbytes"]].view(dtype).reshape(entry["shape"])
+        _scatter_kv_slice(
+            memory_buffer,
+            local_layer_range,
+            dst_blocks,
+            local_head_range,
+            layout.is_mla,
+            recv_view,
+        )
+
+
+def _execute_mamba_src_side(
+    rank: int,
+    mamba_meta: List[dict],
+    conv_states: torch.Tensor,
+    ssm_states: torch.Tensor,
+    src_mamba_state_indices: List[Optional[int]],
+    stream: torch.cuda.Stream,
+) -> None:
+    """Src side of mamba migration: for each packed-op where ``rank`` is
+    the src, gather the conv/SSM block slices into one staging slot at
+    distinct byte offsets and ``put_signal`` under one flag.
+
+    Each ``entry`` packs multiple block kinds (``conv_x`` / ``conv_B`` /
+    ``conv_C`` / ``ssm``) for one (src_rank, dst_rank) overlap.
+    """
+    from megatron.core.inference import nvshmem_migration as _nv
+
+    def _buffer_for(kind):
+        return conv_states if kind.startswith("conv_") else ssm_states
+
+    for entry in mamba_meta:
+        op = entry["op"]
+        if rank != op.src_rank:
+            continue
+        src_state_idx = src_mamba_state_indices[entry["bundle_idx"]]
+        if src_state_idx is None:
+            continue
+        slot = _nv.staging_slot(entry["slot"])
+        layer_idx = torch.tensor(
+            op.mamba_layer_indices,
+            device=conv_states.device,
+            dtype=torch.long,
+        )
+        for b in entry["blocks"]:
+            buf = _buffer_for(b["kind"])
+            lo, hi = b["src_local_range"]
+            send = buf[layer_idx, src_state_idx, lo:hi].contiguous()
+            off = b["byte_offset"]
+            slot[off : off + b["nbytes"]].view(b["dtype"]).reshape(
+                b["shape"]
+            ).copy_(send, non_blocking=True)
+        _nv.put_slot_with_signal(
+            entry["slot"],
+            entry["flag"],
+            entry["dst_rank"],
+            nbytes=entry["nbytes"],
+            stream=stream,
+        )
+
+
+def _execute_mamba_dst_side(
+    rank: int,
+    mamba_meta: List[dict],
+    conv_states: torch.Tensor,
+    ssm_states: torch.Tensor,
+    dst_mamba_state_indices: List[Optional[int]],
+    stream: torch.cuda.Stream,
+) -> None:
+    """Dst side of mamba migration: for each packed-op where ``rank`` is
+    the dst, ``signal_wait`` and scatter each conv/SSM block slice from
+    its byte offset in the staging slot into the local state buffers."""
+    from megatron.core.inference import nvshmem_migration as _nv
+
+    def _buffer_for(kind):
+        return conv_states if kind.startswith("conv_") else ssm_states
+
+    for entry in mamba_meta:
+        op = entry["op"]
+        if rank != op.dst_rank:
+            continue
+        dst_state_idx = dst_mamba_state_indices[entry["bundle_idx"]]
+        if dst_state_idx is None:
+            continue
+        _nv.wait_slot_signal(entry["flag"], expected_value=1, stream=stream)
+        slot = _nv.staging_slot(entry["slot"])
+        layer_idx = torch.tensor(
+            op.mamba_layer_indices,
+            device=conv_states.device,
+            dtype=torch.long,
+        )
+        for b in entry["blocks"]:
+            buf = _buffer_for(b["kind"])
+            lo, hi = b["dst_local_range"]
+            off = b["byte_offset"]
+            recv = (
+                slot[off : off + b["nbytes"]]
+                .view(b["dtype"])
+                .reshape(b["shape"])
+            )
+            buf[layer_idx, dst_state_idx, lo:hi] = recv
+
+
 def _release_src_state(
     meta: dict,
     is_hybrid: bool,
@@ -666,11 +853,22 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         instance._recent_latencies = [deque(maxlen=instance._latency_window) for _ in shards]
         instance._in_flight = [0 for _ in shards]
 
-        # Opt-in end-to-end disagg for every rollout. When
-        # --rl-auto-disagg-{src,dst}-shard are set, the scheduler
-        # watches src_shard and stamps every base_generate with
-        # ``disagg_pair=[src, dst]`` — each HTTP request lands on src,
-        # reaches first-token, then is migrated to dst for decode.
+        instance._register_rollout_policies(args)
+        return instance
+
+    def _register_rollout_policies(self, args) -> None:
+        """Wire optional CLI-driven migration policies.
+
+        - ``--rl-auto-disagg-{src,dst}-shard``: tag every base_generate
+          with ``disagg_pair=[src, dst]`` and register a
+          :class:`FirstTokenDisaggPolicy` that migrates each request
+          from src to dst after its first token.
+        - ``--rl-tail-cut-{dst-shard,min-tokens}``: tag the same
+          requests with ``tail_cut=[dst, n]`` and register a
+          :class:`TailCutPolicy` that migrates them off the decode
+          shard onto a latency-optimized one after ``n`` tokens.
+        """
+        shards = self._shards
         src_idx_arg = getattr(args, "rl_auto_disagg_src_shard", None)
         dst_idx_arg = getattr(args, "rl_auto_disagg_dst_shard", None)
         if src_idx_arg is not None and dst_idx_arg is not None and len(shards) >= 2:
@@ -690,19 +888,13 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             )
             from .migration_policy import FirstTokenDisaggPolicy
 
-            instance._disagg_rollout_pair = (src_idx_arg, dst_idx_arg)
-            instance.register_migration_policy(
+            self._disagg_rollout_pair = (src_idx_arg, dst_idx_arg)
+            self.register_migration_policy(
                 FirstTokenDisaggPolicy(
                     src_shard_index=src_idx_arg, dst_shard_index=dst_idx_arg
                 )
             )
 
-        # Two-stage tail-cut. When --rl-tail-cut-{dst-shard,min-tokens}
-        # are set, every rollout is also stamped with
-        # ``tail_cut=[dst, n]`` and a second scheduler watches the
-        # throughput-decode shard — once a request there has produced
-        # ``n`` tokens, the second scheduler migrates it to the
-        # latency-optimized shard.
         tail_dst_arg = getattr(args, "rl_tail_cut_dst_shard", None)
         tail_min_arg = getattr(args, "rl_tail_cut_min_tokens", None)
         if (
@@ -725,16 +917,14 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             )
             from .migration_policy import TailCutPolicy
 
-            instance._tail_cut_rollout_config = (tail_dst_arg, tail_min_arg)
-            instance.register_migration_policy(
+            self._tail_cut_rollout_config = (tail_dst_arg, tail_min_arg)
+            self.register_migration_policy(
                 TailCutPolicy(
                     src_shard_index=dst_idx_arg,
                     dst_shard_index=tail_dst_arg,
                     min_tokens=int(tail_min_arg),
                 )
             )
-
-        return instance
 
     # ---- Generation routing --------------------------------------------
 
@@ -1275,8 +1465,6 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         from megatron.core.inference import nvshmem_migration as _nv
         from megatron.core.inference.engines.request_migration import (
             RequestMigrationBundle,
-            _gather_kv_slice,
-            _scatter_kv_slice,
             build_kv_migration_plan,
             deserialize_bundle,
         )
@@ -1411,153 +1599,34 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                 )
 
             # Schedule everything on the migration stream and return.
+            # A rank is in at most one of src/dst (shards are
+            # non-overlapping rank windows), so the two branches are
+            # mutually exclusive. Mamba transfers piggyback on the same
+            # stream after KV so the done_event covers both.
             with torch.cuda.stream(stream):
                 if meta["in_src"]:
-                    # Gather + put_signal per op this rank participates in.
-                    for entry in op_meta:
-                        op = entry["op"]
-                        if rank != op.src_rank:
-                            continue
-                        src_blocks = torch.as_tensor(
-                            op.src_block_ids, device=memory_buffer.device, dtype=torch.long
-                        )
-                        local_head_range = (
-                            op.head_range[0] - my_src_head_offset,
-                            op.head_range[1] - my_src_head_offset,
-                        )
-                        local_layer_range = (
-                            op.layer_range[0] - my_src_pp_layer_offset,
-                            op.layer_range[1] - my_src_pp_layer_offset,
-                        )
-                        send_tensor = _gather_kv_slice(
-                            memory_buffer,
-                            local_layer_range,
-                            src_blocks,
-                            local_head_range,
-                            layout.is_mla,
-                        )
-                        slot = _nv.staging_slot(entry["slot"])
-                        slot[: entry["nbytes"]].view(dtype).reshape(
-                            entry["shape"]
-                        ).copy_(send_tensor, non_blocking=True)
-                        _nv.put_slot_with_signal(
-                            entry["slot"],
-                            entry["flag"],
-                            op.dst_rank,
-                            nbytes=entry["nbytes"],
-                            stream=stream,
-                        )
-
+                    _execute_kv_src_side(
+                        rank, op_meta, memory_buffer, dtype, layout,
+                        my_src_head_offset, my_src_pp_layer_offset, stream,
+                    )
                 if meta["in_dst"]:
-                    # signal_wait + scatter per op this rank participates in.
-                    for entry in op_meta:
-                        op = entry["op"]
-                        if rank != op.dst_rank:
-                            continue
-                        _nv.wait_slot_signal(
-                            entry["flag"], expected_value=1, stream=stream
-                        )
-                        dst_blocks = torch.as_tensor(
-                            op.dst_block_ids, device=memory_buffer.device, dtype=torch.long
-                        )
-                        local_head_range = (
-                            op.head_range[0] - my_dst_head_offset,
-                            op.head_range[1] - my_dst_head_offset,
-                        )
-                        local_layer_range = (
-                            op.layer_range[0] - my_dst_pp_layer_offset,
-                            op.layer_range[1] - my_dst_pp_layer_offset,
-                        )
-                        slot = _nv.staging_slot(entry["slot"])
-                        recv_view = (
-                            slot[: entry["nbytes"]]
-                            .view(dtype)
-                            .reshape(entry["shape"])
-                        )
-                        _scatter_kv_slice(
-                            memory_buffer,
-                            local_layer_range,
-                            dst_blocks,
-                            local_head_range,
-                            layout.is_mla,
-                            recv_view,
-                        )
-
-                # Mamba state transfer — plan-driven, packed per overlap.
-                # Each op carries multiple block-kind transfers
-                # (conv_x / conv_B / conv_C / ssm) for one
-                # (src_rank, dst_rank) overlap, gathered into a single
-                # staging slot at distinct byte offsets and shipped
-                # under one flag. The conv state's dim 0 packs three
-                # independently TP-sharded blocks, so the per-block
-                # local ranges and byte offsets are computed
-                # independently in ``_build_mamba_op_meta``;
-                # ``mamba_layer_indices`` is the intersection of
-                # src_pp's and dst_pp's mamba ownership.
+                    _execute_kv_dst_side(
+                        rank, op_meta, memory_buffer, dtype, layout,
+                        my_dst_head_offset, my_dst_pp_layer_offset, stream,
+                    )
                 if is_hybrid and (meta["in_src"] or meta["in_dst"]):
                     conv_states = engine.context.mamba_conv_states
                     ssm_states = engine.context.mamba_ssm_states
-
-                    def _buffer_for(kind):
-                        return conv_states if kind.startswith("conv_") else ssm_states
-
                     if meta["in_src"]:
-                        for entry in mamba_meta:
-                            op = entry["op"]
-                            if rank != op.src_rank:
-                                continue
-                            src_state_idx = src_mamba_state_indices[entry["bundle_idx"]]
-                            if src_state_idx is None:
-                                continue
-                            slot = _nv.staging_slot(entry["slot"])
-                            layer_idx = torch.tensor(
-                                op.mamba_layer_indices,
-                                device=conv_states.device,
-                                dtype=torch.long,
-                            )
-                            for b in entry["blocks"]:
-                                buf = _buffer_for(b["kind"])
-                                lo, hi = b["src_local_range"]
-                                send = buf[layer_idx, src_state_idx, lo:hi].contiguous()
-                                off = b["byte_offset"]
-                                slot[off : off + b["nbytes"]].view(b["dtype"]).reshape(
-                                    b["shape"]
-                                ).copy_(send, non_blocking=True)
-                            _nv.put_slot_with_signal(
-                                entry["slot"],
-                                entry["flag"],
-                                entry["dst_rank"],
-                                nbytes=entry["nbytes"],
-                                stream=stream,
-                            )
-
+                        _execute_mamba_src_side(
+                            rank, mamba_meta, conv_states, ssm_states,
+                            src_mamba_state_indices, stream,
+                        )
                     if meta["in_dst"]:
-                        for entry in mamba_meta:
-                            op = entry["op"]
-                            if rank != op.dst_rank:
-                                continue
-                            dst_state_idx = dst_mamba_state_indices[entry["bundle_idx"]]
-                            if dst_state_idx is None:
-                                continue
-                            _nv.wait_slot_signal(
-                                entry["flag"], expected_value=1, stream=stream
-                            )
-                            slot = _nv.staging_slot(entry["slot"])
-                            layer_idx = torch.tensor(
-                                op.mamba_layer_indices,
-                                device=conv_states.device,
-                                dtype=torch.long,
-                            )
-                            for b in entry["blocks"]:
-                                buf = _buffer_for(b["kind"])
-                                lo, hi = b["dst_local_range"]
-                                off = b["byte_offset"]
-                                recv = (
-                                    slot[off : off + b["nbytes"]]
-                                    .view(b["dtype"])
-                                    .reshape(b["shape"])
-                                )
-                                buf[layer_idx, dst_state_idx, lo:hi] = recv
+                        _execute_mamba_dst_side(
+                            rank, mamba_meta, conv_states, ssm_states,
+                            dst_mamba_state_indices, stream,
+                        )
 
                 # Mark the end of this migration on the stream so the
                 # tick poll can query a CUDA event.
