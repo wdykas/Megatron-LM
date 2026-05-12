@@ -1513,6 +1513,15 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         my_dst_head_offset = meta.my_dst_head_offset
 
         stream = _nv.migration_stream()
+        is_hybrid = engine.context.is_hybrid_model
+
+        # Rollback targets — initialized before the try so the except
+        # handler can always iterate them, even if a failure fires
+        # before the first append.
+        src_block_ids_to_free: List[torch.Tensor] = []
+        src_mamba_state_indices: List[Optional[int]] = []
+        injected: List[Tuple[RequestMigrationBundle, List[int]]] = []
+        dst_mamba_state_indices: List[Optional[int]] = []
 
         # Detach src synchronously so async_step can't emit a stale
         # ENGINE_REPLY for an already-migrated request. ``keep_blocks=True``
@@ -1523,11 +1532,6 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         # conv/SSM state on the migration stream, and the poll callback
         # releases the slot once the event fires.
         try:
-            src_block_ids_to_free: List[torch.Tensor] = []
-            src_mamba_state_indices: List[Optional[int]] = []
-            injected: List[Tuple[RequestMigrationBundle, List[int]]] = []
-            dst_mamba_state_indices: List[Optional[int]] = []
-            is_hybrid = engine.context.is_hybrid_model
             if meta.in_src:
                 for req_id in request_ids:
                     if req_id in engine.requests:
