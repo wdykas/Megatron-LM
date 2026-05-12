@@ -379,6 +379,65 @@ def ack_activation(
     )
 
 
+# ---- High-level hidden-state send/receive ----------------------------------
+#
+# Combine lane selection, slot allocation, the symmetric-tensor view, and
+# the underlying put/wait/ack into single calls per direction. The route
+# dispatcher (the only production caller of activation transport) talks
+# in shard-PE pairs and hidden tensors — it shouldn't need to touch slot
+# indexing or symmetric-memory views.
+
+
+def send_hidden(
+    my_pe: int,
+    dst_pe: int,
+    hidden: torch.Tensor,
+    payload_nbytes: int,
+    *,
+    stream: Optional[torch.cuda.Stream] = None,
+) -> None:
+    """Send a hidden-state tensor from ``my_pe`` to ``dst_pe`` over the
+    activation lane for that pair.
+
+    The activation stream serializes: copy hidden into the symmetric
+    slot view, then ``put_activation`` (which itself stream-waits for
+    the slot's prior ack before issuing the put + fwd signal).
+    """
+    lane = lane_for(my_pe, dst_pe)
+    slot = next_send_slot(lane)
+    sym = activation_slot(slot)
+    s = stream or _activation_stream
+    with torch.cuda.stream(s):
+        view = sym[:payload_nbytes].view(hidden.dtype).reshape(hidden.shape)
+        view.copy_(hidden)
+    put_activation(slot, dst_pe=dst_pe, nbytes=payload_nbytes, stream=s)
+
+
+def receive_hidden(
+    my_pe: int,
+    src_pe: int,
+    hidden_shape: tuple,
+    hidden_dtype: torch.dtype,
+    payload_nbytes: int,
+    *,
+    stream: Optional[torch.cuda.Stream] = None,
+) -> torch.Tensor:
+    """Receive a hidden-state tensor from ``src_pe`` over the activation
+    lane for that pair. Returns a fresh tensor (cloned out of the
+    symmetric slot) so the slot can be acked + reused immediately.
+    """
+    lane = lane_for(src_pe, my_pe)
+    slot = next_recv_slot(lane)
+    s = stream or _activation_stream
+    wait_activation(slot, stream=s)
+    s.synchronize()
+    sym = activation_slot(slot)
+    view = sym[:payload_nbytes].view(hidden_dtype).reshape(hidden_shape)
+    out = view.clone()
+    ack_activation(slot, src_pe=src_pe, stream=s)
+    return out
+
+
 def reset_lane_counters(lane: int) -> None:
     """Reset both send and recv counters for a lane to 0. Used between
     independent runs in tests; not invoked in normal operation."""

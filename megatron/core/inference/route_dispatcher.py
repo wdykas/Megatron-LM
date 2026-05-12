@@ -15,13 +15,28 @@ is no walker / cursor.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Callable, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import torch
 
 from megatron.core.inference import activation_transport as at
 from megatron.rl.inference.route_planner import Route
+
+
+@dataclass(frozen=True)
+class _LayerPlan:
+    """Per-layer action precomputed at dispatcher init.
+
+    ``receive_from``/``send_to`` are peer shard indices when this layer
+    is the entry/exit of the hop and a predecessor/successor hop exists,
+    otherwise ``None``. A layer with a ``_LayerPlan`` is always owned by
+    this shard; not-owned layers are stored as ``None`` in the plan map.
+    """
+
+    receive_from: Optional[int]
+    send_to: Optional[int]
 
 
 class LayerAction(Enum):
@@ -99,13 +114,29 @@ class RouteDispatcher:
         self._payload_nbytes = nelem * torch.empty((), dtype=hidden_dtype).element_size()
         self._stream = stream
 
-        # Precompute layer_idx → (hop, hop_position) so dispatch_layer is
-        # an O(1) dict lookup instead of an O(num_hops) linear scan.
-        self._layer_to_hop: dict = {}
+        # Precompute layer_idx → _LayerPlan so dispatch_layer is a flat
+        # dict lookup. ``None`` means "another shard owns this layer";
+        # a missing key means "past the route's last layer (DONE)".
+        self._plan: Dict[int, Optional[_LayerPlan]] = {}
+        last_hop_pos = len(route.hops) - 1
         for hop_pos, hop in enumerate(route.hops):
-            for li in hop.layer_indices:
-                self._layer_to_hop[li] = (hop, hop_pos)
-        self._last_hop_pos = len(route.hops) - 1
+            if hop.shard_idx != my_shard_idx:
+                for li in hop.layer_indices:
+                    self._plan[li] = None
+                continue
+            receive_from = (
+                route.hops[hop_pos - 1].shard_idx if hop_pos > 0 else None
+            )
+            send_to = (
+                route.hops[hop_pos + 1].shard_idx
+                if hop_pos < last_hop_pos
+                else None
+            )
+            for i, li in enumerate(hop.layer_indices):
+                self._plan[li] = _LayerPlan(
+                    receive_from=receive_from if i == 0 else None,
+                    send_to=send_to if i == len(hop.layer_indices) - 1 else None,
+                )
 
     # ---- public API -------------------------------------------------------
 
@@ -128,64 +159,36 @@ class RouteDispatcher:
         the next RECEIVE) through every layer; no caller-side branch
         on action is needed.
         """
-        entry = self._layer_to_hop.get(layer_idx)
-        if entry is None:
-            # Past the route's last layer (or before its first, which
-            # only happens on degenerate layouts).
+        if layer_idx not in self._plan:
             return hidden, LayerAction.DONE
-
-        hop, hop_pos = entry
-        if hop.shard_idx != self._my_shard:
+        plan = self._plan[layer_idx]
+        if plan is None:
             return hidden, LayerAction.NOT_MY_REQUEST
-
-        # I own this layer. RECEIVE first if this is the hop's entry
-        # layer AND the hop has a predecessor shard.
-        if layer_idx == hop.layer_indices[0] and hop_pos > 0:
-            hidden = self._receive(self._route.hops[hop_pos - 1].shard_idx)
-
+        if plan.receive_from is not None:
+            hidden = self._receive(plan.receive_from)
         hidden = run_local(hidden)
-
-        # SEND if this is the hop's exit layer AND another hop follows
-        # (on any shard — for revisits to the same shard we still send).
-        if layer_idx == hop.layer_indices[-1] and hop_pos < self._last_hop_pos:
-            next_hop = self._route.hops[hop_pos + 1]
-            self._send(next_hop.shard_idx, hidden)
+        if plan.send_to is not None:
+            self._send(plan.send_to, hidden)
             return None, LayerAction.SEND
-
         return hidden, LayerAction.LOCAL
 
     # ---- transport internals ----------------------------------------------
 
     def _send(self, dst_shard: int, hidden: torch.Tensor) -> None:
-        dst_pe = self._shard_to_pe(dst_shard)
-        lane = at.lane_for(self._my_pe, dst_pe)
-        slot = at.next_send_slot(lane)
-        sym = at.activation_slot(slot)
-        s = self._stream or at.activation_stream()
-        with torch.cuda.stream(s):
-            view = (
-                sym[: self._payload_nbytes]
-                .view(self._hidden_dtype)
-                .reshape(hidden.shape)
-            )
-            view.copy_(hidden)
-        at.put_activation(
-            slot, dst_pe=dst_pe, nbytes=self._payload_nbytes, stream=s
+        at.send_hidden(
+            my_pe=self._my_pe,
+            dst_pe=self._shard_to_pe(dst_shard),
+            hidden=hidden,
+            payload_nbytes=self._payload_nbytes,
+            stream=self._stream,
         )
 
     def _receive(self, src_shard: int) -> torch.Tensor:
-        src_pe = self._shard_to_pe(src_shard)
-        lane = at.lane_for(src_pe, self._my_pe)
-        slot = at.next_recv_slot(lane)
-        s = self._stream or at.activation_stream()
-        at.wait_activation(slot, stream=s)
-        s.synchronize()
-        sym = at.activation_slot(slot)
-        view = (
-            sym[: self._payload_nbytes]
-            .view(self._hidden_dtype)
-            .reshape(self._hidden_shape)
+        return at.receive_hidden(
+            my_pe=self._my_pe,
+            src_pe=self._shard_to_pe(src_shard),
+            hidden_shape=self._hidden_shape,
+            hidden_dtype=self._hidden_dtype,
+            payload_nbytes=self._payload_nbytes,
+            stream=self._stream,
         )
-        out = view.clone()
-        at.ack_activation(slot, src_pe=src_pe, stream=s)
-        return out

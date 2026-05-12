@@ -34,12 +34,28 @@ class _MockDispatcher(RouteDispatcher):
     def __init__(self, route, my_shard_idx, received_payload=None):
         self._route = route
         self._my_shard = my_shard_idx
-        # Mirror the parent's precomputed layer→hop index.
-        self._layer_to_hop = {}
+        # Build the parent's precomputed plan via the same logic.
+        from megatron.core.inference.route_dispatcher import _LayerPlan
+        self._plan = {}
+        last_hop_pos = len(route.hops) - 1
         for hop_pos, hop in enumerate(route.hops):
-            for li in hop.layer_indices:
-                self._layer_to_hop[li] = (hop, hop_pos)
-        self._last_hop_pos = len(route.hops) - 1
+            if hop.shard_idx != my_shard_idx:
+                for li in hop.layer_indices:
+                    self._plan[li] = None
+                continue
+            receive_from = (
+                route.hops[hop_pos - 1].shard_idx if hop_pos > 0 else None
+            )
+            send_to = (
+                route.hops[hop_pos + 1].shard_idx
+                if hop_pos < last_hop_pos
+                else None
+            )
+            for i, li in enumerate(hop.layer_indices):
+                self._plan[li] = _LayerPlan(
+                    receive_from=receive_from if i == 0 else None,
+                    send_to=send_to if i == len(hop.layer_indices) - 1 else None,
+                )
         # Test plumbing.
         self.sends: list = []
         self.receives: list = []
