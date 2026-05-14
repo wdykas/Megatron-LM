@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -91,6 +91,63 @@ def tp_pair_routing(src_tp: int, dst_tp: int) -> List[Tuple[int, int]]:
     return [(k * stride, k) for k in range(dst_tp)]
 
 
+def _build_layer_plan(
+    route: Route,
+    my_shard_idx: int,
+    my_tp_offset: int,
+    shard_tp: List[int],
+    shard_rank_offset: List[int],
+) -> Dict[int, Optional[_LayerPlan]]:
+    """Resolve every layer's dispatch action against the given TP
+    topology. ``None`` value means another shard owns the layer; an
+    absent key means past the route's last layer (DONE).
+
+    The hop-level routing tables (built via :func:`tp_pair_routing`)
+    apply only to the hop's entry / exit layer; middle layers of a
+    multi-layer hop have no inbound / outbound transport.
+    """
+    my_tp = shard_tp[my_shard_idx]
+    plan: Dict[int, Optional[_LayerPlan]] = {}
+    last_hop_pos = len(route.hops) - 1
+    for hop_pos, hop in enumerate(route.hops):
+        if hop.shard_idx != my_shard_idx:
+            for li in hop.layer_indices:
+                plan[li] = None
+            continue
+        # Resolve inbound source PE under the prior hop's TP topology,
+        # outbound destination PE list under the next hop's TP topology.
+        # Empty / None when my rank isn't a sender or receiver under
+        # the pair routing (the stride case skips some src ranks).
+        receive_from_pe: Optional[int] = None
+        if hop_pos > 0:
+            prev = route.hops[hop_pos - 1]
+            srcs_for_me = [
+                s for (s, d) in tp_pair_routing(shard_tp[prev.shard_idx], my_tp)
+                if d == my_tp_offset
+            ]
+            if srcs_for_me:
+                # Each dst rank receives from exactly one src under
+                # divisibility mapping.
+                receive_from_pe = shard_rank_offset[prev.shard_idx] + srcs_for_me[0]
+        send_to_pes: Tuple[int, ...] = ()
+        if hop_pos < last_hop_pos:
+            nxt = route.hops[hop_pos + 1]
+            dsts_for_me = [
+                d for (s, d) in tp_pair_routing(my_tp, shard_tp[nxt.shard_idx])
+                if s == my_tp_offset
+            ]
+            send_to_pes = tuple(
+                shard_rank_offset[nxt.shard_idx] + d for d in dsts_for_me
+            )
+        last_layer_in_hop = len(hop.layer_indices) - 1
+        for i, li in enumerate(hop.layer_indices):
+            plan[li] = _LayerPlan(
+                receive_from_pe=(receive_from_pe if i == 0 else None),
+                send_to_pes=(send_to_pes if i == last_layer_in_hop else ()),
+            )
+    return plan
+
+
 class LayerAction(Enum):
     """What happened at a layer this shard dispatched on.
 
@@ -123,13 +180,13 @@ class RouteDispatcher:
     One instance per in-flight disagg request. The dispatcher owns:
 
     - The :class:`Route` (read-only).
-    - A precomputed ``layer_idx → RouteHop`` index so each
-      ``dispatch_layer`` call is O(1).
-    - The activation transport configuration (lane assignment,
-      payload size).
+    - A precomputed ``layer_idx → _LayerPlan`` map so each
+      :meth:`dispatch_layer` call is O(1) — see :class:`_LayerPlan`.
+    - The activation transport configuration (payload size, stream).
 
     No per-layer cursor or "inside hop" flag — every call to
-    :meth:`dispatch_layer` reads the action straight from the route.
+    :meth:`dispatch_layer` reads the action straight from the
+    precomputed plan.
 
     Arguments:
         route: The request's pre-computed route plan.
@@ -163,9 +220,6 @@ class RouteDispatcher:
         self._route = route
         self._my_shard = my_shard_idx
         self._my_pe = my_pe
-        self._my_tp_offset = my_tp_offset
-        self._shard_tp = list(shard_tp)
-        self._shard_rank_offset = list(shard_rank_offset)
         self._hidden_shape = tuple(hidden_shape)
         self._hidden_dtype = hidden_dtype
         nelem = 1
@@ -174,56 +228,13 @@ class RouteDispatcher:
         self._payload_nbytes = nelem * torch.empty((), dtype=hidden_dtype).element_size()
         self._stream = stream
 
-        # Precompute layer_idx → _LayerPlan so dispatch_layer is a flat
-        # dict lookup. ``None`` means "another shard owns this layer";
-        # a missing key means "past the route's last layer (DONE)".
-        my_tp = self._shard_tp[my_shard_idx]
-        self._plan: Dict[int, Optional[_LayerPlan]] = {}
-        last_hop_pos = len(route.hops) - 1
-        for hop_pos, hop in enumerate(route.hops):
-            if hop.shard_idx != my_shard_idx:
-                for li in hop.layer_indices:
-                    self._plan[li] = None
-                continue
-            # Resolve the inbound source PE under the prior hop's
-            # TP topology, and the outbound destination PE list under
-            # the next hop's TP topology. Empty / None when my rank
-            # isn't a sender or receiver under the pair routing.
-            if hop_pos > 0:
-                prev = route.hops[hop_pos - 1]
-                prev_tp = self._shard_tp[prev.shard_idx]
-                pair_table = tp_pair_routing(prev_tp, my_tp)
-                srcs_for_me = [s for (s, d) in pair_table if d == my_tp_offset]
-                # Each dst rank receives from exactly one src under the
-                # divisibility mapping.
-                receive_from_pe = (
-                    self._shard_rank_offset[prev.shard_idx] + srcs_for_me[0]
-                    if srcs_for_me
-                    else None
-                )
-            else:
-                receive_from_pe = None
-            if hop_pos < last_hop_pos:
-                nxt = route.hops[hop_pos + 1]
-                nxt_tp = self._shard_tp[nxt.shard_idx]
-                pair_table = tp_pair_routing(my_tp, nxt_tp)
-                dsts_for_me = [d for (s, d) in pair_table if s == my_tp_offset]
-                send_to_pes = tuple(
-                    self._shard_rank_offset[nxt.shard_idx] + d
-                    for d in dsts_for_me
-                )
-            else:
-                send_to_pes = ()
-
-            for i, li in enumerate(hop.layer_indices):
-                self._plan[li] = _LayerPlan(
-                    receive_from_pe=(
-                        receive_from_pe if i == 0 else None
-                    ),
-                    send_to_pes=(
-                        send_to_pes if i == len(hop.layer_indices) - 1 else ()
-                    ),
-                )
+        self._plan = _build_layer_plan(
+            route=route,
+            my_shard_idx=my_shard_idx,
+            my_tp_offset=my_tp_offset,
+            shard_tp=list(shard_tp),
+            shard_rank_offset=list(shard_rank_offset),
+        )
 
     # ---- public API -------------------------------------------------------
 
@@ -232,6 +243,13 @@ class RouteDispatcher:
 
     def is_exit_shard(self) -> bool:
         return self._route.exit_shard == self._my_shard
+
+    def participating_shards(self) -> List[int]:
+        """Sorted list of shard indices this request's route visits.
+        Used by the engine's release path to address the right
+        coord-side fan-out — same set the route was originally
+        fanned to."""
+        return sorted({h.shard_idx for h in self._route.hops})
 
     def dispatch_layer(
         self,

@@ -52,59 +52,23 @@ def test_non_divisible_tp_rejected():
 
 
 def _build_dispatcher(my_shard_idx, my_tp_offset, shard_tp, shard_rank_offset, route):
-    """Helper: build a real RouteDispatcher (skipping NVSHMEM init) to
-    inspect its precomputed plan."""
-    import torch
+    """Build the dispatcher's plan via the module-level helper. We
+    don't need a full dispatcher (no NVSHMEM init) — the plan is what
+    we're inspecting."""
+    from megatron.core.inference.route_dispatcher import _build_layer_plan
 
-    disp = RouteDispatcher.__new__(RouteDispatcher)
-    # Replay __init__ logic without instantiating activation transport.
-    disp._route = route
-    disp._my_shard = my_shard_idx
-    disp._my_pe = shard_rank_offset[my_shard_idx] + my_tp_offset
-    disp._my_tp_offset = my_tp_offset
-    disp._shard_tp = list(shard_tp)
-    disp._shard_rank_offset = list(shard_rank_offset)
-    disp._hidden_shape = (4, 8)
-    disp._hidden_dtype = torch.float32
-    disp._payload_nbytes = 4 * 8 * 4
-    disp._stream = None
-    # Re-run the plan-building loop (extracted for tests).
-    from megatron.core.inference.route_dispatcher import _LayerPlan
-
-    my_tp = shard_tp[my_shard_idx]
-    disp._plan = {}
-    last_hop_pos = len(route.hops) - 1
-    for hop_pos, hop in enumerate(route.hops):
-        if hop.shard_idx != my_shard_idx:
-            for li in hop.layer_indices:
-                disp._plan[li] = None
-            continue
-        if hop_pos > 0:
-            prev = route.hops[hop_pos - 1]
-            pair_table = tp_pair_routing(shard_tp[prev.shard_idx], my_tp)
-            srcs_for_me = [s for (s, d) in pair_table if d == my_tp_offset]
-            receive_from_pe = (
-                shard_rank_offset[prev.shard_idx] + srcs_for_me[0]
-                if srcs_for_me
-                else None
-            )
-        else:
-            receive_from_pe = None
-        if hop_pos < last_hop_pos:
-            nxt = route.hops[hop_pos + 1]
-            pair_table = tp_pair_routing(my_tp, shard_tp[nxt.shard_idx])
-            dsts_for_me = [d for (s, d) in pair_table if s == my_tp_offset]
-            send_to_pes = tuple(
-                shard_rank_offset[nxt.shard_idx] + d for d in dsts_for_me
-            )
-        else:
-            send_to_pes = ()
-        for i, li in enumerate(hop.layer_indices):
-            disp._plan[li] = _LayerPlan(
-                receive_from_pe=(receive_from_pe if i == 0 else None),
-                send_to_pes=(send_to_pes if i == len(hop.layer_indices) - 1 else ()),
-            )
-    return disp
+    plan = _build_layer_plan(
+        route=route,
+        my_shard_idx=my_shard_idx,
+        my_tp_offset=my_tp_offset,
+        shard_tp=list(shard_tp),
+        shard_rank_offset=list(shard_rank_offset),
+    )
+    # Return a thin shim with the same `._plan` shape the rest of the
+    # tests read.
+    shim = type("PlanShim", (), {})()
+    shim._plan = plan
+    return shim
 
 
 def test_dispatcher_plan_dst_larger_fans_out():

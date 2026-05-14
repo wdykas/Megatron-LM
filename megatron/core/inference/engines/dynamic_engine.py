@@ -551,7 +551,7 @@ class DynamicInferenceEngine(AbstractEngine):
             return
         # Pull participating shards off the dispatcher's route. The
         # entry shard is the sender; the coord won't echo back to it.
-        participating = sorted({h.shard_idx for h in dispatcher._route.hops})
+        participating = dispatcher.participating_shards()
         payload = msgpack.packb(
             [
                 Headers.RELEASE_DISAGG_REQUEST.value,
