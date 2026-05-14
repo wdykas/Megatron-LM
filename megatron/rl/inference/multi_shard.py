@@ -904,17 +904,26 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         if self._my_engine is None:
             return  # rank 0 must own an engine to read layer_type_list
 
-        # Matched-TP requirement, checked at layout level. Same constraint
-        # as _on_route_request_signal but here we fail at launch with a
-        # clearer pointer to the user's CLI args.
+        # Hetero-TP requires that every pair of consecutive shards in
+        # the route have TP sizes that divide one or the other (the
+        # dispatcher's fanout / stride needs an integer ratio). Check
+        # at launch with a CLI-friendly pointer; the dispatcher
+        # re-checks per hop defensively.
         disagg_shards = [s for s in shards if s.kinds is not None]
-        tps = {int(s.spec["tp"]) for s in disagg_shards}
-        assert len(tps) == 1, (
-            f"layer-kind disagg requires matched TP across all disagg "
-            f"shards; layout has tp={sorted(tps)}. Reconfigure "
-            f"--rl-inference-shards so every kinds= shard uses the same "
-            f"tp= (hetero-TP between disagg shards is not yet supported)."
-        )
+        tps = sorted({int(s.spec["tp"]) for s in disagg_shards})
+        for a in tps:
+            for b in tps:
+                if a == b:
+                    continue
+                lo, hi = sorted([a, b])
+                assert hi % lo == 0, (
+                    f"layer-kind disagg with hetero-TP requires every "
+                    f"pair of disagg-shard TP sizes to have a divisibility "
+                    f"relationship; layout has tp={tps} with non-dividing "
+                    f"pair ({a}, {b}). Reconfigure --rl-inference-shards "
+                    f"so every kinds= shard's tp= divides or is divided "
+                    f"by every other disagg shard's tp=."
+                )
 
         from megatron.rl.inference.route_planner import plan_route
 
@@ -1444,25 +1453,10 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             # This shard isn't on this request's route — skip.
             return
 
-        # Matched-TP requirement for layer-kind disagg. The shard_to_pe
-        # mapping below sends my tp_offset to the same tp_offset on each
-        # peer. With unequal TP, the assignment would target out-of-range
-        # PEs on smaller peers (or skip ranks on larger peers). Hetero-TP
-        # between disagg shards needs a redistribution (per-pair fanout
-        # + split/concat); not in v1.
-        my_tp = int(self._shards[self._my_shard_index].spec["tp"])
-        for hop in route.hops:
-            peer_tp = int(self._shards[hop.shard_idx].spec["tp"])
-            if peer_tp != my_tp:
-                raise AssertionError(
-                    f"layer-kind disagg requires matched TP across "
-                    f"participating shards: my shard "
-                    f"{self._my_shard_index} has tp={my_tp} but peer "
-                    f"shard {hop.shard_idx} has tp={peer_tp}. Either "
-                    f"reconfigure the layout so disagg shards share TP, "
-                    f"or extend shard_to_pe / send_hidden / receive_hidden "
-                    f"for hetero-TP redistribution."
-                )
+        # Hetero-TP between disagg shards is allowed when TP sizes
+        # have a divisibility relationship (the dispatcher's per-pair
+        # routing handles fanout / stride). Non-divisible ratios still
+        # fail at dispatcher build time via tp_pair_routing's assertion.
 
         # Hidden-state shape + dtype come from the model's config. For
         # disagg, every shard agrees on the hidden dim (per the
@@ -1477,24 +1471,23 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             or torch.bfloat16
         )
 
-        # Map shard_idx → NVSHMEM PE. PE id equals global rank in
-        # NVSHMEM's standard init. For matched-TP layouts (the common
-        # disagg case) we pair the same tp_offset across shards: my
-        # tp_offset within my shard maps to the same tp_offset on
-        # every peer shard. Hetero-TP between disagg shards would
-        # need a more elaborate routing table — deferred.
+        # NVSHMEM PE id equals global rank under standard init. The
+        # dispatcher computes per-hop send/receive peer PEs from the
+        # per-shard TP topology — matched-TP collapses to 1-to-1, and
+        # divisible hetero-TP fans out / strides.
         my_shard = self._shards[self._my_shard_index]
         global_rank = dist.get_rank() if dist.is_initialized() else 0
         tp_offset = global_rank - my_shard.rank_offset
-
-        def shard_to_pe(shard_idx: int) -> int:
-            return self._shards[shard_idx].rank_offset + tp_offset
+        shard_tp = [int(s.spec["tp"]) for s in self._shards]
+        shard_rank_offset = [s.rank_offset for s in self._shards]
 
         dispatcher = RouteDispatcher(
             route=route,
             my_shard_idx=self._my_shard_index,
             my_pe=global_rank,
-            shard_to_pe=shard_to_pe,
+            my_tp_offset=tp_offset,
+            shard_tp=shard_tp,
+            shard_rank_offset=shard_rank_offset,
             hidden_shape=(self._my_engine.max_requests, hidden_dim),
             hidden_dtype=hidden_dtype,
         )

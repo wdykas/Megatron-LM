@@ -34,7 +34,9 @@ class _MockDispatcher(RouteDispatcher):
     def __init__(self, route, my_shard_idx, received_payload=None):
         self._route = route
         self._my_shard = my_shard_idx
-        # Build the parent's precomputed plan via the same logic.
+        # Build the parent's precomputed plan with matched-TP convention
+        # (peer_pe == peer_shard_idx in these tests — tests treat the
+        # shard index AS the peer PE for inspection purposes).
         from megatron.core.inference.route_dispatcher import _LayerPlan
         self._plan = {}
         last_hop_pos = len(route.hops) - 1
@@ -43,18 +45,22 @@ class _MockDispatcher(RouteDispatcher):
                 for li in hop.layer_indices:
                     self._plan[li] = None
                 continue
-            receive_from = (
+            receive_from_pe = (
                 route.hops[hop_pos - 1].shard_idx if hop_pos > 0 else None
             )
-            send_to = (
-                route.hops[hop_pos + 1].shard_idx
+            send_to_pes = (
+                (route.hops[hop_pos + 1].shard_idx,)
                 if hop_pos < last_hop_pos
-                else None
+                else ()
             )
             for i, li in enumerate(hop.layer_indices):
                 self._plan[li] = _LayerPlan(
-                    receive_from=receive_from if i == 0 else None,
-                    send_to=send_to if i == len(hop.layer_indices) - 1 else None,
+                    receive_from_pe=(
+                        receive_from_pe if i == 0 else None
+                    ),
+                    send_to_pes=(
+                        send_to_pes if i == len(hop.layer_indices) - 1 else ()
+                    ),
                 )
         # Test plumbing.
         self.sends: list = []
@@ -65,11 +71,17 @@ class _MockDispatcher(RouteDispatcher):
             else torch.full((4,), 100.0)
         )
 
-    def _send(self, dst_shard, hidden):
-        self.sends.append((dst_shard, None if hidden is None else hidden.clone()))
+    def _send(self, dst_pes, hidden):
+        # Mock unpacks the single-peer matched-TP case for test
+        # readability; multi-peer (hetero-TP) tests can inspect
+        # ``self.sends`` directly as a list of (dst_pes, hidden) tuples.
+        if len(dst_pes) == 1:
+            self.sends.append((dst_pes[0], None if hidden is None else hidden.clone()))
+        else:
+            self.sends.append((dst_pes, None if hidden is None else hidden.clone()))
 
-    def _receive(self, src_shard):
-        self.receives.append(src_shard)
+    def _receive(self, src_pe):
+        self.receives.append(src_pe)
         return self._received_payload
 
 

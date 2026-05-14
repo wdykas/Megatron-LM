@@ -536,6 +536,34 @@ class DynamicInferenceEngine(AbstractEngine):
         Safe to call on a request that never had one."""
         self._route_dispatchers.pop(request_id, None)
 
+    def _release_disagg_request(self, request_id: int) -> None:
+        """Tell the coord to fan a RELEASE_DISAGG_REQUEST to every shard
+        on this request's route. Non-entry participating shards have no
+        other signal that the request is done — they need this to free
+        dispatchers, KV blocks (on the attention shard), and mamba state
+        slots (on mamba shards). Called by the entry shard when it
+        finalizes a disagg request.
+        """
+        if not self.use_coordinator or not self.is_mp_coordinator:
+            return
+        dispatcher = self._route_dispatchers.get(request_id)
+        if dispatcher is None:
+            return
+        # Pull participating shards off the dispatcher's route. The
+        # entry shard is the sender; the coord won't echo back to it.
+        participating = sorted({h.shard_idx for h in dispatcher._route.hops})
+        payload = msgpack.packb(
+            [
+                Headers.RELEASE_DISAGG_REQUEST.value,
+                int(request_id),
+                participating,
+            ],
+            use_bin_type=True,
+        )
+        self.socket_for_receiving_requests.send(payload)
+        # Local release happens via the normal detach_request path
+        # (which already calls release_route_dispatcher).
+
     def activate_disagg_request(self, request_id: Optional[int]) -> None:
         """Resolve the active disagg request's :class:`RouteDispatcher`
         and push it directly into the model's decoder. ``None`` clears
@@ -2527,6 +2555,15 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.socket_for_receiving_requests.send(payload)
                 nvtx_range_pop("coordinator_communication")
 
+            # Layer-kind disagg cleanup: for every finished request that
+            # had a route dispatcher registered, ask the coord to fan a
+            # RELEASE_DISAGG_REQUEST to every participating shard so they
+            # free dispatchers + KV / mamba state for the request.
+            for r in finished_request_records:
+                rid = r.requests[-1].request_id
+                if rid in self._route_dispatchers:
+                    self._release_disagg_request(rid)
+
         # Drain prefix cache hit counters from context into engine accumulators.
         if self.context.enable_prefix_caching:
             self._prefix_cache_hits += self.context.prefix_cache_hits
@@ -2945,6 +2982,31 @@ class DynamicInferenceEngine(AbstractEngine):
                         logging.error(
                             "Engine: ROUTE_REQUEST handler raised %s — "
                             "continuing run loop", e,
+                        )
+
+            elif header == Headers.RELEASE_DISAGG_REQUEST:
+                # Entry shard's engine has finished this disagg request;
+                # release dispatcher + any KV / mamba state we hold for
+                # it. Non-entry shards have a dispatcher registered via
+                # ROUTE_REQUEST but typically no entry in self.requests
+                # (in v1 only the entry shard processes the request
+                # normally); the detach path is safe to skip when the
+                # request isn't local.
+                _, release_request_id = data[0], data[1]
+                self.release_route_dispatcher(release_request_id)
+                if release_request_id in self.requests:
+                    # Releases KV blocks and mamba state slot if any.
+                    try:
+                        self.detach_request(
+                            release_request_id,
+                            keep_blocks=False,
+                            keep_mamba_state=False,
+                        )
+                    except Exception as e:  # pragma: no cover
+                        logging.error(
+                            "Engine: RELEASE_DISAGG_REQUEST detach for "
+                            "request %d raised %s — continuing run loop",
+                            release_request_id, e,
                         )
 
             else:

@@ -105,6 +105,7 @@ class InferenceClient:
         disagg_dst_shard_index: Optional[int] = None,
         late_dst_shard_index: Optional[int] = None,
         late_dst_min_tokens: Optional[int] = None,
+        disagg_route: Optional[object] = None,
     ) -> asyncio.Future:
         """
         Submits a new inference request to the coordinator.
@@ -128,6 +129,12 @@ class InferenceClient:
                 as soon as it has produced its first decode token. This
                 is the per-request opt-in for HTTP-transparent disagg;
                 ``None`` means the request is not eligible for migration.
+            disagg_route: Optional per-request layer-kind disagg route
+                that overrides the layout-wide stored route for this
+                submit only. Accepts a ``Route`` object or a wire-form
+                list. ``None`` uses the layout's stored route (set via
+                ``set_layout_route``) — collocated layouts have neither
+                and skip the fan-out entirely.
 
         Returns:
             asyncio.Future: A future that will be resolved with a
@@ -150,18 +157,26 @@ class InferenceClient:
         late_set = (
             late_dst_shard_index is not None and late_dst_min_tokens is not None
         )
+        route_set = disagg_route is not None
         any_extra = (
             target_shard_index is not None
             or disagg_dst_shard_index is not None
             or late_set
+            or route_set
         )
         if any_extra:
             payload.append(target_shard_index)
-        if disagg_dst_shard_index is not None or late_set:
+        if disagg_dst_shard_index is not None or late_set or route_set:
             payload.append(disagg_dst_shard_index)
-        if late_set:
+        if late_set or route_set:
             payload.append(late_dst_shard_index)
             payload.append(late_dst_min_tokens)
+        if route_set:
+            from megatron.rl.inference.route_planner import Route, serialize_route
+            if isinstance(disagg_route, Route):
+                payload.append(serialize_route(disagg_route))
+            else:
+                payload.append(list(disagg_route))
         payload_serialized = msgpack.packb(payload, use_bin_type=True)
         self.socket.send(payload_serialized)
         assert request_id not in self.completion_futures

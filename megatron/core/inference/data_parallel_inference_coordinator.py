@@ -647,16 +647,19 @@ class DataParallelInferenceCoordinator:
                 #   5: + disagg_dst_shard_index (auto-disagg opt-in)
                 #   7: + late_dst_shard_index, late_dst_min_tokens
                 #      (two-stage tail-cut migration)
+                #   8: + per_request_disagg_route (overrides stored layout
+                #        route for this submit; layer-kind disagg)
                 fields = deserialized_payload[1:]
-                if len(fields) not in (3, 4, 5, 7):
+                if len(fields) not in (3, 4, 5, 7, 8):
                     raise ValueError(
-                        f"SUBMIT_REQUEST expected 3, 4, 5, or 7 fields, got {len(fields)}"
+                        f"SUBMIT_REQUEST expected 3, 4, 5, 7, or 8 fields, got {len(fields)}"
                     )
                 client_request_id, prompt, sampling_params = fields[:3]
                 target_shard_index = fields[3] if len(fields) >= 4 else None
                 disagg_dst_shard_index = fields[4] if len(fields) >= 5 else None
                 late_dst_shard_index = fields[5] if len(fields) >= 7 else None
                 late_dst_min_tokens = fields[6] if len(fields) >= 7 else None
+                per_request_route = fields[7] if len(fields) >= 8 else None
                 # map client request_id to server request_id
                 # necessary because multiple clients might have the same request_id.
                 request_id = self.next_request_id
@@ -683,23 +686,29 @@ class DataParallelInferenceCoordinator:
                     ]
                 )
 
-                # Layer-kind disagg: if a layout-wide route was uploaded
-                # via SET_DISAGG_ROUTE, fan ROUTE_REQUEST(server_id,
-                # route) to every participating shard BEFORE forwarding
-                # the SUBMIT to the entry shard. ZMQ DEALER/ROUTER
-                # preserves per-peer order, so each engine sees
-                # ROUTE_REQUEST before SUBMIT for this request_id and
-                # has the dispatcher registered when forward fires.
-                if self._disagg_route is not None:
+                # Layer-kind disagg: a per-request route (if supplied on
+                # the SUBMIT) takes precedence over the layout-wide
+                # stored route. Either source kicks off the same
+                # ROUTE_REQUEST fan-out before forwarding the SUBMIT to
+                # the entry shard. ZMQ DEALER/ROUTER preserves per-peer
+                # order, so each engine sees ROUTE_REQUEST before SUBMIT
+                # for this request_id and has the dispatcher registered
+                # when forward fires.
+                effective_route = (
+                    per_request_route
+                    if per_request_route is not None
+                    else self._disagg_route
+                )
+                if effective_route is not None:
                     route_payload = msgpack.packb(
                         [
                             Headers.ROUTE_REQUEST.value,
                             request_id,
-                            self._disagg_route,
+                            effective_route,
                         ],
                         use_bin_type=True,
                     )
-                    participating_shards = {h[0] for h in self._disagg_route}
+                    participating_shards = {h[0] for h in effective_route}
                     for shard_idx in sorted(participating_shards):
                         for ident in self._identities_for_shard(shard_idx):
                             self._send_to_engine(ident, route_payload)
@@ -992,6 +1001,26 @@ class DataParallelInferenceCoordinator:
                     route_hops[-1][0],
                     sorted(participating_shards),
                 )
+
+            elif header == Headers.RELEASE_DISAGG_REQUEST:
+                # Entry shard's engine finished a disagg request and is
+                # telling the coord to fan release to every other
+                # participating shard so they free dispatchers + KV /
+                # mamba state. Wire payload:
+                # [RELEASE_DISAGG_REQUEST, request_id, participating_shards].
+                _, release_request_id, participating_shards = deserialized_payload
+                fanout_payload = msgpack.packb(
+                    [
+                        Headers.RELEASE_DISAGG_REQUEST.value,
+                        int(release_request_id),
+                    ],
+                    use_bin_type=True,
+                )
+                for shard_idx in sorted(participating_shards):
+                    for ident in self._identities_for_shard(shard_idx):
+                        if ident == sender_identity:
+                            continue  # don't echo back to the sender
+                        self._send_to_engine(ident, fanout_payload)
 
             elif header == Headers.SET_DISAGG_ROUTE:
                 # Layer-kind disagg producer wires the layout-wide route

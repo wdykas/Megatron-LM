@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Callable, Dict, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -29,14 +29,66 @@ from megatron.rl.inference.route_planner import Route
 class _LayerPlan:
     """Per-layer action precomputed at dispatcher init.
 
-    ``receive_from``/``send_to`` are peer shard indices when this layer
-    is the entry/exit of the hop and a predecessor/successor hop exists,
-    otherwise ``None``. A layer with a ``_LayerPlan`` is always owned by
-    this shard; not-owned layers are stored as ``None`` in the plan map.
+    ``receive_from_pe`` is the NVSHMEM PE this rank waits on at the
+    hop's entry layer (``None`` if there's no predecessor hop or if
+    this rank isn't a receiver under the TP topology). ``send_to_pes``
+    is the tuple of PEs this rank puts to at the hop's exit layer
+    (empty if no successor hop or this rank isn't a sender). A layer
+    with a ``_LayerPlan`` is always owned by this shard; not-owned
+    layers are stored as ``None`` in the plan map.
+
+    Multi-peer ``send_to_pes`` supports hetero-TP between disagg
+    shards: a tp=2 → tp=4 hop has each src rank fan out to 2 dst ranks
+    (since the residual stream is TP-replicated, sending the same
+    hidden state to multiple peers is correct).
     """
 
-    receive_from: Optional[int]
-    send_to: Optional[int]
+    receive_from_pe: Optional[int]
+    send_to_pes: Tuple[int, ...]
+
+
+def tp_pair_routing(src_tp: int, dst_tp: int) -> List[Tuple[int, int]]:
+    """Return the ``(src_tp_offset, dst_tp_offset)`` exchange pairs for
+    one cross-shard hop between a src shard of TP ``src_tp`` and a dst
+    shard of TP ``dst_tp``.
+
+    The residual stream entering / leaving a block is TP-replicated
+    (every TP rank holds the same ``(batch, hidden)``), so we don't need
+    a slice / concat dance — only correct fan-out / stride so every dst
+    rank receives the full hidden state from exactly one src rank.
+
+    - **Matched TP** (``src_tp == dst_tp``): 1-to-1 by offset.
+    - **Dst larger, divides** (``dst_tp = k * src_tp``): each src rank
+      fans out to ``k`` consecutive dst ranks. Every dst rank receives.
+    - **Src larger, divides** (``src_tp = k * dst_tp``): only every
+      ``k``-th src rank sends; the others would be sending the same
+      data to the same dst, wasting slots. Every dst rank receives from
+      exactly one src rank.
+    - **Non-divisible**: rejected with a clear error. A non-divisible
+      ratio would need slice / concat redistribution within each block,
+      not a primitive of v1.
+    """
+    if src_tp == dst_tp:
+        return [(k, k) for k in range(src_tp)]
+    if dst_tp > src_tp:
+        if dst_tp % src_tp != 0:
+            raise AssertionError(
+                f"hetero-TP between disagg shards requires divisibility: "
+                f"src_tp={src_tp}, dst_tp={dst_tp} (dst must be a multiple "
+                f"of src)."
+            )
+        fanout = dst_tp // src_tp
+        return [
+            (k, k * fanout + i) for k in range(src_tp) for i in range(fanout)
+        ]
+    if src_tp % dst_tp != 0:
+        raise AssertionError(
+            f"hetero-TP between disagg shards requires divisibility: "
+            f"src_tp={src_tp}, dst_tp={dst_tp} (src must be a multiple "
+            f"of dst)."
+        )
+    stride = src_tp // dst_tp
+    return [(k * stride, k) for k in range(dst_tp)]
 
 
 class LayerAction(Enum):
@@ -82,9 +134,13 @@ class RouteDispatcher:
     Arguments:
         route: The request's pre-computed route plan.
         my_shard_idx: The current shard's index in the layout.
-        my_pe: This shard's NVSHMEM PE id.
-        shard_to_pe: Function ``shard_idx → pe_id`` resolving a peer
-            shard to its NVSHMEM PE.
+        my_pe: This shard's NVSHMEM PE id (equal to global rank under
+            standard NVSHMEM init).
+        my_tp_offset: This rank's TP offset within its shard
+            (``my_pe - my_shard.rank_offset`` in the common layout).
+        shard_tp: Per-shard TP size, indexed by shard idx. Used to
+            compute hetero-TP fanout / stride at init.
+        shard_rank_offset: Per-shard base rank, indexed by shard idx.
         hidden_shape: Activation tensor shape (e.g., ``(batch, hidden)``).
         hidden_dtype: dtype of the activation tensor.
         stream: Optional CUDA stream override; defaults to
@@ -96,7 +152,9 @@ class RouteDispatcher:
         route: Route,
         my_shard_idx: int,
         my_pe: int,
-        shard_to_pe: Callable[[int], int],
+        my_tp_offset: int,
+        shard_tp: Sequence[int],
+        shard_rank_offset: Sequence[int],
         hidden_shape: Tuple[int, ...],
         hidden_dtype: torch.dtype,
         *,
@@ -105,7 +163,9 @@ class RouteDispatcher:
         self._route = route
         self._my_shard = my_shard_idx
         self._my_pe = my_pe
-        self._shard_to_pe = shard_to_pe
+        self._my_tp_offset = my_tp_offset
+        self._shard_tp = list(shard_tp)
+        self._shard_rank_offset = list(shard_rank_offset)
         self._hidden_shape = tuple(hidden_shape)
         self._hidden_dtype = hidden_dtype
         nelem = 1
@@ -117,6 +177,7 @@ class RouteDispatcher:
         # Precompute layer_idx → _LayerPlan so dispatch_layer is a flat
         # dict lookup. ``None`` means "another shard owns this layer";
         # a missing key means "past the route's last layer (DONE)".
+        my_tp = self._shard_tp[my_shard_idx]
         self._plan: Dict[int, Optional[_LayerPlan]] = {}
         last_hop_pos = len(route.hops) - 1
         for hop_pos, hop in enumerate(route.hops):
@@ -124,18 +185,44 @@ class RouteDispatcher:
                 for li in hop.layer_indices:
                     self._plan[li] = None
                 continue
-            receive_from = (
-                route.hops[hop_pos - 1].shard_idx if hop_pos > 0 else None
-            )
-            send_to = (
-                route.hops[hop_pos + 1].shard_idx
-                if hop_pos < last_hop_pos
-                else None
-            )
+            # Resolve the inbound source PE under the prior hop's
+            # TP topology, and the outbound destination PE list under
+            # the next hop's TP topology. Empty / None when my rank
+            # isn't a sender or receiver under the pair routing.
+            if hop_pos > 0:
+                prev = route.hops[hop_pos - 1]
+                prev_tp = self._shard_tp[prev.shard_idx]
+                pair_table = tp_pair_routing(prev_tp, my_tp)
+                srcs_for_me = [s for (s, d) in pair_table if d == my_tp_offset]
+                # Each dst rank receives from exactly one src under the
+                # divisibility mapping.
+                receive_from_pe = (
+                    self._shard_rank_offset[prev.shard_idx] + srcs_for_me[0]
+                    if srcs_for_me
+                    else None
+                )
+            else:
+                receive_from_pe = None
+            if hop_pos < last_hop_pos:
+                nxt = route.hops[hop_pos + 1]
+                nxt_tp = self._shard_tp[nxt.shard_idx]
+                pair_table = tp_pair_routing(my_tp, nxt_tp)
+                dsts_for_me = [d for (s, d) in pair_table if s == my_tp_offset]
+                send_to_pes = tuple(
+                    self._shard_rank_offset[nxt.shard_idx] + d
+                    for d in dsts_for_me
+                )
+            else:
+                send_to_pes = ()
+
             for i, li in enumerate(hop.layer_indices):
                 self._plan[li] = _LayerPlan(
-                    receive_from=receive_from if i == 0 else None,
-                    send_to=send_to if i == len(hop.layer_indices) - 1 else None,
+                    receive_from_pe=(
+                        receive_from_pe if i == 0 else None
+                    ),
+                    send_to_pes=(
+                        send_to_pes if i == len(hop.layer_indices) - 1 else ()
+                    ),
                 )
 
     # ---- public API -------------------------------------------------------
@@ -164,29 +251,30 @@ class RouteDispatcher:
         plan = self._plan[layer_idx]
         if plan is None:
             return hidden, LayerAction.NOT_MY_REQUEST
-        if plan.receive_from is not None:
-            hidden = self._receive(plan.receive_from)
+        if plan.receive_from_pe is not None:
+            hidden = self._receive(plan.receive_from_pe)
         hidden = run_local(hidden)
-        if plan.send_to is not None:
-            self._send(plan.send_to, hidden)
+        if plan.send_to_pes:
+            self._send(plan.send_to_pes, hidden)
             return None, LayerAction.SEND
         return hidden, LayerAction.LOCAL
 
     # ---- transport internals ----------------------------------------------
 
-    def _send(self, dst_shard: int, hidden: torch.Tensor) -> None:
-        at.send_hidden(
-            my_pe=self._my_pe,
-            dst_pe=self._shard_to_pe(dst_shard),
-            hidden=hidden,
-            payload_nbytes=self._payload_nbytes,
-            stream=self._stream,
-        )
+    def _send(self, dst_pes: Tuple[int, ...], hidden: torch.Tensor) -> None:
+        for dst_pe in dst_pes:
+            at.send_hidden(
+                my_pe=self._my_pe,
+                dst_pe=dst_pe,
+                hidden=hidden,
+                payload_nbytes=self._payload_nbytes,
+                stream=self._stream,
+            )
 
-    def _receive(self, src_shard: int) -> torch.Tensor:
+    def _receive(self, src_pe: int) -> torch.Tensor:
         return at.receive_hidden(
             my_pe=self._my_pe,
-            src_pe=self._shard_to_pe(src_shard),
+            src_pe=src_pe,
             hidden_shape=self._hidden_shape,
             hidden_dtype=self._hidden_dtype,
             payload_nbytes=self._payload_nbytes,

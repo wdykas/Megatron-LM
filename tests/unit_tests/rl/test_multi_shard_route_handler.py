@@ -130,14 +130,12 @@ def test_route_handler_skips_when_no_engine():
     instance._on_route_request_signal(request_id=1, route=_route_visiting(0))
 
 
-def test_route_handler_rejects_hetero_tp_between_disagg_shards(monkeypatch):
-    """Layer-kind disagg requires every participating shard to share TP.
-    The shard_to_pe mapping pairs my tp_offset with the same tp_offset
-    on peers, which only makes sense with matched TP. Mismatched TP
-    fails loudly with a pointer to the constraint."""
+def test_route_handler_accepts_divisible_hetero_tp(monkeypatch):
+    """Divisible hetero-TP (e.g. tp=2 → tp=4) is supported: the
+    dispatcher's per-pair routing fans out / strides as needed."""
     from megatron.rl.inference.multi_shard import MegatronLocalMulti
 
-    # Shard 0: tp=2; shard 1: tp=4 (hetero).
+    # Shard 0: tp=2; shard 1: tp=4 (divisible, 4 % 2 == 0).
     shards = [
         InferenceShard(
             index=0,
@@ -170,5 +168,49 @@ def test_route_handler_rejects_hetero_tp_between_disagg_shards(monkeypatch):
     instance._my_engine = engine
     monkeypatch.setattr("torch.distributed.is_initialized", lambda: False)
 
-    with pytest.raises(AssertionError, match="matched TP"):
+    # Should succeed and register a dispatcher.
+    instance._on_route_request_signal(request_id=42, route=_route_visiting(0, 1))
+    engine.register_route_dispatcher.assert_called_once()
+
+
+def test_route_handler_rejects_non_divisible_hetero_tp(monkeypatch):
+    """Non-divisible TP pairs (e.g. tp=3 → tp=2) are rejected by the
+    dispatcher's pair-routing builder — no clean fanout / stride
+    mapping exists without slice/concat redistribution."""
+    from megatron.rl.inference.multi_shard import MegatronLocalMulti
+
+    # tp=3 → tp=2: neither divides the other.
+    shards = [
+        InferenceShard(
+            index=0,
+            spec={"tp": 3, "pp": 1, "ep": 1, "expt_tp": 3, "dp": 1, "kinds": ("M",)},
+            rank_offset=0,
+            world_size=3,
+            pg_collection=None,
+            kinds=("M",),
+            layer_indices=(0,),
+        ),
+        InferenceShard(
+            index=1,
+            spec={"tp": 2, "pp": 1, "ep": 1, "expt_tp": 2, "dp": 1, "kinds": ("*",)},
+            rank_offset=3,
+            world_size=2,
+            pg_collection=None,
+            kinds=("*",),
+            layer_indices=(1,),
+        ),
+    ]
+    instance = MegatronLocalMulti.__new__(MegatronLocalMulti)
+    instance._shards = shards
+    instance._my_shard_index = 0
+    engine = MagicMock()
+    engine.max_requests = 16
+    mock_cfg = MagicMock()
+    mock_cfg.hidden_size = 64
+    mock_cfg.params_dtype = torch.bfloat16
+    engine.controller.inference_wrapped_model.model.config = mock_cfg
+    instance._my_engine = engine
+    monkeypatch.setattr("torch.distributed.is_initialized", lambda: False)
+
+    with pytest.raises(AssertionError, match="divisibility"):
         instance._on_route_request_signal(request_id=42, route=_route_visiting(0, 1))

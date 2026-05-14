@@ -92,6 +92,14 @@ class Headers(Enum):
     # [SET_DISAGG_ROUTE, route_hops] (use [SET_DISAGG_ROUTE, None] to
     # clear).
     SET_DISAGG_ROUTE = auto()
+    # Coord → all participating shards' engines: release a finished
+    # disagg request's resources (route dispatcher, KV blocks on the
+    # attention shard, mamba state on the mamba shard). Sent by the
+    # entry shard's engine once it emits the final ENGINE_REPLY for a
+    # disagg request. Non-entry shards have no other signal that the
+    # request is done — they need this to free per-request state.
+    # Wire payload: [RELEASE_DISAGG_REQUEST, request_id].
+    RELEASE_DISAGG_REQUEST = auto()
     TP_BROADCAST = auto()
 
 

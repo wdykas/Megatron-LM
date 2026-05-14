@@ -83,7 +83,9 @@ def test_dispatcher_drives_disagg_forward(_dist_world):
         route=route,
         my_shard_idx=rank,
         my_pe=rank,
-        shard_to_pe=lambda s: s,  # 1:1 mapping in this test
+        my_tp_offset=0,         # 2 ranks, 2 shards, tp=1 each
+        shard_tp=[1, 1],
+        shard_rank_offset=[0, 1],
         hidden_shape=(batch, hidden_dim),
         hidden_dtype=torch.float32,
     )
