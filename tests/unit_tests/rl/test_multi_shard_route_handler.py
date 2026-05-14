@@ -128,3 +128,47 @@ def test_route_handler_skips_when_no_engine():
 
     # Should not raise even though we have no engine / shards.
     instance._on_route_request_signal(request_id=1, route=_route_visiting(0))
+
+
+def test_route_handler_rejects_hetero_tp_between_disagg_shards(monkeypatch):
+    """Layer-kind disagg requires every participating shard to share TP.
+    The shard_to_pe mapping pairs my tp_offset with the same tp_offset
+    on peers, which only makes sense with matched TP. Mismatched TP
+    fails loudly with a pointer to the constraint."""
+    from megatron.rl.inference.multi_shard import MegatronLocalMulti
+
+    # Shard 0: tp=2; shard 1: tp=4 (hetero).
+    shards = [
+        InferenceShard(
+            index=0,
+            spec={"tp": 2, "pp": 1, "ep": 1, "expt_tp": 2, "dp": 1, "kinds": ("M",)},
+            rank_offset=0,
+            world_size=2,
+            pg_collection=None,
+            kinds=("M",),
+            layer_indices=(0,),
+        ),
+        InferenceShard(
+            index=1,
+            spec={"tp": 4, "pp": 1, "ep": 1, "expt_tp": 4, "dp": 1, "kinds": ("*",)},
+            rank_offset=2,
+            world_size=4,
+            pg_collection=None,
+            kinds=("*",),
+            layer_indices=(1,),
+        ),
+    ]
+    instance = MegatronLocalMulti.__new__(MegatronLocalMulti)
+    instance._shards = shards
+    instance._my_shard_index = 0
+    engine = MagicMock()
+    engine.max_requests = 16
+    mock_cfg = MagicMock()
+    mock_cfg.hidden_size = 64
+    mock_cfg.params_dtype = torch.bfloat16
+    engine.controller.inference_wrapped_model.model.config = mock_cfg
+    instance._my_engine = engine
+    monkeypatch.setattr("torch.distributed.is_initialized", lambda: False)
+
+    with pytest.raises(AssertionError, match="matched TP"):
+        instance._on_route_request_signal(request_id=42, route=_route_visiting(0, 1))

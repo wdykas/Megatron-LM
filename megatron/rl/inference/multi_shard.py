@@ -879,7 +879,62 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         instance._in_flight = [0 for _ in shards]
 
         instance._register_rollout_policies(args)
+        instance._maybe_publish_disagg_route()
         return instance
+
+    def _maybe_publish_disagg_route(self) -> None:
+        """If the layout has layer-kind disagg shards, compute the
+        layout-wide route once and upload it to the coord via
+        ``SET_DISAGG_ROUTE``. From then on, every SUBMIT_REQUEST the
+        coord receives auto-fans ROUTE_REQUEST to participating shards
+        before forwarding the SUBMIT — so each engine has a dispatcher
+        registered before its forward fires.
+
+        Layout-level rather than per-request: in v1 every request walks
+        the same route. Per-request routes can be wired later by adding
+        a route field to ``add_request`` and having the coord prefer
+        it over the stored layout route. Only rank 0 publishes (it owns
+        the lifecycle client); on non-disagg layouts this is a no-op.
+        """
+        shards = self._shards
+        if not any(s.kinds is not None for s in shards):
+            return
+        if self._lifecycle_client is None:
+            return  # not the publishing rank
+        if self._my_engine is None:
+            return  # rank 0 must own an engine to read layer_type_list
+
+        # Matched-TP requirement, checked at layout level. Same constraint
+        # as _on_route_request_signal but here we fail at launch with a
+        # clearer pointer to the user's CLI args.
+        disagg_shards = [s for s in shards if s.kinds is not None]
+        tps = {int(s.spec["tp"]) for s in disagg_shards}
+        assert len(tps) == 1, (
+            f"layer-kind disagg requires matched TP across all disagg "
+            f"shards; layout has tp={sorted(tps)}. Reconfigure "
+            f"--rl-inference-shards so every kinds= shard uses the same "
+            f"tp= (hetero-TP between disagg shards is not yet supported)."
+        )
+
+        from megatron.rl.inference.route_planner import plan_route
+
+        layer_type_list = tuple(self._my_engine.context.layer_type_list)
+        if not layer_type_list:
+            # Pure transformer model: every block is attention.
+            layer_type_list = ("*",) * int(
+                self._my_engine.context.num_attention_layers
+                * int(disagg_shards[0].spec.get("pp", 1))
+            )
+        route = plan_route(shards, layer_type_list=layer_type_list)
+        self._lifecycle_client.set_layout_route(route)
+        log_single_rank(
+            logger,
+            logging.INFO,
+            "[disagg] published layout route: %d hops, entry=s%d exit=s%d",
+            len(route.hops),
+            route.entry_shard,
+            route.exit_shard,
+        )
 
     def _register_rollout_policies(self, args) -> None:
         """Wire optional CLI-driven migration policies.
@@ -1388,6 +1443,26 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         if not route.visits(self._my_shard_index):
             # This shard isn't on this request's route — skip.
             return
+
+        # Matched-TP requirement for layer-kind disagg. The shard_to_pe
+        # mapping below sends my tp_offset to the same tp_offset on each
+        # peer. With unequal TP, the assignment would target out-of-range
+        # PEs on smaller peers (or skip ranks on larger peers). Hetero-TP
+        # between disagg shards needs a redistribution (per-pair fanout
+        # + split/concat); not in v1.
+        my_tp = int(self._shards[self._my_shard_index].spec["tp"])
+        for hop in route.hops:
+            peer_tp = int(self._shards[hop.shard_idx].spec["tp"])
+            if peer_tp != my_tp:
+                raise AssertionError(
+                    f"layer-kind disagg requires matched TP across "
+                    f"participating shards: my shard "
+                    f"{self._my_shard_index} has tp={my_tp} but peer "
+                    f"shard {hop.shard_idx} has tp={peer_tp}. Either "
+                    f"reconfigure the layout so disagg shards share TP, "
+                    f"or extend shard_to_pe / send_hidden / receive_hidden "
+                    f"for hetero-TP redistribution."
+                )
 
         # Hidden-state shape + dtype come from the model's config. For
         # disagg, every shard agrees on the hidden dim (per the

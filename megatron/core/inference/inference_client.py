@@ -405,6 +405,32 @@ class InferenceClient:
         )
         return future
 
+    def set_layout_route(self, route) -> None:
+        """Upload the layout-wide layer-kind disagg route to the coord.
+
+        Pass ``None`` to clear. The coord stores the wire form and
+        auto-fans ``ROUTE_REQUEST(server_request_id, route)`` to every
+        participating shard on each subsequent ``SUBMIT_REQUEST`` — so
+        the dispatcher is registered on every engine before that
+        request's forward fires. Called once at launch from
+        :meth:`MegatronLocalMulti.launch` when the layout has any
+        ``kinds=`` shard.
+
+        Args:
+            route: A :class:`megatron.rl.inference.route_planner.Route`
+                or ``None``. Already-serialized routes (the wire form)
+                are also accepted.
+        """
+        from megatron.rl.inference.route_planner import Route, serialize_route
+
+        if route is None:
+            payload = None
+        elif isinstance(route, Route):
+            payload = serialize_route(route)
+        else:
+            payload = list(route)
+        self._send_signal_to_engines(Headers.SET_DISAGG_ROUTE, payload)
+
     def shutdown_coordinator(self):
         """Tells the coordinator process to exit its main loop.
 

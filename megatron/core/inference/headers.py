@@ -81,6 +81,17 @@ class Headers(Enum):
     # src_shard) triples — the wire form of
     # :class:`megatron.rl.inference.route_planner.RouteHop`.
     ROUTE_REQUEST = auto()
+    # Client → coordinator: upload the layout-wide layer-kind disagg route
+    # ONCE at launch. The coord stores the serialized route hops; on every
+    # subsequent SUBMIT_REQUEST the coord auto-fans a ROUTE_REQUEST(
+    # server_request_id, stored_route) to all participating shards before
+    # forwarding the SUBMIT to the entry shard. This is what makes
+    # layer-kind disagg HTTP-transparent — clients don't need to compute
+    # or ship a route per request, and the coord handles the
+    # client→server request-id translation. Wire payload:
+    # [SET_DISAGG_ROUTE, route_hops] (use [SET_DISAGG_ROUTE, None] to
+    # clear).
+    SET_DISAGG_ROUTE = auto()
     TP_BROADCAST = auto()
 
 

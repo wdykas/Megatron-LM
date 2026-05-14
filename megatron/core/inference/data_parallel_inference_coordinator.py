@@ -10,6 +10,7 @@ from collections import deque
 from enum import Enum, auto
 from multiprocessing import Event
 from multiprocessing.connection import Connection
+from typing import Optional
 
 import numpy as np
 import torch
@@ -217,6 +218,16 @@ class DataParallelInferenceCoordinator:
         self.next_request_id = 0
         self.tokenizer = tokenizer
         self.state = self.CoordinatorState.RUNNING
+
+        # Layout-wide layer-kind disagg route. ``None`` means no disagg
+        # is configured for this coord; every SUBMIT_REQUEST is processed
+        # collocated. When set (via ``Headers.SET_DISAGG_ROUTE`` from a
+        # client at launch time), every SUBMIT_REQUEST triggers an
+        # auto-fanned ``ROUTE_REQUEST(server_request_id, stored_route)``
+        # to participating shards before forwarding the SUBMIT. Stored as
+        # the wire form (list-of-hops) — coord doesn't reconstruct the
+        # ``Route`` object.
+        self._disagg_route: Optional[list] = None
 
         # Prefix caching state for routing.
         self.block_size_tokens = block_size_tokens
@@ -672,6 +683,27 @@ class DataParallelInferenceCoordinator:
                     ]
                 )
 
+                # Layer-kind disagg: if a layout-wide route was uploaded
+                # via SET_DISAGG_ROUTE, fan ROUTE_REQUEST(server_id,
+                # route) to every participating shard BEFORE forwarding
+                # the SUBMIT to the entry shard. ZMQ DEALER/ROUTER
+                # preserves per-peer order, so each engine sees
+                # ROUTE_REQUEST before SUBMIT for this request_id and
+                # has the dispatcher registered when forward fires.
+                if self._disagg_route is not None:
+                    route_payload = msgpack.packb(
+                        [
+                            Headers.ROUTE_REQUEST.value,
+                            request_id,
+                            self._disagg_route,
+                        ],
+                        use_bin_type=True,
+                    )
+                    participating_shards = {h[0] for h in self._disagg_route}
+                    for shard_idx in sorted(participating_shards):
+                        for ident in self._identities_for_shard(shard_idx):
+                            self._send_to_engine(ident, route_payload)
+
                 # Serialize prompt.
                 if isinstance(prompt, (str, list)):
                     pass
@@ -960,6 +992,31 @@ class DataParallelInferenceCoordinator:
                     route_hops[-1][0],
                     sorted(participating_shards),
                 )
+
+            elif header == Headers.SET_DISAGG_ROUTE:
+                # Layer-kind disagg producer wires the layout-wide route
+                # once at launch. The coord stores it and auto-fans
+                # ROUTE_REQUEST on every subsequent SUBMIT_REQUEST. Pass
+                # [SET_DISAGG_ROUTE, None] to clear (e.g. during shutdown
+                # or layout swap). Payload: [SET_DISAGG_ROUTE, route_hops].
+                if sender_identity not in known_clients:
+                    logging.warning(
+                        "Coordinator: ignoring SET_DISAGG_ROUTE from unknown client."
+                    )
+                    continue
+                _, route_hops = deserialized_payload
+                if route_hops is None:
+                    self._disagg_route = None
+                    logging.info("Coordinator: cleared disagg route.")
+                else:
+                    self._disagg_route = route_hops
+                    participating = sorted({h[0] for h in route_hops})
+                    logging.info(
+                        "Coordinator: stored disagg route with %d hops, "
+                        "participating shards=%s",
+                        len(route_hops),
+                        participating,
+                    )
 
             elif header in (
                 Headers.UPDATE_REQUEST_RANK,
