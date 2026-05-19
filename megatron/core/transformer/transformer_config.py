@@ -915,6 +915,8 @@ class TransformerConfig(ModelParallelConfig):
          Bitwise-identical to `torch.mm`.
        - "triton": BIK Triton `matmul_persistent` kernel. Works on any
          CUDA device for bf16/fp16/fp32 inputs.
+       - "cute_dsl": cute-dsl `PersistentDenseGemmKernel` (vendored from
+         TRT-LLM; see `bik_cute_dsl/README.md`). bf16/fp16 on Blackwell.
        Grouped GEMM always uses DeepGEMM regardless. Ignored when
        `batch_invariant_mode=False`."""
 

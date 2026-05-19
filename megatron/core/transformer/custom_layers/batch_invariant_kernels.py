@@ -556,7 +556,9 @@ def deterministic_index_add(
 #       `torch.mm`. Requires bf16 CUDA inputs on Hopper/Blackwell.
 #   "triton": BIK Triton `matmul_persistent` — works on any CUDA device with
 #       bf16/fp16/fp32. Has small rounding drift vs `torch.mm`.
-_BIK_BACKENDS = ("deepgemm", "triton")
+#   "cute_dsl": cute-dsl `PersistentDenseGemmKernel` (vendored from TRT-LLM —
+#       see `bik_cute_dsl/README.md`). bf16/fp16 on Blackwell.
+_BIK_BACKENDS = ("deepgemm", "triton", "cute_dsl")
 _BIK_BACKEND: str = "deepgemm"
 
 
@@ -583,6 +585,9 @@ def mm_batch_invariant(a, b):
     """Batch-invariant replacement for `aten::mm`."""
     if _BIK_BACKEND == "deepgemm":
         return _mm_deepgemm(a, b)
+    if _BIK_BACKEND == "cute_dsl":
+        from .bik_cute_dsl.bik_cute_backend import mm_cute_dsl
+        return mm_cute_dsl(a, b)
     return matmul_persistent(a, b)
 
 
@@ -593,6 +598,9 @@ def addmm_batch_invariant(bias, a, b):
         if bias is not None:
             out = out + bias
         return out
+    if _BIK_BACKEND == "cute_dsl":
+        from .bik_cute_dsl.bik_cute_backend import addmm_cute_dsl
+        return addmm_cute_dsl(bias, a, b)
     return matmul_persistent(a, b, bias=bias)
 
 
