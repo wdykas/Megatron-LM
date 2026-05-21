@@ -43,6 +43,65 @@ def test_src_larger_strides():
     assert 3 not in [s for s, _ in pairs]
 
 
+def test_single_rep_collapses_to_one_pair():
+    """``single_rep=True`` always yields a single (0, 0) pair, regardless
+    of TP sizes. Cuts cross-shard bandwidth by max(src_tp, dst_tp) at
+    the cost of a dst-side TP broadcast."""
+    assert tp_pair_routing(4, 4, single_rep=True) == [(0, 0)]
+    assert tp_pair_routing(2, 4, single_rep=True) == [(0, 0)]
+    assert tp_pair_routing(4, 2, single_rep=True) == [(0, 0)]
+    # Non-divisible TPs are no longer rejected in single-rep — the
+    # broadcast distributes within the dst shard regardless of ratio.
+    assert tp_pair_routing(3, 2, single_rep=True) == [(0, 0)]
+
+
+def test_single_rep_plan_only_tp0_sends_others_join_broadcast():
+    """In single-rep mode the dispatcher's plan has only TP-0 with a
+    populated ``send_to_pes`` (so only TP-0 calls NVSHMEM put); every
+    dst rank has ``receive_from_pe`` pointing at TP-0 of src so all
+    participate in the dst-side TP broadcast inside ``_receive``."""
+    from megatron.core.inference.route_dispatcher import _build_layer_plan
+
+    route = Route(
+        hops=(
+            RouteHop(shard_idx=0, layer_indices=(0,)),
+            RouteHop(shard_idx=1, layer_indices=(1,)),
+        )
+    )
+    # Shard 0 at offset 0 (tp=4); shard 1 at offset 4 (tp=4).
+    # Single-rep mode: only TP-0 sends.
+    plans_by_tp = {}
+    for tp_off in range(4):
+        plan = _build_layer_plan(
+            route=route,
+            my_shard_idx=0,  # src
+            my_tp_offset=tp_off,
+            shard_tp=[4, 4],
+            shard_rank_offset=[0, 4],
+            single_rep=True,
+        )
+        plans_by_tp[tp_off] = plan
+    # TP-0 of src has a populated send.
+    assert plans_by_tp[0][0].send_to_pes == (4,)
+    # Other TP ranks of src have no send (broadcast handles dist).
+    assert plans_by_tp[1][0].send_to_pes == ()
+    assert plans_by_tp[2][0].send_to_pes == ()
+    assert plans_by_tp[3][0].send_to_pes == ()
+
+    # All dst TP ranks have receive_from_pe set to TP-0 of src
+    # (so they all participate in the TP broadcast as dst).
+    for tp_off in range(4):
+        dst_plan = _build_layer_plan(
+            route=route,
+            my_shard_idx=1,  # dst
+            my_tp_offset=tp_off,
+            shard_tp=[4, 4],
+            shard_rank_offset=[0, 4],
+            single_rep=True,
+        )
+        assert dst_plan[1].receive_from_pe == 0  # TP-0 of src is PE 0
+
+
 def test_non_divisible_tp_rejected():
     """tp=3 → tp=2 has no integer fanout / stride; reject."""
     with pytest.raises(AssertionError, match="divisibility"):

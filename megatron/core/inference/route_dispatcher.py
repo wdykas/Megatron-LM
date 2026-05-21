@@ -47,7 +47,9 @@ class _LayerPlan:
     send_to_pes: Tuple[int, ...]
 
 
-def tp_pair_routing(src_tp: int, dst_tp: int) -> List[Tuple[int, int]]:
+def tp_pair_routing(
+    src_tp: int, dst_tp: int, *, single_rep: bool = False
+) -> List[Tuple[int, int]]:
     """Return the ``(src_tp_offset, dst_tp_offset)`` exchange pairs for
     one cross-shard hop between a src shard of TP ``src_tp`` and a dst
     shard of TP ``dst_tp``.
@@ -67,7 +69,16 @@ def tp_pair_routing(src_tp: int, dst_tp: int) -> List[Tuple[int, int]]:
     - **Non-divisible**: rejected with a clear error. A non-divisible
       ratio would need slice / concat redistribution within each block,
       not a primitive of v1.
+
+    ``single_rep=True`` collapses the table to a single ``(0, 0)`` pair
+    — only TP-0 of src sends to TP-0 of dst over NVSHMEM, and dst-side
+    TP-internal broadcast distributes the hidden state to its other
+    TP ranks. Cuts cross-shard bandwidth by ``max(src_tp, dst_tp)``
+    at the cost of one NCCL broadcast per dst shard per hop. Win for
+    multi-node disagg where inter-node BW is the bottleneck.
     """
+    if single_rep:
+        return [(0, 0)]
     if src_tp == dst_tp:
         return [(k, k) for k in range(src_tp)]
     if dst_tp > src_tp:
@@ -97,6 +108,8 @@ def _build_layer_plan(
     my_tp_offset: int,
     shard_tp: List[int],
     shard_rank_offset: List[int],
+    *,
+    single_rep: bool = False,
 ) -> Dict[int, Optional[_LayerPlan]]:
     """Resolve every layer's dispatch action against the given TP
     topology. ``None`` value means another shard owns the layer; an
@@ -105,6 +118,12 @@ def _build_layer_plan(
     The hop-level routing tables (built via :func:`tp_pair_routing`)
     apply only to the hop's entry / exit layer; middle layers of a
     multi-layer hop have no inbound / outbound transport.
+
+    ``single_rep=True``: only TP-0 sends/receives via NVSHMEM. Other
+    TP ranks of the dst shard get ``receive_from_pe`` set to TP-0
+    of src so :meth:`RouteDispatcher._receive` knows to participate
+    in the dst-side TP broadcast (TP-0 as src) instead of doing its
+    own NVSHMEM recv. ``send_to_pes`` is empty on non-TP-0 ranks.
     """
     my_tp = shard_tp[my_shard_idx]
     plan: Dict[int, Optional[_LayerPlan]] = {}
@@ -116,29 +135,38 @@ def _build_layer_plan(
             continue
         # Resolve inbound source PE under the prior hop's TP topology,
         # outbound destination PE list under the next hop's TP topology.
-        # Empty / None when my rank isn't a sender or receiver under
-        # the pair routing (the stride case skips some src ranks).
         receive_from_pe: Optional[int] = None
         if hop_pos > 0:
             prev = route.hops[hop_pos - 1]
-            srcs_for_me = [
-                s for (s, d) in tp_pair_routing(shard_tp[prev.shard_idx], my_tp)
-                if d == my_tp_offset
-            ]
-            if srcs_for_me:
-                # Each dst rank receives from exactly one src under
-                # divisibility mapping.
-                receive_from_pe = shard_rank_offset[prev.shard_idx] + srcs_for_me[0]
+            if single_rep:
+                # All dst ranks "receive from" TP-0 of src; non-TP-0
+                # ranks participate in the dst-side TP broadcast rather
+                # than calling NVSHMEM recv directly. The flag lives
+                # in the dispatcher's _receive based on my_tp_offset.
+                receive_from_pe = shard_rank_offset[prev.shard_idx]
+            else:
+                srcs_for_me = [
+                    s for (s, d) in tp_pair_routing(shard_tp[prev.shard_idx], my_tp)
+                    if d == my_tp_offset
+                ]
+                if srcs_for_me:
+                    receive_from_pe = shard_rank_offset[prev.shard_idx] + srcs_for_me[0]
         send_to_pes: Tuple[int, ...] = ()
         if hop_pos < last_hop_pos:
             nxt = route.hops[hop_pos + 1]
-            dsts_for_me = [
-                d for (s, d) in tp_pair_routing(my_tp, shard_tp[nxt.shard_idx])
-                if s == my_tp_offset
-            ]
-            send_to_pes = tuple(
-                shard_rank_offset[nxt.shard_idx] + d for d in dsts_for_me
-            )
+            if single_rep:
+                # Only TP-0 of src actually sends. Other TP ranks
+                # have the same hidden state but skip the NVSHMEM put.
+                if my_tp_offset == 0:
+                    send_to_pes = (shard_rank_offset[nxt.shard_idx],)
+            else:
+                dsts_for_me = [
+                    d for (s, d) in tp_pair_routing(my_tp, shard_tp[nxt.shard_idx])
+                    if s == my_tp_offset
+                ]
+                send_to_pes = tuple(
+                    shard_rank_offset[nxt.shard_idx] + d for d in dsts_for_me
+                )
         last_layer_in_hop = len(hop.layer_indices) - 1
         for i, li in enumerate(hop.layer_indices):
             plan[li] = _LayerPlan(
@@ -216,10 +244,16 @@ class RouteDispatcher:
         hidden_dtype: torch.dtype,
         *,
         stream: Optional[torch.cuda.Stream] = None,
+        tp_group: object = None,
+        single_rep: bool = False,
     ) -> None:
         self._route = route
         self._my_shard = my_shard_idx
         self._my_pe = my_pe
+        self._my_tp_offset = my_tp_offset
+        self._tp_rank_zero_pe = my_pe - my_tp_offset
+        self._tp_group = tp_group
+        self._single_rep = single_rep
         self._hidden_shape = tuple(hidden_shape)
         self._hidden_dtype = hidden_dtype
         nelem = 1
@@ -234,6 +268,7 @@ class RouteDispatcher:
             my_tp_offset=my_tp_offset,
             shard_tp=list(shard_tp),
             shard_rank_offset=list(shard_rank_offset),
+            single_rep=single_rep,
         )
 
     # ---- public API -------------------------------------------------------
@@ -290,6 +325,30 @@ class RouteDispatcher:
             )
 
     def _receive(self, src_pe: int) -> torch.Tensor:
+        if self._single_rep and self._tp_group is not None:
+            import torch.distributed as _dist
+
+            # Single-rep mode: TP-0 of dst pulls the hidden state via
+            # NVSHMEM from TP-0 of src; then we broadcast to the rest
+            # of this shard's TP group. Other TP ranks skip the
+            # NVSHMEM recv and just join the broadcast as dst.
+            if self._my_tp_offset == 0:
+                out = at.receive_hidden(
+                    my_pe=self._my_pe,
+                    src_pe=src_pe,
+                    hidden_shape=self._hidden_shape,
+                    hidden_dtype=self._hidden_dtype,
+                    payload_nbytes=self._payload_nbytes,
+                    stream=self._stream,
+                )
+            else:
+                out = torch.empty(
+                    self._hidden_shape,
+                    dtype=self._hidden_dtype,
+                    device=torch.cuda.current_device(),
+                )
+            _dist.broadcast(out, src=self._tp_rank_zero_pe, group=self._tp_group)
+            return out
         return at.receive_hidden(
             my_pe=self._my_pe,
             src_pe=src_pe,
