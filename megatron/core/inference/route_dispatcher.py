@@ -21,7 +21,9 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from megatron.core.inference import activation_transport as at
+from megatron.core.inference.transport_backend import (
+    get_activation_transport_backend,
+)
 from megatron.rl.inference.route_planner import Route
 
 
@@ -315,8 +317,9 @@ class RouteDispatcher:
     # ---- transport internals ----------------------------------------------
 
     def _send(self, dst_pes: Tuple[int, ...], hidden: torch.Tensor) -> None:
+        backend = get_activation_transport_backend()
         for dst_pe in dst_pes:
-            at.send_hidden(
+            backend.send_hidden(
                 my_pe=self._my_pe,
                 dst_pe=dst_pe,
                 hidden=hidden,
@@ -325,15 +328,16 @@ class RouteDispatcher:
             )
 
     def _receive(self, src_pe: int) -> torch.Tensor:
+        backend = get_activation_transport_backend()
         if self._single_rep and self._tp_group is not None:
             import torch.distributed as _dist
 
             # Single-rep mode: TP-0 of dst pulls the hidden state via
-            # NVSHMEM from TP-0 of src; then we broadcast to the rest
-            # of this shard's TP group. Other TP ranks skip the
-            # NVSHMEM recv and just join the broadcast as dst.
+            # the transport from TP-0 of src; then we broadcast to the
+            # rest of this shard's TP group. Other TP ranks skip the
+            # transport recv and just join the broadcast as dst.
             if self._my_tp_offset == 0:
-                out = at.receive_hidden(
+                out = backend.receive_hidden(
                     my_pe=self._my_pe,
                     src_pe=src_pe,
                     hidden_shape=self._hidden_shape,
@@ -349,7 +353,7 @@ class RouteDispatcher:
                 )
             _dist.broadcast(out, src=self._tp_rank_zero_pe, group=self._tp_group)
             return out
-        return at.receive_hidden(
+        return backend.receive_hidden(
             my_pe=self._my_pe,
             src_pe=src_pe,
             hidden_shape=self._hidden_shape,
