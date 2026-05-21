@@ -326,6 +326,14 @@ class DynamicInferenceEngine(AbstractEngine):
         # step-loop integration that drives forward + skips sampling
         # for non-exit participants.
         self._disagg_participants: dict = {}
+        # Optional callback ``(request_id, prompt, params, role) -> None``
+        # invoked when DISAGG_SUBMIT arrives. Registered via
+        # :meth:`set_disagg_submit_handler`; the multi_shard handler
+        # uses it to spawn a forward-driver task that pumps the
+        # dispatcher's transport from this engine's side.
+        self._disagg_submit_handler: Optional[
+            Callable[[int, object, object, str], None]
+        ] = None
 
         self.resume_request_ids = None
 
@@ -525,6 +533,27 @@ class DynamicInferenceEngine(AbstractEngine):
         ``megatron/core/inference/DISAGG_DESIGN.md``.
         """
         self._route_handler = handler
+
+    def set_disagg_submit_handler(
+        self,
+        handler: Optional[Callable[[int, object, object, str], None]],
+    ) -> None:
+        """Register the non-entry disagg-participant submit handler.
+
+        Invoked when a ``Headers.DISAGG_SUBMIT`` arrives. The handler
+        is given ``(request_id, prompt, sampling_params, role)`` and
+        is expected to drive the forward path that pumps the
+        request's dispatcher (allocating per-shard state as needed,
+        running the local layers under the dispatcher, and — for
+        ``role == "exit"`` — sampling + emitting the reply).
+
+        The default behaviour when no handler is registered is to
+        record the participant under ``_disagg_participants`` and
+        otherwise be a no-op — the forward never fires on this
+        shard for the request and the dispatcher idles. Registering
+        a handler unlocks the actual engine-driven path.
+        """
+        self._disagg_submit_handler = handler
 
     def register_route_dispatcher(
         self, request_id: int, dispatcher
@@ -2995,21 +3024,30 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Layer-kind disagg: non-entry participating shard
                 # receives the SUBMIT companion (the entry shard gets
                 # the normal SUBMIT_REQUEST). Records role + prompt
-                # so the step-loop integration can drive forward
-                # for this request and skip sampling unless role is
-                # "exit". For now the record is built; the step-loop
-                # hook is the next integration phase.
+                # for inspection and invokes the registered handler
+                # (if any) so the forward-driver task can spawn.
                 # Payload: [DISAGG_SUBMIT, request_id, prompt, params, role]
                 _, ds_request_id, ds_prompt, ds_params, ds_role = data
-                self._disagg_participants[int(ds_request_id)] = {
+                rid = int(ds_request_id)
+                self._disagg_participants[rid] = {
                     "role": ds_role,
                     "prompt": ds_prompt,
                     "params": ds_params,
                 }
                 logging.debug(
                     "Engine: DISAGG_SUBMIT request_id=%d role=%s",
-                    ds_request_id, ds_role,
+                    rid, ds_role,
                 )
+                if self._disagg_submit_handler is not None:
+                    try:
+                        self._disagg_submit_handler(
+                            rid, ds_prompt, ds_params, ds_role,
+                        )
+                    except Exception as e:
+                        logging.error(
+                            "Engine: DISAGG_SUBMIT handler raised %s — "
+                            "continuing run loop", e,
+                        )
 
             elif header == Headers.RELEASE_DISAGG_REQUEST:
                 # Entry shard's engine has finished this disagg request;

@@ -1430,6 +1430,10 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                 self._my_engine.set_migration_handler(self._on_migrate_batch_signal)
             if self._my_engine._route_handler is None:
                 self._my_engine.set_route_handler(self._on_route_request_signal)
+            if getattr(self._my_engine, "_disagg_submit_handler", None) is None:
+                self._my_engine.set_disagg_submit_handler(
+                    self._on_disagg_submit_signal
+                )
 
     def _on_route_request_signal(self, request_id: int, route) -> None:
         """Engine-side ROUTE_REQUEST handler.
@@ -1492,6 +1496,94 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             hidden_dtype=hidden_dtype,
         )
         self._my_engine.register_route_dispatcher(request_id, dispatcher)
+
+    def _on_disagg_submit_signal(
+        self,
+        request_id: int,
+        prompt: object,
+        sampling_params: object,
+        role: str,
+    ) -> None:
+        """Engine-side ``DISAGG_SUBMIT`` handler. Spawns a forward-
+        driver asyncio task that pumps the per-request dispatcher.
+
+        The task calls ``dispatch_layer`` for every global layer in
+        order. Non-owned layers return ``NOT_MY_REQUEST`` (the
+        transport doesn't fire). Owned hop layers receive activation
+        from the previous shard, run the local layer's compute, and
+        send the result to the next shard. This is what makes a
+        non-entry shard's transport actually fire end-to-end without
+        going through the engine's request-iteration / controller
+        machinery — bypassing the controller is what avoids the
+        full step-loop refactor (allocate-state / sample-routing /
+        token-sync) that would otherwise be required for the engine
+        to drive forward for a participant request.
+
+        Trade-off: this path doesn't invoke the actual model layers
+        on the non-entry shard — it just pumps the dispatcher's
+        transport. So it correctly closes the cross-shard handshake
+        loop but doesn't apply the shard's owned layers to the
+        hidden state. Useful for protocol-level validation and
+        future "engine-driven" handlers can replace this with the
+        real ``run_local`` (model.decoder.layers[li](...)) callable.
+
+        Args:
+            request_id: Server-side request id (matches what the
+                coord assigned and what the dispatcher was
+                registered under).
+            prompt: The prompt (tokens or string) — used by future
+                ``run_local`` callables to construct attention masks.
+                Currently unused by this stub.
+            sampling_params: Sampling parameters — used only if
+                ``role == "exit"`` (LM head + sampling).
+            role: ``"intermediate"`` or ``"exit"``. ``"exit"``
+                shards would sample + emit ``ENGINE_REPLY``; the
+                stub here doesn't sample because there's no real
+                model forward (see trade-off above).
+        """
+        if self._my_engine is None:
+            return
+        dispatcher = self._my_engine._route_dispatchers.get(request_id)
+        if dispatcher is None:
+            logger.warning(
+                "[disagg] DISAGG_SUBMIT for request %d arrived without a "
+                "dispatcher — ROUTE_REQUEST race or out-of-order delivery",
+                request_id,
+            )
+            return
+
+        # Number of global layers covered by the route's hops.
+        num_layers = (
+            max(
+                (max(h.layer_indices) for h in dispatcher._route.hops),
+                default=-1,
+            )
+            + 1
+        )
+        # Stub layer compute: pass-through (a real engine-driven
+        # handler would substitute model.decoder.layers[li](h, ...)
+        # with the request's attention_mask / positions).
+        def _stub_run_local(h):
+            return h
+
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            return  # no loop on this rank — can't spawn
+
+        async def _drive_forward():
+            import torch
+
+            # The dispatcher will receive at the hop's first layer
+            # (via signal_wait); for non-entry shards `hidden` starts
+            # as None and the first dispatch_layer call replaces it.
+            hidden: Optional[torch.Tensor] = None
+            for li in range(num_layers):
+                hidden, _ = dispatcher.dispatch_layer(li, hidden, _stub_run_local)
+            # Exit shards would now run LM head + sample. The stub
+            # leaves that to a future engine-driven handler.
+
+        loop.create_task(_drive_forward())
 
     def _on_migrate_batch_signal(
         self,
