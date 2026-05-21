@@ -1046,6 +1046,17 @@ class DataParallelInferenceCoordinator:
                         len(route_hops),
                         participating,
                     )
+                # Ack the client so it can unblock launch before the
+                # first SUBMIT lands.
+                self.router_socket.send_multipart(
+                    [
+                        sender_identity,
+                        msgpack.packb(
+                            [Headers.SET_DISAGG_ROUTE_ACK.value],
+                            use_bin_type=True,
+                        ),
+                    ]
+                )
 
             elif header in (
                 Headers.UPDATE_REQUEST_RANK,

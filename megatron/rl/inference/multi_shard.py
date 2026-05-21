@@ -879,10 +879,10 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         instance._in_flight = [0 for _ in shards]
 
         instance._register_rollout_policies(args)
-        instance._maybe_publish_disagg_route()
+        await instance._maybe_publish_disagg_route()
         return instance
 
-    def _maybe_publish_disagg_route(self) -> None:
+    async def _maybe_publish_disagg_route(self) -> None:
         """If the layout has layer-kind disagg shards, compute the
         layout-wide route once and upload it to the coord via
         ``SET_DISAGG_ROUTE``. From then on, every SUBMIT_REQUEST the
@@ -935,7 +935,7 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                 * int(disagg_shards[0].spec.get("pp", 1))
             )
         route = plan_route(shards, layer_type_list=layer_type_list)
-        self._lifecycle_client.set_layout_route(route)
+        await self._lifecycle_client.set_layout_route(route)
         log_single_rank(
             logger,
             logging.INFO,

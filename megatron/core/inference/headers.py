@@ -92,6 +92,12 @@ class Headers(Enum):
     # [SET_DISAGG_ROUTE, route_hops] (use [SET_DISAGG_ROUTE, None] to
     # clear).
     SET_DISAGG_ROUTE = auto()
+    # Coordinator → client: ack for SET_DISAGG_ROUTE. ``set_layout_route``
+    # blocks on this so callers can't submit requests before the coord
+    # has the route stored — otherwise SUBMITs that arrive between
+    # SET_DISAGG_ROUTE and the coord's store land collocated and run
+    # against a partial model. Wire payload: [SET_DISAGG_ROUTE_ACK].
+    SET_DISAGG_ROUTE_ACK = auto()
     # Coord → all participating shards' engines: release a finished
     # disagg request's resources (route dispatcher, KV blocks on the
     # attention shard, mamba state on the mamba shard). Sent by the

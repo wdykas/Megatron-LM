@@ -113,34 +113,56 @@ def test_submit_without_stored_route_does_not_fan():
     coord._send_to_engine.assert_not_called()
 
 
-def test_inference_client_set_layout_route_serializes_and_sends():
-    """``InferenceClient.set_layout_route`` accepts a ``Route`` object,
-    serializes it, and sends the wire form via the signal channel."""
+@pytest.mark.asyncio
+async def test_inference_client_set_layout_route_serializes_and_sends():
+    """``InferenceClient.set_layout_route`` serializes a ``Route``,
+    sends it via the signal channel, and resolves once the coord
+    acks (caller awaits before opening submission)."""
+    import asyncio
     from megatron.core.inference.inference_client import InferenceClient
 
     client = InferenceClient.__new__(InferenceClient)
     client._send_signal_to_engines = MagicMock()
+    client._loop = asyncio.get_running_loop()
+    client._set_disagg_route_ack = None
     route = Route(
         hops=(
             RouteHop(shard_idx=0, layer_indices=(0, 2)),
             RouteHop(shard_idx=1, layer_indices=(1, 3)),
         )
     )
-    client.set_layout_route(route)
+
+    # Pre-resolve the ack future so the await returns immediately.
+    async def _pre_ack():
+        await asyncio.sleep(0)
+        client._set_disagg_route_ack.set_result(True)
+
+    asyncio.ensure_future(_pre_ack())
+    await client.set_layout_route(route)
     client._send_signal_to_engines.assert_called_once()
     args = client._send_signal_to_engines.call_args.args
     assert args[0] == Headers.SET_DISAGG_ROUTE
     assert args[1] == serialize_route(route)
 
 
-def test_inference_client_set_layout_route_none_clears():
+@pytest.mark.asyncio
+async def test_inference_client_set_layout_route_none_clears():
     """``set_layout_route(None)`` ships ``None`` so the coord clears its
-    stored route."""
+    stored route. Still acks → caller unblocks normally."""
+    import asyncio
     from megatron.core.inference.inference_client import InferenceClient
 
     client = InferenceClient.__new__(InferenceClient)
     client._send_signal_to_engines = MagicMock()
-    client.set_layout_route(None)
+    client._loop = asyncio.get_running_loop()
+    client._set_disagg_route_ack = None
+
+    async def _pre_ack():
+        await asyncio.sleep(0)
+        client._set_disagg_route_ack.set_result(True)
+
+    asyncio.ensure_future(_pre_ack())
+    await client.set_layout_route(None)
     args = client._send_signal_to_engines.call_args.args
     assert args[0] == Headers.SET_DISAGG_ROUTE
     assert args[1] is None

@@ -93,6 +93,10 @@ class InferenceClient:
         # and the coord's ownership map untouched.
         self._migrate_batch_futures: dict = {}
         self._next_migrate_batch_id: int = 0
+        # Single-shot future resolved when the coord acks the most
+        # recent SET_DISAGG_ROUTE. ``set_layout_route`` awaits it so
+        # callers can't submit requests before the route is stored.
+        self._set_disagg_route_ack: Optional[asyncio.Future] = None
         self.request_submission_times = {}
         self.next_request_id = 0
 
@@ -271,6 +275,10 @@ class InferenceClient:
                     fut = self._migrate_batch_futures.pop(batch_id, None)
                     if fut is not None and not fut.done():
                         fut.set_result(bool(accepted))
+                elif header == Headers.SET_DISAGG_ROUTE_ACK:
+                    fut = self._set_disagg_route_ack
+                    if fut is not None and not fut.done():
+                        fut.set_result(True)
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue
@@ -420,8 +428,15 @@ class InferenceClient:
         )
         return future
 
-    def set_layout_route(self, route) -> None:
-        """Upload the layout-wide layer-kind disagg route to the coord.
+    async def set_layout_route(self, route) -> None:
+        """Upload the layout-wide layer-kind disagg route to the coord
+        and wait for the coord's ack.
+
+        Awaiting the ack is what closes the launch-time race: requests
+        submitted before the coord has stored the route would silently
+        skip the ROUTE_REQUEST fan-out and run collocated against a
+        partial model. Callers should ``await`` this before opening
+        the request submission path.
 
         Pass ``None`` to clear. The coord stores the wire form and
         auto-fans ``ROUTE_REQUEST(server_request_id, route)`` to every
@@ -444,7 +459,10 @@ class InferenceClient:
             payload = serialize_route(route)
         else:
             payload = list(route)
+        loop = self._loop or asyncio.get_running_loop()
+        self._set_disagg_route_ack = loop.create_future()
         self._send_signal_to_engines(Headers.SET_DISAGG_ROUTE, payload)
+        await self._set_disagg_route_ack
 
     def shutdown_coordinator(self):
         """Tells the coordinator process to exit its main loop.
