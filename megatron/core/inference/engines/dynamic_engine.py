@@ -334,6 +334,13 @@ class DynamicInferenceEngine(AbstractEngine):
         self._disagg_submit_handler: Optional[
             Callable[[int, object, object, str], None]
         ] = None
+        # Per-request count of tokens this engine has already emitted
+        # over the disagg token-sync channel. Each step, any request
+        # whose ``generated_tokens`` grew past this count gets the
+        # new tokens shipped as ``DISAGG_TOKEN`` so other participating
+        # shards' engines can update their local view (entry shard's
+        # embedding for next step; intermediate shards' KV state).
+        self._disagg_emitted_token_count: dict = {}
 
         self.resume_request_ids = None
 
@@ -2667,6 +2674,38 @@ class DynamicInferenceEngine(AbstractEngine):
                 rid = r.requests[-1].request_id
                 if rid in self._route_dispatchers:
                     self._release_disagg_request(rid)
+                    # Drop the per-request emit counter too.
+                    self._disagg_emitted_token_count.pop(rid, None)
+
+            # Layer-kind disagg token sync: for every active disagg
+            # request whose ``generated_tokens`` grew this step, fan
+            # the new token(s) via DISAGG_TOKEN so other participating
+            # shards' engines can keep their local view aligned. Only
+            # the shard that actually sampled (the LM-head shard) has
+            # growing ``generated_tokens``; others' lists stay empty
+            # because their model has no LM head (post_process=False).
+            for rid in list(self._route_dispatchers):
+                if rid not in self.requests:
+                    continue
+                req = self.requests[rid].record.requests[-1]
+                gen = req.generated_tokens
+                if not isinstance(gen, list):
+                    gen = list(gen)
+                prev_count = self._disagg_emitted_token_count.get(rid, 0)
+                if len(gen) > prev_count:
+                    participating = self._route_dispatchers[rid].participating_shards()
+                    for tok in gen[prev_count:]:
+                        token_payload = msgpack.packb(
+                            [
+                                Headers.DISAGG_TOKEN.value,
+                                int(rid),
+                                int(tok),
+                                participating,
+                            ],
+                            use_bin_type=True,
+                        )
+                        self.socket_for_receiving_requests.send(token_payload)
+                    self._disagg_emitted_token_count[rid] = len(gen)
 
         # Drain prefix cache hit counters from context into engine accumulators.
         if self.context.enable_prefix_caching:
@@ -3087,6 +3126,23 @@ class DynamicInferenceEngine(AbstractEngine):
                             "Engine: ROUTE_REQUEST handler raised %s — "
                             "continuing run loop", e,
                         )
+
+            elif header == Headers.DISAGG_TOKEN:
+                # Exit shard sampled a token; sync our local view so
+                # the next decode step's forward embeds the correct
+                # token on the entry shard (and KV state advances
+                # consistently on intermediate attention shards).
+                # Payload: [DISAGG_TOKEN, request_id, token_id]
+                _, dt_request_id, dt_token = data
+                rid = int(dt_request_id)
+                if rid in self.requests:
+                    req = self.requests[rid].record.requests[-1]
+                    if isinstance(req.generated_tokens, list):
+                        req.generated_tokens.append(int(dt_token))
+                    else:
+                        # Tensorised form (legacy / migration); convert
+                        # back to list semantics for append.
+                        req.generated_tokens = list(req.generated_tokens) + [int(dt_token)]
 
             elif header == Headers.DISAGG_SUBMIT:
                 # Layer-kind disagg: non-entry participating shard

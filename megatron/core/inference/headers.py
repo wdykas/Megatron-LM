@@ -111,6 +111,15 @@ class Headers(Enum):
     # Wire payload:
     #   [DISAGG_SUBMIT, server_request_id, prompt, sampling_params, role].
     DISAGG_SUBMIT = auto()
+    # Exit shard → all non-exit participants (via coord): the token the
+    # exit shard just sampled for this request. Non-exit shards append
+    # it to their participant request's ``generated_tokens`` so the
+    # next decode step's forward embeds the latest token on the entry
+    # shard. Without this signal, multi-step decode would diverge:
+    # the entry shard would embed stale tokens (or none) while the
+    # exit shard's logits drift. Wire payload:
+    # [DISAGG_TOKEN, request_id, token_id].
+    DISAGG_TOKEN = auto()
     # Coord → all participating shards' engines: release a finished
     # disagg request's resources (route dispatcher, KV blocks on the
     # attention shard, mamba state on the mamba shard). Sent by the

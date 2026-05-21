@@ -1029,6 +1029,23 @@ class DataParallelInferenceCoordinator:
                     sorted(participating_shards),
                 )
 
+            elif header == Headers.DISAGG_TOKEN:
+                # Exit shard sampled a token; fan to every other
+                # participating shard so they sync ``generated_tokens``
+                # for the next step's embedding / KV bookkeeping.
+                # Wire payload:
+                # [DISAGG_TOKEN, request_id, token_id, participating_shards].
+                _, dt_request_id, dt_token, dt_participating = deserialized_payload
+                fanout_payload = msgpack.packb(
+                    [Headers.DISAGG_TOKEN.value, int(dt_request_id), int(dt_token)],
+                    use_bin_type=True,
+                )
+                for shard_idx in sorted(dt_participating):
+                    for ident in self._identities_for_shard(shard_idx):
+                        if ident == sender_identity:
+                            continue  # don't echo back to the sender
+                        self._send_to_engine(ident, fanout_payload)
+
             elif header == Headers.RELEASE_DISAGG_REQUEST:
                 # Entry shard's engine finished a disagg request and is
                 # telling the coord to fan release to every other

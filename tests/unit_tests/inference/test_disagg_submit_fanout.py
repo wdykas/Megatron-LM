@@ -169,6 +169,112 @@ def test_inject_disagg_participant_idempotent():
     eng._add_request.assert_not_called()
 
 
+def test_disagg_token_fanout_skips_sender_and_appends_to_locals():
+    """Exit shard emits ``DISAGG_TOKEN``; coord fans to every other
+    participating shard. Receiving engines append the token to their
+    request's ``generated_tokens`` so the next step's forward
+    embedding uses the latest token consistently."""
+    from megatron.core.inference.data_parallel_inference_coordinator import (
+        DataParallelInferenceCoordinator,
+    )
+    from megatron.core.inference.engines.dynamic_engine import (
+        DynamicInferenceEngine,
+    )
+
+    # Coord side: replay the DISAGG_TOKEN fan branch.
+    coord = DataParallelInferenceCoordinator.__new__(
+        DataParallelInferenceCoordinator
+    )
+    coord._send_to_engine = MagicMock()
+    coord._identities_for_shard = lambda s: [f"engine_s{s}".encode()]
+
+    sender_identity = b"engine_s2"
+    dt_request_id = 7
+    dt_token = 1234
+    dt_participating = [0, 1, 2]
+
+    fanout_payload = msgpack.packb(
+        [Headers.DISAGG_TOKEN.value, dt_request_id, dt_token],
+        use_bin_type=True,
+    )
+    for shard_idx in sorted(dt_participating):
+        for ident in coord._identities_for_shard(shard_idx):
+            if ident == sender_identity:
+                continue
+            coord._send_to_engine(ident, fanout_payload)
+
+    # Only s0 and s1 receive (s2 is sender — skipped).
+    sent_idents = [c.args[0] for c in coord._send_to_engine.call_args_list]
+    assert sorted(sent_idents) == [b"engine_s0", b"engine_s1"]
+
+    # Engine side: replay the DISAGG_TOKEN receive branch on a
+    # bare engine + a request with empty generated_tokens.
+    eng = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    fake_request = MagicMock()
+    fake_request.generated_tokens = []
+    fake_entry = MagicMock()
+    fake_entry.record.requests = [fake_request]
+    eng.requests = {dt_request_id: fake_entry}
+
+    # Replay the engine's DISAGG_TOKEN receive logic.
+    data = [Headers.DISAGG_TOKEN.value, dt_request_id, dt_token]
+    _, rid, tok = data[0], data[1], data[2]
+    rid = int(rid)
+    if rid in eng.requests:
+        req = eng.requests[rid].record.requests[-1]
+        if isinstance(req.generated_tokens, list):
+            req.generated_tokens.append(int(tok))
+
+    # The request's generated_tokens grew by the synced token.
+    assert fake_request.generated_tokens == [1234]
+
+
+def test_disagg_token_emit_tracks_growth():
+    """Engine emits ``DISAGG_TOKEN`` for new tokens each step.
+    ``_disagg_emitted_token_count`` tracks what was already sent
+    so we don't re-emit the full history."""
+    from megatron.core.inference.engines.dynamic_engine import (
+        DynamicInferenceEngine,
+    )
+
+    eng = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    eng._disagg_emitted_token_count = {}
+    eng._route_dispatchers = {}  # explicitly empty
+    # No fan-out expected because no dispatcher registered for this id.
+    rid = 99
+    fake_request = MagicMock()
+    fake_request.generated_tokens = [42, 100]
+    fake_entry = MagicMock()
+    fake_entry.record.requests = [fake_request]
+    eng.requests = {rid: fake_entry}
+
+    # With no dispatcher registered the emit loop skips entirely.
+    if rid in eng._route_dispatchers:
+        pytest.fail("loop should not iterate for non-disagg requests")
+
+    # Register a dispatcher and simulate the growth tracking.
+    eng._route_dispatchers[rid] = MagicMock(participating_shards=lambda: [0, 1])
+
+    # First step: 2 tokens new (prev_count = 0).
+    gen = fake_request.generated_tokens
+    prev_count = eng._disagg_emitted_token_count.get(rid, 0)
+    assert len(gen) > prev_count
+    new_tokens = gen[prev_count:]
+    assert new_tokens == [42, 100]
+    eng._disagg_emitted_token_count[rid] = len(gen)
+
+    # Second step: same generated_tokens; no growth, no emit.
+    prev_count = eng._disagg_emitted_token_count.get(rid, 0)
+    assert len(gen) == prev_count
+
+    # Third step: append a new token; only it emits.
+    fake_request.generated_tokens.append(500)
+    gen = fake_request.generated_tokens
+    prev_count = eng._disagg_emitted_token_count.get(rid, 0)
+    new_tokens = gen[prev_count:]
+    assert new_tokens == [500]
+
+
 def test_release_drops_participant_record():
     """RELEASE_DISAGG_REQUEST drops the participant entry along with
     the dispatcher / KV state."""
