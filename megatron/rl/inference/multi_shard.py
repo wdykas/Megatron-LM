@@ -1509,21 +1509,16 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         controller drives forward in lockstep with the entry shard.
 
         Delegates to :meth:`DynamicInferenceEngine.inject_disagg_participant`,
-        which:
-        - Builds a ``DynamicInferenceRequest`` from the prompt + params.
-        - Marks it ``_is_disagg_participant = True`` with the role.
-        - Routes through ``_add_request`` to allocate per-shard state
-          (KV blocks for owned attention layers, mamba slot for owned
-          mamba layers, slot in ``self.context``).
-        - On role=="exit": the engine samples + emits ``ENGINE_REPLY``
-          like a normal request. Non-exit participants ran forward
-          locally but their reply is filtered out — only the exit
-          shard's reply ships to the client.
+        which builds the request, marks it
+        ``_is_disagg_participant = True`` + role, and routes through
+        ``_add_request`` so the controller drives forward (allocating
+        per-shard state for owned layers). On ``role == "exit"`` the
+        engine samples and emits ``ENGINE_REPLY``; non-exit
+        participants run forward but have their reply filtered out.
         """
         if self._my_engine is None:
             return
-        dispatcher = self._my_engine._route_dispatchers.get(request_id)
-        if dispatcher is None:
+        if request_id not in self._my_engine._route_dispatchers:
             logger.warning(
                 "[disagg] DISAGG_SUBMIT for request %d arrived without a "
                 "dispatcher — ROUTE_REQUEST race or out-of-order delivery",
@@ -1537,45 +1532,11 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                 sampling_params_serialized=sampling_params,
                 role=role,
             )
-            return
         except Exception as e:
-            # Inject can fail when the engine isn't fully initialized
-            # (e.g. test contexts using mocks; or future engine
-            # variants without the controller). Fall back to the
-            # transport-pump asyncio task — it drives ``dispatch_layer``
-            # for every layer in the route so the cross-shard
-            # handshake still closes. The non-entry shard's owned
-            # layers won't be applied to the hidden state in the
-            # fallback (the inject path was the one that ran them via
-            # the controller), but the route's transport completes
-            # cleanly for downstream shards.
-            logger.warning(
+            logger.error(
                 "[disagg] inject_disagg_participant failed for request "
-                "%d (%s); falling back to transport-only pump",
-                request_id, e,
+                "%d: %s", request_id, e,
             )
-
-        # Fallback: drive dispatch_layer for every layer in the route
-        # so the dispatcher's signal_wait + put_signal + ack flow.
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            return
-        num_layers = (
-            max(
-                (max(h.layer_indices) for h in dispatcher._route.hops),
-                default=-1,
-            )
-            + 1
-        )
-
-        async def _pump_transport():
-            import torch
-            hidden: Optional[torch.Tensor] = None
-            for li in range(num_layers):
-                hidden, _ = dispatcher.dispatch_layer(li, hidden, lambda h: h)
-
-        loop.create_task(_pump_transport())
 
     def _on_migrate_batch_signal(
         self,

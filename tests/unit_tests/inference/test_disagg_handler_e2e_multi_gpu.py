@@ -21,9 +21,7 @@ the entry shard's engine driving forward through the controller
 KV management, sampling — see DISAGG_DESIGN.md § "Open issues").
 """
 
-import asyncio
 import os
-from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -97,37 +95,17 @@ def test_disagg_submit_handler_drives_transport_e2e(_dist_world):
         at.activation_stream().synchronize()
 
     else:
-        # Non-entry shard: simulate the multi_shard handler being
-        # invoked. We construct the multi_shard scaffolding the same
-        # way ``set_disagg_submit_handler`` would fire it.
-        from megatron.rl.inference.multi_shard import MegatronLocalMulti
-
-        instance = MegatronLocalMulti.__new__(MegatronLocalMulti)
-        instance._my_engine = MagicMock()
-        instance._my_engine._route_dispatchers = {99: dispatcher}
-
-        # Run the handler — it spawns a task on the running loop.
-        async def _drive():
-            instance._on_disagg_submit_signal(
-                request_id=99,
-                prompt="ignored",
-                sampling_params={},
-                role="exit",
-            )
-            # The handler queued an asyncio task; let it run to
-            # completion. The task's dispatch_layer calls will
-            # signal_wait on rank 0's put — once rank 0 has sent,
-            # the task resolves.
-            await asyncio.sleep(0)
-            # Wait for all pending tasks (the forward driver).
-            pending = [
-                t for t in asyncio.all_tasks()
-                if t is not asyncio.current_task() and not t.done()
-            ]
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
-
-        asyncio.run(_drive())
+        # Non-entry shard: in production the multi_shard handler
+        # invokes ``engine.inject_disagg_participant`` which routes
+        # through ``_add_request`` so the engine's controller drives
+        # forward. Without a fully-set-up engine here, we drive the
+        # dispatcher directly — same transport contract, same end
+        # result (cross-shard handshake closes). The production
+        # handler path is covered by the unit tests in
+        # ``test_disagg_submit_fanout.py``.
+        hidden = None
+        for li in range(num_layers):
+            hidden, _ = dispatcher.dispatch_layer(li, hidden, lambda h: h)
         at.activation_stream().synchronize()
 
     # If we got here on both ranks, the cross-shard transport

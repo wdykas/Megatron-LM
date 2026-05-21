@@ -319,18 +319,14 @@ class DynamicInferenceEngine(AbstractEngine):
             Callable[[int, "Route"], None]
         ] = None
         self._route_dispatchers: dict = {}
-        # Per-request participant metadata for layer-kind disagg
-        # non-entry shards. Keyed by server request_id; value is
-        # ``{"role": "intermediate"|"exit", "prompt": ..., "params": ...}``.
-        # Populated by the ``DISAGG_SUBMIT`` handler; consumed by the
-        # step-loop integration that drives forward + skips sampling
-        # for non-exit participants.
-        self._disagg_participants: dict = {}
         # Optional callback ``(request_id, prompt, params, role) -> None``
         # invoked when DISAGG_SUBMIT arrives. Registered via
         # :meth:`set_disagg_submit_handler`; the multi_shard handler
-        # uses it to spawn a forward-driver task that pumps the
-        # dispatcher's transport from this engine's side.
+        # uses it to call :meth:`inject_disagg_participant` which adds
+        # the participant to ``self.requests``. The participant flag
+        # ``request._is_disagg_participant`` on the resulting request
+        # is what the ENGINE_REPLY emit path filters on (non-exit
+        # participants don't ship a reply).
         self._disagg_submit_handler: Optional[
             Callable[[int, object, object, str], None]
         ] = None
@@ -610,11 +606,11 @@ class DynamicInferenceEngine(AbstractEngine):
         running the local layers under the dispatcher, and — for
         ``role == "exit"`` — sampling + emitting the reply).
 
-        The default behaviour when no handler is registered is to
-        record the participant under ``_disagg_participants`` and
-        otherwise be a no-op — the forward never fires on this
-        shard for the request and the dispatcher idles. Registering
-        a handler unlocks the actual engine-driven path.
+        With no handler registered the DISAGG_SUBMIT signal is a
+        no-op — the forward never fires on this shard for the
+        request and the dispatcher idles. Registering a handler
+        unlocks the actual engine-driven path (the multi_shard
+        handler calls :meth:`inject_disagg_participant`).
         """
         self._disagg_submit_handler = handler
 
@@ -3151,25 +3147,19 @@ class DynamicInferenceEngine(AbstractEngine):
             elif header == Headers.DISAGG_SUBMIT:
                 # Layer-kind disagg: non-entry participating shard
                 # receives the SUBMIT companion (the entry shard gets
-                # the normal SUBMIT_REQUEST). Records role + prompt
-                # for inspection and invokes the registered handler
-                # (if any) so the forward-driver task can spawn.
+                # the normal SUBMIT_REQUEST). Invokes the registered
+                # handler which calls inject_disagg_participant to
+                # add the participant to self.requests.
                 # Payload: [DISAGG_SUBMIT, request_id, prompt, params, role]
                 _, ds_request_id, ds_prompt, ds_params, ds_role = data
-                rid = int(ds_request_id)
-                self._disagg_participants[rid] = {
-                    "role": ds_role,
-                    "prompt": ds_prompt,
-                    "params": ds_params,
-                }
                 logging.debug(
                     "Engine: DISAGG_SUBMIT request_id=%d role=%s",
-                    rid, ds_role,
+                    ds_request_id, ds_role,
                 )
                 if self._disagg_submit_handler is not None:
                     try:
                         self._disagg_submit_handler(
-                            rid, ds_prompt, ds_params, ds_role,
+                            int(ds_request_id), ds_prompt, ds_params, ds_role,
                         )
                     except Exception as e:
                         logging.error(
@@ -3180,12 +3170,11 @@ class DynamicInferenceEngine(AbstractEngine):
             elif header == Headers.RELEASE_DISAGG_REQUEST:
                 # Entry shard's engine has finished this disagg request;
                 # release dispatcher + any KV / mamba state we hold for
-                # it. Non-entry shards have a dispatcher registered via
-                # ROUTE_REQUEST and a participant entry via
-                # DISAGG_SUBMIT; both drop here.
+                # it. The participant (if any) lives in self.requests
+                # with the _is_disagg_participant flag; detach_request
+                # frees its KV blocks and mamba slot.
                 _, release_request_id = data[0], data[1]
                 self.release_route_dispatcher(release_request_id)
-                self._disagg_participants.pop(int(release_request_id), None)
                 if release_request_id in self.requests:
                     # Releases KV blocks and mamba state slot if any.
                     try:

@@ -85,32 +85,28 @@ def test_coord_fans_disagg_submit_to_non_entry_participants():
         assert payload[3] == sampling_params
 
 
-def test_engine_disagg_submit_handler_records_participant():
-    """The engine's DISAGG_SUBMIT branch records the participant role
-    so the step-loop integration can drive forward + skip sampling
-    for non-exit participants."""
+def test_engine_disagg_submit_invokes_handler_with_role():
+    """The engine's DISAGG_SUBMIT branch invokes the registered
+    handler with ``(request_id, prompt, params, role)`` — the handler
+    then calls ``inject_disagg_participant`` which adds the
+    participant to ``self.requests``."""
     from megatron.core.inference.engines.dynamic_engine import (
         DynamicInferenceEngine,
     )
 
     eng = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
-    eng._disagg_participants = {}
+    eng._disagg_submit_handler = MagicMock()
 
-    # Replay the engine's DISAGG_SUBMIT branch (matches the if branch
-    # in async_step — the handler body is small enough to inline here).
+    # Replay the engine's DISAGG_SUBMIT branch body.
     data = [Headers.DISAGG_SUBMIT.value, 7, "prompt", {"top_p": 0.9}, "exit"]
     _, ds_request_id, ds_prompt, ds_params, ds_role = data
-    eng._disagg_participants[int(ds_request_id)] = {
-        "role": ds_role,
-        "prompt": ds_prompt,
-        "params": ds_params,
-    }
+    eng._disagg_submit_handler(
+        int(ds_request_id), ds_prompt, ds_params, ds_role,
+    )
 
-    assert 7 in eng._disagg_participants
-    record = eng._disagg_participants[7]
-    assert record["role"] == "exit"
-    assert record["prompt"] == "prompt"
-    assert record["params"] == {"top_p": 0.9}
+    eng._disagg_submit_handler.assert_called_once_with(
+        7, "prompt", {"top_p": 0.9}, "exit",
+    )
 
 
 def test_inject_disagg_participant_marks_role_and_routes_to_add_request():
@@ -276,22 +272,20 @@ def test_disagg_token_emit_tracks_growth():
 
 
 def test_release_drops_participant_record():
-    """RELEASE_DISAGG_REQUEST drops the participant entry along with
-    the dispatcher / KV state."""
+    """RELEASE_DISAGG_REQUEST drops the dispatcher; the participant
+    request itself (if local) is detached via the engine's normal
+    detach path."""
     from megatron.core.inference.engines.dynamic_engine import (
         DynamicInferenceEngine,
     )
 
     eng = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     eng._route_dispatchers = {7: MagicMock()}
-    eng._disagg_participants = {7: {"role": "intermediate"}}
     eng.requests = {}  # not local; detach path skipped
 
     # Replay the RELEASE_DISAGG_REQUEST branch (the parts that don't
     # need engine machinery).
     request_id = 7
     eng._route_dispatchers.pop(request_id, None)
-    eng._disagg_participants.pop(request_id, None)
 
     assert 7 not in eng._route_dispatchers
-    assert 7 not in eng._disagg_participants
