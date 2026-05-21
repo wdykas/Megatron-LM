@@ -677,6 +677,11 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
     _recent_latencies: List[Deque[float]] = PrivateAttr(default_factory=list)
     _in_flight: List[int] = PrivateAttr(default_factory=list)
     _latency_window: int = PrivateAttr(default=32)
+    # Optional :class:`RouteSelector` consulted by ``base_generate`` to
+    # pick a per-request layer-kind disagg route. When ``None`` (default)
+    # every request walks the stored layout route. Lives on every rank
+    # but only the rollout-driver rank exercises it.
+    _route_selector: Optional[object] = PrivateAttr(default=None)
 
     # ---- Public API -----------------------------------------------------
 
@@ -1070,6 +1075,34 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         # decode shard once they exceed the threshold.
         if self._tail_cut_rollout_config is not None:
             extra_body["tail_cut"] = list(self._tail_cut_rollout_config)
+        # Adaptive per-request route: when a RouteSelector is registered
+        # (see ``set_route_selector``), consult it for a per-request
+        # disagg route override and stamp it onto extra_body. The
+        # text-gen server forwards this to
+        # ``InferenceClient.add_request(disagg_route=...)`` and the coord
+        # prefers the per-request route over the stored layout route.
+        if self._route_selector is not None:
+            from megatron.rl.inference.route_planner import serialize_route
+            from megatron.rl.inference.route_selector import RequestInfo
+
+            # Tokenization happens on the text-gen server, not here, so
+            # ``prompt_tokens`` is left unset — selectors that need it
+            # should tokenize ``prompt_text`` themselves. The combined
+            # raw text is concatenated message contents (selectors
+            # typically only care about its length, not structure).
+            prompt_text = " ".join(
+                str(m.content) for m in request.prompt if m.content
+            )
+            info = RequestInfo(
+                prompt_text=prompt_text,
+                sampling_params={
+                    "temperature": request.generation_args.temperature,
+                    "top_p": request.generation_args.top_p,
+                },
+            )
+            route = self._route_selector.select(info)
+            if route is not None:
+                extra_body["disagg_route"] = serialize_route(route)
         start = time.monotonic()
         try:
             response = await client.chat.completions.create(
@@ -1339,6 +1372,18 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
     # No cross-rank broadcast is required to coordinate the migration
     # decision — only the decider decides, and the trigger flows over
     # the coord's ZMQ control channel (same path as PAUSE / SUSPEND).
+
+    def set_route_selector(self, selector: Optional[object]) -> None:
+        """Register a :class:`RouteSelector` consulted by ``base_generate``
+        to pick a per-request layer-kind disagg route.
+
+        ``None`` clears the selector and falls back to the stored layout
+        route for every request. Lives on every rank but only the
+        rollout-driver rank exercises it; idle ranks store the selector
+        harmlessly so a future driver-rank handoff doesn't need a separate
+        registration step.
+        """
+        self._route_selector = selector
 
     def register_migration_policy(self, policy) -> None:
         """Register a :class:`MigrationPolicy` instance.

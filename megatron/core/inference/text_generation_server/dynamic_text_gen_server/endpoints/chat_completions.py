@@ -580,6 +580,10 @@ try:
         #     running on the throughput decode shard.
         #   "target_shard_index": int — lower-level pin without disagg.
         #     Ignored when "disagg_pair" is set.
+        #   "disagg_route": [[shard_idx, [layer_idx, ...]], ...] —
+        #     per-request layer-kind disagg route override (forwarded
+        #     to ``InferenceClient.add_request(disagg_route=...)``).
+        #     The coord prefers this over its stored layout route.
         #
         # Length-aware short-circuit: when the deployment sets
         # DISAGG_LENGTH_THRESHOLD and the prompt is shorter than it,
@@ -588,6 +592,7 @@ try:
         disagg_pair = req.get("disagg_pair")
         tail_cut = req.get("tail_cut")
         target_shard_index = req.get("target_shard_index")
+        disagg_route = req.get("disagg_route")
         disagg_dst_shard_index = None
         late_dst_shard_index = None
         late_dst_min_tokens = None
@@ -629,6 +634,25 @@ try:
                     status=400,
                 )
             late_dst_shard_index, late_dst_min_tokens = tail_cut
+        if disagg_route is not None:
+            # Light validation; the coord re-validates on deserialize.
+            if (
+                not isinstance(disagg_route, list)
+                or not disagg_route
+                or not all(
+                    isinstance(h, (list, tuple))
+                    and len(h) == 2
+                    and isinstance(h[0], int)
+                    and isinstance(h[1], (list, tuple))
+                    and all(isinstance(li, int) for li in h[1])
+                    for h in disagg_route
+                )
+            ):
+                return Response(
+                    "'disagg_route' must be a non-empty list of "
+                    "[shard_idx, [layer_idx, ...]] hops",
+                    status=400,
+                )
 
         tasks = [
             client.add_request(
@@ -638,6 +662,7 @@ try:
                 disagg_dst_shard_index=disagg_dst_shard_index,
                 late_dst_shard_index=late_dst_shard_index,
                 late_dst_min_tokens=late_dst_min_tokens,
+                disagg_route=disagg_route,
             )
             for _ in range(n)
         ]
