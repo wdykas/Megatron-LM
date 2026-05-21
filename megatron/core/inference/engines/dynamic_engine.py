@@ -2493,21 +2493,25 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if will_log_this_step:
             self.step_start_event.record()
-        # Disagg routing: only walk to the decoder when at least one
-        # request in this batch has a registered dispatcher.
-        # Single-disagg-request-per-batch only; mixed batches need a
-        # deeper per-request forward refactor.
+        # Disagg routing: activate a dispatcher when at least one
+        # request in this batch has one registered. With v1's layout-
+        # level routing every in-flight disagg request shares the
+        # same plan, so any one of them suffices for the forward.
+        # (Mixed batches with per-request routes that differ between
+        # requests would need the dispatcher hook to fire per-request
+        # inside the layer iteration — a separate refactor; v1's
+        # layout-level route makes this collapse safe.)
         if self._route_dispatchers:
             in_flight_with_dispatcher = [
                 rid for rid in self._route_dispatchers
                 if rid in self.requests
             ]
-            single_disagg_request_id = (
+            active_disagg_request_id = (
                 in_flight_with_dispatcher[0]
-                if len(in_flight_with_dispatcher) == 1
+                if in_flight_with_dispatcher
                 else None
             )
-            self.activate_disagg_request(single_disagg_request_id)
+            self.activate_disagg_request(active_disagg_request_id)
             try:
                 result = await self.controller.async_generate_output_tokens_dynamic_batch()
             finally:
