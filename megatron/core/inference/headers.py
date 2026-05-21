@@ -98,6 +98,19 @@ class Headers(Enum):
     # SET_DISAGG_ROUTE and the coord's store land collocated and run
     # against a partial model. Wire payload: [SET_DISAGG_ROUTE_ACK].
     SET_DISAGG_ROUTE_ACK = auto()
+    # Coord → non-entry participating shards: companion to SUBMIT_REQUEST
+    # for layer-kind disagg. The entry shard gets the standard
+    # SUBMIT_REQUEST (carrying prompt + sampling params); non-entry
+    # participating shards get DISAGG_SUBMIT, which carries the same
+    # payload plus a role tag ("intermediate" / "exit") so the engine
+    # can:
+    #   - allocate per-shard state (KV blocks for *-shards, mamba slots
+    #     for M-shards) sized from the prompt length;
+    #   - drive forward through the dispatcher;
+    #   - sample + emit ENGINE_REPLY only when role == "exit".
+    # Wire payload:
+    #   [DISAGG_SUBMIT, server_request_id, prompt, sampling_params, role].
+    DISAGG_SUBMIT = auto()
     # Coord → all participating shards' engines: release a finished
     # disagg request's resources (route dispatcher, KV blocks on the
     # attention shard, mamba state on the mamba shard). Sent by the

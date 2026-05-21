@@ -694,6 +694,12 @@ class DataParallelInferenceCoordinator:
                 # order, so each engine sees ROUTE_REQUEST before SUBMIT
                 # for this request_id and has the dispatcher registered
                 # when forward fires.
+                #
+                # Non-entry participating shards additionally receive a
+                # DISAGG_SUBMIT carrying the same prompt + params plus a
+                # role tag, so each engine allocates per-shard state and
+                # drives forward in lockstep with the entry shard. Only
+                # role="exit" samples + emits ENGINE_REPLY.
                 effective_route = (
                     per_request_route
                     if per_request_route is not None
@@ -708,10 +714,31 @@ class DataParallelInferenceCoordinator:
                         ],
                         use_bin_type=True,
                     )
+                    entry_shard = effective_route[0][0]
+                    exit_shard = effective_route[-1][0]
                     participating_shards = {h[0] for h in effective_route}
                     for shard_idx in sorted(participating_shards):
                         for ident in self._identities_for_shard(shard_idx):
                             self._send_to_engine(ident, route_payload)
+                    # Fan DISAGG_SUBMIT to non-entry participating
+                    # shards. Entry shard receives the normal SUBMIT
+                    # forwarded below.
+                    for shard_idx in sorted(participating_shards):
+                        if shard_idx == entry_shard:
+                            continue
+                        role = "exit" if shard_idx == exit_shard else "intermediate"
+                        disagg_submit_payload = msgpack.packb(
+                            [
+                                Headers.DISAGG_SUBMIT.value,
+                                request_id,
+                                prompt,
+                                sampling_params,
+                                role,
+                            ],
+                            use_bin_type=True,
+                        )
+                        for ident in self._identities_for_shard(shard_idx):
+                            self._send_to_engine(ident, disagg_submit_payload)
 
                 # Serialize prompt.
                 if isinstance(prompt, (str, list)):

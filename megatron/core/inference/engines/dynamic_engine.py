@@ -319,6 +319,13 @@ class DynamicInferenceEngine(AbstractEngine):
             Callable[[int, "Route"], None]
         ] = None
         self._route_dispatchers: dict = {}
+        # Per-request participant metadata for layer-kind disagg
+        # non-entry shards. Keyed by server request_id; value is
+        # ``{"role": "intermediate"|"exit", "prompt": ..., "params": ...}``.
+        # Populated by the ``DISAGG_SUBMIT`` handler; consumed by the
+        # step-loop integration that drives forward + skips sampling
+        # for non-exit participants.
+        self._disagg_participants: dict = {}
 
         self.resume_request_ids = None
 
@@ -2984,16 +2991,35 @@ class DynamicInferenceEngine(AbstractEngine):
                             "continuing run loop", e,
                         )
 
+            elif header == Headers.DISAGG_SUBMIT:
+                # Layer-kind disagg: non-entry participating shard
+                # receives the SUBMIT companion (the entry shard gets
+                # the normal SUBMIT_REQUEST). Records role + prompt
+                # so the step-loop integration can drive forward
+                # for this request and skip sampling unless role is
+                # "exit". For now the record is built; the step-loop
+                # hook is the next integration phase.
+                # Payload: [DISAGG_SUBMIT, request_id, prompt, params, role]
+                _, ds_request_id, ds_prompt, ds_params, ds_role = data
+                self._disagg_participants[int(ds_request_id)] = {
+                    "role": ds_role,
+                    "prompt": ds_prompt,
+                    "params": ds_params,
+                }
+                logging.debug(
+                    "Engine: DISAGG_SUBMIT request_id=%d role=%s",
+                    ds_request_id, ds_role,
+                )
+
             elif header == Headers.RELEASE_DISAGG_REQUEST:
                 # Entry shard's engine has finished this disagg request;
                 # release dispatcher + any KV / mamba state we hold for
                 # it. Non-entry shards have a dispatcher registered via
-                # ROUTE_REQUEST but typically no entry in self.requests
-                # (in v1 only the entry shard processes the request
-                # normally); the detach path is safe to skip when the
-                # request isn't local.
+                # ROUTE_REQUEST and a participant entry via
+                # DISAGG_SUBMIT; both drop here.
                 _, release_request_id = data[0], data[1]
                 self.release_route_dispatcher(release_request_id)
+                self._disagg_participants.pop(int(release_request_id), None)
                 if release_request_id in self.requests:
                     # Releases KV blocks and mamba state slot if any.
                     try:
