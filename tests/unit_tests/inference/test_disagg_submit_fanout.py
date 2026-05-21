@@ -113,6 +113,62 @@ def test_engine_disagg_submit_handler_records_participant():
     assert record["params"] == {"top_p": 0.9}
 
 
+def test_inject_disagg_participant_marks_role_and_routes_to_add_request():
+    """``inject_disagg_participant`` builds a request, marks it as a
+    disagg participant with the given role, and routes through
+    ``_add_request`` so the engine's normal lifecycle handles it.
+    The participant flag is what the ENGINE_REPLY emit path consults
+    to skip non-exit shards."""
+    from megatron.core.inference.engines.dynamic_engine import (
+        DynamicInferenceEngine,
+    )
+    from megatron.core.inference.sampling_params import SamplingParams
+
+    eng = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    eng.requests = {}
+    eng._add_request = MagicMock()
+    eng.controller = MagicMock()
+    eng.controller.tokenizer.tokenize = MagicMock(return_value=[1, 2, 3, 4])
+
+    # SamplingParams.deserialize round-trips a serialized form;
+    # use the same path the handler uses.
+    sp = SamplingParams(temperature=1.0, top_p=0.9)
+    sp_wire = sp.serialize()
+
+    eng.inject_disagg_participant(
+        request_id=42,
+        prompt="hello world",
+        sampling_params_serialized=sp_wire,
+        role="exit",
+    )
+    eng._add_request.assert_called_once()
+    request = eng._add_request.call_args.args[0]
+    assert request.request_id == 42
+    assert request._is_disagg_participant is True
+    assert request._disagg_role == "exit"
+    # Prompt was tokenized.
+    assert request.prompt_tokens.tolist() == [1, 2, 3, 4]
+
+
+def test_inject_disagg_participant_idempotent():
+    """Duplicate DISAGG_SUBMIT for the same request_id is a no-op."""
+    from megatron.core.inference.engines.dynamic_engine import (
+        DynamicInferenceEngine,
+    )
+
+    eng = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    eng.requests = {7: object()}  # already tracked
+    eng._add_request = MagicMock()
+
+    eng.inject_disagg_participant(
+        request_id=7,
+        prompt="x",
+        sampling_params_serialized=b"",
+        role="intermediate",
+    )
+    eng._add_request.assert_not_called()
+
+
 def test_release_drops_participant_record():
     """RELEASE_DISAGG_REQUEST drops the participant entry along with
     the dispatcher / KV state."""

@@ -534,6 +534,62 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         self._route_handler = handler
 
+    def inject_disagg_participant(
+        self,
+        request_id: int,
+        prompt: object,
+        sampling_params_serialized: object,
+        role: str,
+    ) -> None:
+        """Inject a layer-kind disagg participant request into the
+        engine's active set so the controller drives forward for it
+        in lockstep with the entry shard.
+
+        The participant is added through the standard ``_add_request``
+        path (allocating KV blocks for owned attention layers, mamba
+        slot for owned mamba layers, slot in ``self.context``). The
+        only difference from a normal request is a per-request flag
+        ``_is_disagg_participant`` that the engine's ENGINE_REPLY emit
+        path uses to skip the reply unless ``role == "exit"`` — only
+        the exit shard samples + replies.
+
+        Idempotent: a duplicate signal for the same request_id is a
+        no-op.
+
+        Args:
+            request_id: Server-side request id assigned by the coord
+                (matches what the dispatcher was registered under).
+            prompt: Prompt tokens (list of ints) or string. Strings
+                are tokenized via the controller's tokenizer.
+            sampling_params_serialized: Serialized SamplingParams as
+                shipped on the wire.
+            role: ``"intermediate"`` or ``"exit"``.
+        """
+        if request_id in self.requests:
+            return  # idempotent
+
+        sampling = SamplingParams.deserialize(sampling_params_serialized)
+        if isinstance(prompt, str):
+            prompt_tokens = self.controller.tokenizer.tokenize(prompt)
+        else:
+            prompt_tokens = list(prompt)
+        device = torch.cuda.current_device()
+        prompt_tensor = torch.tensor(
+            prompt_tokens, dtype=torch.int64, device=device
+        )
+        request = DynamicInferenceRequest(
+            request_id=request_id,
+            prompt_tokens=prompt_tensor,
+            sampling_params=sampling,
+        )
+        request.status = Status.ACTIVE_AND_GENERATING_TOKENS
+        # Per-request flag consumed by the ENGINE_REPLY emit path
+        # (see async_step). Python lets us set arbitrary attributes
+        # on the request object without a schema change.
+        request._is_disagg_participant = True
+        request._disagg_role = role
+        self._add_request(request)
+
     def set_disagg_submit_handler(
         self,
         handler: Optional[Callable[[int, object, object, str], None]],
@@ -2579,9 +2635,21 @@ class DynamicInferenceEngine(AbstractEngine):
         # Failed request replies were already sent in _handle_failed_request,
         # so only send completed records here.
         if self.use_coordinator and self.is_mp_coordinator:
-            records_to_send = [
-                r for r in finished_request_records if r.requests[-1].status != Status.FAILED
-            ]
+            # Filter:
+            # - FAILED records were already replied to in
+            #   _handle_failed_request.
+            # - Layer-kind disagg participants on non-exit shards
+            #   ran forward locally but don't sample / emit. Only
+            #   the exit shard's reply ships back to the client.
+            def _should_send(r):
+                req = r.requests[-1]
+                if req.status == Status.FAILED:
+                    return False
+                if getattr(req, "_is_disagg_participant", False):
+                    return getattr(req, "_disagg_role", "exit") == "exit"
+                return True
+
+            records_to_send = [r for r in finished_request_records if _should_send(r)]
             if records_to_send:
                 nvtx_range_push("coordinator_communication")
                 payload = msgpack.packb(

@@ -1504,42 +1504,21 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         sampling_params: object,
         role: str,
     ) -> None:
-        """Engine-side ``DISAGG_SUBMIT`` handler. Spawns a forward-
-        driver asyncio task that pumps the per-request dispatcher.
+        """Engine-side ``DISAGG_SUBMIT`` handler. Injects the
+        participant request into the engine's active set so the
+        controller drives forward in lockstep with the entry shard.
 
-        The task calls ``dispatch_layer`` for every global layer in
-        order. Non-owned layers return ``NOT_MY_REQUEST`` (the
-        transport doesn't fire). Owned hop layers receive activation
-        from the previous shard, run the local layer's compute, and
-        send the result to the next shard. This is what makes a
-        non-entry shard's transport actually fire end-to-end without
-        going through the engine's request-iteration / controller
-        machinery — bypassing the controller is what avoids the
-        full step-loop refactor (allocate-state / sample-routing /
-        token-sync) that would otherwise be required for the engine
-        to drive forward for a participant request.
-
-        Trade-off: this path doesn't invoke the actual model layers
-        on the non-entry shard — it just pumps the dispatcher's
-        transport. So it correctly closes the cross-shard handshake
-        loop but doesn't apply the shard's owned layers to the
-        hidden state. Useful for protocol-level validation and
-        future "engine-driven" handlers can replace this with the
-        real ``run_local`` (model.decoder.layers[li](...)) callable.
-
-        Args:
-            request_id: Server-side request id (matches what the
-                coord assigned and what the dispatcher was
-                registered under).
-            prompt: The prompt (tokens or string) — used by future
-                ``run_local`` callables to construct attention masks.
-                Currently unused by this stub.
-            sampling_params: Sampling parameters — used only if
-                ``role == "exit"`` (LM head + sampling).
-            role: ``"intermediate"`` or ``"exit"``. ``"exit"``
-                shards would sample + emit ``ENGINE_REPLY``; the
-                stub here doesn't sample because there's no real
-                model forward (see trade-off above).
+        Delegates to :meth:`DynamicInferenceEngine.inject_disagg_participant`,
+        which:
+        - Builds a ``DynamicInferenceRequest`` from the prompt + params.
+        - Marks it ``_is_disagg_participant = True`` with the role.
+        - Routes through ``_add_request`` to allocate per-shard state
+          (KV blocks for owned attention layers, mamba slot for owned
+          mamba layers, slot in ``self.context``).
+        - On role=="exit": the engine samples + emits ``ENGINE_REPLY``
+          like a normal request. Non-exit participants ran forward
+          locally but their reply is filtered out — only the exit
+          shard's reply ships to the client.
         """
         if self._my_engine is None:
             return
@@ -1551,8 +1530,37 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                 request_id,
             )
             return
+        try:
+            self._my_engine.inject_disagg_participant(
+                request_id=request_id,
+                prompt=prompt,
+                sampling_params_serialized=sampling_params,
+                role=role,
+            )
+            return
+        except Exception as e:
+            # Inject can fail when the engine isn't fully initialized
+            # (e.g. test contexts using mocks; or future engine
+            # variants without the controller). Fall back to the
+            # transport-pump asyncio task — it drives ``dispatch_layer``
+            # for every layer in the route so the cross-shard
+            # handshake still closes. The non-entry shard's owned
+            # layers won't be applied to the hidden state in the
+            # fallback (the inject path was the one that ran them via
+            # the controller), but the route's transport completes
+            # cleanly for downstream shards.
+            logger.warning(
+                "[disagg] inject_disagg_participant failed for request "
+                "%d (%s); falling back to transport-only pump",
+                request_id, e,
+            )
 
-        # Number of global layers covered by the route's hops.
+        # Fallback: drive dispatch_layer for every layer in the route
+        # so the dispatcher's signal_wait + put_signal + ack flow.
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            return
         num_layers = (
             max(
                 (max(h.layer_indices) for h in dispatcher._route.hops),
@@ -1560,30 +1568,14 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             )
             + 1
         )
-        # Stub layer compute: pass-through (a real engine-driven
-        # handler would substitute model.decoder.layers[li](h, ...)
-        # with the request's attention_mask / positions).
-        def _stub_run_local(h):
-            return h
 
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            return  # no loop on this rank — can't spawn
-
-        async def _drive_forward():
+        async def _pump_transport():
             import torch
-
-            # The dispatcher will receive at the hop's first layer
-            # (via signal_wait); for non-entry shards `hidden` starts
-            # as None and the first dispatch_layer call replaces it.
             hidden: Optional[torch.Tensor] = None
             for li in range(num_layers):
-                hidden, _ = dispatcher.dispatch_layer(li, hidden, _stub_run_local)
-            # Exit shards would now run LM head + sample. The stub
-            # leaves that to a future engine-driven handler.
+                hidden, _ = dispatcher.dispatch_layer(li, hidden, lambda h: h)
 
-        loop.create_task(_drive_forward())
+        loop.create_task(_pump_transport())
 
     def _on_migrate_batch_signal(
         self,
