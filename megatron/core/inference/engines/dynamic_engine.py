@@ -3167,6 +3167,50 @@ class DynamicInferenceEngine(AbstractEngine):
                             "continuing run loop", e,
                         )
 
+            elif header == Headers.RESELECT_REQUEST_ROUTE:
+                # Producer requested a mid-rollout route swap. Swap the
+                # dispatcher on the fly so the next layer dispatched
+                # for this request walks the new route. Engines that
+                # are common to old + new keep their request record
+                # intact (KV / mamba state stays valid as long as
+                # ownership of the relevant layer kinds is preserved
+                # in the new route — the selector is responsible for
+                # honoring that contract; dropping a layer mid-decode
+                # without releasing the request first is undefined).
+                # Wire payload:
+                # [RESELECT_REQUEST_ROUTE, request_id, new_route_hops]
+                from megatron.rl.inference.route_planner import (
+                    deserialize_route,
+                )
+
+                _, rs_request_id, rs_new_hops = data
+                rs_request_id = int(rs_request_id)
+                if self._route_handler is None:
+                    logging.warning(
+                        "Engine: ignoring RESELECT_REQUEST_ROUTE "
+                        "(no route handler registered)"
+                    )
+                else:
+                    try:
+                        # Re-use the standard route handler — it will
+                        # build a fresh RouteDispatcher and overwrite
+                        # the existing one in the engine's per-request
+                        # dispatcher table. The next dispatch_layer
+                        # call picks up the new plan transparently.
+                        self._route_handler(
+                            rs_request_id, deserialize_route(rs_new_hops)
+                        )
+                        logging.debug(
+                            "Engine: swapped route for request_id=%d "
+                            "via RESELECT_REQUEST_ROUTE",
+                            rs_request_id,
+                        )
+                    except Exception as e:
+                        logging.error(
+                            "Engine: RESELECT_REQUEST_ROUTE handler "
+                            "raised %s — continuing run loop", e,
+                        )
+
             elif header == Headers.RELEASE_DISAGG_REQUEST:
                 # Entry shard's engine has finished this disagg request;
                 # release dispatcher + any KV / mamba state we hold for

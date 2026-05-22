@@ -1066,6 +1066,79 @@ class DataParallelInferenceCoordinator:
                             continue  # don't echo back to the sender
                         self._send_to_engine(ident, fanout_payload)
 
+            elif header == Headers.RESELECT_REQUEST_ROUTE:
+                # Per-request dynamic reroute. Producer is mid-rollout
+                # and wants this request to walk a different route
+                # (typically prefill→decode flip or load-aware swap).
+                # Fan to ``union(participants(old), participants(new))``:
+                #   - common shards: get RESELECT (swap the dispatcher
+                #     at the next token boundary)
+                #   - old-only shards: get RELEASE (free per-request
+                #     state)
+                #   - new-only shards: get DISAGG_SUBMIT (inject as
+                #     participant with the new route)
+                #
+                # Wire payload:
+                # [RESELECT_REQUEST_ROUTE, request_id, old_hops, new_hops].
+                if sender_identity not in known_clients:
+                    logging.warning(
+                        "Coordinator: ignoring RESELECT_REQUEST_ROUTE "
+                        "from unknown client."
+                    )
+                    continue
+                _, rr_request_id, old_hops, new_hops = deserialized_payload
+                old_shards = {h[0] for h in old_hops}
+                new_shards = {h[0] for h in new_hops}
+                common = old_shards & new_shards
+                drop = old_shards - new_shards
+                add = new_shards - old_shards
+
+                rr_payload = msgpack.packb(
+                    [
+                        Headers.RESELECT_REQUEST_ROUTE.value,
+                        int(rr_request_id),
+                        new_hops,
+                    ],
+                    use_bin_type=True,
+                )
+                rel_payload = msgpack.packb(
+                    [
+                        Headers.RELEASE_DISAGG_REQUEST.value,
+                        int(rr_request_id),
+                    ],
+                    use_bin_type=True,
+                )
+                for shard_idx in sorted(common):
+                    for ident in self._identities_for_shard(shard_idx):
+                        self._send_to_engine(ident, rr_payload)
+                for shard_idx in sorted(drop):
+                    for ident in self._identities_for_shard(shard_idx):
+                        self._send_to_engine(ident, rel_payload)
+                # Add-only participants need a DISAGG_SUBMIT. The
+                # producer side already knows the request's prompt and
+                # sampling params; we don't track them here. The
+                # current design assumes ``add`` is empty for the v1
+                # reselect path — typical reroutes shrink the
+                # participant set or keep it constant. A future
+                # extension could carry prompt + sampling params on
+                # the wire to support arbitrary add sets.
+                if add:
+                    logging.warning(
+                        "Coordinator: RESELECT_REQUEST_ROUTE add-only "
+                        "shards=%s for request_id=%d not yet supported; "
+                        "skipping. Reduce-only reroutes still work.",
+                        sorted(add),
+                        rr_request_id,
+                    )
+                logging.info(
+                    "Coordinator: RESELECT_REQUEST_ROUTE request_id=%d "
+                    "common=%s drop=%s add=%s",
+                    rr_request_id,
+                    sorted(common),
+                    sorted(drop),
+                    sorted(add),
+                )
+
             elif header == Headers.SET_DISAGG_ROUTE:
                 # Layer-kind disagg producer wires the layout-wide route
                 # once at launch. The coord stores it and auto-fans

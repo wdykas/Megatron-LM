@@ -128,6 +128,24 @@ class Headers(Enum):
     # request is done — they need this to free per-request state.
     # Wire payload: [RELEASE_DISAGG_REQUEST, request_id].
     RELEASE_DISAGG_REQUEST = auto()
+    # Per-request dynamic reroute. Producer (e.g. a stateful
+    # ``RouteSelector``) decides mid-rollout that the request should
+    # walk a different route — typically prefill→decode flips that
+    # want to drop a prefill-heavy shard once the prompt is consumed.
+    # Wire payload:
+    # [RESELECT_REQUEST_ROUTE, request_id, old_route_hops, new_route_hops].
+    # Coord fans to ``union(participants(old), participants(new))``
+    # so:
+    #   - Common participants get the new route and swap their
+    #     dispatcher at the next token boundary.
+    #   - Old-only participants get a RELEASE_DISAGG_REQUEST so they
+    #     free per-request state.
+    #   - New-only participants get a DISAGG_SUBMIT so they inject the
+    #     request and stand up a dispatcher with the new route.
+    # Both old and new routes are on the wire because not every
+    # participant knows both (the coord knows neither in advance —
+    # routes are per-request, not stored).
+    RESELECT_REQUEST_ROUTE = auto()
     TP_BROADCAST = auto()
 
 
