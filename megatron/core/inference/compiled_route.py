@@ -117,6 +117,15 @@ class CompiledRoute:
         prompt_tokens: Prompt token sequence — required when ``cache``
             is set (it's the cache key).
         single_rep: Hetero-TP single-rep mode.
+        use_torch_ops: When ``True``, ``run`` calls the registered
+            ``disagg::send_hidden`` / ``disagg::receive_hidden``
+            torch ops instead of the backend directly. Required for
+            Dynamo to fully trace through hop boundaries; without
+            this flag the backend calls graph-break. Default
+            ``False`` (the un-compiled path stays unchanged).
+        device: CUDA device the registered ``receive_hidden`` op
+            constructs new tensors on. Only consulted when
+            ``use_torch_ops=True``. Defaults to current CUDA device.
     """
 
     def __init__(
@@ -133,6 +142,8 @@ class CompiledRoute:
         cache: Optional[object] = None,
         prompt_tokens: Optional[Sequence[int]] = None,
         single_rep: bool = False,
+        use_torch_ops: bool = False,
+        device: Optional[torch.device] = None,
     ) -> None:
         self._route = route
         self._my_shard = my_shard_idx
@@ -145,6 +156,8 @@ class CompiledRoute:
         self._payload_nbytes = (
             nelem * torch.empty((), dtype=hidden_dtype).element_size()
         )
+        self._use_torch_ops = use_torch_ops
+        self._device = device
 
         plan = _build_layer_plan(
             route=route,
@@ -300,6 +313,35 @@ class CompiledRoute:
     # ---- internals -------------------------------------------------------
 
     def _do_recv(self, backend, action: _Action) -> torch.Tensor:
+        if self._use_torch_ops:
+            from megatron.core.inference.transport_ops import receive_via_op
+
+            first = receive_via_op(
+                hidden_shape=self._hidden_shape,
+                hidden_dtype=self._hidden_dtype,
+                device=self._device,
+                my_pe=self._my_pe,
+                src_pe=action.pes[0],
+                payload_nbytes=self._payload_nbytes,
+            )
+            for src_pe in action.pes[1:]:
+                extra = receive_via_op(
+                    hidden_shape=self._hidden_shape,
+                    hidden_dtype=self._hidden_dtype,
+                    device=self._device,
+                    my_pe=self._my_pe,
+                    src_pe=src_pe,
+                    payload_nbytes=self._payload_nbytes,
+                )
+                first = first + extra
+            if action.reduce_op == "mean":
+                first = first / len(action.pes)
+            elif action.reduce_op not in ("sum", None):
+                raise AssertionError(
+                    f"CompiledRoute: unsupported reduce_op={action.reduce_op!r}"
+                )
+            return first
+
         if len(action.pes) == 1:
             return backend.receive_hidden(
                 my_pe=self._my_pe,
@@ -334,6 +376,18 @@ class CompiledRoute:
         return first
 
     def _do_send(self, backend, action: _Action, hidden: torch.Tensor) -> None:
+        if self._use_torch_ops:
+            from megatron.core.inference.transport_ops import send_via_op
+
+            for dst_pe in action.pes:
+                send_via_op(
+                    hidden,
+                    my_pe=self._my_pe,
+                    dst_pe=dst_pe,
+                    payload_nbytes=self._payload_nbytes,
+                )
+            return
+
         for dst_pe in action.pes:
             backend.send_hidden(
                 my_pe=self._my_pe,
