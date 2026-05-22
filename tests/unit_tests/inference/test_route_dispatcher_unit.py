@@ -45,8 +45,8 @@ class _MockDispatcher(RouteDispatcher):
                 for li in hop.layer_indices:
                     self._plan[li] = None
                 continue
-            receive_from_pe = (
-                route.hops[hop_pos - 1].shard_idx if hop_pos > 0 else None
+            receive_from_pes: tuple = (
+                (route.hops[hop_pos - 1].shard_idx,) if hop_pos > 0 else ()
             )
             send_to_pes = (
                 (route.hops[hop_pos + 1].shard_idx,)
@@ -55,8 +55,8 @@ class _MockDispatcher(RouteDispatcher):
             )
             for i, li in enumerate(hop.layer_indices):
                 self._plan[li] = _LayerPlan(
-                    receive_from_pe=(
-                        receive_from_pe if i == 0 else None
+                    receive_from_pes=(
+                        receive_from_pes if i == 0 else ()
                     ),
                     send_to_pes=(
                         send_to_pes if i == len(hop.layer_indices) - 1 else ()

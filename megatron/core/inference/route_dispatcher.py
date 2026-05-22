@@ -31,22 +31,38 @@ from megatron.rl.inference.route_planner import Route
 class _LayerPlan:
     """Per-layer action precomputed at dispatcher init.
 
-    ``receive_from_pe`` is the NVSHMEM PE this rank waits on at the
-    hop's entry layer (``None`` if there's no predecessor hop or if
-    this rank isn't a receiver under the TP topology). ``send_to_pes``
-    is the tuple of PEs this rank puts to at the hop's exit layer
-    (empty if no successor hop or this rank isn't a sender). A layer
-    with a ``_LayerPlan`` is always owned by this shard; not-owned
-    layers are stored as ``None`` in the plan map.
+    ``receive_from_pes`` lists the PEs this rank waits on at the hop's
+    entry layer:
 
-    Multi-peer ``send_to_pes`` supports hetero-TP between disagg
-    shards: a tp=2 → tp=4 hop has each src rank fan out to 2 dst ranks
-    (since the residual stream is TP-replicated, sending the same
-    hidden state to multiple peers is correct).
+    - 0 entries: no predecessor (entry hop) or this rank isn't a
+      receiver under the TP topology — the dispatcher just uses the
+      inbound ``hidden`` from the caller.
+    - 1 entry: linear inbound; the dispatcher does a single
+      ``backend.receive_hidden`` to overwrite ``hidden``.
+    - >1 entries: DAG merge point; the dispatcher receives one
+      activation per predecessor and reduces them via :attr:`reduce_op`.
+
+    ``send_to_pes`` is the flat tuple of PEs this rank puts the
+    outbound activation to at the hop's exit layer. The flatness is
+    intentional — it combines TWO orthogonal sources of fan-out:
+
+    - **Hetero-TP fan-out**: a tp=2 → tp=4 hop has each src rank send
+      to 2 dst ranks (the residual stream is TP-replicated so sending
+      the same hidden state to multiple peers is correct).
+    - **DAG fan-out**: a hop with ``parallel_succs`` sends the same
+      hidden state to multiple downstream shards in parallel.
+
+    The dispatcher's ``_send`` loop doesn't need to distinguish the two
+    — both are "ship this hidden to N peers" operations under
+    NVSHMEM's stream-ordered put_signal.
+
+    A layer with a ``_LayerPlan`` is always owned by this shard;
+    not-owned layers are stored as ``None`` in the plan map.
     """
 
-    receive_from_pe: Optional[int]
+    receive_from_pes: Tuple[int, ...]
     send_to_pes: Tuple[int, ...]
+    reduce_op: Optional[str] = None
 
 
 def tp_pair_routing(
@@ -104,6 +120,50 @@ def tp_pair_routing(
     return [(k * stride, k) for k in range(dst_tp)]
 
 
+def _resolve_inbound_pe(
+    src_shard_idx: int,
+    my_tp_offset: int,
+    my_tp: int,
+    shard_tp: List[int],
+    shard_rank_offset: List[int],
+    *,
+    single_rep: bool,
+) -> Optional[int]:
+    """One predecessor's PE under hetero-TP. ``None`` if this rank
+    doesn't receive from that predecessor under the routing table."""
+    if single_rep:
+        return shard_rank_offset[src_shard_idx]
+    srcs_for_me = [
+        s for (s, d) in tp_pair_routing(shard_tp[src_shard_idx], my_tp)
+        if d == my_tp_offset
+    ]
+    if not srcs_for_me:
+        return None
+    return shard_rank_offset[src_shard_idx] + srcs_for_me[0]
+
+
+def _resolve_outbound_pes(
+    dst_shard_idx: int,
+    my_tp_offset: int,
+    my_tp: int,
+    shard_tp: List[int],
+    shard_rank_offset: List[int],
+    *,
+    single_rep: bool,
+) -> Tuple[int, ...]:
+    """One successor's PE list under hetero-TP. Empty when this rank
+    doesn't send to that successor (e.g. non-TP-0 under single-rep)."""
+    if single_rep:
+        if my_tp_offset != 0:
+            return ()
+        return (shard_rank_offset[dst_shard_idx],)
+    dsts_for_me = [
+        d for (s, d) in tp_pair_routing(my_tp, shard_tp[dst_shard_idx])
+        if s == my_tp_offset
+    ]
+    return tuple(shard_rank_offset[dst_shard_idx] + d for d in dsts_for_me)
+
+
 def _build_layer_plan(
     route: Route,
     my_shard_idx: int,
@@ -121,59 +181,65 @@ def _build_layer_plan(
     apply only to the hop's entry / exit layer; middle layers of a
     multi-layer hop have no inbound / outbound transport.
 
+    DAG hops (:attr:`RouteHop.parallel_succs` /
+    :attr:`RouteHop.reduce_from`) add extra predecessor / successor
+    edges on top of the linear ``hop_pos ± 1`` chain. The PE list for
+    each edge is computed independently against that edge's hetero-TP
+    relationship; the lists are concatenated into a single flat
+    ``send_to_pes`` / ``receive_from_pes`` per layer plan so the
+    dispatcher's transport loop stays straightforward.
+
     ``single_rep=True``: only TP-0 sends/receives via NVSHMEM. Other
-    TP ranks of the dst shard get ``receive_from_pe`` set to TP-0
+    TP ranks of the dst shard get ``receive_from_pes`` set to TP-0
     of src so :meth:`RouteDispatcher._receive` knows to participate
     in the dst-side TP broadcast (TP-0 as src) instead of doing its
     own NVSHMEM recv. ``send_to_pes`` is empty on non-TP-0 ranks.
     """
     my_tp = shard_tp[my_shard_idx]
     plan: Dict[int, Optional[_LayerPlan]] = {}
-    last_hop_pos = len(route.hops) - 1
     for hop_pos, hop in enumerate(route.hops):
         if hop.shard_idx != my_shard_idx:
             for li in hop.layer_indices:
                 plan[li] = None
             continue
-        # Resolve inbound source PE under the prior hop's TP topology,
-        # outbound destination PE list under the next hop's TP topology.
-        receive_from_pe: Optional[int] = None
-        if hop_pos > 0:
-            prev = route.hops[hop_pos - 1]
-            if single_rep:
-                # All dst ranks "receive from" TP-0 of src; non-TP-0
-                # ranks participate in the dst-side TP broadcast rather
-                # than calling NVSHMEM recv directly. The flag lives
-                # in the dispatcher's _receive based on my_tp_offset.
-                receive_from_pe = shard_rank_offset[prev.shard_idx]
-            else:
-                srcs_for_me = [
-                    s for (s, d) in tp_pair_routing(shard_tp[prev.shard_idx], my_tp)
-                    if d == my_tp_offset
-                ]
-                if srcs_for_me:
-                    receive_from_pe = shard_rank_offset[prev.shard_idx] + srcs_for_me[0]
-        send_to_pes: Tuple[int, ...] = ()
-        if hop_pos < last_hop_pos:
-            nxt = route.hops[hop_pos + 1]
-            if single_rep:
-                # Only TP-0 of src actually sends. Other TP ranks
-                # have the same hidden state but skip the NVSHMEM put.
-                if my_tp_offset == 0:
-                    send_to_pes = (shard_rank_offset[nxt.shard_idx],)
-            else:
-                dsts_for_me = [
-                    d for (s, d) in tp_pair_routing(my_tp, shard_tp[nxt.shard_idx])
-                    if s == my_tp_offset
-                ]
-                send_to_pes = tuple(
-                    shard_rank_offset[nxt.shard_idx] + d for d in dsts_for_me
+
+        # Inbound: union of linear predecessor + DAG reduce_from edges.
+        inbound_pes: List[int] = []
+        for pred_pos in route.predecessors(hop_pos):
+            prev = route.hops[pred_pos]
+            pe = _resolve_inbound_pe(
+                prev.shard_idx,
+                my_tp_offset,
+                my_tp,
+                shard_tp,
+                shard_rank_offset,
+                single_rep=single_rep,
+            )
+            if pe is not None:
+                inbound_pes.append(pe)
+        reduce_op = hop.reduce_op if len(inbound_pes) > 1 else None
+
+        # Outbound: union of linear successor + DAG parallel_succs edges.
+        outbound_pes: List[int] = []
+        for succ_pos in route.successors(hop_pos):
+            nxt = route.hops[succ_pos]
+            outbound_pes.extend(
+                _resolve_outbound_pes(
+                    nxt.shard_idx,
+                    my_tp_offset,
+                    my_tp,
+                    shard_tp,
+                    shard_rank_offset,
+                    single_rep=single_rep,
                 )
+            )
+
         last_layer_in_hop = len(hop.layer_indices) - 1
         for i, li in enumerate(hop.layer_indices):
             plan[li] = _LayerPlan(
-                receive_from_pe=(receive_from_pe if i == 0 else None),
-                send_to_pes=(send_to_pes if i == last_layer_in_hop else ()),
+                receive_from_pes=(tuple(inbound_pes) if i == 0 else ()),
+                send_to_pes=(tuple(outbound_pes) if i == last_layer_in_hop else ()),
+                reduce_op=(reduce_op if i == 0 else None),
             )
     return plan
 
@@ -306,8 +372,10 @@ class RouteDispatcher:
         plan = self._plan[layer_idx]
         if plan is None:
             return hidden, LayerAction.NOT_MY_REQUEST
-        if plan.receive_from_pe is not None:
-            hidden = self._receive(plan.receive_from_pe)
+        if plan.receive_from_pes:
+            hidden = self._receive_and_maybe_reduce(
+                plan.receive_from_pes, plan.reduce_op
+            )
         hidden = run_local(hidden)
         if plan.send_to_pes:
             self._send(plan.send_to_pes, hidden)
@@ -361,3 +429,45 @@ class RouteDispatcher:
             payload_nbytes=self._payload_nbytes,
             stream=self._stream,
         )
+
+    def _receive_and_maybe_reduce(
+        self,
+        src_pes: Tuple[int, ...],
+        reduce_op: Optional[str],
+    ) -> torch.Tensor:
+        """Receive one tensor per predecessor PE and combine them.
+
+        Single-input fast path: identical to ``_receive`` (no reduce).
+        Multi-input: pull each branch's activation via the transport,
+        then reduce per ``reduce_op``:
+
+        - ``"sum"``: in-place accumulate into the first branch's tensor.
+        - ``"mean"``: sum + divide by branch count.
+
+        The recv order matches ``src_pes`` order — branches with
+        independent payloads land in independent slots so a slow branch
+        doesn't head-of-line-block the others (the transport's
+        ``signal_wait`` is per-(my_pe, src_pe) lane). The reduce
+        happens on the transport stream after all branches arrive.
+        """
+        if len(src_pes) == 1:
+            return self._receive(src_pes[0])
+        # Each branch lands in its own buffer (the backend's
+        # receive_hidden returns a fresh tensor cloned out of the slot,
+        # so we can hold all branches simultaneously without worrying
+        # about slot recycling). First branch goes through the standard
+        # _receive helper to keep single-rep / TP-broadcast semantics
+        # intact for the head branch; subsequent branches bypass it
+        # since the dst-side broadcast already populated TP-replication.
+        accum = self._receive(src_pes[0])
+        for src_pe in src_pes[1:]:
+            extra = self._receive(src_pe)
+            accum.add_(extra)
+        if reduce_op == "mean":
+            accum.div_(len(src_pes))
+        elif reduce_op not in ("sum", None):
+            raise AssertionError(
+                f"_receive_and_maybe_reduce: unsupported reduce_op={reduce_op!r}; "
+                f"expected 'sum' or 'mean'."
+            )
+        return accum
