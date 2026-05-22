@@ -70,6 +70,14 @@ class _MockDispatcher(RouteDispatcher):
             if received_payload is not None
             else torch.full((4,), 100.0)
         )
+        # Cache-related fields the real dispatcher initializes — set
+        # to "no cache" defaults so dispatch_layer's cache branches
+        # are inert in these tests.
+        self._cache = None
+        self._prompt_tokens = None
+        self._cache_skip_depth = 0
+        self._cache_starting_hidden = None
+        self._cache_dispatch_layer_zero_count = 0
 
     def _send(self, dst_pes, hidden):
         # Mock unpacks the single-peer matched-TP case for test

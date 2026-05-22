@@ -268,6 +268,12 @@ class LayerAction(Enum):
     # This layer's hop belongs to another shard; ``hidden`` flows
     # through unchanged.
     NOT_MY_REQUEST = auto()
+    # Layer's output was served from the prefix activation cache —
+    # this shard owns the layer but skipped ``run_local`` because a
+    # prior prefill on a matching prefix already computed the result.
+    # The forward loop continues; the next dispatched layer either
+    # also CACHEs or runs normally with the cached hidden as input.
+    CACHED = auto()
 
 
 class RouteDispatcher:
@@ -314,6 +320,8 @@ class RouteDispatcher:
         stream: Optional[torch.cuda.Stream] = None,
         tp_group: object = None,
         single_rep: bool = False,
+        cache: Optional[object] = None,
+        prompt_tokens: Optional[Sequence[int]] = None,
     ) -> None:
         self._route = route
         self._my_shard = my_shard_idx
@@ -338,6 +346,30 @@ class RouteDispatcher:
             shard_rank_offset=list(shard_rank_offset),
             single_rep=single_rep,
         )
+
+        # Prefix activation cache state. Only the entry shard
+        # participates in v1 (cross-shard cache lives in a follow-up).
+        # The cache lookup happens once at construction; the result
+        # drives a one-shot "skip these layers on the first forward
+        # pass" behavior. Subsequent decode passes (detected by
+        # observing layer 0 a second time in ``dispatch_layer``)
+        # ignore the cache and run normally.
+        self._cache = cache
+        self._prompt_tokens: Optional[Tuple[int, ...]] = (
+            tuple(prompt_tokens) if prompt_tokens is not None else None
+        )
+        self._cache_skip_depth: int = 0
+        self._cache_starting_hidden: Optional[torch.Tensor] = None
+        self._cache_dispatch_layer_zero_count: int = 0
+        if (
+            cache is not None
+            and self._prompt_tokens is not None
+            and my_shard_idx == route.entry_shard
+        ):
+            hit = cache.lookup(self._prompt_tokens)
+            if hit is not None:
+                self._cache_skip_depth = hit.skip_depth
+                self._cache_starting_hidden = hit.starting_hidden
 
     # ---- public API -------------------------------------------------------
 
@@ -367,16 +399,62 @@ class RouteDispatcher:
         the next RECEIVE) through every layer; no caller-side branch
         on action is needed.
         """
+        # Track passes: the prefix cache only fires on the FIRST
+        # forward pass after construction (the prefill). Decode-step
+        # passes through the same dispatcher must run every layer
+        # normally — their state depends on the cumulative
+        # token sequence, not the prefix-only computation.
+        if layer_idx == 0:
+            self._cache_dispatch_layer_zero_count += 1
+        cache_active = (
+            self._cache_skip_depth > 0
+            and self._cache_dispatch_layer_zero_count == 1
+        )
+
         if layer_idx not in self._plan:
             return hidden, LayerAction.DONE
         plan = self._plan[layer_idx]
         if plan is None:
             return hidden, LayerAction.NOT_MY_REQUEST
-        if plan.receive_from_pes:
+
+        # Cache hit: this layer's output is already in the cache.
+        # Skip run_local entirely; no send (the dispatcher's send
+        # only fires at hop boundaries, and cached layers are
+        # always strictly before the entry shard's first hop-out).
+        if cache_active and layer_idx < self._cache_skip_depth:
+            return None, LayerAction.CACHED
+
+        # Cache-boundary layer: skip the standard inbound (there's
+        # nothing to recv on layer 0 of the entry shard anyway) and
+        # use the cached hidden as ``run_local``'s input. After this
+        # layer the cache_active path is exited — subsequent layers
+        # take the normal recv / run / send path because they're
+        # past the cached prefix.
+        if cache_active and layer_idx == self._cache_skip_depth:
+            hidden = self._cache_starting_hidden
+        elif plan.receive_from_pes:
             hidden = self._receive_and_maybe_reduce(
                 plan.receive_from_pes, plan.reduce_op
             )
+
         hidden = run_local(hidden)
+
+        # Populate the cache for future requests with matching prefix.
+        # Only the entry shard's first forward pass writes; subsequent
+        # decode passes don't (the prefix doesn't extend to those).
+        if (
+            self._cache is not None
+            and self._prompt_tokens is not None
+            and self._my_shard == self._route.entry_shard
+            and self._cache_dispatch_layer_zero_count == 1
+        ):
+            self._cache.store(
+                prompt_tokens=self._prompt_tokens,
+                prefix_len=len(self._prompt_tokens),
+                layer_idx=layer_idx,
+                hidden=hidden,
+            )
+
         if plan.send_to_pes:
             self._send(plan.send_to_pes, hidden)
             return None, LayerAction.SEND
