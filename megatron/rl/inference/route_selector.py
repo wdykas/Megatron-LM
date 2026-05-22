@@ -29,7 +29,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Protocol, Sequence, Tuple, runtime_checkable
 
-from megatron.rl.inference.route_planner import Route
+from megatron.rl.inference.route_planner import Route, SpeculativeRoute
 
 
 @dataclass
@@ -193,6 +193,44 @@ class PromptLengthRouteSelector:
             if n <= max_len:
                 return route
         return self._tiers[-1][1]
+
+    def select_for_step(self, step_info: StepInfo) -> Optional[Route]:
+        return None
+
+
+class SpeculativeRouteSelector:
+    """Submits a request that runs all branches of a
+    :class:`SpeculativeRoute` in parallel, then picks a winner once
+    the decision boundary is reached.
+
+    This selector is unusual: it exposes the bundle via ``select`` so
+    the producer (e.g. ``MegatronLocalMulti.base_generate``) can submit
+    one request per branch under the same prompt. ``select`` returns
+    ``branches[0]`` as the "primary" — the request walked by the
+    submit-time path; the rest must be submitted by the caller via
+    :func:`speculative_request_ids` after the primary is in-flight.
+
+    Once a winner is picked (the caller decides based on the bundle's
+    ``policy``), the producer cancels the losers via
+    :meth:`InferenceClient.cancel_branch` on each loser branch's
+    ``server_request_id``.
+
+    The selector itself is stateless — it just hands the bundle to the
+    caller. Coordination (submitting N requests, deciding the winner,
+    cancelling losers) lives in the producer because the producer is
+    the one with access to the InferenceClient and the request-id space.
+    """
+
+    def __init__(self, speculative_route: SpeculativeRoute) -> None:
+        self._spec_route = speculative_route
+
+    @property
+    def speculative_route(self) -> SpeculativeRoute:
+        return self._spec_route
+
+    def select(self, request_info: RequestInfo) -> Optional[Route]:
+        # Primary branch is the one walked by the standard submit path.
+        return self._spec_route.branches[0]
 
     def select_for_step(self, step_info: StepInfo) -> Optional[Route]:
         return None

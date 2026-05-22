@@ -146,6 +146,17 @@ class Headers(Enum):
     # participant knows both (the coord knows neither in advance —
     # routes are per-request, not stored).
     RESELECT_REQUEST_ROUTE = auto()
+    # Speculative parallel routes: producer submits N requests (one
+    # per branch) sharing the same prompt + sampling params, then
+    # cancels all-but-one once a winner is picked. Each cancellation
+    # frees the loser branch's per-request state on every shard the
+    # branch was visiting (dispatcher slot, KV blocks, mamba state).
+    # Wire payload:
+    # [CANCEL_SPECULATIVE_BRANCH, request_id, participating_shards].
+    # The coord fans a RELEASE_DISAGG_REQUEST under the hood — the
+    # distinct header exists so producers can be explicit about
+    # "this is a cancellation, not a normal completion".
+    CANCEL_SPECULATIVE_BRANCH = auto()
     TP_BROADCAST = auto()
 
 
