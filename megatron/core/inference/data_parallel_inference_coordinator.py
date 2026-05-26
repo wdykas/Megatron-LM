@@ -1066,38 +1066,6 @@ class DataParallelInferenceCoordinator:
                             continue  # don't echo back to the sender
                         self._send_to_engine(ident, fanout_payload)
 
-            elif header == Headers.CANCEL_SPECULATIVE_BRANCH:
-                # Producer cancels one branch of a speculative route.
-                # Mechanically identical to RELEASE_DISAGG_REQUEST
-                # (free per-request state on every participating
-                # engine), but the distinct header signals "this is
-                # a cancellation, not a normal completion" for
-                # telemetry / debugging. Wire payload:
-                # [CANCEL_SPECULATIVE_BRANCH, request_id, shards].
-                if sender_identity not in known_clients:
-                    logging.warning(
-                        "Coordinator: ignoring CANCEL_SPECULATIVE_BRANCH "
-                        "from unknown client."
-                    )
-                    continue
-                _, cancel_request_id, cancel_shards = deserialized_payload
-                rel_payload = msgpack.packb(
-                    [
-                        Headers.RELEASE_DISAGG_REQUEST.value,
-                        int(cancel_request_id),
-                    ],
-                    use_bin_type=True,
-                )
-                for shard_idx in sorted(cancel_shards):
-                    for ident in self._identities_for_shard(shard_idx):
-                        self._send_to_engine(ident, rel_payload)
-                logging.info(
-                    "Coordinator: CANCEL_SPECULATIVE_BRANCH request_id=%d "
-                    "shards=%s",
-                    cancel_request_id,
-                    sorted(cancel_shards),
-                )
-
             elif header == Headers.RESELECT_REQUEST_ROUTE:
                 # Per-request dynamic reroute. Producer is mid-rollout
                 # and wants this request to walk a different route

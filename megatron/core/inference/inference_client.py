@@ -508,35 +508,6 @@ class InferenceClient:
             new_wire,
         )
 
-    def cancel_branch(
-        self, request_id: int, participating_shards: List[int]
-    ) -> None:
-        """Cancel one branch of a speculative route.
-
-        The producer holds the ``SpeculativeRoute`` and knows which
-        shards each branch visits, so it passes ``participating_shards``
-        explicitly — the coord doesn't track that per request.
-
-        The coord fans ``CANCEL_SPECULATIVE_BRANCH`` to every
-        participating shard's engine; each engine treats it identically
-        to ``RELEASE_DISAGG_REQUEST`` (frees the per-request dispatcher
-        slot, KV blocks, and mamba state). The distinct header exists
-        so the producer can be explicit about "this is a cancellation,
-        not a normal completion" — useful for telemetry / debugging
-        speculative-routing experiments.
-
-        Args:
-            request_id: Coord ``server_request_id`` of the branch to
-                cancel.
-            participating_shards: Shard indices the branch visits.
-                Derivable from the branch's ``Route``.
-        """
-        self._send_signal_to_engines(
-            Headers.CANCEL_SPECULATIVE_BRANCH,
-            int(request_id),
-            list(int(s) for s in participating_shards),
-        )
-
     def shutdown_coordinator(self):
         """Tells the coordinator process to exit its main loop.
 
