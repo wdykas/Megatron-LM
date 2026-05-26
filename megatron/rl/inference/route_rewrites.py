@@ -399,6 +399,151 @@ class MergeAdjacentSameShardHops(RouteRewriter):
         return list(hops), False
 
 
+def _compute_downstream_costs(
+    route: Route, hop_cost_ms: Dict[int, float]
+) -> Dict[int, float]:
+    """For each hop, the longest path from it to any exit (inclusive
+    of the hop's own cost). Computed via reverse-topological DP.
+
+    Used by :class:`PrioritizeFanOutByCost` to decide which
+    successor of a fan-out hop should receive its activation first
+    — the successor with the longest downstream chain is the
+    critical-path bottleneck and starting it earliest minimizes
+    overall wall time.
+    """
+    n = len(route.hops)
+    cost = [hop_cost_ms.get(i, 1.0) for i in range(n)]
+    downstream: Dict[int, float] = {}
+    order = topological_order(route)
+    for i in reversed(order):
+        succs = successors_of(route, i)
+        if not succs:
+            downstream[i] = cost[i]
+        else:
+            downstream[i] = cost[i] + max(downstream[s] for s in succs)
+    return downstream
+
+
+class PrioritizeFanOutByCost(RouteRewriter):
+    """Reorder a fan-out hop's ``succs`` list so successors with
+    the longest downstream critical path come first.
+
+    Motivation: at a hop with N successors, the dispatcher emits
+    N ``send_hidden`` calls in ``succs`` order. With async NVSHMEM
+    transport these sends run concurrently on the GPU, but **the
+    receiver-side compute can only start once its activation has
+    arrived**. So the wall-time floor on each branch is
+    ``send_latency + downstream_critical_path``. Picking the
+    longest downstream first means the longest branch starts its
+    compute as early as possible — net wall time shrinks toward
+    the longest branch's natural duration.
+
+    For linear hops (one successor) this is a no-op. For DAG
+    fan-out (e.g. MoE backbone → multiple expert shards) it picks
+    the slowest expert to send to first.
+
+    Args:
+        hop_cost_ms: Per-hop cost estimate (typically from a
+            profiling pass like ``pipelining_gap_probe``). Missing
+            entries default to 1.0 unit-cost, so the pass is
+            usable without profiling data (it just picks the
+            unweighted-longest path).
+
+    Composition: re-orders only ``succs``. ``preds`` references
+    on receiver hops are untouched (the reduce_op semantics are
+    commutative: ``sum`` and ``mean`` don't care about predecessor
+    order).
+    """
+
+    name = "prioritize_fan_out_by_cost"
+
+    def __init__(self, hop_cost_ms: Optional[Dict[int, float]] = None) -> None:
+        self._costs = hop_cost_ms or {}
+
+    def apply(self, route: Route) -> Route:
+        if not route.is_dag():
+            # Linear routes have at most one successor per hop —
+            # nothing to reorder.
+            return route
+        downstream = _compute_downstream_costs(route, self._costs)
+        new_hops: List[RouteHop] = []
+        for hop in route.hops:
+            if hop.succs is None or len(hop.succs) <= 1:
+                new_hops.append(hop)
+                continue
+            # Sort succs by descending downstream cost so the
+            # heaviest branch fires first.
+            reordered = tuple(
+                sorted(hop.succs, key=lambda s: -downstream[s])
+            )
+            if reordered == hop.succs:
+                new_hops.append(hop)
+            else:
+                new_hops.append(replace(hop, succs=reordered))
+        return Route(hops=tuple(new_hops))
+
+
+class PrioritizeFanOutByTopology(RouteRewriter):
+    """Reorder a fan-out hop's ``succs`` list so successors on the
+    farthest network distance come first.
+
+    Motivation: a cross-node NVSHMEM put pays a higher latency
+    (e.g. IB ~30 µs) than an intra-node put (NVLink ~5 µs). If a
+    hop fans to mixed-distance destinations, issuing the high-latency
+    sends first hides their cost behind the lower-latency sends
+    that follow. By the time the lower-latency sends queue, the
+    high-latency ones are already in flight.
+
+    Args:
+        shard_node_id: Mapping from ``shard_idx`` to an opaque
+            "node id" (any hashable). Shards with the same id are
+            treated as on the same node (closer); different ids
+            are treated as on different nodes (farther). The pass
+            doesn't care about absolute distances, only the
+            partition.
+
+    For single-node deployments where every shard has the same
+    node id, this pass is a no-op (no distance variance to
+    exploit). Composes safely after :class:`PrioritizeFanOutByCost`
+    — the secondary cost-based order becomes a tiebreaker within
+    each distance class.
+
+    Composition: re-orders only ``succs``; ``preds`` references
+    on receiver hops are untouched.
+    """
+
+    name = "prioritize_fan_out_by_topology"
+
+    def __init__(self, shard_node_id: Dict[int, object]) -> None:
+        self._node_id = shard_node_id
+
+    def apply(self, route: Route) -> Route:
+        if not route.is_dag():
+            return route
+        new_hops: List[RouteHop] = []
+        for hop in route.hops:
+            if hop.succs is None or len(hop.succs) <= 1:
+                new_hops.append(hop)
+                continue
+            src_node = self._node_id.get(hop.shard_idx)
+
+            def _distance_class(succ_pos: int) -> int:
+                # 1 if cross-node from src, 0 if same-node. Cross-node
+                # comes first under descending sort.
+                dst_shard = route.hops[succ_pos].shard_idx
+                dst_node = self._node_id.get(dst_shard)
+                if src_node is None or dst_node is None:
+                    return 0
+                return 1 if src_node != dst_node else 0
+
+            reordered = tuple(sorted(hop.succs, key=lambda s: -_distance_class(s)))
+            if reordered == hop.succs:
+                new_hops.append(hop)
+            else:
+                new_hops.append(replace(hop, succs=reordered))
+        return Route(hops=tuple(new_hops))
+
+
 class SortHopsTopologically(RouteRewriter):
     """Re-order ``route.hops`` so the hop tuple is in topological
     order. The dispatcher walks ``hops`` in order, and the implicit
