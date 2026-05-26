@@ -464,50 +464,6 @@ class InferenceClient:
         self._send_signal_to_engines(Headers.SET_DISAGG_ROUTE, payload)
         await self._set_disagg_route_ack
 
-    def reselect_route(self, request_id: int, old_route, new_route) -> None:
-        """Swap a request's disagg route mid-rollout.
-
-        The coord fans ``RESELECT_REQUEST_ROUTE`` to every participant
-        of ``union(participants(old_route), participants(new_route))``;
-        engines on shards in both routes swap their dispatcher's route
-        at the next token boundary, dropped shards release per-request
-        state, and newly-joined shards inject the request as a
-        participant under the new route.
-
-        Args:
-            request_id: The coord's ``server_request_id`` (NOT the
-                engine-local id).
-            old_route: The request's current :class:`Route` (or
-                serialized wire form). Needed so old-only participants
-                can be sent a release; passing the wrong old route is
-                a benign no-op — coord just sends release to the wrong
-                shards which they ignore.
-            new_route: The :class:`Route` (or serialized wire form) the
-                request should walk going forward. Cannot be ``None``.
-        """
-        from megatron.rl.inference.route_planner import Route, serialize_route
-
-        assert new_route is not None, (
-            "reselect_route: new_route cannot be None; use the release "
-            "path to fully drop a request."
-        )
-        old_wire = (
-            serialize_route(old_route)
-            if isinstance(old_route, Route)
-            else list(old_route)
-        )
-        new_wire = (
-            serialize_route(new_route)
-            if isinstance(new_route, Route)
-            else list(new_route)
-        )
-        self._send_signal_to_engines(
-            Headers.RESELECT_REQUEST_ROUTE,
-            int(request_id),
-            old_wire,
-            new_wire,
-        )
-
     def shutdown_coordinator(self):
         """Tells the coordinator process to exit its main loop.
 
