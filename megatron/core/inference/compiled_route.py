@@ -65,8 +65,6 @@ class _ActionKind(Enum):
     RECV = auto()       # Hop entry: receive (+ optional reduce) one or more inbound activations.
     LOCAL = auto()      # Owned layer's local compute (``layer_callables[layer_idx]``).
     SEND = auto()       # Hop exit: send the outbound activation to peer PE(s).
-    CACHE_HIT = auto()  # Layer covered by the prefix activation cache — skip the local compute.
-    CACHE_BOUNDARY = auto()  # First non-cached layer — substitute cached hidden as input.
 
 
 @dataclass(frozen=True)
@@ -76,8 +74,7 @@ class _Action:
     Attributes:
         kind: The action class.
         layer_idx: Original global layer index this action belongs to.
-            ``LOCAL`` / ``CACHE_HIT`` / ``CACHE_BOUNDARY`` actions key
-            into ``layer_callables[layer_idx]``.
+            ``LOCAL`` actions key into ``layer_callables[layer_idx]``.
         pes: For ``RECV`` and ``SEND``, the resolved peer PE list.
             Empty for non-transport actions.
         reduce_op: For ``RECV`` with multiple PEs, the reduction
@@ -109,13 +106,6 @@ class CompiledRoute:
         shard_rank_offset: Per-shard base rank, indexed by shard idx.
         hidden_shape: Activation tensor shape.
         hidden_dtype: dtype of the activation tensor.
-        cache: Optional :class:`PrefixActivationCache`. When set + this
-            rank is the entry shard, a lookup at construction time
-            sets the cache skip depth; the action list emits
-            ``CACHE_HIT`` for skipped layers and ``CACHE_BOUNDARY``
-            for the first uncached one.
-        prompt_tokens: Prompt token sequence — required when ``cache``
-            is set (it's the cache key).
         single_rep: Hetero-TP single-rep mode.
         use_torch_ops: When ``True``, ``run`` calls the registered
             ``disagg::send_hidden`` / ``disagg::receive_hidden``
@@ -139,8 +129,6 @@ class CompiledRoute:
         hidden_shape: Tuple[int, ...],
         hidden_dtype: torch.dtype,
         *,
-        cache: Optional[object] = None,
-        prompt_tokens: Optional[Sequence[int]] = None,
         single_rep: bool = False,
         use_torch_ops: bool = False,
         device: Optional[torch.device] = None,
@@ -168,25 +156,6 @@ class CompiledRoute:
             single_rep=single_rep,
         )
 
-        # Cache lookup at construction — drives the CACHE_HIT /
-        # CACHE_BOUNDARY action emission below.
-        self._cache = cache
-        self._prompt_tokens: Optional[Tuple[int, ...]] = (
-            tuple(prompt_tokens) if prompt_tokens is not None else None
-        )
-        skip_depth = 0
-        self._cache_starting_hidden: Optional[torch.Tensor] = None
-        if (
-            cache is not None
-            and self._prompt_tokens is not None
-            and my_shard_idx == route.entry_shard
-        ):
-            hit = cache.lookup(self._prompt_tokens)
-            if hit is not None:
-                skip_depth = hit.skip_depth
-                self._cache_starting_hidden = hit.starting_hidden
-        self._cache_skip_depth = skip_depth
-
         # Flatten the plan into the action list. We walk every layer
         # the route covers; NOT_MY_REQUEST layers (plan[li] is None)
         # don't produce actions — they're implicit "skip this step"
@@ -198,15 +167,7 @@ class CompiledRoute:
         for li in owned_layers:
             p = plan[li]
             assert p is not None  # for type narrowing
-            # Cache hit: skip the local compute entirely.
-            if skip_depth > 0 and li < skip_depth:
-                actions.append(_Action(kind=_ActionKind.CACHE_HIT, layer_idx=li))
-                continue
-            # Cache boundary: substitute cached hidden for the inbound.
-            is_boundary = (skip_depth > 0 and li == skip_depth)
-            # Receive at hop entry (skipped at cache boundary — the
-            # cached hidden replaces the inbound).
-            if p.receive_from_pes and not is_boundary:
+            if p.receive_from_pes:
                 actions.append(
                     _Action(
                         kind=_ActionKind.RECV,
@@ -215,15 +176,7 @@ class CompiledRoute:
                         reduce_op=p.reduce_op,
                     )
                 )
-            actions.append(
-                _Action(
-                    kind=(
-                        _ActionKind.CACHE_BOUNDARY if is_boundary
-                        else _ActionKind.LOCAL
-                    ),
-                    layer_idx=li,
-                )
-            )
+            actions.append(_Action(kind=_ActionKind.LOCAL, layer_idx=li))
             if p.send_to_pes:
                 actions.append(
                     _Action(
@@ -239,8 +192,8 @@ class CompiledRoute:
     @property
     def actions(self) -> Tuple[_Action, ...]:
         """Read-only view of the compiled action list. Useful for
-        tests and debugging — e.g. counting RECV/SEND/CACHE_HIT
-        actions on a given shard."""
+        tests and debugging — e.g. counting RECV/SEND actions on a
+        given shard."""
         return self._actions
 
     @property
@@ -248,10 +201,6 @@ class CompiledRoute:
         """Layer indices this shard owns under the compiled route, in
         ascending order."""
         return tuple(sorted({a.layer_idx for a in self._actions}))
-
-    @property
-    def cache_skip_depth(self) -> int:
-        return self._cache_skip_depth
 
     # ---- execution -------------------------------------------------------
 
@@ -284,26 +233,13 @@ class CompiledRoute:
         for action in self._actions:
             if action.kind == _ActionKind.RECV:
                 hidden = self._do_recv(backend, action)
-            elif action.kind == _ActionKind.CACHE_HIT:
-                # No local compute, no transport — the cache covered
-                # this layer's output on a prior prefill. The next
-                # action is either another CACHE_HIT (still inside the
-                # cached region) or a CACHE_BOUNDARY (which will
-                # substitute the cached hidden).
-                continue
-            elif action.kind == _ActionKind.CACHE_BOUNDARY:
-                hidden = self._cache_starting_hidden
-                hidden = layer_callables[action.layer_idx](hidden)
-                self._maybe_populate(action.layer_idx, hidden)
             elif action.kind == _ActionKind.LOCAL:
                 assert hidden is not None, (
                     "CompiledRoute.run: LOCAL action with no inbound "
-                    "hidden — route lacks a preceding RECV / "
-                    "CACHE_BOUNDARY or the caller didn't pass "
-                    "hidden_in for an entry-shard run."
+                    "hidden — route lacks a preceding RECV or the "
+                    "caller didn't pass hidden_in for an entry-shard run."
                 )
                 hidden = layer_callables[action.layer_idx](hidden)
-                self._maybe_populate(action.layer_idx, hidden)
             elif action.kind == _ActionKind.SEND:
                 assert hidden is not None
                 self._do_send(backend, action, hidden)
@@ -396,15 +332,3 @@ class CompiledRoute:
                 payload_nbytes=self._payload_nbytes,
             )
 
-    def _maybe_populate(self, layer_idx: int, hidden: torch.Tensor) -> None:
-        if (
-            self._cache is not None
-            and self._prompt_tokens is not None
-            and self._my_shard == self._route.entry_shard
-        ):
-            self._cache.store(
-                prompt_tokens=self._prompt_tokens,
-                prefix_len=len(self._prompt_tokens),
-                layer_idx=layer_idx,
-                hidden=hidden,
-            )

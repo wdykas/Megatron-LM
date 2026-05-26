@@ -4,10 +4,11 @@
 
 :class:`CompiledRoute` pre-resolves the per-layer dispatch decisions
 at construction time, so its ``run`` method is a flat sequence of
-``RECV / LOCAL / SEND / CACHE_HIT / CACHE_BOUNDARY`` actions with no
-runtime control flow keyed on layer_idx. This makes the resulting
-function torch.compile-friendly (the for-loop unrolls; only transport
-calls graph-break, and a follow-up will register those as torch ops).
+``RECV / LOCAL / SEND`` actions with no runtime control flow keyed
+on layer_idx. This makes the resulting function torch.compile-friendly
+(the for-loop unrolls; transport calls go through registered
+``torch.library.custom_op`` so they don't break the graph either when
+``use_torch_ops=True``).
 
 These tests verify the action list shape against the standard
 :class:`RouteDispatcher`'s behavior on the same route + that ``run``
@@ -20,7 +21,6 @@ from typing import List
 import pytest
 import torch
 
-from megatron.core.inference.activation_cache import PrefixActivationCache
 from megatron.core.inference.compiled_route import (
     CompiledRoute,
     _Action,
@@ -79,7 +79,7 @@ def backend():
     set_activation_transport_backend(None)
 
 
-def _make_compiled(route, my_shard_idx, cache=None, prompt_tokens=None):
+def _make_compiled(route, my_shard_idx):
     max_shard = max(h.shard_idx for h in route.hops)
     return CompiledRoute(
         route=route,
@@ -90,8 +90,6 @@ def _make_compiled(route, my_shard_idx, cache=None, prompt_tokens=None):
         shard_rank_offset=list(range(max_shard + 1)),
         hidden_shape=(1, 4),
         hidden_dtype=torch.float32,
-        cache=cache,
-        prompt_tokens=prompt_tokens,
     )
 
 
@@ -216,31 +214,8 @@ def test_dag_expert_shard_emits_recv_then_local_then_send(backend):
 # ---- Cache integration in compiled form ----------------------------------
 
 
-def test_compiled_route_emits_cache_hits_for_skipped_layers(backend):
-    """When the cache covers layers 0..K-1, expect K CACHE_HIT actions
-    then a CACHE_BOUNDARY at layer K (which substitutes the cached
-    hidden as input)."""
-    cache = PrefixActivationCache()
-    prompt = [1, 2, 3]
-    # Pre-populate so a hit covers layers 0 + 1.
-    cache.store(prompt, 3, 0, torch.full((1, 4), 10.0))
-    cache.store(prompt, 3, 1, torch.full((1, 4), 20.0))
-
-    # Single-hop route covering layers 0..2.
-    route = Route(hops=(RouteHop(shard_idx=0, layer_indices=(0, 1, 2)),))
-    cr = _make_compiled(route, my_shard_idx=0, cache=cache, prompt_tokens=prompt)
-    kinds = [a.kind for a in cr.actions]
-    assert kinds == [
-        _ActionKind.CACHE_HIT,      # layer 0
-        _ActionKind.CACHE_HIT,      # layer 1
-        _ActionKind.CACHE_BOUNDARY, # layer 2 (first uncached)
-    ]
-    assert cr.cache_skip_depth == 2
-
-
-def test_compiled_route_no_cache_hit_emits_pure_locals(backend):
-    """No cache passed → no CACHE_HIT / CACHE_BOUNDARY actions,
-    every owned layer is LOCAL."""
+def test_compiled_route_single_hop_emits_pure_locals(backend):
+    """Single-hop owned by one shard: every layer is LOCAL."""
     route = Route(hops=(RouteHop(shard_idx=0, layer_indices=(0, 1, 2)),))
     cr = _make_compiled(route, my_shard_idx=0)
     kinds = [a.kind for a in cr.actions]
@@ -305,36 +280,6 @@ def test_run_receives_at_hop_entry_and_threads_through(backend):
     # Send fired with 7 * 3 = 21s.
     sent_hidden = backend.sends[0][1]
     assert torch.allclose(sent_hidden, torch.full((1, 4), 21.0))
-
-
-def test_run_with_cache_hit_skips_local_compute(backend):
-    """Cache hit: skipped layers never call into layer_callables.
-    Boundary layer substitutes the cached hidden as input."""
-    cache = PrefixActivationCache()
-    prompt = [1, 2, 3]
-    cache.store(prompt, 3, 0, torch.full((1, 4), 100.0))
-
-    route = Route(hops=(RouteHop(shard_idx=0, layer_indices=(0, 1)),))
-    cr = _make_compiled(
-        route, my_shard_idx=0, cache=cache, prompt_tokens=prompt
-    )
-
-    calls = []
-
-    def layer_0(h):
-        calls.append(("l0", h.clone()))
-        return h
-
-    def layer_1(h):
-        calls.append(("l1", h.clone()))
-        return h * 2
-
-    out = cr.run(torch.zeros(1, 4), layer_callables=[layer_0, layer_1])
-    # Layer 0 was cached → not called. Layer 1 saw cached hidden (100s)
-    # → output is 200s.
-    assert [c[0] for c in calls] == ["l1"]
-    assert torch.allclose(calls[0][1], torch.full((1, 4), 100.0))
-    assert torch.allclose(out, torch.full((1, 4), 200.0))
 
 
 def test_run_reduces_multi_input_recv(backend):
