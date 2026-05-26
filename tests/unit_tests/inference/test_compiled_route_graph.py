@@ -32,11 +32,21 @@ from megatron.rl.inference.route_planner import Route, RouteHop
 
 class _NoopBackend(ActivationTransportBackend):
     """Backend that does nothing — sufficient for tests that don't
-    actually exercise transport (single-shard routes)."""
+    actually exercise transport (single-shard routes).
+
+    Returns a real non-default CUDA stream when CUDA is available
+    so ``CompiledRouteGraph.capture`` has a valid capture stream
+    (CUDA rejects graph capture on the default stream).
+    """
+
+    def __init__(self):
+        self._stream = (
+            torch.cuda.Stream() if torch.cuda.is_available() else None
+        )
 
     def is_initialized(self): return True
     def init(self, **kwargs): pass
-    def stream(self): return None
+    def stream(self): return self._stream
 
     def send_hidden(self, my_pe, dst_pe, hidden, payload_nbytes, *, stream=None):
         pass
