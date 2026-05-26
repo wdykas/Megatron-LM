@@ -18,8 +18,10 @@ import pytest
 from megatron.rl.inference.route_planner import Route, RouteHop
 from megatron.rl.inference.route_selector import (
     LayoutRouteSelector,
+    PromptLengthRouteSelector,
     RequestInfo,
     RouteSelector,
+    StickyShardRouteSelector,
 )
 
 
@@ -73,3 +75,87 @@ def test_custom_selector_satisfies_protocol():
     assert sel.select(RequestInfo(prompt_text="fast")) is route_a
     assert sel.select(RequestInfo(prompt_text="slow")) is None
     assert sel.calls == 2
+
+
+# ---- PromptLengthRouteSelector --------------------------------------------
+
+
+def test_prompt_length_selector_picks_short_tier():
+    """Short prompt falls into the first tier with a max >= len."""
+    sel = PromptLengthRouteSelector([
+        (10, route_a),
+        (1000, route_b),
+    ])
+    assert sel.select(RequestInfo(prompt_tokens=[0] * 5)) is route_a
+
+
+def test_prompt_length_selector_picks_long_tier():
+    """Prompt that exceeds the small tier rolls over to the next."""
+    sel = PromptLengthRouteSelector([
+        (10, route_a),
+        (1000, route_b),
+    ])
+    assert sel.select(RequestInfo(prompt_tokens=[0] * 500)) is route_b
+
+
+def test_prompt_length_selector_fallback_above_max():
+    """Prompts longer than every tier fall back to the highest tier
+    (so the selector is never undefined for any input length)."""
+    sel = PromptLengthRouteSelector([
+        (10, route_a),
+        (100, route_b),
+    ])
+    assert sel.select(RequestInfo(prompt_tokens=[0] * 10_000)) is route_b
+
+
+def test_prompt_length_selector_fallback_on_unknown_length():
+    """If neither ``prompt_tokens`` nor a computable length is set,
+    the selector picks the last tier — typically the "be safe" route."""
+    sel = PromptLengthRouteSelector([
+        (10, route_a),
+        (100, route_b),
+    ])
+    assert sel.select(RequestInfo(prompt_text="raw text")) is route_b
+    assert sel.select(RequestInfo()) is route_b
+
+
+def test_prompt_length_selector_sorts_tiers():
+    """Tiers don't need to be pre-sorted; the constructor sorts
+    ascending so the per-call match is unambiguous."""
+    sel = PromptLengthRouteSelector([
+        (1000, route_b),  # larger first
+        (10, route_a),
+    ])
+    assert sel.select(RequestInfo(prompt_tokens=[0] * 5)) is route_a
+    assert sel.select(RequestInfo(prompt_tokens=[0] * 500)) is route_b
+
+
+def test_prompt_length_selector_boundary_inclusive():
+    """The boundary is inclusive on the tier max — a prompt of
+    exactly the tier max picks that tier, not the next."""
+    sel = PromptLengthRouteSelector([
+        (10, route_a),
+        (100, route_b),
+    ])
+    assert sel.select(RequestInfo(prompt_tokens=[0] * 10)) is route_a
+    assert sel.select(RequestInfo(prompt_tokens=[0] * 11)) is route_b
+
+
+def test_prompt_length_selector_rejects_empty_tiers():
+    """No tiers → no valid route; reject at construction time so the
+    error surfaces near the bad config rather than at request time."""
+    with pytest.raises(ValueError):
+        PromptLengthRouteSelector([])
+
+
+# ---- StickyShardRouteSelector ---------------------------------------------
+
+
+def test_sticky_selector_returns_fixed_route():
+    """Always returns the route it was constructed with, regardless
+    of the request info — useful when a caller wants to override the
+    layout route for an entire job (e.g. an A/B benchmark)."""
+    sel = StickyShardRouteSelector(route_b)
+    assert sel.select(RequestInfo(prompt_tokens=[0])) is route_b
+    assert sel.select(RequestInfo(prompt_tokens=[0] * 100_000)) is route_b
+    assert sel.select(RequestInfo()) is route_b
