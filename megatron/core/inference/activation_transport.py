@@ -425,16 +425,38 @@ def receive_hidden(
     """Receive a hidden-state tensor from ``src_pe`` over the activation
     lane for that pair. Returns a fresh tensor (cloned out of the
     symmetric slot) so the slot can be acked + reused immediately.
+
+    Pipelining: this function does NOT host-sync. The signal wait,
+    the clone, and the ack all run on the activation stream
+    (stream-ordered). The caller's current stream is made to wait
+    for the activation stream's completion via ``wait_stream`` — a
+    GPU-side cross-stream barrier that does NOT block the host.
+    This means the host can continue issuing other work (e.g. the
+    next batch's send / the next layer's compute) while the GPU
+    waits for the inbound activation. Pre-change behavior was a
+    host-side ``s.synchronize()`` which forced the host to wait
+    for the receive to fully complete before doing anything else
+    — measured as the single biggest pipelining blocker on the
+    receiver side (see :doc:`DISAGG_DESIGN.md` Pipelining section).
     """
     lane = lane_for(src_pe, my_pe)
     slot = next_recv_slot(lane)
     s = stream or _activation_stream
     wait_activation(slot, stream=s)
-    s.synchronize()
-    sym = activation_slot(slot)
-    view = sym[:payload_nbytes].view(hidden_dtype).reshape(hidden_shape)
-    out = view.clone()
+    # Clone the slot data on the activation stream so the clone is
+    # ordered after wait_activation. The returned tensor will be
+    # produced on the activation stream; the caller's current
+    # stream waits via the wait_stream barrier below.
+    with torch.cuda.stream(s):
+        sym = activation_slot(slot)
+        view = sym[:payload_nbytes].view(hidden_dtype).reshape(hidden_shape)
+        out = view.clone()
     ack_activation(slot, src_pe=src_pe, stream=s)
+    # Cross-stream sync: caller's current stream must see the
+    # clone before reading ``out``. This is a GPU-side barrier,
+    # not a host block — the host returns immediately and can
+    # issue the next batch's commands.
+    torch.cuda.current_stream().wait_stream(s)
     return out
 
 
