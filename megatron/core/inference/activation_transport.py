@@ -17,27 +17,38 @@ from migration's:
   second. Slot count cannot scale with op count — must be a small ring
   buffer with explicit ``dst → src`` ack-flag recycling.
 
-The pool is laned by ``(src_pe, dst_pe)``: each src→dst PE pair gets its
-own contiguous block of ``pool_depth`` slots. Within a lane, slots cycle
-0 → 1 → ... → pool_depth-1 → 0. The src tracks "next slot to use" per
-lane on its own; the dst tracks "next slot to wait on" per lane;
-because both walk activations in the same model order, the counters
-stay in sync without explicit messaging — same invariant as the
-migration ``StagingArena``.
+Lifecycle: same active-pair model as :mod:`migration_transport`.
+
+1. ``maybe_init_activation_transport()`` — runtime + stream only; no
+   pools allocated.
+2. ``register_activation_pair(src_pe, dst_pe)`` (or the
+   ``register_activation_shard_pair`` / ``register_activation_route``
+   helpers) — reserves a lane for every PE pair that any registered
+   route will use. Bounded by topology, not by ``world_size²``.
+3. ``realize_activation_pools()`` — collective, one-shot; allocates
+   slot + fwd + ack pools sized by the registered active-pair set.
+
+After realize, the per-lane ring works exactly like before: each
+``(src_pe, dst_pe)`` pair owns a contiguous block of ``pool_depth``
+slots; within a lane, slots cycle ``0 → 1 → ... → pool_depth-1 → 0``.
+Both endpoints walk activations in model order so the per-lane
+send/recv counters stay in sync without explicit messaging — same
+invariant as the migration ``StagingArena``.
 
 Recycling: before src reuses slot N (i.e., counter wraps past N), it
 must observe that the dst's prior scatter on slot N has completed. That
 fact is delivered as a ``dst → src`` signal on ``ack_flag[N]``. The src
 signals_wait on the ack before reusing the slot. The dst's
-``send_activation_ack`` raises the ack after its scatter is done.
+``ack_activation`` raises the ack after its scatter is done.
 
 The module is split into:
 
-- ``maybe_init_activation_transport`` — collective init; allocates the
-  pool + flags + activation stream.
-- ``lane_for(src_pe, dst_pe)`` — deterministic lane index.
-- ``next_slot_for(lane)`` — increment the per-lane sender counter,
-  return the absolute slot index in the pool.
+- ``maybe_init_activation_transport`` — collective init for runtime + stream.
+- ``register_activation_pair`` / ``_shard_pair`` / ``_route`` — declare
+  the active-pair set.
+- ``realize_activation_pools`` — collective one-shot pool allocation.
+- ``lane_for(src_pe, dst_pe)`` — dict lookup into the active-pair
+  registry; raises on unregistered pairs.
 - ``put_activation`` / ``wait_activation`` / ``ack_activation`` —
   primitives that compose into a send-receive-ack cycle.
 
@@ -50,7 +61,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -63,18 +74,23 @@ logger = logging.getLogger(__name__)
 # Module-level state. All `_a_*` names belong to activation transport;
 # `_nv` module state is reused but not duplicated here.
 _initialized: bool = False
+_pools_realized: bool = False
 _activation_stream: Optional[torch.cuda.Stream] = None
 
-# Pool layout: ``_a_num_lanes × _a_pool_depth`` total slots. Slot index
-# of (lane, slot_in_lane) is ``lane * pool_depth + slot_in_lane``. Same
-# encoding for fwd_flag / ack_flag pools.
-_a_num_lanes: int = 0
+# Active-pair registry. Mirrors migration_transport: instead of
+# pre-allocating ``world_size²`` lanes, we collect the ``(src_pe, dst_pe)``
+# pairs that any registered route will actually use and allocate only
+# those. ``_active_pairs[i] == (src, dst)`` owns lane ``i``;
+# ``_pair_to_lane_idx`` is the inverse lookup used by :func:`lane_for`.
+_active_pairs: List[Tuple[int, int]] = []
+_pair_to_lane_idx: Dict[Tuple[int, int], int] = {}
+
+# Sizing knobs (set in maybe_init_activation_transport, before realize).
 _a_pool_depth: int = 0
 _a_slot_bytes: int = 0
-_a_max_pes: int = 0
-# Encoding base for ``lane_for(src, dst) = src * stride + dst``.
-# Defaults to ``world_size`` so ``num_lanes = stride²`` lines up.
-_a_lane_stride: int = 0
+
+# Derived after realize: total slot count = ``len(_active_pairs) × _a_pool_depth``.
+_a_num_slots: int = 0
 
 # Symmetric pools (one bytetensor per slot / per flag).
 _a_slots: list = []
@@ -95,15 +111,12 @@ _a_ack_payload: Optional[torch.Tensor] = None
 # Per-lane sender + receiver counters. Both walk in lockstep through
 # the lane's ring; src increments before each put, dst increments after
 # each wait. Same invariant as the migration StagingArena.
-_lane_send_counter: list = []  # len = num_lanes
-_lane_recv_counter: list = []  # len = num_lanes
+_lane_send_counter: list = []  # len = len(_active_pairs)
+_lane_recv_counter: list = []  # len = len(_active_pairs)
 
 
 DEFAULT_POOL_DEPTH = 64
 DEFAULT_SLOT_BYTES = 4 * 1024 * 1024
-# Encoding upper bound on PE id; ``num_lanes`` defaults to
-# ``world_size²`` so the actual allocation tracks the live cluster size.
-DEFAULT_MAX_PES = 64
 
 
 def activation_stream() -> torch.cuda.Stream:
@@ -126,28 +139,27 @@ def is_initialized() -> bool:
 
 def maybe_init_activation_transport(
     *,
-    num_lanes: Optional[int] = None,
     pool_depth: Optional[int] = None,
     slot_bytes: Optional[int] = None,
-    max_pes: Optional[int] = None,
     group: Optional[dist.ProcessGroup] = None,
 ) -> None:
-    """Initialize the activation-transport pools. Idempotent.
+    """Initialize the activation-transport runtime, stream, and sizing
+    knobs. **Does not** allocate the slot or flag pools — those are
+    deferred to :func:`realize_activation_pools` once the active-pair
+    set is known via :func:`register_activation_pair` (or the
+    ``_shard_pair`` / ``_route`` helpers).
 
     Calls :func:`nvshmem_runtime.maybe_init_nvshmem` first so the
-    process-wide PE identity is set up. Then allocates this module's
-    own symmetric pools and stream.
+    shared runtime is up. Collective: every rank must call.
+    Idempotent — subsequent calls are no-ops.
 
-    All sizing knobs are also reachable via env vars
-    (``ACTIVATION_POOL_DEPTH``, ``ACTIVATION_SLOT_BYTES``,
-    ``ACTIVATION_MAX_PES``, ``ACTIVATION_NUM_LANES``); explicit kwargs
-    take precedence.
+    Sizing knobs: ``pool_depth`` and ``slot_bytes`` also reachable via
+    env vars (``ACTIVATION_POOL_DEPTH`` / ``ACTIVATION_SLOT_BYTES``);
+    kwargs take precedence. These are fixed at this call — they cannot
+    change between this call and :func:`realize_activation_pools`.
     """
     global _initialized, _activation_stream
-    global _a_num_lanes, _a_pool_depth, _a_slot_bytes, _a_max_pes, _a_lane_stride
-    global _a_slots, _a_fwd_flags, _a_fwd_flag_bufs
-    global _a_ack_flags, _a_ack_flag_bufs
-    global _lane_send_counter, _lane_recv_counter
+    global _a_pool_depth, _a_slot_bytes
 
     if _initialized:
         return
@@ -156,28 +168,6 @@ def maybe_init_activation_transport(
     # it raises with a clear message if either is missing.
     _nv.maybe_init_nvshmem(group=group)
 
-    _a_max_pes = int(
-        max_pes
-        if max_pes is not None
-        else os.environ.get("ACTIVATION_MAX_PES", DEFAULT_MAX_PES)
-    )
-    # Default num_lanes to ``world_size²`` (actual upper bound on
-    # ordered PE pairs in this run) rather than ``max_pes²`` (a
-    # conservative ceiling). For a 4-PE cluster that's 16 lanes
-    # instead of 4096, saving ~250× symmetric memory. Callers can
-    # still override for sparse-connectivity layouts via the kwarg
-    # or ``ACTIVATION_NUM_LANES``.
-    env_num_lanes = os.environ.get("ACTIVATION_NUM_LANES")
-    if num_lanes is not None:
-        _a_num_lanes = int(num_lanes)
-        _a_lane_stride = _a_max_pes
-    elif env_num_lanes is not None:
-        _a_num_lanes = int(env_num_lanes)
-        _a_lane_stride = _a_max_pes
-    else:
-        world_size = dist.get_world_size(group) if dist.is_initialized() else _a_max_pes
-        _a_num_lanes = world_size * world_size
-        _a_lane_stride = world_size
     _a_pool_depth = int(
         pool_depth
         if pool_depth is not None
@@ -190,61 +180,153 @@ def maybe_init_activation_transport(
     )
 
     _activation_stream = torch.cuda.Stream()
-
-    n_slots = _a_num_lanes * _a_pool_depth
-    _a_slots = _nv.allocate_slot_pool(n_slots, _a_slot_bytes)
-
-    # Two flag pools paired 1-to-1 with slots: fwd (src signals dst that
-    # data has landed) and ack (dst signals src that scatter is done and
-    # slot is free for reuse). ack flags initialize to 1 ("first use is
-    # free") so the first round-trip on each slot doesn't deadlock on a
-    # never-issued ack.
-    _a_fwd_flags, _a_fwd_flag_bufs = _nv.allocate_flag_pool(n_slots)
-    _a_ack_flags, _a_ack_flag_bufs = _nv.allocate_flag_pool(
-        n_slots, initial_value=1
+    _initialized = True
+    logger.info(
+        "[activation-transport] runtime initialized: depth=%d, slot_bytes=%d; "
+        "pools deferred to realize_activation_pools()",
+        _a_pool_depth,
+        _a_slot_bytes,
     )
 
-    _lane_send_counter = [0] * _a_num_lanes
-    _lane_recv_counter = [0] * _a_num_lanes
+
+def register_activation_pair(src_pe: int, dst_pe: int) -> None:
+    """Reserve an activation lane for the ``(src_pe, dst_pe)`` pair.
+
+    Must be called before :func:`realize_activation_pools`. Idempotent —
+    duplicates are no-ops.
+
+    Cross-rank consistency: every rank must register the same set of
+    pairs in the same order so each rank assigns the same lane index
+    per pair. In practice, callers compute pairs as a deterministic
+    function of registered routes (which are themselves collective), so
+    this is automatic.
+    """
+    if _pools_realized:
+        raise RuntimeError(
+            f"activation pools already realized; cannot register new pair "
+            f"({src_pe}, {dst_pe}). Register all routes before "
+            f"realize_activation_pools()."
+        )
+    pair = (src_pe, dst_pe)
+    if pair in _pair_to_lane_idx:
+        return
+    _pair_to_lane_idx[pair] = len(_active_pairs)
+    _active_pairs.append(pair)
+
+
+def register_activation_shard_pair(
+    src_pes: Iterable[int], dst_pes: Iterable[int]
+) -> None:
+    """Register every ``(s, d)`` in ``src_pes × dst_pes`` — convenience
+    for hop transitions where any rank in the src shard might send to
+    any rank in the dst shard. Over-registers slightly compared to the
+    actual TP-coupling pattern, but the cost is symmetric-memory only
+    (lanes with no traffic just go unused) and the implementation is
+    layout-agnostic."""
+    for s in src_pes:
+        for d in dst_pes:
+            register_activation_pair(s, d)
+
+
+def register_activation_route(route, shards) -> None:
+    """Walk every hop transition in ``route`` and register
+    ``(src_pes, dst_pes)`` for each, using ``shards`` to resolve which
+    PEs belong to each shard. ``shards`` is a sequence of objects with
+    a ``ranks()`` method (matching :class:`InferenceShard`).
+
+    Includes both linear-chain successors (``hop_pos + 1``) and DAG
+    fan-out / fan-in edges via the route's ``successors`` /
+    ``predecessors`` methods.
+    """
+    for hop_pos, hop in enumerate(route.hops):
+        src_shard = shards[hop.shard_idx]
+        for succ_pos in route.successors(hop_pos):
+            dst_shard = shards[route.hops[succ_pos].shard_idx]
+            register_activation_shard_pair(src_shard.ranks(), dst_shard.ranks())
+
+
+def realize_activation_pools() -> None:
+    """Allocate slot + fwd-flag + ack-flag pools for all registered
+    pairs. Collective: every rank must call. Idempotent — second call
+    is a no-op. After this returns, :func:`register_activation_pair`
+    rejects new pairs (NVSHMEM symmetric allocation is one-shot per
+    pool — the size is fixed at realize time).
+
+    Pool size is ``pool_depth × len(active_pairs)`` slots, plus the
+    matching fwd + ack flag pools. Empty (no registered pairs) is
+    allowed and is a no-op apart from the ack payload.
+    """
+    global _a_slots, _a_fwd_flags, _a_fwd_flag_bufs
+    global _a_ack_flags, _a_ack_flag_bufs, _a_ack_payload
+    global _a_num_slots, _pools_realized
+    global _lane_send_counter, _lane_recv_counter
+
+    assert _initialized, (
+        "activation_transport not initialized; call "
+        "maybe_init_activation_transport() first"
+    )
+    if _pools_realized:
+        return
+
+    n_lanes = len(_active_pairs)
+    _a_num_slots = n_lanes * _a_pool_depth
+
+    if _a_num_slots > 0:
+        _a_slots = _nv.allocate_slot_pool(_a_num_slots, _a_slot_bytes)
+        # Two flag pools paired 1-to-1 with slots: fwd (src signals dst
+        # that data has landed) and ack (dst signals src that scatter is
+        # done and slot is free for reuse). ack flags initialize to 1
+        # ("first use is free") so the first round-trip on each slot
+        # doesn't deadlock on a never-issued ack.
+        _a_fwd_flags, _a_fwd_flag_bufs = _nv.allocate_flag_pool(_a_num_slots)
+        _a_ack_flags, _a_ack_flag_bufs = _nv.allocate_flag_pool(
+            _a_num_slots, initial_value=1
+        )
+
+    _lane_send_counter = [0] * n_lanes
+    _lane_recv_counter = [0] * n_lanes
 
     # Dedicated 1-byte payload for ack puts — see the comment on
     # _a_ack_payload at module top for why this can't be a slice of a
     # real slot.
-    global _a_ack_payload
     _a_ack_payload = _nv.allocate_slot_pool(1, 1)[0]
     _a_ack_payload.zero_()
 
     _nv.barrier_all_and_sync()
-    _initialized = True
+    _pools_realized = True
     logger.info(
-        "[activation-transport] initialized: lanes=%d, depth=%d, "
+        "[activation-transport] pools realized: active_pairs=%d, depth=%d, "
         "slot_bytes=%d, total_symm_per_pe=%d MB",
-        _a_num_lanes,
+        n_lanes,
         _a_pool_depth,
         _a_slot_bytes,
-        (_a_num_lanes * _a_pool_depth * _a_slot_bytes) // (1024 * 1024),
+        (_a_num_slots * _a_slot_bytes) // (1024 * 1024),
     )
 
 
 def lane_for(src_pe: int, dst_pe: int) -> int:
-    """Deterministic lane index from a ``(src_pe, dst_pe)`` pair.
+    """Lane index for the ``(src_pe, dst_pe)`` pair.
 
-    Both endpoints compute the same lane id so they coordinate without
-    explicit messaging. Returned lane id is in ``[0, num_lanes)``.
+    Returns the pair's index in the active-pair registry. Different
+    pairs land in disjoint slot ranges so the ack handshake on flag
+    ``F`` is unambiguous — only this pair's prior use of slot ``F`` can
+    have raised the ack.
+
+    Raises if the pair wasn't registered before
+    :func:`realize_activation_pools` — usually that means a route is
+    trying to send/receive on a hop transition that wasn't included in
+    any registered route's hop set.
     """
     assert _initialized
-    assert 0 <= src_pe < _a_lane_stride, (
-        f"src_pe={src_pe} out of range; raise ACTIVATION_MAX_PES."
-    )
-    assert 0 <= dst_pe < _a_lane_stride, (
-        f"dst_pe={dst_pe} out of range; raise ACTIVATION_MAX_PES."
-    )
-    lane = src_pe * _a_lane_stride + dst_pe
-    assert lane < _a_num_lanes, (
-        f"lane id {lane} from (src={src_pe}, dst={dst_pe}) exceeds "
-        f"num_lanes={_a_num_lanes}; raise ACTIVATION_NUM_LANES."
-    )
-    return lane
+    pair = (src_pe, dst_pe)
+    idx = _pair_to_lane_idx.get(pair)
+    if idx is None:
+        raise RuntimeError(
+            f"activation pair ({src_pe}, {dst_pe}) not registered. "
+            f"Every (src_pe, dst_pe) used by a route must be passed to "
+            f"register_activation_pair() before realize_activation_pools()."
+        )
+    return idx
 
 
 def _slot_index(lane: int, lane_offset: int) -> int:
@@ -472,14 +554,14 @@ def pool_stats() -> dict:
     """Diagnostic snapshot. Used by tests + the bench validation path."""
     assert _initialized
     return {
-        "num_lanes": _a_num_lanes,
+        "active_pairs": len(_active_pairs),
         "pool_depth": _a_pool_depth,
         "slot_bytes": _a_slot_bytes,
-        "max_pes": _a_max_pes,
-        "total_slots": len(_a_slots),
-        "symm_per_pe_bytes": _a_num_lanes * _a_pool_depth * _a_slot_bytes,
+        "total_slots": _a_num_slots,
+        "symm_per_pe_bytes": _a_num_slots * _a_slot_bytes,
         "send_counters": list(_lane_send_counter),
         "recv_counters": list(_lane_recv_counter),
+        "pools_realized": _pools_realized,
     }
 
 
@@ -488,46 +570,70 @@ def pool_stats() -> dict:
 
 def _init_state_for_test(
     *,
-    num_lanes: int,
+    n_pes: int,
     pool_depth: int,
     slot_bytes: int = 1024,
-    max_pes: int = 8,
+    register_all_pairs: bool = True,
+    realize: bool = True,
 ) -> None:
-    """Set up the Python-side bookkeeping (counters, sizing) without
-    allocating any NVSHMEM buffers or starting the CUDA stream. Used
-    by unit tests that exercise lane encoding / counter advancement
-    without needing a real GPU + multi-rank world.
+    """Set up the Python-side bookkeeping (active-pair registry, counters,
+    sizing) without allocating any NVSHMEM buffers or starting the CUDA
+    stream. Used by unit tests that exercise lane encoding / counter
+    advancement without needing a real GPU + multi-rank world.
 
-    Calling :func:`maybe_init_activation_transport` after this raises;
-    explicitly :func:`_reset_state_for_test` first to switch modes.
+    By default, registers every ``(src, dst)`` pair in ``range(n_pes)``
+    and marks the pool realized — existing tests can call ``lane_for``
+    and the counter helpers without further setup. Pass
+    ``register_all_pairs=False`` and/or ``realize=False`` to exercise
+    the registration / realize lifecycle directly.
     """
-    global _initialized, _a_num_lanes, _a_pool_depth, _a_slot_bytes, _a_max_pes, _a_lane_stride
+    global _initialized, _pools_realized, _a_pool_depth, _a_slot_bytes
+    global _a_num_slots
     global _lane_send_counter, _lane_recv_counter
     if _initialized:
         raise RuntimeError(
             "activation_transport already initialized; call "
             "_reset_state_for_test() first."
         )
-    _a_num_lanes = num_lanes
+    _nv._init_state_for_test(n_pes=n_pes)
     _a_pool_depth = pool_depth
     _a_slot_bytes = slot_bytes
-    _a_max_pes = max_pes
-    _a_lane_stride = max_pes
-    _lane_send_counter = [0] * num_lanes
-    _lane_recv_counter = [0] * num_lanes
     _initialized = True
+    if register_all_pairs:
+        for s in range(n_pes):
+            for d in range(n_pes):
+                register_activation_pair(s, d)
+    n_lanes = len(_active_pairs)
+    _a_num_slots = n_lanes * _a_pool_depth
+    _lane_send_counter = [0] * n_lanes
+    _lane_recv_counter = [0] * n_lanes
+    if realize:
+        _pools_realized = True
 
 
 def _reset_state_for_test() -> None:
     """Tear down test-only state. NOT safe to call after a real
     NVSHMEM init — would leak the symmetric allocations."""
-    global _initialized, _a_num_lanes, _a_pool_depth, _a_slot_bytes, _a_max_pes, _a_lane_stride
+    global _initialized, _pools_realized
+    global _active_pairs, _pair_to_lane_idx
+    global _a_pool_depth, _a_slot_bytes, _a_num_slots
     global _lane_send_counter, _lane_recv_counter
+    global _a_slots, _a_fwd_flags, _a_fwd_flag_bufs, _a_ack_flags, _a_ack_flag_bufs
+    global _a_ack_payload, _activation_stream
     _initialized = False
-    _a_num_lanes = 0
+    _pools_realized = False
+    _active_pairs = []
+    _pair_to_lane_idx = {}
     _a_pool_depth = 0
     _a_slot_bytes = 0
-    _a_max_pes = 0
-    _a_lane_stride = 0
+    _a_num_slots = 0
     _lane_send_counter = []
     _lane_recv_counter = []
+    _a_slots = []
+    _a_fwd_flags = []
+    _a_fwd_flag_bufs = []
+    _a_ack_flags = []
+    _a_ack_flag_bufs = []
+    _a_ack_payload = None
+    _activation_stream = None
+    _nv._reset_state_for_test()

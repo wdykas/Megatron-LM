@@ -760,6 +760,18 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
 
             _mig.maybe_init_migration_transport()
 
+        # Activation transport: runtime + stream init on every rank.
+        # The flag/ack/slot pools are deferred to
+        # ``realize_activation_pools`` once the layout route is
+        # broadcast and each rank registers its active (src_pe, dst_pe)
+        # pairs. Same active-pair lifecycle as migration_transport;
+        # bounds memory by topology instead of ``world_size²``.
+        # Collective: every rank participates.
+        if any(s.kinds is not None for s in shards):
+            from megatron.core.inference import activation_transport as _at
+
+            _at.maybe_init_activation_transport()
+
         # Build the engine first so rank 0 can seed the coord from its
         # InferenceContext (tokenizer, block size, prefix-caching config).
         my_engine: Optional[DynamicInferenceEngine] = None
@@ -891,7 +903,48 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
 
         instance._register_rollout_policies(args)
         await instance._maybe_publish_disagg_route()
+        await instance._register_activation_pairs_and_realize()
         return instance
+
+    async def _register_activation_pairs_and_realize(self) -> None:
+        """Broadcast the layout route to every rank, register the
+        ``(src_pe, dst_pe)`` pairs the route uses with activation
+        transport, and realize the activation pools collectively.
+
+        Mirrors migration_transport's pair-registration lifecycle: the
+        activation pool is sized by the actual set of communicating
+        pairs (bounded by route topology), not by ``world_size²``.
+
+        Collective: every rank (including non-participants) must reach
+        this — ``realize_activation_pools`` is a world-collective
+        NVSHMEM allocation.
+        """
+        shards = self._shards
+        if not any(s.kinds is not None for s in shards):
+            return  # no disagg layout, activation transport unused
+
+        from megatron.core.inference import activation_transport as _at
+        from megatron.rl.inference.route_planner import plan_route
+
+        # Rank 0 (the one with the engine able to read layer_type_list)
+        # computes the layout route; every other rank receives it via
+        # broadcast so they can register the same pair set.
+        rank = dist.get_rank()
+        holder: List[object] = [None]
+        if rank == 0 and self._my_engine is not None:
+            layer_type_list = tuple(self._my_engine.context.layer_type_list)
+            if not layer_type_list:
+                disagg_shards = [s for s in shards if s.kinds is not None]
+                layer_type_list = ("*",) * int(
+                    self._my_engine.context.num_attention_layers
+                    * int(disagg_shards[0].spec.get("pp", 1))
+                )
+            holder[0] = plan_route(shards, layer_type_list=layer_type_list)
+        dist.broadcast_object_list(holder, src=0)
+        route = holder[0]
+        if route is not None:
+            _at.register_activation_route(route, shards)
+        _at.realize_activation_pools()
 
     async def _maybe_publish_disagg_route(self) -> None:
         """If the layout has layer-kind disagg shards, compute the

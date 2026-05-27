@@ -55,17 +55,15 @@ class ActivationTransportBackend(abc.ABC):
     def init(
         self,
         *,
-        num_lanes: Optional[int] = None,
         pool_depth: Optional[int] = None,
         slot_bytes: Optional[int] = None,
-        max_pes: Optional[int] = None,
         group: Optional[object] = None,
     ) -> None:
         """One-shot collective init. Idempotent on subsequent calls.
 
-        The kwargs are NVSHMEM-shaped (lane count, slot pool depth,
-        slot size in bytes); other backends should accept and either
-        honor or ignore them. The ``group`` is an
+        ``pool_depth`` and ``slot_bytes`` set per-pair ring depth and
+        per-slot byte capacity; backends without those concepts should
+        accept and ignore them. ``group`` is a
         ``torch.distributed.ProcessGroup`` for backends that need to
         scope the collective.
         """
@@ -124,18 +122,14 @@ class NvshmemActivationTransportBackend(ActivationTransportBackend):
     def init(
         self,
         *,
-        num_lanes: Optional[int] = None,
         pool_depth: Optional[int] = None,
         slot_bytes: Optional[int] = None,
-        max_pes: Optional[int] = None,
         group: Optional[object] = None,
     ) -> None:
         from megatron.core.inference import activation_transport as _at
         _at.maybe_init_activation_transport(
-            num_lanes=num_lanes,
             pool_depth=pool_depth,
             slot_bytes=slot_bytes,
-            max_pes=max_pes,
             group=group,
         )
 

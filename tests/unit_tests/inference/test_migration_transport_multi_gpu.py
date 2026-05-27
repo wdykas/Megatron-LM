@@ -27,9 +27,14 @@ from megatron.core.inference import migration_transport as mt
 from megatron.core.inference import nvshmem_runtime as _rt
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def _dist_world():
-    """Initialize torch.distributed exactly once for the module.
+    """Initialize torch.distributed exactly once per pytest session.
+
+    Session-scoped so the process group persists across this and any
+    other transport test files in the same run — destroying it
+    mid-session would also invalidate NVSHMEM and deadlock the next
+    test file's NVSHMEM-collective allocations.
 
     Run under torchrun / torch.distributed.run; if the env vars aren't
     set we skip (the test is multi-rank by construction)."""
@@ -42,8 +47,8 @@ def _dist_world():
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl")
     yield rank
-    if dist.is_initialized():
-        dist.destroy_process_group()
+    # No destroy: let the process exit clean up. See the activation
+    # transport multi-GPU test's matching comment.
 
 
 @pytest.fixture(scope="module")

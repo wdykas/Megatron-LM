@@ -19,7 +19,7 @@ def _activation_transport_test_state():
     """Each test gets a freshly-initialized in-memory state. Reset on teardown
     so tests don't leak counters into one another."""
     at._reset_state_for_test()
-    at._init_state_for_test(num_lanes=16, pool_depth=4, max_pes=4)
+    at._init_state_for_test(n_pes=4, pool_depth=4)
     yield
     at._reset_state_for_test()
 
@@ -48,12 +48,13 @@ def test_lane_encoding_directional():
     assert at.lane_for(0, 1) != at.lane_for(1, 0)
 
 
-def test_lane_for_rejects_out_of_range_pe():
-    """PE ids beyond max_pes are rejected at the API boundary, not
-    silently aliased to a different lane."""
-    with pytest.raises(AssertionError, match="src_pe="):
+def test_lane_for_rejects_unregistered_pair():
+    """``lane_for`` of a pair that wasn't registered raises. In
+    production this typically means a route is using a PE pair whose
+    layout route didn't pre-register it."""
+    with pytest.raises(RuntimeError, match="not registered"):
         at.lane_for(99, 0)
-    with pytest.raises(AssertionError, match="dst_pe="):
+    with pytest.raises(RuntimeError, match="not registered"):
         at.lane_for(0, 99)
 
 
@@ -132,9 +133,8 @@ def test_pool_stats_snapshot():
     at.next_send_slot(lane)
     at.next_send_slot(lane)
     stats = at.pool_stats()
-    assert stats["num_lanes"] == 16
+    assert stats["active_pairs"] == 16
     assert stats["pool_depth"] == 4
-    assert stats["total_slots"] == 0  # _init_state_for_test doesn't allocate
     assert stats["send_counters"][lane] == 2
     assert stats["recv_counters"][lane] == 0
 
@@ -145,4 +145,62 @@ def test_is_initialized_flag():
     at._reset_state_for_test()
     assert at.is_initialized() is False
     # Re-init for the autouse fixture teardown.
-    at._init_state_for_test(num_lanes=16, pool_depth=4, max_pes=4)
+    at._init_state_for_test(n_pes=4, pool_depth=4)
+
+
+# ---- Active-pair registration -------------------------------------------
+
+
+def test_register_activation_pair_idempotent():
+    """Registering the same pair twice leaves the registry unchanged —
+    important because a route helper may register a pair for multiple
+    hops that share endpoints."""
+    at._reset_state_for_test()
+    at._init_state_for_test(n_pes=4, pool_depth=4, register_all_pairs=False, realize=False)
+    at.register_activation_pair(0, 1)
+    n = len(at._active_pairs)
+    at.register_activation_pair(0, 1)
+    assert len(at._active_pairs) == n
+
+
+def test_register_activation_pair_rejects_after_realize():
+    """Pool size is fixed at realize time — late registrations would
+    have nowhere to go and we raise instead of silently misbehaving."""
+    at._reset_state_for_test()
+    at._init_state_for_test(n_pes=4, pool_depth=4, register_all_pairs=False, realize=False)
+    at.register_activation_pair(0, 1)
+    at._pools_realized = True
+    with pytest.raises(RuntimeError, match="already realized"):
+        at.register_activation_pair(0, 2)
+
+
+def test_pool_sizing_scales_with_active_pairs():
+    """Active-pair count bounds pool size, not ``n_pes²``. The whole
+    point of explicit registration is bounding the pool by actual
+    route topology."""
+    at._reset_state_for_test()
+    at._init_state_for_test(n_pes=8, pool_depth=4, register_all_pairs=False, realize=False)
+    # Only register 3 of the 64 possible pairs.
+    at.register_activation_pair(0, 4)
+    at.register_activation_pair(0, 5)
+    at.register_activation_pair(1, 4)
+    assert len(at._active_pairs) == 3
+    # Lane indices for the registered pairs are 0..2; lane_for of an
+    # unregistered pair raises.
+    assert at.lane_for(0, 4) == 0
+    assert at.lane_for(0, 5) == 1
+    assert at.lane_for(1, 4) == 2
+    with pytest.raises(RuntimeError, match="not registered"):
+        at.lane_for(2, 6)
+
+
+def test_register_activation_shard_pair_takes_cross_product():
+    """The convenience helper registers every ``(s, d)`` in
+    ``src_pes × dst_pes`` for a hop transition where any rank in the
+    src shard might send to any rank in the dst shard."""
+    at._reset_state_for_test()
+    at._init_state_for_test(n_pes=8, pool_depth=4, register_all_pairs=False, realize=False)
+    at.register_activation_shard_pair(src_pes=[0, 1, 2, 3], dst_pes=[4, 5, 6, 7])
+    assert len(at._active_pairs) == 16
+    lanes = {at.lane_for(s, d) for s in [0, 1, 2, 3] for d in [4, 5, 6, 7]}
+    assert len(lanes) == 16
