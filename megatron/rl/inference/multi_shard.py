@@ -543,25 +543,48 @@ def _make_migration_poll_callback(
     is_hybrid: bool,
     src_block_ids_to_free: List[torch.Tensor],
     src_mamba_state_indices: List[Optional[int]],
+    injected: List[Tuple["RequestMigrationBundle", torch.Tensor]],
+    dst_mamba_state_indices: List[Optional[int]],
     engine,
 ) -> Callable[[], bool]:
     """Build the poll callback the engine ticks each loop iteration.
 
-    Returns ``True`` once the migration's ``done_event`` has fired —
-    at which point src-side KV blocks / mamba slots are returned to
-    the allocators. Flag clearing is no longer the poll's job: fwd
-    flags are cleared stream-ordered inside :func:`wait_slot_signal`,
-    and ack flags inside :func:`put_slot_with_signal`, so by the time
-    ``done_event`` fires both pools are already in their post-round
-    resting state for the next migration.
+    Returns ``True`` once the migration's ``done_event`` has fired,
+    at which point:
+
+    - **Src**: kept KV blocks and Mamba state slots go back to the
+      allocators.
+    - **Dst**: ``default_stream.wait_event(done_event)`` syncs the
+      engine compute stream to the migration stream's writes, then
+      :meth:`complete_migration` installs each migrated request into
+      the active batch. The next call to ``step_modern`` includes it.
+
+    Until the event fires, the migrating request is *in transit* — off
+    src's active list (detached at handler entry) and not yet on dst's
+    (reservation made but slot not installed). Non-migrating requests
+    on both sides continue forward-passing unaffected.
     """
 
     def _poll() -> bool:
         if not done_event.query():
             return False
+        # Src: release blocks + mamba state slots.
         _release_src_state(
             meta, is_hybrid, src_block_ids_to_free, src_mamba_state_indices, engine
         )
+        # Dst: sync the default stream to the migration stream's
+        # writes, then activate each reserved request. The wait_event
+        # here is the cross-stream memory-ordering barrier that makes
+        # the scattered KV visible to subsequent forward passes on the
+        # default stream.
+        if meta.in_dst and injected:
+            torch.cuda.default_stream().wait_event(done_event)
+            for (bundle, block_ids), mamba_state_idx in zip(
+                injected, dst_mamba_state_indices
+            ):
+                engine.complete_migration(
+                    bundle, block_ids, mamba_state_idx=mamba_state_idx
+                )
         return True
 
     return _poll
@@ -1582,15 +1605,27 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         dst_dp_rank: int = 0,
     ) -> None:
         """Engine-side handler for ``Headers.MIGRATE_BATCH`` —
-        **non-blocking** on both src and dst.
+        **non-blocking** on both src and dst, including for requests
+        that aren't part of this migration.
 
-        - **Src:** gather KV slices into staging slots and issue
-          ``put_signal`` on the migration stream; push a poll that
-          frees src blocks once the migration event fires.
-        - **Dst:** ``inject_request`` to allocate dst KV blocks +
-          register the request, then ``signal_wait`` + scatter on the
-          migration stream and ``wait_stream`` the engine's compute
-          stream onto it.
+        - **Src:** detach the migrating requests so the engine stops
+          forwarding on them, gather KV slices into staging slots, and
+          issue ``put_signal`` on the migration stream. A poll callback
+          releases the src KV blocks once the migration event fires.
+        - **Dst:** reserve dst KV blocks (and a Mamba state slot on
+          hybrid models) without installing the request in the active
+          batch, then ``signal_wait`` + scatter on the migration
+          stream. A poll callback waits on the migration done event,
+          syncs the engine compute stream to it via ``wait_event``,
+          and calls ``complete_migration`` — at which point the request
+          joins the active batch.
+
+        Crucially, no ``wait_stream`` on the engine compute stream:
+        the migrating request is *in transit* (off src's active list,
+        not yet on dst's), and the staging-pool memory is on the
+        migration stream — neither overlaps with the engine compute
+        stream's accesses to non-migrating requests' KV. So those
+        requests keep generating at full speed throughout the migration.
 
         No ``barrier_all``, no cross-shard broadcast, no engine pause.
         Exceptions propagate to the engine's run-loop catch.
@@ -1668,7 +1703,7 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         # before the first append.
         src_block_ids_to_free: List[torch.Tensor] = []
         src_mamba_state_indices: List[Optional[int]] = []
-        injected: List[Tuple[RequestMigrationBundle, List[int]]] = []
+        injected: List[Tuple[RequestMigrationBundle, torch.Tensor]] = []
         dst_mamba_state_indices: List[Optional[int]] = []
 
         # Detach src synchronously so async_step can't emit a stale
@@ -1701,17 +1736,18 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                     else:
                         src_mamba_state_indices.append(None)
 
-            # Dst injects each bundle (allocates dst blocks + a fresh
-            # mamba state slot on hybrid models) and accumulates the
-            # (bundle, dst_blocks) pairs.
+            # Dst reserves dst KV blocks + a fresh mamba state slot
+            # (on hybrid models) for each bundle, but does NOT install
+            # the request in the active batch yet. The two-phase
+            # activation keeps the engine forwarding on other requests
+            # while migration is in flight: the request only becomes
+            # part of the active batch after the migration's done event
+            # fires (in the poll callback below).
             if meta.in_dst:
                 for bundle in parsed_bundles:
-                    dst_blocks = engine.inject_request(bundle).tolist()
-                    injected.append((bundle, dst_blocks))
-                    dst_mamba_state_indices.append(
-                        engine.get_mamba_state_idx_for(bundle.request_id)
-                        if is_hybrid else None
-                    )
+                    rsv = engine.prepare_migration_reservation(bundle)
+                    injected.append((bundle, rsv["block_ids"]))
+                    dst_mamba_state_indices.append(rsv["mamba_state_idx"])
 
             # Build per-bundle KV migration plans. Both src and dst walk
             # the bundles in identical order so slot/flag assignment
@@ -1719,7 +1755,7 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             # left to the plan helper to fill.
             all_ops_by_bundle: List[List] = []
             for i, bundle in enumerate(parsed_bundles):
-                dst_blocks = injected[i][1] if meta.in_dst else None
+                dst_blocks = injected[i][1].tolist() if meta.in_dst else None
                 ops = build_kv_migration_plan(
                     bundle,
                     src_global_rank_of=_src_rank_of,
@@ -1787,16 +1823,14 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                 done_event = torch.cuda.Event()
                 done_event.record(stream)
 
-            # Engine compute stream waits for the migration stream — any
-            # forward pass touching the migrated KV blocks (on either
-            # side) implicitly waits without us having to pause the
-            # engine here.
-            torch.cuda.default_stream().wait_stream(stream)
-
-            # Once the migration event fires, return src-kept blocks +
-            # mamba state slots to the allocators. Flag clearing is
-            # stream-ordered inside wait_slot_signal / put_slot_with_signal,
-            # so we don't need to touch flag state from the poll.
+            # No cross-stream barrier: src's other requests aren't
+            # touching the migrating KV blocks (the request was detached
+            # at the top of the handler), and dst's other requests don't
+            # touch them either (the migrated request isn't in dst's
+            # active batch yet — it gets installed in the poll callback
+            # below, after wait_event syncs the default stream to the
+            # migration stream's writes). Non-migrating requests on both
+            # sides keep generating at full speed.
             engine.push_pending_migration(
                 _make_migration_poll_callback(
                     done_event,
@@ -1804,6 +1838,8 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                     is_hybrid,
                     src_block_ids_to_free,
                     src_mamba_state_indices,
+                    injected,
+                    dst_mamba_state_indices,
                     engine,
                 )
             )
@@ -1813,8 +1849,10 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             # block-release path before propagating — otherwise an
             # interrupt during the gather/put leaks GPU blocks. Roll
             # back any partial state: src kept-blocks/slots back to
-            # allocators, dst-injected requests detached with
-            # ``keep_blocks=False`` so their dst blocks are reclaimed.
+            # allocators, dst reservations released (blocks were
+            # reserved but the requests were never installed in the
+            # active batch, so a plain reservation release is enough —
+            # no detach needed).
             _release_src_state(
                 meta,
                 is_hybrid,
@@ -1822,9 +1860,12 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
                 src_mamba_state_indices,
                 engine,
             )
-            for bundle, _ in injected:
-                if bundle.request_id in engine.requests:
-                    engine.detach_request(bundle.request_id, keep_blocks=False)
+            for (_, block_ids), mamba_state_idx in zip(
+                injected, dst_mamba_state_indices
+            ):
+                engine.release_migration_reservation(
+                    block_ids, mamba_state_idx
+                )
             raise
 
     async def _pause_scheduler(self) -> None:

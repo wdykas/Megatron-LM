@@ -1496,47 +1496,98 @@ class DynamicInferenceEngine(AbstractEngine):
         ctx.mamba_metadata.free_slots(torch.tensor([sentinel], device=device))
 
     @experimental_api
-    def inject_request(
+    def prepare_migration_reservation(
         self, bundle: "RequestMigrationBundle"
-    ) -> Tensor:
-        """Insert a request directly into the active batch in DECODE state.
+    ) -> dict:
+        """Reserve KV blocks (and a Mamba state slot for hybrid models)
+        for an incoming migrated request, without installing the request
+        in the active batch.
 
-        Allocates ``bundle.num_kv_blocks`` fresh blocks from the KV
-        allocator, sets up a slot as if the request had already finished
-        prefill and accumulated ``len(prompt_tokens) + len(generated_tokens)``
-        tokens of KV cache (populated by the caller), and registers the
-        request in :attr:`requests`. Returns the new block ids so the
-        caller can write received KV tensors into them.
-
-        Contract for the caller:
-            1. Call :meth:`inject_request` to acquire block ids.
-            2. Write KV data into
-               ``engine.context.memory_buffer[..., block_id, ...]`` for
-               each returned block id (via the migration transport).
-            3. The next call to :meth:`step_modern` will resume generation.
-
-        Must be called between engine steps. Hybrid / Mamba models also
-        allocate a fresh per-request Mamba state slot as part of the
-        injection; the caller fills it via the migration transport.
-
-        Args:
-            bundle: Migration envelope produced by
-                :meth:`snapshot_request` on the source engine (optionally
-                transported through the coordinator wire format).
+        Used by the migration transport's two-phase activation: the
+        scatter target needs concrete block ids to write into, but the
+        engine should not start forwarding on the request until the
+        scatter completes (otherwise compute reads garbage KV).
+        :meth:`complete_migration` installs the slot once scatter is
+        done; :meth:`release_migration_reservation` rolls back on
+        failure.
 
         Returns:
-            1-D tensor of block ids the caller must fill.
+            ``{"block_ids": Tensor, "mamba_state_idx": Optional[int]}``.
+            ``mamba_state_idx`` is ``None`` on pure-attention models.
         """
         from megatron.core.inference.engines.request_migration import RequestMigrationBundle
 
         assert isinstance(bundle, RequestMigrationBundle)
         assert bundle.request_id not in self.requests, (
             f"request {bundle.request_id} already tracked by this engine; "
-            "inject_request does not support re-injection"
+            "prepare_migration_reservation does not support re-injection"
         )
         ctx = self.context
         assert ctx.total_request_count < ctx.max_requests, (
-            f"cannot inject: request slot table is full "
+            f"cannot reserve: request slot table is full "
+            f"({ctx.total_request_count}/{ctx.max_requests})"
+        )
+
+        block_ids = ctx.kv_block_allocator.allocate_memory_blocks(bundle.num_kv_blocks)
+        if block_ids is None:
+            raise BlockOverflowError(bundle.request_id)
+        assert block_ids.numel() == bundle.num_kv_blocks
+
+        mamba_state_idx: Optional[int] = None
+        if ctx.is_hybrid_model:
+            mamba_state_idx = ctx.mamba_metadata.allocate_slot()
+            if mamba_state_idx is None:
+                ctx.kv_block_allocator.release_memory_blocks(block_ids)
+                raise BlockOverflowError(bundle.request_id)
+
+        return {"block_ids": block_ids, "mamba_state_idx": mamba_state_idx}
+
+    @experimental_api
+    def release_migration_reservation(
+        self,
+        block_ids: Tensor,
+        mamba_state_idx: Optional[int] = None,
+    ) -> None:
+        """Roll back a reservation made by
+        :meth:`prepare_migration_reservation` when the migration fails
+        before the request is activated. No-op for the slot table since
+        the slot was never installed.
+        """
+        ctx = self.context
+        ctx.kv_block_allocator.release_memory_blocks(block_ids)
+        if mamba_state_idx is not None:
+            self.release_mamba_state_slot(mamba_state_idx)
+
+    @experimental_api
+    def complete_migration(
+        self,
+        bundle: "RequestMigrationBundle",
+        block_ids: Tensor,
+        mamba_state_idx: Optional[int] = None,
+    ) -> None:
+        """Install a previously-reserved migrated request into the
+        active batch. The migration transport must have completed
+        scattering KV (and Mamba state on hybrid models) into the
+        reserved blocks before this is called — typically from a poll
+        callback that fires when the migration's done event fires.
+
+        After this returns, the next call to :meth:`step_modern` will
+        include this request in the forward batch.
+        """
+        from megatron.core.inference.engines.request_migration import RequestMigrationBundle
+
+        assert isinstance(bundle, RequestMigrationBundle)
+        assert bundle.request_id not in self.requests, (
+            f"request {bundle.request_id} already tracked by this engine; "
+            "complete_migration does not support re-injection"
+        )
+        ctx = self.context
+        is_hybrid = ctx.is_hybrid_model
+        assert (mamba_state_idx is None) == (not is_hybrid), (
+            "mamba_state_idx must be set iff the model is hybrid"
+        )
+        assert ctx.total_request_count < ctx.max_requests, (
+            f"cannot complete migration: request slot table is full "
             f"({ctx.total_request_count}/{ctx.max_requests})"
         )
 
@@ -1583,13 +1634,6 @@ class DynamicInferenceEngine(AbstractEngine):
             ).reshape(bundle.routing_indices_shape)
         request.status = Status.ACTIVE_AND_GENERATING_TOKENS
 
-        # Allocate KV blocks before touching context state so an
-        # allocator failure leaves the engine untouched.
-        block_ids = ctx.kv_block_allocator.allocate_memory_blocks(bundle.num_kv_blocks)
-        if block_ids is None:
-            raise BlockOverflowError(bundle.request_id)
-        assert block_ids.numel() == bundle.num_kv_blocks
-
         # Register with the engine.
         self.requests[bundle.request_id] = RequestEntry(
             record=DynamicInferenceRequestRecord.from_request(request),
@@ -1629,8 +1673,9 @@ class DynamicInferenceEngine(AbstractEngine):
         # ``total_len - 1`` tokens; adding query_lengths (=1) gives the
         # post-step sequence length ``total_len``.
         assert gen_len >= 1, (
-            "inject_request only supports requests past the prefill boundary "
-            "(need at least one generated token to derive the pending query)"
+            "complete_migration only supports requests past the prefill "
+            "boundary (need at least one generated token to derive the "
+            "pending query)"
         )
         ctx.request_kv_length_offsets[slot_idx] = total_len - 1
         ctx.request_kv_block_counts[slot_idx] = bundle.num_kv_blocks
@@ -1641,24 +1686,41 @@ class DynamicInferenceEngine(AbstractEngine):
         ctx.request_to_kv_block_ids[slot_idx, :] = -1
         ctx.request_to_kv_block_ids[slot_idx, : bundle.num_kv_blocks] = block_ids
 
-        # Hybrid / Mamba models: allocate a fresh slot in the per-request
-        # Mamba state table and record its index. The caller will write
-        # the received ``mamba_conv_states`` / ``mamba_ssm_states`` at
-        # this index through the migration transport. If allocation
-        # fails, roll back the KV blocks we already allocated so the
-        # engine state is untouched.
-        if ctx.is_hybrid_model:
-            mamba_state_idx = ctx.mamba_metadata.allocate_slot()
-            if mamba_state_idx is None:
-                ctx.kv_block_allocator.release_memory_blocks(block_ids)
-                del self.requests[bundle.request_id]
-                self.release_route_dispatcher(bundle.request_id)
-                raise BlockOverflowError(bundle.request_id)
+        if is_hybrid:
             ctx.mamba_metadata.request_to_mamba_state_idx[slot_idx] = mamba_state_idx
 
         ctx.total_request_count += 1
 
-        return block_ids
+    @experimental_api
+    def inject_request(
+        self, bundle: "RequestMigrationBundle"
+    ) -> Tensor:
+        """Backward-compat single-shot wrapper: reserve KV blocks
+        (and Mamba slot) and immediately install the request in the
+        active batch.
+
+        Prefer the two-phase :meth:`prepare_migration_reservation` /
+        :meth:`complete_migration` API when the transport needs to
+        scatter into the reserved blocks before the request becomes
+        active — that's what lets non-migrating requests keep
+        generating during the transfer.
+
+        Returns:
+            1-D tensor of block ids the caller can fill.
+        """
+        rsv = self.prepare_migration_reservation(bundle)
+        try:
+            self.complete_migration(
+                bundle,
+                rsv["block_ids"],
+                mamba_state_idx=rsv["mamba_state_idx"],
+            )
+        except Exception:
+            self.release_migration_reservation(
+                rsv["block_ids"], rsv["mamba_state_idx"]
+            )
+            raise
+        return rsv["block_ids"]
 
     def _add_request(
         self, request: DynamicInferenceRequest
