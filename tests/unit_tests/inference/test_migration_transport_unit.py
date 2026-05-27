@@ -52,13 +52,71 @@ def test_lane_encoding_directional():
     assert nv.lane_for(0, 1) != nv.lane_for(1, 0)
 
 
-def test_lane_encoding_rejects_out_of_range():
-    """PE indices outside ``[0, n_pes)`` are caller bugs, not silent
-    wraps — the assertion catches them at construction time."""
-    with pytest.raises(AssertionError):
-        nv.lane_for(0, 4)  # n_pes=4 → max valid is 3
-    with pytest.raises(AssertionError):
+def test_lane_encoding_rejects_unregistered_pair():
+    """``lane_for`` of an unregistered ``(src, dst)`` raises. In
+    production this typically means the migration handler is firing
+    for a shard pair whose policy never got registered."""
+    with pytest.raises(RuntimeError, match="not registered"):
+        nv.lane_for(0, 99)  # PE 99 doesn't exist in n_pes=4
+    with pytest.raises(RuntimeError, match="not registered"):
         nv.lane_for(-1, 0)
+
+
+# ---- Active-pair registration --------------------------------------------
+
+
+def test_register_migration_pair_idempotent():
+    """Calling ``register_migration_pair`` twice with the same pair
+    leaves the registry unchanged — important because the multi_shard
+    code may call ``_register_migration_pair`` once per policy and
+    several policies can target the same shard pair."""
+    nv._reset_state_for_test()
+    nv._init_state_for_test(n_pes=4, ops_per_pair=8, register_all_pairs=False, realize=False)
+    nv.register_migration_pair(0, 1)
+    n_after_first = len(nv._active_pairs)
+    nv.register_migration_pair(0, 1)
+    assert len(nv._active_pairs) == n_after_first
+
+
+def test_register_migration_pair_rejects_after_realize():
+    """Once pools are realized, adding new pairs would change pool
+    layout — but NVSHMEM symmetric allocation is one-shot, so we
+    reject loudly."""
+    nv._reset_state_for_test()
+    nv._init_state_for_test(n_pes=4, ops_per_pair=8, register_all_pairs=False, realize=False)
+    nv.register_migration_pair(0, 1)
+    nv._pools_realized = True  # simulate realize
+    with pytest.raises(RuntimeError, match="already realized"):
+        nv.register_migration_pair(0, 2)
+
+
+def test_pool_sizing_scales_with_active_pairs_not_n_pes_squared():
+    """Flag pool size = ``ops_per_pair × len(active_pairs)``. The whole
+    point of explicit pair registration is bounding the pool by actual
+    migration topology, not by ``n_pes²``."""
+    # n_pes=8 → n_pes² = 64. Register only 3 pairs.
+    nv._reset_state_for_test()
+    nv._init_state_for_test(n_pes=8, ops_per_pair=16, register_all_pairs=False, realize=False)
+    nv.register_migration_pair(0, 4)
+    nv.register_migration_pair(0, 5)
+    nv.register_migration_pair(1, 4)
+    expected_size = 16 * 3  # ops_per_pair × len(active_pairs)
+    assert len(nv._active_pairs) * nv._ops_per_pair == expected_size
+    # And not the n_pes² version we'd get without the bound.
+    assert expected_size != 16 * 64
+
+
+def test_register_migration_shard_pair_takes_cross_product():
+    """The convenience helper registers every ``(s, d)`` in
+    ``src_pes × dst_pes`` — typical case where any rank in src
+    might migrate to any rank in dst."""
+    nv._reset_state_for_test()
+    nv._init_state_for_test(n_pes=8, ops_per_pair=16, register_all_pairs=False, realize=False)
+    nv.register_migration_shard_pair(src_pes=[0, 1, 2, 3], dst_pes=[4, 5, 6, 7])
+    assert len(nv._active_pairs) == 16  # 4 × 4
+    # Every cross-product pair is registered and distinct lanes.
+    lanes = {nv.lane_for(s, d) for s in [0, 1, 2, 3] for d in [4, 5, 6, 7]}
+    assert len(lanes) == 16
 
 
 # ---- FlagArena ------------------------------------------------------------

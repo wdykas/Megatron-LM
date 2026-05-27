@@ -1404,6 +1404,13 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         the engine's MIGRATE_BATCH handler. Cheap and rank-local — the
         NVSHMEM migration path uses one-sided put_signal / signal_wait,
         no torch process group.
+
+        Also reserves NVSHMEM flag-pool lanes for every ``(src_pe,
+        dst_pe)`` in the shard cross-product. This is what bounds the
+        flag pool by *active* migration topology (typically tens to
+        hundreds of pairs) instead of ``n_pes²`` (which would dominate
+        startup at 32+ GPUs since each flag is its own collective
+        symmetric allocation).
         """
         assert 0 <= src_shard_index < len(self._shards)
         assert 0 <= dst_shard_index < len(self._shards)
@@ -1414,6 +1421,12 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
 
         src_shard = self._shards[src_shard_index]
         dst_shard = self._shards[dst_shard_index]
+        # Reserve flag-pool lanes for this shard pair before pools are
+        # realized. Same registration set on every rank because the
+        # caller (``register_migration_policy``) is collective.
+        from megatron.core.inference import migration_transport as _mig
+        if _mig._initialized:
+            _mig.register_migration_shard_pair(src_shard.ranks(), dst_shard.ranks())
         rank = dist.get_rank()
         in_src = src_shard.owns_rank(rank)
         in_dst = dst_shard.owns_rank(rank)
@@ -1833,7 +1846,19 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
 
     def _resume_scheduler(self) -> None:
         """Spawn one asyncio task per registered policy. No-op on ranks
-        that aren't a decider for any policy."""
+        that aren't a decider for any policy.
+
+        Also realizes the migration_transport's flag/ack pools the
+        first time it runs — collective across every rank that called
+        :meth:`resume`. Idempotent on subsequent calls.
+        """
+        # Realize flag pools now that the active-pair set is known.
+        # Collective: every rank's ``resume()`` reaches this, idle ranks
+        # included (via ``resume()``'s finally block). Cheap no-op on
+        # second call.
+        from megatron.core.inference import migration_transport as _mig
+        if _mig._initialized:
+            _mig.realize_migration_pools()
         if self._migration_tasks:
             return
         if not self._migration_policies:

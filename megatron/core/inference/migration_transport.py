@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -45,8 +45,21 @@ logger = logging.getLogger(__name__)
 _initialized: bool = False
 _migration_stream: Optional[torch.cuda.Stream] = None
 
-# Fwd-flag pool: ``ops_per_pair × n_pes²`` slots, partitioned by
-# ``(src_pe, dst_pe)`` lane. Set by put_signal on the dst PE; observed
+# Active-pair registry. Migration only happens between specific shard
+# pairs (defined by registered migration policies), so the flag/ack
+# pool is sized for the actual pairs in use — not the full ``n_pes²``
+# Cartesian product, which would scale quadratically with cluster
+# size and dominate startup at 32+ GPUs (each flag is its own NVSHMEM
+# symmetric allocation, and symmetric alloc is a collective).
+#
+# ``_active_pairs[i] == (src_pe, dst_pe)`` is the pair owning lane ``i``.
+# ``_pair_to_lane_idx`` is the inverse lookup used by :func:`lane_for`.
+_active_pairs: List[Tuple[int, int]] = []
+_pair_to_lane_idx: Dict[Tuple[int, int], int] = {}
+_pools_realized: bool = False
+
+# Fwd-flag pool: ``ops_per_pair × len(active_pairs)`` slots, partitioned
+# by ``(src_pe, dst_pe)`` lane. Set by put_signal on the dst PE; observed
 # by dst's signal_wait. Each slot is its own 8-byte ``bytetensor``
 # (NVSHMEM signal_var requires Buffer >= 8 bytes).
 _flag_pool: List[torch.Tensor] = []
@@ -67,10 +80,9 @@ _ack_pool_buffers: List[object] = []
 # size, not just the bytes the caller cares about).
 _ack_payload: Optional[torch.Tensor] = None
 
-# Pool dimensions. Pool size = ops_per_pair × n_pes².
+# Pool dimensions. Pool size = ops_per_pair × len(active_pairs).
 _ops_per_pair: int = 0
-_num_lanes: int = 0  # = n_pes²
-_flag_pool_size: int = 0  # = _ops_per_pair × _num_lanes (derived)
+_flag_pool_size: int = 0  # = _ops_per_pair × len(_active_pairs) (derived)
 
 _staging_slots: List[torch.Tensor] = []  # pool of symmetric uint8[SLOT_BYTES]
 _staging_slot_bytes: int = 0
@@ -114,7 +126,10 @@ def migration_stream() -> torch.cuda.Stream:
 def maybe_init_migration_transport(
     group: Optional[dist.ProcessGroup] = None,
 ) -> None:
-    """Initialize the migration transport's pools and stream.
+    """Initialize the migration transport's runtime, stream, and
+    pair-independent staging slots. **Does not** allocate the flag/ack
+    pool — that's deferred to :func:`realize_migration_pools` once the
+    set of communicating PE pairs is known.
 
     Calls :func:`nvshmem_runtime.maybe_init_nvshmem` first so the
     shared runtime is up. Collective: every rank must call.
@@ -129,26 +144,10 @@ def maybe_init_migration_transport(
     _migration_stream = torch.cuda.Stream()
     _initialized = True
 
-    # Flag + ack pools: lane-partitioned by (src_pe, dst_pe). Pool size
-    # is ``ops_per_pair × n_pes²``. Ack pool is pre-credited so the
-    # first put on each flag doesn't block waiting for a never-issued
-    # prior-round ack.
-    global _flag_pool, _flag_pool_buffers
-    global _ack_pool, _ack_pool_buffers, _ack_payload
-    global _ops_per_pair, _num_lanes, _flag_pool_size
-    _ops_per_pair = int(
-        os.environ.get("MIGRATION_OPS_PER_PAIR", DEFAULT_OPS_PER_PAIR)
-    )
-    n_pes = _rt.n_pes()
-    _num_lanes = n_pes * n_pes
-    _flag_pool_size = _ops_per_pair * _num_lanes
-    _flag_pool, _flag_pool_buffers = _rt.allocate_flag_pool(_flag_pool_size)
-    _ack_pool, _ack_pool_buffers = _rt.allocate_flag_pool(
-        _flag_pool_size, initial_value=1
-    )
-    _ack_payload = _rt.allocate_slot_pool(1, 1)[0]
-    _ack_payload.zero_()
-
+    # Staging slots are pair-independent — the StagingArena allocator
+    # is linear over the whole pool, not partitioned by lane. Allocate
+    # here so the migration handler can run gather/scatter even before
+    # flag/ack pools exist (rare but possible during setup races).
     global _staging_slots, _staging_slot_bytes, _staging_num_slots
     _staging_slot_bytes = int(
         os.environ.get("MIGRATION_STAGING_SLOT_BYTES", DEFAULT_STAGING_SLOT_BYTES)
@@ -160,10 +159,93 @@ def maybe_init_migration_transport(
 
     _rt.barrier_all_and_sync()
     logger.info(
-        "[migration-transport] initialized: ops_per_pair=%d, lanes=%d, "
-        "flag_pool_size=%d",
+        "[migration-transport] runtime + staging initialized; "
+        "flag/ack pools deferred to realize_migration_pools()"
+    )
+
+
+def register_migration_pair(src_pe: int, dst_pe: int) -> None:
+    """Reserve a flag-pool lane for the ``(src_pe, dst_pe)`` pair.
+
+    Must be called before :func:`realize_migration_pools` (which is
+    when the pools are actually allocated). Idempotent — calling
+    twice with the same pair is a no-op.
+
+    Cross-rank consistency: callers must register the *same* set of
+    pairs on every rank, in the same order, so each rank assigns the
+    same lane index to each pair. The migration policy registration
+    path in :mod:`multi_shard` enforces this because it's already
+    collective.
+    """
+    if _pools_realized:
+        raise RuntimeError(
+            f"migration pools already realized; cannot register new pair "
+            f"({src_pe}, {dst_pe}). Register all pairs before "
+            f"realize_migration_pools()."
+        )
+    pair = (src_pe, dst_pe)
+    if pair in _pair_to_lane_idx:
+        return
+    _pair_to_lane_idx[pair] = len(_active_pairs)
+    _active_pairs.append(pair)
+
+
+def register_migration_shard_pair(
+    src_pes: Iterable[int], dst_pes: Iterable[int]
+) -> None:
+    """Register every ``(s, d)`` for ``s in src_pes, d in dst_pes`` —
+    convenience for the typical case where migration is between two
+    shards and any rank in the src shard might send to any rank in
+    the dst shard."""
+    for s in src_pes:
+        for d in dst_pes:
+            register_migration_pair(s, d)
+
+
+def realize_migration_pools() -> None:
+    """Allocate flag + ack pools for all registered ``(src, dst)`` pairs.
+
+    Collective: every rank must call. Idempotent — second call is a
+    no-op. After this returns, :func:`register_migration_pair` rejects
+    new pairs (the pool sizes are fixed at realize time because
+    NVSHMEM symmetric allocation is one-shot per pool).
+
+    Pool size is ``ops_per_pair × len(active_pairs)`` — bounded by the
+    actual migration topology, not by ``n_pes²``. Empty pool (no
+    registered pairs) is allowed and is cheap; trivializes to a
+    barrier with zero allocations.
+    """
+    global _flag_pool, _flag_pool_buffers
+    global _ack_pool, _ack_pool_buffers, _ack_payload
+    global _ops_per_pair, _flag_pool_size, _pools_realized
+
+    assert _initialized, (
+        "migration_transport not initialized; call "
+        "maybe_init_migration_transport() first"
+    )
+    if _pools_realized:
+        return
+
+    _ops_per_pair = int(
+        os.environ.get("MIGRATION_OPS_PER_PAIR", DEFAULT_OPS_PER_PAIR)
+    )
+    _flag_pool_size = _ops_per_pair * len(_active_pairs)
+
+    if _flag_pool_size > 0:
+        _flag_pool, _flag_pool_buffers = _rt.allocate_flag_pool(_flag_pool_size)
+        _ack_pool, _ack_pool_buffers = _rt.allocate_flag_pool(
+            _flag_pool_size, initial_value=1
+        )
+        _ack_payload = _rt.allocate_slot_pool(1, 1)[0]
+        _ack_payload.zero_()
+        _rt.barrier_all_and_sync()
+
+    _pools_realized = True
+    logger.info(
+        "[migration-transport] pools realized: active_pairs=%d, "
+        "ops_per_pair=%d, flag_pool_size=%d",
+        len(_active_pairs),
         _ops_per_pair,
-        _num_lanes,
         _flag_pool_size,
     )
 
@@ -171,16 +253,25 @@ def maybe_init_migration_transport(
 def lane_for(src_pe: int, dst_pe: int) -> int:
     """Lane index for the ``(src_pe, dst_pe)`` pair.
 
-    Mirrors :func:`activation_transport.lane_for` so the two transports
-    share the same lane-encoding discipline. Lane = ``src * n_pes + dst``;
-    each lane gets ``_ops_per_pair`` contiguous flag/ack slots in the
-    pool. Different pairs use disjoint slot ranges so an ack from
-    ``dst_a → src_a`` can't be misread as an ack from ``dst_b → src_b``.
+    Returns the pair's index in the registry, which the flag pool
+    uses as the lane's offset multiplier. Different pairs land in
+    disjoint slot ranges so an ack from ``dst_a → src_a`` can't be
+    misread as an ack from ``dst_b → src_b``.
+
+    Raises if the pair wasn't registered before
+    :func:`realize_migration_pools` — usually that means the migration
+    handler is firing for a shard pair whose policy wasn't registered.
     """
     assert _initialized
-    n_pes = _rt.n_pes()
-    assert 0 <= src_pe < n_pes and 0 <= dst_pe < n_pes
-    return src_pe * n_pes + dst_pe
+    pair = (src_pe, dst_pe)
+    idx = _pair_to_lane_idx.get(pair)
+    if idx is None:
+        raise RuntimeError(
+            f"migration pair ({src_pe}, {dst_pe}) not registered. "
+            f"Every (src_pe, dst_pe) used by a migration must be passed "
+            f"to register_migration_pair() before realize_migration_pools()."
+        )
+    return idx
 
 
 def flag_buffer(slot: int) -> object:
@@ -391,13 +482,25 @@ class FlagArena:
 # ---- Test hooks -----------------------------------------------------------
 
 
-def _init_state_for_test(*, n_pes: int, ops_per_pair: int = 16) -> None:
+def _init_state_for_test(
+    *,
+    n_pes: int,
+    ops_per_pair: int = 16,
+    register_all_pairs: bool = True,
+    realize: bool = True,
+) -> None:
     """Set up the module state ``FlagArena`` / ``lane_for`` need, without
     allocating any NVSHMEM buffers or starting the migration stream.
     Tests that only exercise the per-pair flag allocator use this in
     place of :func:`maybe_init_migration_transport`.
+
+    By default, registers every ``(src, dst)`` pair in ``range(n_pes)``
+    and marks the pool realized — existing tests can call
+    ``FlagArena.take(s, d)`` without further setup. Pass
+    ``register_all_pairs=False`` and/or ``realize=False`` to exercise
+    the registration / realize lifecycle directly.
     """
-    global _initialized, _ops_per_pair, _num_lanes, _flag_pool_size
+    global _initialized, _ops_per_pair, _flag_pool_size, _pools_realized
     if _initialized:
         raise RuntimeError(
             "migration_transport already initialized; call "
@@ -405,9 +508,14 @@ def _init_state_for_test(*, n_pes: int, ops_per_pair: int = 16) -> None:
         )
     _rt._init_state_for_test(n_pes=n_pes)
     _ops_per_pair = ops_per_pair
-    _num_lanes = n_pes * n_pes
-    _flag_pool_size = _ops_per_pair * _num_lanes
     _initialized = True
+    if register_all_pairs:
+        for s in range(n_pes):
+            for d in range(n_pes):
+                register_migration_pair(s, d)
+    _flag_pool_size = _ops_per_pair * len(_active_pairs)
+    if realize:
+        _pools_realized = True  # pretend pools exist for FlagArena.take
 
 
 def _reset_state_for_test() -> None:
@@ -416,7 +524,8 @@ def _reset_state_for_test() -> None:
     global _initialized, _migration_stream
     global _flag_pool, _flag_pool_buffers
     global _ack_pool, _ack_pool_buffers, _ack_payload
-    global _ops_per_pair, _num_lanes, _flag_pool_size
+    global _ops_per_pair, _flag_pool_size, _pools_realized
+    global _active_pairs, _pair_to_lane_idx
     global _staging_slots, _staging_slot_bytes, _staging_num_slots
     _initialized = False
     _migration_stream = None
@@ -426,8 +535,10 @@ def _reset_state_for_test() -> None:
     _ack_pool_buffers = []
     _ack_payload = None
     _ops_per_pair = 0
-    _num_lanes = 0
     _flag_pool_size = 0
+    _pools_realized = False
+    _active_pairs = []
+    _pair_to_lane_idx = {}
     _staging_slots = []
     _staging_slot_bytes = 0
     _staging_num_slots = 0
