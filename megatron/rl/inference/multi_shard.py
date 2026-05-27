@@ -743,11 +743,17 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         # the client's ENGINE_REPLY future resolves regardless of which
         # shard's engine actually produced the final tokens.
         #
-        # NVSHMEM init for cross-shard migration. Must happen *before*
-        # engine creation because the engine's KV ``memory_buffer`` and
-        # Mamba state buffers are allocated on the symmetric heap when
-        # NVSHMEM is initialized — direct one-sided put for migration
-        # (no staging, no barrier_all) requires symmetric memory.
+        # NVSHMEM init for cross-shard migration. Brings up the shared
+        # runtime + the migration stream + the symmetric staging slots
+        # (the flag/ack pools are deferred to ``realize_migration_pools``
+        # after policies register their active (src_pe, dst_pe) pairs).
+        # KV ``memory_buffer`` and Mamba state buffers themselves live
+        # in the engine's normal caching-allocator memory — migration
+        # gathers them into a symmetric staging slot, puts the slot to
+        # dst, and the receiver scatters out of its slot. So this init
+        # doesn't have to happen before engine construction for
+        # symmetric-heap reasons; it's run here at setup just to fail
+        # fast on missing NVSHMEM rather than at first migration.
         # Collective: every rank participates.
         if len(shards) >= 2:
             from megatron.core.inference import migration_transport as _mig
