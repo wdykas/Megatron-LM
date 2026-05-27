@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Non-distributed unit tests for nvshmem_migration bookkeeping.
+"""Non-distributed unit tests for migration_transport bookkeeping.
 
 The NVSHMEM put/wait/ack primitives require a real GPU + multi-PE world
 and are covered by a separate integration test. These tests cover the
@@ -12,11 +12,11 @@ so getting this right matters more than the NVSHMEM call ergonomics.
 
 import pytest
 
-from megatron.core.inference import nvshmem_migration as nv
+from megatron.core.inference import migration_transport as nv
 
 
 @pytest.fixture(autouse=True)
-def _nvshmem_migration_test_state():
+def _migration_transport_test_state():
     """Each test gets a freshly-initialized in-memory state. Reset on
     teardown so tests don't leak counters into one another."""
     nv._reset_state_for_test()

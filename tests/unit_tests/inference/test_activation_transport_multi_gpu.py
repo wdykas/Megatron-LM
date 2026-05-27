@@ -20,7 +20,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.inference import activation_transport as at
-from megatron.core.inference import nvshmem_migration as _nv
+from megatron.core.inference import nvshmem_runtime as _nv
 
 
 @pytest.fixture(scope="module")

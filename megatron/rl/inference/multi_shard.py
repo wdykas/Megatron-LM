@@ -331,7 +331,7 @@ def _execute_kv_src_side(
     """Src side of KV migration: for each KV op where ``rank`` is the src
     rank, gather the local KV slice into a staging slot and issue a
     ``put_signal`` to the dst rank. Stream-ordered."""
-    from megatron.core.inference import nvshmem_migration as _nv
+    from megatron.core.inference import migration_transport as _nv
     from megatron.core.inference.engines.request_migration import _gather_kv_slice
 
     for entry in op_meta:
@@ -382,7 +382,7 @@ def _execute_kv_dst_side(
     """Dst side of KV migration: for each KV op where ``rank`` is the dst
     rank, ``signal_wait`` and scatter the received slot into the local KV
     buffer. Stream-ordered."""
-    from megatron.core.inference import nvshmem_migration as _nv
+    from megatron.core.inference import migration_transport as _nv
     from megatron.core.inference.engines.request_migration import _scatter_kv_slice
 
     for entry in op_meta:
@@ -432,7 +432,7 @@ def _execute_mamba_src_side(
     Each ``entry`` packs multiple block kinds (``conv_x`` / ``conv_B`` /
     ``conv_C`` / ``ssm``) for one (src_rank, dst_rank) overlap.
     """
-    from megatron.core.inference import nvshmem_migration as _nv
+    from megatron.core.inference import migration_transport as _nv
 
     def _buffer_for(kind):
         return conv_states if kind.startswith("conv_") else ssm_states
@@ -478,7 +478,7 @@ def _execute_mamba_dst_side(
     """Dst side of mamba migration: for each packed-op where ``rank`` is
     the dst, ``signal_wait`` and scatter each conv/SSM block slice from
     its byte offset in the staging slot into the local state buffers."""
-    from megatron.core.inference import nvshmem_migration as _nv
+    from megatron.core.inference import migration_transport as _nv
 
     def _buffer_for(kind):
         return conv_states if kind.startswith("conv_") else ssm_states
@@ -727,9 +727,9 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         # (no staging, no barrier_all) requires symmetric memory.
         # Collective: every rank participates.
         if len(shards) >= 2:
-            from megatron.core.inference import nvshmem_migration as _nvshmem_mig
+            from megatron.core.inference import migration_transport as _mig
 
-            _nvshmem_mig.maybe_init_nvshmem()
+            _mig.maybe_init_migration_transport()
 
         # Build the engine first so rank 0 can seed the coord from its
         # InferenceContext (tokenizer, block size, prefix-caching config).
@@ -1595,7 +1595,7 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
         if not (meta.in_src or meta.in_dst):
             return  # bystander; coord shouldn't forward to us anyway
 
-        from megatron.core.inference import nvshmem_migration as _nv
+        from megatron.core.inference import migration_transport as _nv
         from megatron.core.inference.engines.request_migration import (
             RequestMigrationBundle,
             build_kv_migration_plan,

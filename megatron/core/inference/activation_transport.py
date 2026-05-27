@@ -5,7 +5,7 @@
 Activations flow between shards in the layer-kind-disaggregated forward
 pass; this module is the on-the-wire mechanism.
 
-Reuses the NVSHMEM runtime primitives from :mod:`nvshmem_migration` (one
+Reuses the NVSHMEM runtime primitives from :mod:`nvshmem_runtime` (one
 PE identity per process, shared pool builders and put/signal wrappers)
 but allocates its own symmetric pools — slot sizing and lifecycle differ
 from migration's:
@@ -55,7 +55,7 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 
-from megatron.core.inference import nvshmem_migration as _nv
+from megatron.core.inference import nvshmem_runtime as _nv
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +109,7 @@ DEFAULT_MAX_PES = 64
 def activation_stream() -> torch.cuda.Stream:
     """Dedicated CUDA stream for activation puts.
 
-    Kept separate from :func:`nvshmem_migration.migration_stream` so
+    Kept separate from :func:`migration_transport.migration_stream` so
     that migrations don't head-of-line-block activations and vice versa
     (migrations are per-request, low-frequency; activations are
     per-layer-per-token, high-frequency).
@@ -134,7 +134,7 @@ def maybe_init_activation_transport(
 ) -> None:
     """Initialize the activation-transport pools. Idempotent.
 
-    Calls :func:`nvshmem_migration.maybe_init_nvshmem` first so the
+    Calls :func:`nvshmem_runtime.maybe_init_nvshmem` first so the
     process-wide PE identity is set up. Then allocates this module's
     own symmetric pools and stream.
 
