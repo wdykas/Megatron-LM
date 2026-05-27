@@ -55,18 +55,6 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-# Per-request flag-slot budget. Each migration packs
-# ``(request_id, op_index_within_bundle)`` into the key passed to
-# :func:`nvshmem_migration.flag_slot_for`, so two requests' flags
-# can't collide as long as ``op_index < MAX_OPS_PER_REQ``. KV ops
-# claim ``[0, num_kv_ops)``; Mamba conv/ssm reuse the top two
-# indices ``MAX_OPS_PER_REQ - 2`` and ``- 1``. A bundle's KV op
-# count must stay below ``MAX_OPS_PER_REQ - 2`` (asserted in the
-# handler) — bump this if a future migration grows the per-bundle
-# op fanout.
-MAX_OPS_PER_REQ = 32
-
-
 @dataclass
 class MigrationMeta:
     """Per-(src_shard, dst_shard) snapshot of everything the migration
@@ -170,7 +158,7 @@ async def _spawn_unified_coord(
 
 def _build_kv_op_meta(
     arena,
-    parsed_bundles,
+    flag_arena,
     all_ops_by_bundle,
     layout,
     memory_buffer,
@@ -180,23 +168,16 @@ def _build_kv_op_meta(
 
     Both src and dst call this with identical inputs, so the
     ``(slot, flag)`` choice for each op matches across PEs without any
-    cross-rank coordination.
+    cross-rank coordination. Flag identity is per-(src_pe, dst_pe)
+    lane (via :class:`FlagArena`) so cross-pair acks can't be misread,
+    and the ack handshake inside ``put_slot_with_signal`` serializes
+    cross-migration reuse of the same flag.
     """
-    from megatron.core.inference import nvshmem_migration as _nv
 
     op_meta: List[dict] = []
     elem_size = memory_buffer.element_size()
-    for bundle_idx, ops in enumerate(all_ops_by_bundle):
-        # Guard against silent flag-key collision: the top two indices
-        # are reserved for mamba conv/ssm, and op N+1 would alias the
-        # next request's KV flag.
-        assert len(ops) <= MAX_OPS_PER_REQ - 2, (
-            f"bundle has {len(ops)} KV ops but MAX_OPS_PER_REQ-2 "
-            f"= {MAX_OPS_PER_REQ - 2}; raise MAX_OPS_PER_REQ or "
-            f"split the bundle"
-        )
-        req_id = parsed_bundles[bundle_idx].request_id
-        for op_idx_in_bundle, op in enumerate(ops):
+    for ops in all_ops_by_bundle:
+        for op in ops:
             num_blocks = len(op.src_block_ids)
             layer_span = op.layer_range[1] - op.layer_range[0]
             head_span = op.head_range[1] - op.head_range[0]
@@ -220,14 +201,13 @@ def _build_kv_op_meta(
             for d in shape:
                 nelems *= d
             nbytes = nelems * elem_size
-            flag_key = req_id * MAX_OPS_PER_REQ + op_idx_in_bundle
             op_meta.append(
                 {
                     "op": op,
                     "shape": shape,
                     "nbytes": nbytes,
                     "slot": arena.take(nbytes),
-                    "flag": _nv.flag_slot_for(flag_key),
+                    "flag": flag_arena.take(op.src_rank, op.dst_rank),
                 }
             )
     return op_meta
@@ -235,6 +215,7 @@ def _build_kv_op_meta(
 
 def _build_mamba_op_meta(
     arena,
+    flag_arena,
     parsed_bundles,
     engine_ctx,
     src_mamba_layout,
@@ -252,17 +233,16 @@ def _build_mamba_op_meta(
     flag. This keeps slot-pool pressure at ``num_overlap_pairs × batch``
     rather than ``4 × num_overlap_pairs × batch``.
 
-    Mamba ops claim per-request flag indices counting down from
-    ``MAX_OPS_PER_REQ - 1`` so KV ops keep the low-index range; the
-    bundle asserts ``num_mamba_ops <= MAX_OPS_PER_REQ`` to prevent
-    silent collisions.
+    Shares the migration's :class:`FlagArena` with KV ops, so flag
+    indices keep counting up in the same per-(src_pe, dst_pe) lane —
+    no KV-up / Mamba-down hand-partitioning needed (lane partitioning
+    + ack handshake handles it).
 
     Returns a list of dicts, one per (bundle × mamba op); each
     carries a ``blocks`` sub-list with per-kind ``shape`` / ``dtype``
     / ``byte_offset`` / ``nbytes`` so gather / scatter can address
     its slice of the packed slot.
     """
-    from megatron.core.inference import nvshmem_migration as _nv
     from megatron.core.inference.engines.request_migration import (
         build_mamba_migration_plan,
     )
@@ -297,16 +277,7 @@ def _build_mamba_op_meta(
             src_global_rank_of,
             dst_global_rank_of,
         )
-        # Each mamba op claims one flag index packed into the
-        # per-request flag-key budget. Mamba indices count down from
-        # the top so KV ops fill the bottom; their packed offsets
-        # must stay in ``[0, MAX_OPS_PER_REQ)``.
-        assert len(ops) <= MAX_OPS_PER_REQ, (
-            f"bundle has {len(ops)} mamba ops but MAX_OPS_PER_REQ = "
-            f"{MAX_OPS_PER_REQ}; raise the constant or split the bundle"
-        )
-        req_id = bundle.request_id
-        for op_local_idx, op in enumerate(ops):
+        for op in ops:
             num_op_layers = len(op.mamba_layer_indices)
             block_meta: List[dict] = []
             byte_offset = 0
@@ -332,8 +303,6 @@ def _build_mamba_op_meta(
                 )
                 byte_offset += block_nbytes
             total_nbytes = byte_offset
-            flag_idx = MAX_OPS_PER_REQ - 1 - op_local_idx
-            flag = _nv.flag_slot_for(req_id * MAX_OPS_PER_REQ + flag_idx)
             mamba_meta.append(
                 {
                     "bundle_idx": bundle_idx,
@@ -341,7 +310,7 @@ def _build_mamba_op_meta(
                     "src_rank": op.src_rank,
                     "dst_rank": op.dst_rank,
                     "slot": arena.take(total_nbytes),
-                    "flag": flag,
+                    "flag": flag_arena.take(op.src_rank, op.dst_rank),
                     "nbytes": total_nbytes,
                     "blocks": block_meta,
                 }
@@ -442,6 +411,10 @@ def _execute_kv_dst_side(
             layout.is_mla,
             recv_view,
         )
+        # Tell src this flag slot is safe to reuse for the next round.
+        # Stream-ordered after the scatter so src can't overwrite the
+        # slot until scatter has finished reading it.
+        _nv.send_ack(entry["flag"], op.src_rank, stream=stream)
 
 
 def _execute_mamba_src_side(
@@ -534,6 +507,10 @@ def _execute_mamba_dst_side(
                 .reshape(b["shape"])
             )
             buf[layer_idx, dst_state_idx, lo:hi] = recv
+        # Tell src this flag slot is safe to reuse for the next round.
+        # Stream-ordered after the scatter so src can't overwrite the
+        # slot until scatter has finished reading it.
+        _nv.send_ack(entry["flag"], op.src_rank, stream=stream)
 
 
 def _release_src_state(
@@ -562,7 +539,6 @@ def _release_src_state(
 
 def _make_migration_poll_callback(
     done_event: torch.cuda.Event,
-    flags_used: List[int],
     meta: "MigrationMeta",
     is_hybrid: bool,
     src_block_ids_to_free: List[torch.Tensor],
@@ -572,16 +548,17 @@ def _make_migration_poll_callback(
     """Build the poll callback the engine ticks each loop iteration.
 
     Returns ``True`` once the migration's ``done_event`` has fired —
-    at which point the flags are reset to ``0`` and src-side KV
-    blocks / mamba slots are returned to the allocators.
+    at which point src-side KV blocks / mamba slots are returned to
+    the allocators. Flag clearing is no longer the poll's job: fwd
+    flags are cleared stream-ordered inside :func:`wait_slot_signal`,
+    and ack flags inside :func:`put_slot_with_signal`, so by the time
+    ``done_event`` fires both pools are already in their post-round
+    resting state for the next migration.
     """
-    from megatron.core.inference import nvshmem_migration as _nv
 
     def _poll() -> bool:
         if not done_event.query():
             return False
-        for slot in flags_used:
-            _nv.reset_flag(slot)
         _release_src_state(
             meta, is_hybrid, src_block_ids_to_free, src_mamba_state_indices, engine
         )
@@ -1740,16 +1717,20 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
 
             # Build per-op staging-slot + flag-slot tables. Both sides
             # walk the bundles in identical order so the choices match
-            # without coordination.
+            # without coordination. Slots come from a linear arena;
+            # flags come from a lane-partitioned arena (per-(src_pe,
+            # dst_pe) sub-counter) so cross-pair acks can't be misread.
             arena = _nv.StagingArena()
+            flag_arena = _nv.FlagArena()
             dtype = memory_buffer.dtype
             op_meta = _build_kv_op_meta(
-                arena, parsed_bundles, all_ops_by_bundle, layout, memory_buffer
+                arena, flag_arena, all_ops_by_bundle, layout, memory_buffer
             )
             mamba_meta: List[dict] = []
             if is_hybrid:
                 mamba_meta = _build_mamba_op_meta(
                     arena,
+                    flag_arena,
                     parsed_bundles,
                     engine.context,
                     meta.src_mamba_layout,
@@ -1799,17 +1780,13 @@ class MegatronLocalMulti(InferenceServer, ReturnsTokens, ReturnsRaw):
             # engine here.
             torch.cuda.default_stream().wait_stream(stream)
 
-            # Once the migration event fires: reset the flags and (on src)
-            # return the kept blocks + the kept mamba state slots to
-            # the allocators.
-            flags_used = [e["flag"] for e in op_meta] + [
-                e["flag"] for e in mamba_meta
-            ]
-
+            # Once the migration event fires, return src-kept blocks +
+            # mamba state slots to the allocators. Flag clearing is
+            # stream-ordered inside wait_slot_signal / put_slot_with_signal,
+            # so we don't need to touch flag state from the poll.
             engine.push_pending_migration(
                 _make_migration_poll_callback(
                     done_event,
-                    flags_used,
                     meta,
                     is_hybrid,
                     src_block_ids_to_free,

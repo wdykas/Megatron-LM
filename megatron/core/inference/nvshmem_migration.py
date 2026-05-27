@@ -2,17 +2,27 @@
 
 """Direct NVSHMEM transport for cross-shard request migration.
 
-One-sided ``put_signal`` from src lands KV bytes plus a completion flag
-in a single op; dst's ``signal_wait`` on the same flag implies all bytes
-have arrived. Both sides issue everything on a dedicated migration
-stream, so neither engine has to pause its run loop.
+One-sided ``put_signal`` from src lands KV bytes plus a completion
+flag in a single op; dst's ``signal_wait`` on the same flag implies
+all bytes have arrived. Both sides issue everything on a dedicated
+migration stream, so neither engine has to pause its run loop.
 
-KV / Mamba buffers themselves are *not* in the symmetric heap; only the
-fixed-size symmetric staging slots (one ``bytetensor`` per slot,
-allocated up front in :func:`maybe_init_nvshmem`) and per-op flags are.
-The migration handler stages each op into a slot, ``put_signal``s the
-slot to the matching offset on the destination's symmetric region, and
-the destination scatters the slot back into its local buffer.
+KV / Mamba buffers themselves are *not* in the symmetric heap; only
+the fixed-size symmetric staging slots (one ``bytetensor`` per slot,
+allocated up front in :func:`maybe_init_nvshmem`) and per-op flags
+are. The migration handler stages each op into a slot,
+``put_signal``s the slot to the matching offset on the destination's
+symmetric region, and the destination scatters the slot back into
+its local buffer.
+
+Cross-migration safety: the flag pool is partitioned by ``(src_pe,
+dst_pe)`` lane (so different pairs can't alias on the same dst flag)
+and reuse within a lane is serialized by an ack handshake — src
+``signal_wait``s on a per-flag ack before re-issuing a put; dst raises
+the ack after its scatter completes. This is the same discipline
+that :mod:`activation_transport` uses, applied to the bulk-migration
+traffic shape (one transport, two access patterns; identical
+synchronization invariant).
 """
 
 from __future__ import annotations
@@ -20,7 +30,7 @@ from __future__ import annotations
 import logging
 import os
 from importlib import metadata
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -40,28 +50,48 @@ _initialized: bool = False
 _my_pe: int = -1
 _n_pes: int = -1
 _migration_stream: Optional[torch.cuda.Stream] = None
-# Each flag is its own 8-byte ``bytetensor`` (NVSHMEM signal_var
-# requires Buffer >= 8 bytes). The pool stores both the tensor view
-# (for local read/clear) and the Buffer (for ``put_signal`` /
-# ``signal_wait``).
+
+# Fwd-flag pool: ``ops_per_pair × n_pes²`` slots, partitioned by
+# ``(src_pe, dst_pe)`` lane. Set by put_signal on the dst PE; observed
+# by dst's signal_wait. Each slot is its own 8-byte ``bytetensor``
+# (NVSHMEM signal_var requires Buffer >= 8 bytes).
 _flag_pool: List[torch.Tensor] = []
 _flag_pool_buffers: List[object] = []  # cuda.core Buffer per slot
-_flag_pool_size: int = 0
+
+# Ack pool: same shape as flag pool, parallel allocation. Set by dst
+# (via put_signal targeting src's ack-flag) after scatter completes;
+# observed by src's signal_wait before re-issuing a put on that flag.
+# Pre-credited at init (initial_value=1) so the first put on a flag
+# doesn't block.
+_ack_pool: List[torch.Tensor] = []
+_ack_pool_buffers: List[object] = []
+
+# 1-byte symmetric payload used as the bulk-data argument of ack
+# ``put_signal``s. Same trick as activation_transport's _a_ack_payload:
+# a dedicated buffer keeps the ack put from clobbering the staging slot
+# on the src side (NVSHMEM's put copies the full src buffer's tracked
+# size, not just the bytes the caller cares about).
+_ack_payload: Optional[torch.Tensor] = None
+
+# Pool dimensions. Pool size = ops_per_pair × n_pes².
+_ops_per_pair: int = 0
+_num_lanes: int = 0  # = n_pes²
+_flag_pool_size: int = 0  # = _ops_per_pair × _num_lanes (derived)
+
 _staging_slots: List[torch.Tensor] = []  # pool of symmetric uint8[SLOT_BYTES]
 _staging_slot_bytes: int = 0
 _staging_num_slots: int = 0
 
 
-# 1<<14 = 16384 slots, 128 KB per PE. Aliasing under
-# ``flag_slot_for(req_id * MAX_OPS_PER_REQ + op_idx)`` is bounded by
-# how many flags can be in-flight simultaneously — with the singleton
-# migration stream serializing migrations and at most
-# ``batch_size * MAX_OPS_PER_REQ`` flags unresolved per migration, even
-# 4096 slots have headroom. 16384 keeps a comfortable margin and
-# initializes in seconds (each flag is its own NVSHMEM symmetric
-# allocation, so a 1M pool stalled startup for minutes). Tunable via
-# env.
-DEFAULT_FLAG_POOL_SIZE = 1 << 14
+# Per-(src, dst) ops budget. Within one migration, at most
+# ``DEFAULT_OPS_PER_PAIR`` ops can target a given pair without the
+# allocator wrapping; wraps within the pair recycle via the ack
+# handshake. A KV migration with deep PP × big batch hits ~30 ops/pair
+# at worst; mamba adds a few more. 64 leaves comfortable headroom for
+# typical configs and stays small enough that the symmetric alloc
+# count doesn't dominate startup (each flag is its own ``bytetensor``
+# allocation). Tunable via ``MIGRATION_OPS_PER_PAIR``.
+DEFAULT_OPS_PER_PAIR = 64
 
 # NVSHMEM only tracks the full tensor handle returned by ``bytetensor``;
 # slices with non-zero offsets aren't tracked, so we pre-allocate a
@@ -74,7 +104,14 @@ DEFAULT_STAGING_NUM_SLOTS = 256  # 4 GB total per PE
 
 def migration_stream() -> torch.cuda.Stream:
     """Dedicated CUDA stream for migration puts so they don't serialize
-    against the engine's compute stream."""
+    against the engine's compute stream.
+
+    Singleton: every cross-migration safety argument in this module
+    assumes all migration ops issue on this one stream, so they're
+    GPU-serialized regardless of which Python task submitted them.
+    Submitting migration ops on a different stream would break the
+    ack-handshake → put ordering and is not supported.
+    """
     assert _initialized, "NVSHMEM not initialized"
     assert _migration_stream is not None
     return _migration_stream
@@ -266,9 +303,24 @@ def maybe_init_nvshmem(group: Optional[dist.ProcessGroup] = None) -> None:
 
     _initialized = True
 
+    # Flag + ack pools: lane-partitioned by (src_pe, dst_pe). Pool size
+    # is ``ops_per_pair × n_pes²``. Ack pool is pre-credited so the
+    # first put on each flag doesn't block waiting for a never-issued
+    # prior-round ack.
     global _flag_pool, _flag_pool_buffers
-    _flag_pool_size = int(os.environ.get("MIGRATION_FLAG_POOL_SIZE", DEFAULT_FLAG_POOL_SIZE))
+    global _ack_pool, _ack_pool_buffers, _ack_payload
+    global _ops_per_pair, _num_lanes, _flag_pool_size
+    _ops_per_pair = int(
+        os.environ.get("MIGRATION_OPS_PER_PAIR", DEFAULT_OPS_PER_PAIR)
+    )
+    _num_lanes = _n_pes * _n_pes
+    _flag_pool_size = _ops_per_pair * _num_lanes
     _flag_pool, _flag_pool_buffers = allocate_flag_pool(_flag_pool_size)
+    _ack_pool, _ack_pool_buffers = allocate_flag_pool(
+        _flag_pool_size, initial_value=1
+    )
+    _ack_payload = allocate_slot_pool(1, 1)[0]
+    _ack_payload.zero_()
 
     global _staging_slots, _staging_slot_bytes, _staging_num_slots
     _staging_slot_bytes = int(
@@ -281,33 +333,45 @@ def maybe_init_nvshmem(group: Optional[dist.ProcessGroup] = None) -> None:
 
     barrier_all_and_sync()
     logger.info(
-        "[nvshmem-migration] initialized: PE %d/%d, flag_pool_size=%d",
+        "[nvshmem-migration] initialized: PE %d/%d, ops_per_pair=%d, "
+        "lanes=%d, flag_pool_size=%d",
         _my_pe,
         _n_pes,
+        _ops_per_pair,
+        _num_lanes,
         _flag_pool_size,
     )
 
 
-def flag_slot_for(key: int) -> int:
-    """Deterministic flag-slot index from ``key``.
+def lane_for(src_pe: int, dst_pe: int) -> int:
+    """Lane index for the ``(src_pe, dst_pe)`` pair.
 
-    Both src and dst compute the slot index from a value they both
-    see (typically ``request_id * MAX_OPS_PER_REQ + op_index``), so
-    no per-PE counter sync is needed even when only a subset of dst
-    replicas participates in a given migration. Wraps around the
-    pool — caller should ensure ``key`` doesn't recycle within the
-    pool's TTL.
+    Mirrors :func:`activation_transport.lane_for` so the two transports
+    share the same lane-encoding discipline. Lane = ``src * n_pes + dst``;
+    each lane gets ``_ops_per_pair`` contiguous flag/ack slots in the
+    pool. Different pairs use disjoint slot ranges so an ack from
+    ``dst_a → src_a`` can't be misread as an ack from ``dst_b → src_b``.
     """
     assert _initialized
-    return key % _flag_pool_size
+    assert 0 <= src_pe < _n_pes and 0 <= dst_pe < _n_pes
+    return src_pe * _n_pes + dst_pe
 
 
 def flag_buffer(slot: int) -> object:
-    """Return the cached ``cuda.core.Buffer`` for the given flag slot —
-    ``put_signal`` / ``signal_wait`` accept Buffer, not tensor."""
+    """Return the cached ``cuda.core.Buffer`` for the given fwd-flag
+    slot — ``put_signal`` / ``signal_wait`` accept Buffer, not tensor.
+    """
     assert _initialized
     assert 0 <= slot < len(_flag_pool_buffers)
     return _flag_pool_buffers[slot]
+
+
+def ack_buffer(slot: int) -> object:
+    """Return the cached ``cuda.core.Buffer`` for the given ack-flag
+    slot. Same indexing space as :func:`flag_buffer`."""
+    assert _initialized
+    assert 0 <= slot < len(_ack_pool_buffers)
+    return _ack_pool_buffers[slot]
 
 
 def put_slot_with_signal(
@@ -319,18 +383,36 @@ def put_slot_with_signal(
     stream: Optional[torch.cuda.Stream] = None,
     signal_value: int = 1,
 ) -> None:
-    """Atomic put + signal: copies the staging slot to ``dst_pe`` and
-    sets the flag to ``signal_value`` on ``dst_pe`` in one stream-
-    ordered NVSHMEM op. The signal arrives strictly after the data, so
-    a ``signal_wait`` on the same flag implies all bytes have landed.
+    """Src-side migration op: wait for the prior round's ack on this
+    flag, then put the staging slot to ``dst_pe`` and signal the fwd
+    flag. All three steps are stream-ordered on the migration stream.
+
+    The ack-wait at the top is what makes cross-migration reuse of the
+    same flag slot safe: ``dst_pe`` only acks after its scatter of the
+    previous round has completed, so by the time the wait returns the
+    flag is genuinely free to overwrite. Pre-credited at init
+    (``initial_value=1``) so the first put on each flag doesn't block.
     """
+    assert _initialized
+    s = stream or _migration_stream
+
+    # Wait for dst's ack on this flag slot's previous round. Pre-credited
+    # at init so first use is free.
+    signal_wait(ack_buffer(flag_slot), expected_value=1, stream=s)
+    # Reset the local ack so the next round's ack-put causes a 0 → 1
+    # transition. The reset MUST run on the migration stream — without
+    # the explicit context, ``.zero_()`` falls back to the default
+    # stream and races with the put below.
+    with torch.cuda.stream(s):
+        _ack_pool[flag_slot].zero_()
+
     put_signal(
         staging_slot(slot_idx),
         flag_buffer(flag_slot),
         dst_pe,
         signal_value=signal_value,
         nbytes=nbytes,
-        stream=stream or _migration_stream,
+        stream=s,
     )
 
 
@@ -340,21 +422,46 @@ def wait_slot_signal(
     expected_value: int = 1,
     stream: Optional[torch.cuda.Stream] = None,
 ) -> None:
-    """Stream-side wait: blocks the migration stream (GPU-side) until
-    the local flag reaches ``expected_value``. Pair with
-    :func:`put_slot_with_signal` on src.
+    """Dst-side wait: block the migration stream until the local fwd
+    flag reaches ``expected_value``, then reset it to 0 (stream-
+    ordered) for the next round.
+
+    Caller is responsible for scattering the staged slot out *before*
+    calling :func:`send_ack` — sending the ack frees src to overwrite
+    the slot, so the scatter must finish first.
     """
-    signal_wait(
-        flag_buffer(flag_slot),
-        expected_value=expected_value,
+    assert _initialized
+    s = stream or _migration_stream
+    signal_wait(flag_buffer(flag_slot), expected_value=expected_value, stream=s)
+    # Reset must be stream-ordered after the signal_wait so the next
+    # round's put_signal sees a clean 0 → 1 transition.
+    with torch.cuda.stream(s):
+        _flag_pool[flag_slot].zero_()
+
+
+def send_ack(
+    flag_slot: int,
+    src_pe: int,
+    *,
+    stream: Optional[torch.cuda.Stream] = None,
+) -> None:
+    """Dst-side ack: signal ``src_pe`` that ``flag_slot`` is safe to
+    reuse. Issued after the destination has scattered the staged
+    slot out — sending the ack lets src overwrite the slot, so the
+    scatter must complete first (which it does, because both are
+    stream-ordered on the migration stream).
+
+    Uses a dedicated 1-byte symmetric payload (:data:`_ack_payload`),
+    not a slice of the staging slot: NVSHMEM tracks slot tensors by
+    their root handle and would interpret a slice as the full slot,
+    racing with src's pending fill on the same slot.
+    """
+    put_signal(
+        _ack_payload,
+        ack_buffer(flag_slot),
+        src_pe,
         stream=stream or _migration_stream,
     )
-
-
-def reset_flag(slot: int) -> None:
-    """Reset the local flag to 0 so it can be reused on the next migration."""
-    assert _initialized
-    _flag_pool[slot].zero_()
 
 
 def staging_slot(slot_idx: int) -> torch.Tensor:
@@ -405,3 +512,108 @@ class StagingArena:
         idx = self._next
         self._next += 1
         return idx
+
+
+class FlagArena:
+    """Per-migration allocator over the lane-partitioned flag/ack pool.
+
+    For each ``(src_pe, dst_pe)`` pair, hands out a unique flag-slot
+    index in the lane reserved for that pair. Both src and dst call
+    ``take(src_pe, dst_pe)`` once per op while walking the migration
+    plan in identical order, so they pick the same flag index for the
+    same op without coordination — the same invariant the
+    :class:`StagingArena` relies on, applied to flags.
+
+    Lane partitioning makes the ack handshake unambiguous: an ack from
+    ``dst_pe → src_pe`` on slot ``S`` refers to *this* pair's prior
+    use of slot ``S``, never to some other pair's flag that happened
+    to hash to the same global index. Within a lane, the per-pair
+    counter wraps modulo :data:`_ops_per_pair`; the ack handshake
+    inside :func:`put_slot_with_signal` is what makes wrap-around safe
+    — the src signal_waits on the previous round's ack before
+    reissuing on the wrapped index.
+
+    No ``MAX_OPS_PER_REQ`` semantics: flag identity is per-pair
+    per-op, not per-request. Multiple ops in one bundle, multiple
+    bundles in one migration, and multiple migrations across time
+    all share the same per-pair lane and recycle via acks rather
+    than via a key-based collision-avoidance scheme.
+    """
+
+    def __init__(self):
+        # Per-(src_pe, dst_pe) op counter for this migration. Resets
+        # on each new arena; cross-migration safety is the ack
+        # handshake's responsibility, not the arena's.
+        self._counters: Dict[Tuple[int, int], int] = {}
+
+    def take(self, src_pe: int, dst_pe: int) -> int:
+        """Reserve the next flag-slot in the ``(src_pe, dst_pe)`` lane;
+        returns the absolute pool index.
+
+        Wraps modulo :data:`_ops_per_pair` within the lane. Wrap-around
+        is correct because :func:`put_slot_with_signal`'s ack-wait
+        serializes a new put on a slot with its previous round's
+        completion on the same slot.
+        """
+        assert _initialized
+        key = (src_pe, dst_pe)
+        n = self._counters.get(key, 0)
+        self._counters[key] = n + 1
+        lane = lane_for(src_pe, dst_pe)
+        return lane * _ops_per_pair + (n % _ops_per_pair)
+
+
+# ---- Test hooks -----------------------------------------------------------
+#
+# The NVSHMEM init path requires a real GPU + multi-rank distributed world.
+# These hooks let unit tests exercise the pure-Python bookkeeping (lane
+# encoding, FlagArena counter discipline) without those dependencies.
+# Mirror activation_transport's ``_init_state_for_test`` / ``_reset_state_for_test``.
+
+
+def _init_state_for_test(*, n_pes: int, ops_per_pair: int = 16) -> None:
+    """Set up the module state ``FlagArena`` / ``lane_for`` need, without
+    allocating any NVSHMEM buffers or starting the migration stream.
+    Tests that only exercise the per-pair flag allocator use this in
+    place of :func:`maybe_init_nvshmem`.
+
+    Calling :func:`maybe_init_nvshmem` after this raises (the module
+    already thinks it's initialized); call :func:`_reset_state_for_test`
+    to flip back.
+    """
+    global _initialized, _n_pes, _ops_per_pair, _num_lanes, _flag_pool_size
+    if _initialized:
+        raise RuntimeError(
+            "nvshmem_migration already initialized; call "
+            "_reset_state_for_test() first."
+        )
+    _n_pes = n_pes
+    _ops_per_pair = ops_per_pair
+    _num_lanes = n_pes * n_pes
+    _flag_pool_size = _ops_per_pair * _num_lanes
+    _initialized = True
+
+
+def _reset_state_for_test() -> None:
+    """Tear down whatever ``_init_state_for_test`` set up. Idempotent;
+    safe to call from a pytest fixture teardown."""
+    global _initialized, _my_pe, _n_pes, _migration_stream
+    global _flag_pool, _flag_pool_buffers
+    global _ack_pool, _ack_pool_buffers, _ack_payload
+    global _ops_per_pair, _num_lanes, _flag_pool_size
+    global _staging_slots, _staging_slot_bytes, _staging_num_slots
+    _initialized = False
+    _my_pe = -1
+    _n_pes = -1
+    _migration_stream = None
+    _flag_pool = []
+    _flag_pool_buffers = []
+    _ack_pool = []
+    _ack_pool_buffers = []
+    _ack_payload = None
+    _ops_per_pair = 0
+    _num_lanes = 0
+    _flag_pool_size = 0
+    _staging_slots = []
+    _staging_slot_bytes = 0
+    _staging_num_slots = 0

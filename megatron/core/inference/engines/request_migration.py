@@ -509,10 +509,9 @@ class MambaMigrationOp:
     src_rank: int
     dst_rank: int
     request_id: int
-    # Which one this is among the per-request mamba ops; used to
-    # derive disjoint flag-slot indices from the shared per-request
-    # key budget. See ``MAX_OPS_PER_REQ`` in
-    # ``megatron.rl.inference.multi_shard``.
+    # Which one this is among the per-request mamba ops. Carried for
+    # debugging / telemetry; flag identity comes from the per-(src_pe,
+    # dst_pe) FlagArena lane and is independent of this field.
     op_index_in_request: int
     # Mamba-buffer indices along the layer dim. Same on both sides
     # (mamba_layer_map is a model invariant).
