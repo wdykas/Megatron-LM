@@ -3914,7 +3914,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         mamba_payload: Optional[Dict[str, Any]] = None
 
         if getattr(self, "is_hybrid_model", False):
-            mamba_payload = self._export_mamba_state(internal_idx)
+            mamba_payload = self._export_mamba_state(internal_idx, block_ids=block_ids)
             if mamba_payload is not None:
                 layout = "hybrid_v1"
 
@@ -3932,12 +3932,26 @@ class DynamicInferenceContext(BaseInferenceContext):
             result["mamba_payload"] = mamba_payload
         return result
 
-    def _export_mamba_state(self, internal_idx: int) -> Optional[Dict[str, Any]]:
-        """Stage a request's Mamba conv + SSM state for off-GPU transfer.
+    def _export_mamba_state(
+        self, internal_idx: int, block_ids: Optional[list] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Stage a request's Mamba state — both the live end-state and
+        the per-block-boundary snapshots — for off-GPU transfer.
 
-        Pulled out of ``export_request_kv`` so the attention-only path
-        stays readable. Returns ``None`` for non-hybrid models or when
-        the request hasn't been assigned a Mamba slot yet.
+        The end-state binds to the decode worker's request slot via
+        :attr:`_pending_disagg_mamba_slot` so the disagg request itself
+        decodes correctly. The snapshots populate the decode worker's
+        :class:`MambaSlotAllocator` so a follow-up request that shares
+        any prefix of the same prompt can still restore the right
+        Mamba state at the matching block boundary — i.e. the prefix
+        cache continues to work for hybrid models after a disagg
+        import.
+
+        Returns ``None`` for non-hybrid models, when the request has
+        no Mamba slot, or when the model lacks a slot allocator. The
+        ``snapshots`` field is optional and present only when the slot
+        allocator has cached one or more block boundaries for the
+        request's attention blocks.
         """
         mamba_metadata = getattr(self, "mamba_metadata", None)
         if mamba_metadata is None:
@@ -3960,7 +3974,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         conv_slice = conv_states[:, slot_idx].contiguous().clone()
         ssm_slice = ssm_states[:, slot_idx].contiguous().clone()
 
-        return {
+        result: Dict[str, Any] = {
             "num_mamba_layers": int(conv_states.shape[0]),
             "conv_states_shape": list(conv_slice.shape),
             "ssm_states_shape": list(ssm_slice.shape),
@@ -3968,6 +3982,73 @@ class DynamicInferenceContext(BaseInferenceContext):
             "ssm_states_dtype": str(ssm_slice.dtype),
             "conv_states_tensor": conv_slice,
             "ssm_states_tensor": ssm_slice,
+        }
+
+        snapshots = self._export_mamba_snapshots(block_ids or [])
+        if snapshots is not None:
+            result["snapshots"] = snapshots
+        return result
+
+    def _export_mamba_snapshots(self, block_ids: list) -> Optional[Dict[str, Any]]:
+        """Collect per-block Mamba snapshots for the listed attention block IDs.
+
+        Returns a dict carrying staged ``conv`` / ``ssm`` tensors of
+        shape ``(num_snapshots, num_mamba_layers, *state_shape)`` plus
+        the matching ``block_hashes`` so the decode side can look them
+        up by hash in its own attention allocator.
+
+        Returns ``None`` when the model has no
+        :class:`MambaSlotAllocator` (e.g. pure attention or hybrid
+        without prefix caching) or when none of the request's blocks
+        have a slot allocated.
+        """
+        slot_allocator = getattr(self, "mamba_slot_allocator", None)
+        if slot_allocator is None or not block_ids:
+            return None
+
+        # Filter to blocks that actually have a Mamba snapshot.
+        block_to_slot = getattr(slot_allocator, "block_to_slot", None)
+        if block_to_slot is None:
+            return None
+        kv_allocator = getattr(self, "kv_block_allocator", None)
+        if kv_allocator is None or not hasattr(kv_allocator, "block_hashes"):
+            return None
+
+        snapshot_pairs = []  # list of (block_id, slot, hash)
+        block_id_tensor = torch.tensor(block_ids, dtype=torch.int64)
+        for bid in block_ids:
+            slot = int(block_to_slot[bid].item())
+            if slot < 0:
+                continue
+            h = int(kv_allocator.block_hashes[bid].item())
+            if h == -1:
+                continue
+            snapshot_pairs.append((bid, slot, h))
+
+        if not snapshot_pairs:
+            return None
+
+        slot_indices = [s for _, s, _ in snapshot_pairs]
+        hashes = [h for _, _, h in snapshot_pairs]
+
+        slot_tensor = torch.tensor(slot_indices, dtype=torch.int64)
+        # Slot tensors live on GPU; the gather copies the right rows out.
+        conv = slot_allocator.conv_states[:, slot_tensor].contiguous().clone()
+        ssm = slot_allocator.ssm_states[:, slot_tensor].contiguous().clone()
+
+        # Rearrange to (num_snapshots, num_mamba_layers, *state_shape) so
+        # decode can index by snapshot rather than by layer.
+        conv = conv.transpose(0, 1).contiguous()
+        ssm = ssm.transpose(0, 1).contiguous()
+
+        return {
+            "block_hashes": hashes,
+            "conv_states_shape": list(conv.shape),
+            "ssm_states_shape": list(ssm.shape),
+            "conv_states_dtype": str(conv.dtype),
+            "ssm_states_dtype": str(ssm.dtype),
+            "conv_states_tensor": conv,
+            "ssm_states_tensor": ssm,
         }
 
     def import_request_kv(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -4070,7 +4151,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         return result
 
     def _import_mamba_state(self, payload: Dict[str, Any]) -> Optional[int]:
-        """Allocate a Mamba slot and write the imported conv + SSM state.
+        """Allocate a Mamba slot, write the end-state, and rehydrate
+        per-block snapshots so the decode worker's prefix cache works.
 
         Returns the allocated slot index, or ``None`` if the model is
         not hybrid, the layout is incompatible, or no slot is free.
@@ -4107,4 +4189,92 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         conv_local[:, slot_idx] = conv_remote
         ssm_local[:, slot_idx] = ssm_remote
+
+        snapshots = payload.get("snapshots")
+        if snapshots is not None:
+            self._import_mamba_snapshots(snapshots)
         return slot_idx
+
+    def _import_mamba_snapshots(self, snapshots: Dict[str, Any]) -> None:
+        """Populate the local :class:`MambaSlotAllocator` with snapshots
+        the prefill peer captured at attention block boundaries.
+
+        For each ``(block_hash, conv_state, ssm_state)`` triple we:
+
+        1. Resolve the local attention ``block_id`` via
+           ``kv_block_allocator.kv_hash_to_block_id`` — the matching
+           prefix-cache entry from the attention import.
+        2. Reserve a Mamba slot for it via
+           ``slot_allocator.allocate_slots_batch`` (or reuse an
+           existing slot when the block already had one).
+        3. Copy the snapshotted states into that slot.
+        4. Register the hash → block_id mapping in the slot allocator
+           so the engine's restoration path finds it on a sub-prefix
+           hit.
+
+        Failures (no slot allocator, no matching local block) are
+        silently skipped per-entry; the disagg request itself still
+        succeeds, only follow-up prefix-cache hits would degrade.
+        """
+        slot_allocator = getattr(self, "mamba_slot_allocator", None)
+        if slot_allocator is None:
+            return
+        kv_allocator = getattr(self, "kv_block_allocator", None)
+        if kv_allocator is None:
+            return
+        hash_to_block = getattr(kv_allocator, "kv_hash_to_block_id", None)
+        if not hash_to_block:
+            return
+
+        hashes = list(snapshots.get("block_hashes") or [])
+        if not hashes:
+            return
+        conv = snapshots.get("conv_states_tensor")
+        ssm = snapshots.get("ssm_states_tensor")
+        if conv is None or ssm is None:
+            return
+        # Conv / SSM shapes are (num_snapshots, num_mamba_layers, *state_shape).
+        if conv.shape[0] != len(hashes) or ssm.shape[0] != len(hashes):
+            return
+
+        # Map remote hashes → local attention block_ids. Skip entries
+        # whose hash didn't land in this worker's attention allocator
+        # (shouldn't happen when the attention import succeeded, but be
+        # defensive).
+        target_block_ids = []
+        keep_indices = []
+        for i, h in enumerate(hashes):
+            local_bid = hash_to_block.get(h)
+            if local_bid is None:
+                continue
+            target_block_ids.append(int(local_bid))
+            keep_indices.append(i)
+
+        if not target_block_ids:
+            return
+
+        slots = slot_allocator.allocate_slots_batch(target_block_ids)
+        if not slots or any(s is None or s < 0 for s in slots):
+            return
+
+        # Bulk-copy snapshots → slot_allocator.{conv,ssm}_states.
+        # The slot allocator stores (num_mamba_layers, max_slots, *state_shape);
+        # our staged tensors are (num_snapshots, num_mamba_layers, *state_shape).
+        slot_tensor = torch.tensor(slots, dtype=torch.int64)
+        keep_tensor = torch.tensor(keep_indices, dtype=torch.int64)
+        # Move snapshots to the slot allocator's device.
+        device = slot_allocator.conv_states.device
+        conv_slice = conv.index_select(0, keep_tensor).to(device=device)
+        ssm_slice = ssm.index_select(0, keep_tensor).to(device=device)
+        slot_tensor_dev = slot_tensor.to(device=device)
+        # Transpose back to (num_mamba_layers, num_snapshots, *state_shape)
+        # for fancy-indexed assignment.
+        slot_allocator.conv_states[:, slot_tensor_dev] = conv_slice.transpose(0, 1)
+        slot_allocator.ssm_states[:, slot_tensor_dev] = ssm_slice.transpose(0, 1)
+
+        # Register hash → block_id so the slot allocator's lookups (and
+        # the engine's restoration probes) find these on sub-prefix hits.
+        registered_hashes = [hashes[i] for i in keep_indices]
+        slot_allocator.register_block_hashes_batch(
+            target_block_ids, registered_hashes
+        )
