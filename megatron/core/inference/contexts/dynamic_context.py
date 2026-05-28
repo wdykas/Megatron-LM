@@ -5,7 +5,7 @@ import math
 import operator
 import warnings
 from contextlib import nullcontext
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch  # type: ignore
 import torch.nn.functional as F  # type: ignore
@@ -2863,21 +2863,37 @@ class DynamicInferenceContext(BaseInferenceContext):
             _register_range(already_allocated_blocks + num_matched_blocks, num_complete_blocks)
 
         if self.is_hybrid_model and req.finished_chunk_token_count == 0:
-            # Allocate a slot for Mamba states
-            mamba_idx = self.mamba_metadata.allocate_slot()
-            if mamba_idx is None:
-                raise ContextOverflowError(req.request_id, "No Mamba slots available")
-            self.mamba_metadata.request_to_mamba_state_idx[self.total_request_count] = mamba_idx
-
-            # Restore Mamba state from the block corresponding to prefix_skip_tokens
-            restore_block_count = prefix_skip_tokens // self.block_size_tokens
-            if restore_block_count > 0 and self.mamba_slot_allocator is not None:
-                restore_block_id = matched_block_ids[restore_block_count - 1]
-                self._pending_mamba_restores.append(
-                    (self.total_request_count, restore_block_id, mamba_idx)
-                )
+            # Check for a slot pre-bound by a disaggregated KV import; if
+            # present, reuse the imported Mamba state and skip the
+            # restoration / zeroing paths (the state is already correct
+            # on the GPU).
+            preset_slot = getattr(self, "_pending_disagg_mamba_slot", None)
+            if preset_slot is not None:
+                mamba_idx = int(preset_slot)
+                self._pending_disagg_mamba_slot = None
+                self.mamba_metadata.request_to_mamba_state_idx[
+                    self.total_request_count
+                ] = mamba_idx
             else:
-                self._pending_mamba_zeros.append(mamba_idx)
+                # Allocate a slot for Mamba states
+                mamba_idx = self.mamba_metadata.allocate_slot()
+                if mamba_idx is None:
+                    raise ContextOverflowError(
+                        req.request_id, "No Mamba slots available"
+                    )
+                self.mamba_metadata.request_to_mamba_state_idx[
+                    self.total_request_count
+                ] = mamba_idx
+
+                # Restore Mamba state from the block corresponding to prefix_skip_tokens
+                restore_block_count = prefix_skip_tokens // self.block_size_tokens
+                if restore_block_count > 0 and self.mamba_slot_allocator is not None:
+                    restore_block_id = matched_block_ids[restore_block_count - 1]
+                    self._pending_mamba_restores.append(
+                        (self.total_request_count, restore_block_id, mamba_idx)
+                    )
+                else:
+                    self._pending_mamba_zeros.append(mamba_idx)
 
             # compute_and_store_offsets sets both CPU state (hash_to_block_id,
             # _eos_cache_block_id_gpu) and GPU staging buffers.  Runs immediately
@@ -3799,3 +3815,296 @@ class DynamicInferenceContext(BaseInferenceContext):
             'total_request_count': int(total_request_count),
             'max_requests': int(self.max_requests),
         }
+
+    # ------------------------------------------------------------------
+    # Disaggregated-serving hooks
+    #
+    # The two methods below extract a request's KV blocks from this
+    # context's GPU buffer into a contiguous staging tensor, and inject
+    # such a payload back into a fresh request on a peer worker. They
+    # exist so a Dynamo (or other framework) prefill→decode pipeline can
+    # ship KV over an RDMA transport (NIXL, etc.) without re-running
+    # prefill on the decode peer.
+    #
+    # Constraints (v1):
+    #   * standard attention only; MLA latent caches and Mamba states
+    #     fall through to the existing prefix-cache + re-prefill path.
+    #   * the staging buffer is sized per request and lives only for the
+    #     duration of one export/import — no pool, no double-buffering.
+    #   * the caller is responsible for ensuring both peers run the same
+    #     model topology (layer count, head dim, dtype) so the staging
+    #     shape matches.
+    # ------------------------------------------------------------------
+
+    def _resolve_internal_request_slot(self, request_id: int) -> Optional[int]:
+        """Reverse-lookup the engine-internal slot index for ``request_id``.
+
+        The context indexes block / mamba bookkeeping by an internal
+        slot counter (``total_request_count`` at the time the request
+        was added), not by the user-supplied ``request_id``. We keep the
+        mapping in ``self.request_ids[internal_idx] == user_request_id``.
+        """
+        request_ids_tensor = getattr(self, "request_ids", None)
+        if request_ids_tensor is None:
+            return None
+        upper = int(getattr(self, "total_request_count", 0) or 0)
+        if upper <= 0:
+            return None
+        # Search only the active portion to avoid matching stale -1 entries.
+        active = request_ids_tensor[:upper]
+        matches = (active == request_id).nonzero(as_tuple=False)
+        if matches.numel() == 0:
+            return None
+        return int(matches[0, 0].item())
+
+    def export_request_kv(self, request_id: int) -> Optional[Dict[str, Any]]:
+        """Stage a request's KV (and Mamba state) for off-GPU transfer.
+
+        Returns ``None`` when the request is unknown, has no KV blocks,
+        or uses the MLA latent cache (which we don't yet support).
+        Otherwise returns a dict with:
+
+        * ``staging_tensor`` — KV blocks for the request, shape
+          ``(num_blocks, 2, num_layers, block_size_tokens,
+          num_heads_per_partition, hidden_per_head)``.
+        * ``block_hashes`` — the allocator's hash per block (``-1``
+          for unregistered partials).
+        * ``mamba_payload`` — present only for hybrid models. A dict
+          with ``conv_states``, ``ssm_states``, and their shape/dtype
+          descriptors so the decode side can rebuild matching tensors.
+        * ``layout`` — version tag (``"std_attn_v1"`` for pure
+          attention, ``"hybrid_v1"`` when Mamba state rides along).
+        """
+        if getattr(self, "cache_mla_latent", False):
+            return None
+
+        internal_idx = self._resolve_internal_request_slot(request_id)
+        if internal_idx is None:
+            return None
+
+        block_count = int(self.request_kv_block_counts[internal_idx].item())
+        if block_count <= 0:
+            return None
+        block_ids = self.request_to_kv_block_ids[internal_idx, :block_count].tolist()
+        if not block_ids:
+            return None
+
+        memory_buffer = self.memory_buffer
+        # memory_buffer shape: (2, L, total_blocks, block_size, heads, hidden)
+        _, num_layers, _, block_size, heads, hidden = memory_buffer.shape
+        staging = torch.empty(
+            (block_count, 2, num_layers, block_size, heads, hidden),
+            dtype=memory_buffer.dtype,
+            device=memory_buffer.device,
+        )
+        for i, bid in enumerate(block_ids):
+            staging[i] = memory_buffer[:, :, bid, :, :, :]
+
+        if (
+            getattr(self.kv_block_allocator, "enable_prefix_caching", False)
+            and hasattr(self.kv_block_allocator, "block_hashes")
+        ):
+            block_hashes = self.kv_block_allocator.block_hashes[
+                torch.tensor(block_ids, dtype=torch.int64)
+            ].tolist()
+        else:
+            block_hashes = [-1] * block_count
+
+        layout = "std_attn_v1"
+        mamba_payload: Optional[Dict[str, Any]] = None
+
+        if getattr(self, "is_hybrid_model", False):
+            mamba_payload = self._export_mamba_state(internal_idx)
+            if mamba_payload is not None:
+                layout = "hybrid_v1"
+
+        result: Dict[str, Any] = {
+            "layout": layout,
+            "block_count": block_count,
+            "block_size_tokens": int(self.block_size_tokens),
+            "num_layers": int(num_layers),
+            "num_heads_per_partition": int(heads),
+            "hidden_per_head": int(hidden),
+            "staging_tensor": staging,
+            "block_hashes": block_hashes,
+        }
+        if mamba_payload is not None:
+            result["mamba_payload"] = mamba_payload
+        return result
+
+    def _export_mamba_state(self, internal_idx: int) -> Optional[Dict[str, Any]]:
+        """Stage a request's Mamba conv + SSM state for off-GPU transfer.
+
+        Pulled out of ``export_request_kv`` so the attention-only path
+        stays readable. Returns ``None`` for non-hybrid models or when
+        the request hasn't been assigned a Mamba slot yet.
+        """
+        mamba_metadata = getattr(self, "mamba_metadata", None)
+        if mamba_metadata is None:
+            return None
+        slot_tensor = getattr(mamba_metadata, "request_to_mamba_state_idx", None)
+        if slot_tensor is None:
+            return None
+        slot_idx = int(slot_tensor[internal_idx].item())
+        if slot_idx < 0:
+            return None
+
+        conv_states = getattr(self, "mamba_conv_states", None)
+        ssm_states = getattr(self, "mamba_ssm_states", None)
+        if conv_states is None or ssm_states is None:
+            return None
+
+        # Both buffers are shaped (num_mamba_layers, max_requests, *state_shape).
+        # Slice off this request's slot and clone so the staging tensor
+        # is self-contained for transport registration.
+        conv_slice = conv_states[:, slot_idx].contiguous().clone()
+        ssm_slice = ssm_states[:, slot_idx].contiguous().clone()
+
+        return {
+            "num_mamba_layers": int(conv_states.shape[0]),
+            "conv_states_shape": list(conv_slice.shape),
+            "ssm_states_shape": list(ssm_slice.shape),
+            "conv_states_dtype": str(conv_slice.dtype),
+            "ssm_states_dtype": str(ssm_slice.dtype),
+            "conv_states_tensor": conv_slice,
+            "ssm_states_tensor": ssm_slice,
+        }
+
+    def import_request_kv(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Inject a staged KV (and optional Mamba) payload into this context.
+
+        ``payload['staging_tensor']`` is expected to be already
+        populated with the remote K/V data (typically by the NIXL
+        transport on the caller's side, after an RDMA read completes).
+
+        Returns ``None`` on incompatibility. Otherwise returns a dict
+        with:
+
+        * ``block_ids`` — local block IDs we wrote into; the engine's
+          prefix-cache match path will reuse them via the registered
+          block hashes.
+        * ``block_hashes`` — passed-through from the payload.
+        * ``mamba_slot`` — present only when a Mamba payload arrived
+          and was applied. The slot is pre-bound to the next request
+          this engine will add via :attr:`_pending_disagg_mamba_slot`;
+          the engine's add path picks it up automatically.
+        """
+        layout = payload.get("layout")
+        if layout not in ("std_attn_v1", "hybrid_v1"):
+            return None
+        if getattr(self, "cache_mla_latent", False):
+            return None
+
+        memory_buffer = self.memory_buffer
+        _, num_layers, _, block_size, heads, hidden = memory_buffer.shape
+        if (
+            payload["num_layers"] != num_layers
+            or payload["block_size_tokens"] != block_size
+            or payload["num_heads_per_partition"] != heads
+            or payload["hidden_per_head"] != hidden
+        ):
+            return None
+
+        staging = payload["staging_tensor"]
+        if staging.dtype != memory_buffer.dtype:
+            return None
+
+        block_count = int(payload["block_count"])
+        if block_count <= 0:
+            return None
+
+        local_block_ids_tensor = self.kv_block_allocator.allocate_memory_blocks(
+            block_count
+        )
+        if local_block_ids_tensor is None:
+            return None
+        local_block_ids = local_block_ids_tensor.tolist()
+
+        for i, bid in enumerate(local_block_ids):
+            memory_buffer[:, :, bid, :, :, :] = staging[i]
+
+        # Register hashes so the engine's prefix-cache match treats these
+        # blocks as already populated. Filter -1 sentinels because the
+        # allocator's registry can't represent them.
+        block_hashes_in = list(payload.get("block_hashes") or [])
+        if len(block_hashes_in) == block_count and getattr(
+            self.kv_block_allocator, "enable_prefix_caching", False
+        ):
+            valid_pairs = [
+                (bid, h)
+                for bid, h in zip(local_block_ids, block_hashes_in)
+                if h is not None and h != -1
+            ]
+            if valid_pairs:
+                ids_to_register = [bid for bid, _ in valid_pairs]
+                hashes_to_register = [h for _, h in valid_pairs]
+                self.kv_block_allocator.register_kv_block_hashes(
+                    ids_to_register, hashes_to_register
+                )
+
+        # We allocated with ref_count=1; the engine's request lifecycle
+        # will increment again on match. Release once here to balance
+        # the books — the matched-block path expects ref_count to grow
+        # from the cached (ref_count==0) state.
+        if getattr(self.kv_block_allocator, "enable_prefix_caching", False):
+            self.kv_block_allocator.release_memory_blocks(
+                torch.tensor(local_block_ids, dtype=torch.int64)
+            )
+
+        result: Dict[str, Any] = {
+            "block_ids": local_block_ids,
+            "block_hashes": block_hashes_in,
+        }
+
+        mamba_payload = payload.get("mamba_payload")
+        if mamba_payload is not None and getattr(self, "is_hybrid_model", False):
+            slot_idx = self._import_mamba_state(mamba_payload)
+            if slot_idx is not None:
+                # Pre-bind the slot so the next `_add_request` reuses it
+                # instead of allocating a fresh one (and skipping the
+                # block-derived restoration). Cleared by the engine's
+                # add path the moment it consumes the binding.
+                self._pending_disagg_mamba_slot = slot_idx
+                result["mamba_slot"] = slot_idx
+
+        return result
+
+    def _import_mamba_state(self, payload: Dict[str, Any]) -> Optional[int]:
+        """Allocate a Mamba slot and write the imported conv + SSM state.
+
+        Returns the allocated slot index, or ``None`` if the model is
+        not hybrid, the layout is incompatible, or no slot is free.
+        """
+        mamba_metadata = getattr(self, "mamba_metadata", None)
+        if mamba_metadata is None:
+            return None
+
+        conv_local = getattr(self, "mamba_conv_states", None)
+        ssm_local = getattr(self, "mamba_ssm_states", None)
+        if conv_local is None or ssm_local is None:
+            return None
+
+        conv_remote = payload["conv_states_tensor"]
+        ssm_remote = payload["ssm_states_tensor"]
+
+        if conv_remote.dtype != conv_local.dtype:
+            return None
+        if ssm_remote.dtype != ssm_local.dtype:
+            return None
+
+        # Local layout per slot is (num_mamba_layers, *state_shape); the
+        # remote tensor was sliced from the same shape, so it must match
+        # element-by-element apart from the leading "slot" dimension.
+        if conv_remote.shape != conv_local.shape[:1] + conv_local.shape[2:]:
+            return None
+        if ssm_remote.shape != ssm_local.shape[:1] + ssm_local.shape[2:]:
+            return None
+
+        slot_idx = mamba_metadata.allocate_slot()
+        if slot_idx is None:
+            return None
+        slot_idx = int(slot_idx)
+
+        conv_local[:, slot_idx] = conv_remote
+        ssm_local[:, slot_idx] = ssm_remote
+        return slot_idx
