@@ -239,6 +239,131 @@ class PrefillHandoff:
         self.keepalive.clear()
 
 
+def send_request_kv_resharded(
+    engine: Any,
+    request_id: int,
+    my_layout,
+    src_layouts: list,
+    dst_layouts: list,
+    *,
+    backend: Optional[KVTransportBackend] = None,
+    group: Optional[object] = None,
+    base_tag: int = 0,
+) -> Optional["PrefillHandoff"]:
+    """Hetero-layout prefill send: reshard this rank's KV sub-blocks to
+    the decode layout via global-coordinate range intersection.
+
+    ``my_layout`` is this prefill rank's :class:`KVShardLayout`;
+    ``src_layouts`` / ``dst_layouts`` are the full prefill / decode
+    layout lists (known from a one-time config handshake). Attention KV
+    only in this MR -- a hybrid request raises ``NotImplementedError``.
+    Header-free: the decode side derives shapes from config + prompt.
+    """
+    from megatron.core.inference.kv_shard_layout import (
+        plan_kv_reshard,
+        transfers_for_src,
+    )
+
+    backend = backend or get_kv_transport_backend()
+    payload = engine.context.export_request_kv(request_id)
+    if payload is None:
+        raise ValueError(
+            f"send_request_kv_resharded: request {request_id} has no exportable KV"
+        )
+    if payload.get("mamba_payload") is not None:
+        raise NotImplementedError(
+            "hetero KV reshard supports attention KV only in this MR; "
+            "hybrid/Mamba hetero handoff is a future MR"
+        )
+
+    attn = payload["staging_tensor"]  # [BC, 2, local_layers, BS, local_heads, HD]
+    plan = plan_kv_reshard(src_layouts, dst_layouts)
+    mine = transfers_for_src(plan, my_layout.global_rank)
+    handles: List[TransferHandle] = []
+    keep: List[torch.Tensor] = []
+    for t in mine:
+        sub = attn[
+            :, :, t.src_layer_slice(my_layout), :, t.src_head_slice(my_layout), :
+        ].contiguous()
+        keep.append(sub)
+        tag = t.tag(my_layout.num_layers, my_layout.num_heads, base_tag)
+        handles.append(backend.isend(sub, dst=t.dst_rank, tag=tag))
+    return PrefillHandoff(handles=handles, keepalive=keep)
+
+
+def recv_request_kv_resharded(
+    engine: Any,
+    my_layout,
+    src_layouts: list,
+    dst_layouts: list,
+    prompt_token_ids,
+    *,
+    backend: Optional[KVTransportBackend] = None,
+    group: Optional[object] = None,
+    base_tag: int = 0,
+    device: Optional[torch.device] = None,
+) -> Optional[dict]:
+    """Hetero-layout decode receive: pull the KV sub-blocks covering this
+    rank's (layer x head) rectangle and assemble the local staging
+    tensor, then import. Header-free (schema derived from config+prompt)."""
+    from megatron.core.inference.kv_shard_layout import (
+        plan_kv_reshard,
+        transfers_for_dst,
+    )
+
+    backend = backend or get_kv_transport_backend()
+    meta = derive_decode_schema(engine, prompt_token_ids)
+    if meta is None:
+        return None
+    if meta["has_mamba"]:
+        raise NotImplementedError(
+            "hetero KV reshard supports attention KV only in this MR"
+        )
+
+    bc = meta["block_count"]
+    bs = meta["block_size_tokens"]
+    hd = meta["hidden_per_head"]
+    dtype = meta["attn_dtype"]
+    if device is None:
+        mb = getattr(engine.context, "memory_buffer", None)
+        device = mb.device if mb is not None else None
+
+    local_layers = my_layout.local_num_layers()
+    local_heads = my_layout.local_num_heads()
+    staging = torch.empty(
+        bc, 2, local_layers, bs, local_heads, hd, dtype=dtype, device=device
+    )
+
+    plan = plan_kv_reshard(src_layouts, dst_layouts)
+    mine = transfers_for_dst(plan, my_layout.global_rank)
+    pending = []
+    for t in mine:
+        n_lay = t.g_layer1 - t.g_layer0
+        n_head = t.g_head1 - t.g_head0
+        tag = t.tag(my_layout.num_layers, my_layout.num_heads, base_tag)
+        h = backend.irecv(
+            (bc, 2, n_lay, bs, n_head, hd), dtype, src=t.src_rank, tag=tag, device=device
+        )
+        pending.append((t, h))
+    for t, h in pending:
+        sub = h.wait()
+        staging[
+            :, :, t.dst_layer_slice(my_layout), :, t.dst_head_slice(my_layout), :
+        ] = sub
+
+    payload = {
+        "layout": "std_attn_v1",
+        "block_count": bc,
+        "block_size_tokens": bs,
+        "num_layers": local_layers,
+        "num_heads_per_partition": local_heads,
+        "hidden_per_head": hd,
+        "block_hashes": list(meta.get("block_hashes") or []),
+        "staging_tensor": staging,
+    }
+    return engine.context.import_request_kv(payload)
+
+
 def _send_object(obj, dst: int, group) -> None:
     import torch.distributed as dist
 
