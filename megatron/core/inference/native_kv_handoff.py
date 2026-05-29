@@ -25,6 +25,30 @@ Two planes:
 The wire ordering of tensors is fixed and mirrored on both sides:
 ``[attn_staging, (mamba_conv, mamba_ssm), (snap_conv, snap_ssm)]``.
 
+**Header-free by default.** Following the same principle Dynamo's
+vLLM/TRT-LLM connectors use -- they derive the KV *schema* (shapes,
+dtypes, layout) from the shared model config and only thread the
+*non-derivable transport addressing* (``kv_transfer_params``:
+remote_block_ids / engine_id / transfer_id) prefill->decode -- this
+module derives the entire schema on the decode side from the model
+config plus the prompt tokens it already holds:
+
+* shapes / dtypes / layout / hybrid-ness  -> static model config,
+  identical on both workers;
+* ``block_count``                          -> ``ceil(prompt_len / block_size)``;
+* ``block_hashes``                         -> ``compute_block_hashes_batched``
+  over the prompt tokens (a pure function, byte-identical on both sides).
+
+So with the two-sided NCCL backend (addressing implicit in rank+tag
+matching) the control plane disappears entirely -- no metadata object,
+no pickling, no ``headers.py`` -- and the data plane is pure KV bytes.
+A one-sided pull transport (NIXL / NVSHMEM-get) still needs the remote
+descriptor, exactly as Dynamo's NIXL connector ships ``remote_block_ids``;
+for that, set ``header_free=False`` to fall back to the explicit
+metadata path (and a future MR carries the descriptor in it). The
+header-free path assumes homogeneous prefill/decode and a fresh prefill
+(no cross-request prefix-cache reuse on the prefill side).
+
 This is intentionally small. The full route-DAG dispatcher and the
 bulk request-state migration on ``hetero-inference`` are future MRs;
 this gets one prefill->decode KV handoff working natively end to end.
@@ -128,6 +152,76 @@ def _slot_shape_dtype(meta: dict, idx: int):
     raise KeyError(name)
 
 
+def derive_decode_schema(engine: Any, prompt_token_ids) -> Optional[dict]:
+    """Reconstruct the KV schema on the decode side with no control message.
+
+    Returns the same metadata dict :func:`_build_metadata` produces, but
+    computed locally from the engine's static config + the prompt tokens
+    the decode worker already holds. Returns ``None`` for the MLA latent
+    cache (not header-free in this MR; use ``header_free=False``).
+
+    Assumes a homogeneous, fresh prefill: ``block_count`` and the
+    snapshot count follow directly from the prompt length and block size.
+    """
+    from megatron.core.inference.inference_request import compute_block_hashes_batched
+
+    ctx = engine.context
+    if getattr(ctx, "cache_mla_latent", False):
+        return None
+
+    bs = int(ctx.block_size_tokens)
+    if isinstance(prompt_token_ids, torch.Tensor):
+        toks = prompt_token_ids
+        prompt_len = int(toks.numel())
+    else:
+        prompt_len = len(prompt_token_ids)
+        toks = torch.tensor(list(prompt_token_ids), dtype=torch.int64)
+    block_count = (prompt_len + bs - 1) // bs
+    block_hashes = list(compute_block_hashes_batched(toks, bs))
+
+    mb = ctx.memory_buffer  # (2, num_layers, total_blocks, block_size, heads, hidden)
+    _, num_layers, _, _, heads, hidden = mb.shape
+    meta: dict = {
+        "layout": "std_attn_v1",
+        "block_count": block_count,
+        "block_size_tokens": bs,
+        "num_layers": int(num_layers),
+        "num_heads_per_partition": int(heads),
+        "hidden_per_head": int(hidden),
+        "block_hashes": block_hashes,
+        "attn_shape": (block_count, 2, int(num_layers), bs, int(heads), int(hidden)),
+        "attn_dtype": mb.dtype,
+        "has_mamba": False,
+        "has_snapshots": False,
+        "empty": False,
+    }
+    if getattr(ctx, "is_hybrid_model", False):
+        conv = ctx.mamba_conv_states  # (num_mamba_layers, max_requests, *conv_state)
+        ssm = ctx.mamba_ssm_states
+        nml = int(conv.shape[0])
+        conv_state = tuple(int(x) for x in conv.shape[2:])
+        ssm_state = tuple(int(x) for x in ssm.shape[2:])
+        meta["has_mamba"] = True
+        meta["mamba"] = {
+            "num_mamba_layers": nml,
+            "conv_shape": (nml, *conv_state),
+            "conv_dtype": conv.dtype,
+            "ssm_shape": (nml, *ssm_state),
+            "ssm_dtype": ssm.dtype,
+        }
+        n_snap = len(block_hashes)  # one snapshot per complete block
+        if getattr(ctx, "mamba_slot_allocator", None) is not None and n_snap > 0:
+            meta["has_snapshots"] = True
+            meta["snapshots"] = {
+                "block_hashes": block_hashes,
+                "conv_shape": (n_snap, nml, *conv_state),
+                "conv_dtype": conv.dtype,
+                "ssm_shape": (n_snap, nml, *ssm_state),
+                "ssm_dtype": ssm.dtype,
+            }
+    return meta
+
+
 @dataclass
 class PrefillHandoff:
     """Bookkeeping the prefill side holds until the transfer drains.
@@ -167,25 +261,39 @@ def send_request_kv(
     backend: Optional[KVTransportBackend] = None,
     group: Optional[object] = None,
     base_tag: int = 0,
+    header_free: bool = True,
 ) -> Optional[PrefillHandoff]:
     """Prefill side: stage ``request_id``'s KV and ship it to ``dst``.
 
     Non-blocking on the data plane: returns a :class:`PrefillHandoff`
     whose ``wait()`` the caller can defer (e.g. until after the next
-    engine step). Returns ``None`` if the request has no exportable KV
-    (zero-length / unsupported layout), in which case the caller should
-    fall back to having the decode side re-prefill.
+    engine step).
+
+    With ``header_free=True`` (default) no metadata is sent -- the
+    decode side reconstructs the schema from config + prompt; only the
+    KV tensors go on the wire. With ``header_free=False`` a metadata
+    object is sent first (the fallback for one-sided / hetero cases).
+
+    Returns ``None`` if the request has no exportable KV (zero-length /
+    MLA): in ``header_free`` mode this raises, since the contract is
+    that a valid KV exists; in object mode it signals the decode side.
     """
     backend = backend or get_kv_transport_backend()
     payload = engine.context.export_request_kv(request_id)
     if payload is None:
-        # Tell the decode side there is nothing to receive.
-        _send_object({"empty": True}, dst, group)
+        if header_free:
+            raise ValueError(
+                f"send_request_kv(header_free=True): request {request_id} has no "
+                "exportable KV (MLA / zero-length). Use header_free=False or "
+                "re-prefill on the decode side."
+            )
+        _send_object({"empty": True}, dst, group)  # signal nothing to receive
         return None
 
     meta = _build_metadata(payload)
     meta["empty"] = False
-    _send_object(meta, dst, group)  # control plane (small, blocking)
+    if not header_free:
+        _send_object(meta, dst, group)  # control plane (small, blocking)
 
     tensors = _ordered_tensors(payload, meta)
     handles = [
@@ -202,8 +310,15 @@ def recv_request_kv(
     group: Optional[object] = None,
     base_tag: int = 0,
     device: Optional[torch.device] = None,
+    header_free: bool = True,
+    prompt_token_ids=None,
 ) -> Optional[dict]:
     """Decode side: receive a request's KV from ``src`` and import it.
+
+    With ``header_free=True`` (default) the schema is derived locally
+    from config + ``prompt_token_ids`` (required) -- no control message
+    is received. With ``header_free=False`` the metadata object is
+    received from the prefill side.
 
     Returns the dict from :meth:`import_request_kv` (``block_ids`` etc.)
     on success, or ``None`` if the prefill side had nothing to send or
@@ -214,7 +329,15 @@ def recv_request_kv(
         mb = getattr(engine.context, "memory_buffer", None)
         device = mb.device if mb is not None else None
 
-    meta = _recv_object(src, group)
+    if header_free:
+        if prompt_token_ids is None:
+            raise ValueError(
+                "recv_request_kv(header_free=True) requires prompt_token_ids "
+                "to derive the KV schema."
+            )
+        meta = derive_decode_schema(engine, prompt_token_ids)
+    else:
+        meta = _recv_object(src, group)
     if meta is None or meta.get("empty", True):
         return None
 
