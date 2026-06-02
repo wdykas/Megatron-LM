@@ -2034,6 +2034,18 @@ def _add_inference_args(parser):
                             'disaggregated prefill->decode inference.')
     group.add_argument('--disagg-decode-pipeline-model-parallel-size', type=int, default=1,
                        help='Pipeline-parallel size of the decode replica(s). Default 1.')
+    # Expert (EP) / expert-tensor (ETP) parallelism per replica. These are
+    # KV-replica dimensions (they shard the MoE FFN, not the attention KV),
+    # so they may differ between prefill and decode without changing the KV
+    # handoff. Default None -> fall back to the model's expert sizes (or 1).
+    group.add_argument('--disagg-prefill-expert-model-parallel-size', type=int, default=None,
+                       help='Expert-parallel size of the prefill replica(s) (MoE only).')
+    group.add_argument('--disagg-prefill-expert-tensor-parallel-size', type=int, default=None,
+                       help='Expert-tensor-parallel size of the prefill replica(s) (MoE only).')
+    group.add_argument('--disagg-decode-expert-model-parallel-size', type=int, default=None,
+                       help='Expert-parallel size of the decode replica(s) (MoE only).')
+    group.add_argument('--disagg-decode-expert-tensor-parallel-size', type=int, default=None,
+                       help='Expert-tensor-parallel size of the decode replica(s) (MoE only).')
     return parser
 
 

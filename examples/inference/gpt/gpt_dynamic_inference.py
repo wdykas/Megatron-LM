@@ -277,85 +277,83 @@ def run_inference(
     }
 
 
-def run_disaggregated_inference(args, engine, requests):
-    """Prefill on data-parallel replica 0, hand KV to replica 1, decode there.
+def _build_disagg_parallel_config(args):
+    """Per-replica parallelism from the --disagg-* args. Expert sizes fall
+    back to the model's expert config (or 1) when not explicitly set."""
+    from megatron.core.inference.disaggregation.pg_setup import DisaggParallelConfig
 
-    Reuses the already-built ``engine`` and the deterministic ``requests``
-    list (identical on every rank, since ``build_requests`` is seeded), so
-    the decode side recovers each request's prompt by id. The decode
-    replica admits a request by importing its KV (which registers the
-    prefix-cache blocks) and calling ``add_request(prompt)`` -- the prompt
-    matches the cache, prefill is skipped, and generation continues, so
-    output is identical to the colocated run.
+    model_ep = getattr(args, "expert_model_parallel_size", 1) or 1
+    model_etp = getattr(args, "expert_tensor_parallel_size", 1) or 1
+    return DisaggParallelConfig(
+        prefill_tp=args.disagg_prefill_tensor_model_parallel_size,
+        prefill_pp=args.disagg_prefill_pipeline_model_parallel_size,
+        decode_tp=args.disagg_decode_tensor_model_parallel_size,
+        decode_pp=args.disagg_decode_pipeline_model_parallel_size,
+        prefill_ep=args.disagg_prefill_expert_model_parallel_size or model_ep,
+        prefill_etp=args.disagg_prefill_expert_tensor_parallel_size or model_etp,
+        decode_ep=args.disagg_decode_expert_model_parallel_size or model_ep,
+        decode_etp=args.disagg_decode_expert_tensor_parallel_size or model_etp,
+    )
+
+
+def _build_engine_for(args, tokenizer, sampling_params, requests, pg_collection):
+    """Build a DynamicInferenceEngine for one replica at the parallelism of
+    ``pg_collection`` (which may differ from the launched/global layout)."""
+    model = get_model_for_inference(pg_collection=pg_collection)
+    inference_config = get_inference_config_from_model_and_args(model, args)
+    inference_config.pg_collection = pg_collection
+    max_gen_length = sampling_params.num_tokens_to_generate
+    max_context_length = max(len(r.prompt_tokens) for r in requests)
+    inference_config.max_sequence_length = max_context_length + max_gen_length
+    context = DynamicInferenceContext(model.config, inference_config)
+    wrapped_model = GPTInferenceWrapper(model, context)
+    controller = TextGenerationController(wrapped_model, tokenizer)
+    return DynamicInferenceEngine(controller, context)
+
+
+def run_disaggregated_inference(args, tokenizer, sampling_params, requests):
+    """Non-collocated prefill->decode disaggregation.
+
+    Prefill and decode run as two independent replicas on disjoint rank
+    sets (ranks ``[0, Wp)`` and ``[Wp, Wp+Wd)``), each built against its
+    own ``ProcessGroupCollection`` at its own TP/PP/EP/ETP. Prefill
+    computes the KV, hands it to decode (resharding across any TP/PP
+    mismatch); decode admits each request by importing the KV (which
+    registers the prefix-cache blocks) and calling ``add_request`` -- the
+    prompt matches the cache, prefill is skipped, and generation
+    continues. ``requests`` is seeded/identical on every rank, so decode
+    recovers each prompt by id.
     """
-    from megatron.core import parallel_state as ps
     from megatron.core.inference.disaggregation.disagg_coordinator import DisaggCoordinator
-    from megatron.core.inference.disaggregation.kv_shard_layout import KVShardLayout, is_matched
     from megatron.core.inference.disaggregation.kv_transport_backend import NcclTransportBackend
+    from megatron.core.inference.disaggregation.pg_setup import (
+        build_role_pg_collection,
+        layout_from_pg_collection,
+    )
 
-    # Matched layouts are supported today; the disagg prefill/decode TP/PP
-    # args must equal the engine's actual TP/PP (heterogeneous layouts need
-    # the cross-layout process-group construction, a follow-up MR).
-    tp = ps.get_tensor_model_parallel_world_size()
-    pp = ps.get_pipeline_model_parallel_world_size()
-    if (
-        args.disagg_prefill_tensor_model_parallel_size != tp
-        or args.disagg_decode_tensor_model_parallel_size != tp
-        or args.disagg_prefill_pipeline_model_parallel_size != pp
-        or args.disagg_decode_pipeline_model_parallel_size != pp
-    ):
-        raise NotImplementedError(
-            "disaggregated inference currently supports matched prefill/decode "
-            "TP/PP (equal to the launched layout); heterogeneous prefill/decode "
-            "parallelism needs the inference process-group construction (follow-up MR)."
-        )
-    if ps.get_data_parallel_world_size() != 2:
+    cfg = _build_disagg_parallel_config(args)
+    world = torch.distributed.get_world_size()
+    if world != cfg.required_world:
         raise RuntimeError(
-            "matched disaggregation expects data-parallel size 2 (replica "
-            f"0=prefill, replica 1=decode); got {ps.get_data_parallel_world_size()}. "
-            "Set GPUS_PER_NODE so world_size = 2 * TP * PP."
+            f"disaggregation needs exactly prefill_world + decode_world = "
+            f"{cfg.prefill_world} + {cfg.decode_world} = {cfg.required_world} ranks "
+            f"(no idle ranks, since the handoff handshake spans the whole world); "
+            f"got world_size={world}. Set GPUS_PER_NODE accordingly."
         )
-    role = "prefill" if ps.get_data_parallel_rank() == 0 else "decode"
+
+    # All ranks build both meshes (collective); keep this rank's own.
+    role, pg = build_role_pg_collection(cfg)
     replica_id = "prefill" if role == "prefill" else "decode0"
     num_heads = getattr(args, "num_query_groups", None) or args.num_attention_heads
+    layout = layout_from_pg_collection(pg, args.num_layers, num_heads)
 
-    # Expert (EP) / expert-tensor (ETP) parallelism are KV-replica dimensions
-    # -- they shard the MoE FFN weights, never the attention KV -- but we pass
-    # them so the handoff dedupes replicated KV to one source per attention
-    # shard. Default to 1/0 for dense models (getters absent / EP disabled).
-    def _safe(getter, default):
-        fn = getattr(ps, getter, None)
-        try:
-            return fn() if fn is not None else default
-        except Exception:
-            return default
-
-    layout = KVShardLayout(
-        num_layers=args.num_layers,
-        num_heads=num_heads,
-        tp_size=ps.get_tensor_model_parallel_world_size(),
-        tp_rank=ps.get_tensor_model_parallel_rank(),
-        pp_size=ps.get_pipeline_model_parallel_world_size(),
-        pp_rank=ps.get_pipeline_model_parallel_rank(),
-        global_rank=torch.distributed.get_rank(),
-        ep_size=_safe("get_expert_model_parallel_world_size", 1),
-        ep_rank=_safe("get_expert_model_parallel_rank", 0),
-        etp_size=_safe("get_expert_tensor_parallel_world_size", 1),
-        etp_rank=_safe("get_expert_tensor_parallel_rank", 0),
-    )
+    engine = _build_engine_for(args, tokenizer, sampling_params, requests, pg)
     backend = NcclTransportBackend()
     backend.init()
     coord = DisaggCoordinator(
         role=role, replica_id=replica_id, my_layout=layout, backend=backend
     )
     coord.handshake()
-    for tgt in coord.decode_targets:
-        if any(not is_matched(layout, dl) for dl in tgt.layouts):
-            raise NotImplementedError(
-                "--disaggregation supports matched prefill/decode TP/PP only; "
-                "heterogeneous layouts need the inference process-group "
-                "construction (separate MR)."
-            )
 
     if role == "prefill":
         for i, req in enumerate(requests):
@@ -383,7 +381,9 @@ def run_disaggregated_inference(args, engine, requests):
             merged = rec.merge()
             finished[merged.request_id] = merged
 
-    if args.output_path and torch.distributed.get_rank() == ps.get_data_parallel_src_rank():
+    # The decode replica's representative rank (tp0/pp0) writes the output.
+    is_decode_writer = layout.tp_rank == 0 and layout.pp_rank == 0
+    if args.output_path and is_decode_writer:
         out = {}
         for rid, m in sorted(finished.items()):
             gt = m.generated_tokens
@@ -439,10 +439,22 @@ def main():
         stop_words=args.stop_words,
     )
 
+    # Requests (seeded -> identical on every rank).
+    requests = build_requests(args, tokenizer, sampling_params)
+
+    # Disaggregated path: prefill and decode are built as two independent
+    # replicas at their own parallelism (--disagg-* args), on disjoint rank
+    # sets. Gated entirely behind --disaggregation; the colocated path below
+    # is untouched. Writes the same output JSON, so it validates against the
+    # colocated golden values. Built here (before the global model) so each
+    # replica instantiates its model against its own process groups.
+    if args.disaggregation:
+        run_disaggregated_inference(args, tokenizer, sampling_params, requests)
+        return
+
     model = get_model_for_inference()
 
-    # Requests, context, controller.
-    requests = build_requests(args, tokenizer, sampling_params)
+    # Context, controller.
     inference_config = get_inference_config_from_model_and_args(model, args)
 
     # Calculate max_sequence_length from requests
@@ -472,14 +484,6 @@ def main():
     print("~~~")
     print(setup_prefix)
     print("~~~")
-
-    # Disaggregated path: prefill on replica 0, decode on replica 1. Gated
-    # entirely behind --disaggregation so the colocated path below is
-    # untouched. Writes the same output JSON, so it validates against the
-    # colocated golden values.
-    if args.disaggregation:
-        run_disaggregated_inference(args, engine, requests)
-        return
 
     # Run and time test, optionally `args.inference_repeat_n` times.
     throughputs = []
