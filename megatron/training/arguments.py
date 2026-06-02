@@ -1763,18 +1763,12 @@ def validate_args(args, defaults={}):
         assert args.moe_latent_size > 0, "MoE latent projection dimension has to be greater than zero."
         assert args.num_experts is not None, "MoE latent projections are applicable only for MoE models."
 
-    # Disaggregated prefill->decode inference. Enabled iff both prefill and
-    # decode parallelism specs are given. ``args.disaggregation`` is the
-    # single switch the inference/RL paths check; spec parsing/validation
-    # happens where the topology is built (disaggregation.pg_setup).
-    _p_par = getattr(args, 'disagg_prefill_parallelism', None)
-    _d_par = getattr(args, 'disagg_decode_parallelism', None)
-    args.disaggregation = bool(_p_par) and bool(_d_par)
-    if bool(_p_par) != bool(_d_par):
-        raise AssertionError(
-            'disaggregation requires BOTH --disagg-prefill-parallelism and '
-            '--disagg-decode-parallelism to be set.'
-        )
+    # Disaggregated prefill->decode inference. Enabled iff --inference-shards
+    # tags shards with prefill/decode roles. ``args.disaggregation`` is the
+    # single switch the inference/RL paths check; the spec is fully parsed +
+    # validated where the topology is built (inference.shards_spec).
+    _shards = getattr(args, 'inference_shards', None)
+    args.disaggregation = bool(_shards) and ('role=' in _shards)
 
     # Print arguments.
     _print_args("arguments", args)
@@ -2013,28 +2007,21 @@ def _add_inference_args(parser):
                        help='Skip the EP-group consensus all-reduce in the inference engine control loop and step on local state only. '
                             'Pause/unpause take effect as soon as the signal is delivered to a rank. '
                             'Only safe when EP coordination is not required (e.g. ep_world_size == 1).')
-    # Disaggregated prefill->decode inference. Each replica's parallelism is
-    # given as a "tp=N[,pp=N][,ep=N][,etp=N]" spec. Setting BOTH prefill and
-    # decode parallelism turns disaggregation on (``args.disaggregation``,
-    # derived in validate_args): prefill and decode run as separate model
-    # replicas (on disjoint ranks, at independent parallelism) and KV is
-    # handed off between them. The decode side is a pool -- pass one spec per
-    # decode replica, and replicas may differ in parallelism (requests are
-    # routed across them). EP/ETP are KV-replica dimensions (they shard the
-    # MoE FFN, not the attention KV), so they may differ freely between
-    # replicas without changing the handoff. Shared by the inference examples
-    # and the RL rollout path.
-    group.add_argument('--disagg-prefill-parallelism', type=str, nargs='+', default=None,
-                       metavar='SPEC',
-                       help='Prefill replica parallelism as "tp=N[,pp=N][,ep=N][,etp=N]". '
-                            'Setting this and --disagg-decode-parallelism enables '
-                            'disaggregated inference. (One prefill replica today; pass a '
-                            'single spec.)')
-    group.add_argument('--disagg-decode-parallelism', type=str, nargs='+', default=None,
-                       metavar='SPEC',
-                       help='Decode pool parallelism: one "tp=N[,pp=N][,ep=N][,etp=N]" spec '
-                            'per decode replica (repeatable). Replicas may differ; requests '
-                            'are routed across them.')
+    # Heterogeneous inference shards. One CLI string partitions the world
+    # into independent inference models, each with its own parallelism:
+    # "tp=2,dp=1,role=prefill+tp=1,dp=2,role=decode" (shards separated by
+    # '+' or ';'; per-shard keys tp/pp/ep/expt_tp/dp, default 1). Tagging
+    # shards role=prefill / role=decode turns on disaggregated inference
+    # (``args.disaggregation``, derived in validate_args): prefill shards
+    # hand KV to the decode pool. A dp>1 decode shard is several independent
+    # decode instances. Parsed where the topology is built
+    # (megatron.core.inference.shards_spec); shared by the inference
+    # examples and the RL rollout path.
+    group.add_argument('--inference-shards', type=str, default=None, metavar='SPEC',
+                       help='Heterogeneous inference shard layout, e.g. '
+                            '"tp=2,role=prefill+tp=1,dp=2,role=decode". Per-shard keys: '
+                            'tp,pp,ep,expt_tp,dp (default 1) and role=prefill|decode. '
+                            'Tagging prefill/decode roles enables disaggregated inference.')
     return parser
 
 

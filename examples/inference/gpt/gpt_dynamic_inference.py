@@ -297,11 +297,12 @@ def _build_engine_for(args, tokenizer, sampling_params, requests, pg_collection)
 def run_disaggregated_inference(args, tokenizer, sampling_params, requests):
     """Thin example wrapper over the core disaggregation orchestration.
 
-    All the orchestration -- topology, building the two meshes, the
-    coordinator handshake, and the prefill/decode loops -- lives in
-    ``megatron.core.inference.disaggregation``; here we only adapt the
-    example's requests, supply a (Megatron-specific) engine builder, and
-    write the output JSON for the colocated golden-value comparison.
+    All the orchestration -- parsing the shard layout, building each
+    shard's process groups, the coordinator handshake, and the
+    prefill/decode loops -- lives in core (inference.shards{,_spec} +
+    inference.disaggregation); here we only adapt the example's requests,
+    supply a (Megatron-specific) engine builder, and write the output JSON
+    for the colocated golden-value comparison.
     """
     from megatron.core.inference.disaggregation.orchestration import (
         DisaggRequest,
@@ -309,10 +310,10 @@ def run_disaggregated_inference(args, tokenizer, sampling_params, requests):
         run_prefill_replica,
         setup_disagg,
     )
-    from megatron.core.inference.disaggregation.pg_setup import DisaggTopology
+    from megatron.core.inference.shards_spec import parse_inference_shards_spec
 
-    topo = DisaggTopology.from_specs(
-        args.disagg_prefill_parallelism, args.disagg_decode_parallelism
+    specs = parse_inference_shards_spec(
+        args.inference_shards, torch.distributed.get_world_size()
     )
     num_heads = getattr(args, "num_query_groups", None) or args.num_attention_heads
     disagg_requests = [
@@ -321,7 +322,7 @@ def run_disaggregated_inference(args, tokenizer, sampling_params, requests):
     ]
 
     setup = setup_disagg(
-        topo,
+        specs,
         engine_builder=lambda pg: _build_engine_for(
             args, tokenizer, sampling_params, requests, pg
         ),
@@ -334,19 +335,19 @@ def run_disaggregated_inference(args, tokenizer, sampling_params, requests):
         return
 
     finished = run_decode_replica(setup.coordinator, setup.engine, disagg_requests)
-    _write_disagg_output(args, topo, setup, finished)
+    _write_disagg_output(args, setup, finished)
 
 
-def _write_disagg_output(args, topo, setup, finished):
-    """Decode representative rank (tp0/pp0) writes its replica's outputs.
-    With one decode replica this is the whole result (matches the colocated
-    golden values); with several, each replica writes its own subset to a
-    per-replica path."""
+def _write_disagg_output(args, setup, finished):
+    """Decode representative rank (tp0/pp0) writes its instance's outputs.
+    With one decode instance this is the whole result (matches the colocated
+    golden values); with several, each instance writes its own subset to a
+    per-instance path."""
     layout = setup.coordinator.my_layout
     if not args.output_path or layout.tp_rank != 0 or layout.pp_rank != 0:
         return
     path = args.output_path
-    if topo.num_decode_replicas > 1:
+    if setup.num_decode_instances > 1:
         path = f"{path}.{setup.replica_id}"
     out = {}
     for rid, m in sorted(finished.items()):
