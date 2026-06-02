@@ -1,36 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Parser for the ``--inference-shards`` / ``--rl-inference-shards`` CLI string.
-
-Turns the user-supplied shard layout string into a list of
-:class:`InferenceShardSpec` describing the heterogeneous inference layout. Each
-shard spec carries the (TP, PP, EP, expt_tp, DP) parallelism for one contiguous
-slice of the world; ranks are partitioned across shards in the order they
-appear.
-
-Spec syntax (one shard per ``;`` or ``+`` separator):
-
-    "tp=2,pp=1,ep=1,dp=1+tp=1,dp=2"
-
-Per-shard keys (all optional, default ``1``; ``expt_tp`` defaults to
-``tp``): ``tp``, ``pp``, ``ep``, ``expt_tp``, ``dp``.
-
-Disaggregation role (optional): ``role=prefill`` / ``role=decode``
-tags a shard as a prefill source or a decode target for
-prefill->decode KV disaggregation, e.g.
-
-    "tp=2,role=prefill+tp=1,dp=2,role=decode"
-
-Role is metadata the shard layer ignores; the disaggregation
-coordinator groups shards by it. A ``dp>1`` decode shard is several
-independent decode instances (each takes a routed subset of
-requests), not KV replicas.
-
-Examples for a 4-rank world:
-
-    "tp=2,dp=1+tp=1,dp=2"     -> shard 0 owns ranks [0,1], shard 1 owns [2,3]
-    "tp=4,dp=1"               -> single shard over all 4 ranks
-"""
+"""Parser and typed representation (:class:`InferenceShardSpec`) for the
+``--inference-shards`` shard-layout string."""
 
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Union

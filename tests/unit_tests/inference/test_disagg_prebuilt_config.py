@@ -1,16 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""configure_prebuilt_disagg_engine derives the disagg config from a pre-built
-engine + its shard process groups (the path MegatronAsyncLLM(inference_shards=)
-uses).
-
-Validates, over real ``dist.new_group`` (gloo, CPU), that for a given
-``--inference-shards`` layout each rank gets the right role / identity /
-instance layouts / total instance count -- including a ``dp>1`` decode shard,
-where each dp replica is an independent decode instance. The engine forward and
-KV are irrelevant here; only the config derivation (shard-window placement,
-``pg.dp`` rank, and the layout gather over ``pg.mp``) is exercised.
-"""
+"""configure_prebuilt_disagg_engine derives each rank's disagg role/identity/
+layouts from a shard layout + live process groups (gloo, CPU; incl. dp>1 decode)."""
 
 import os
 

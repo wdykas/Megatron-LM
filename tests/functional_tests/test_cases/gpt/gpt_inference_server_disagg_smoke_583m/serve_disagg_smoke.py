@@ -1,18 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Disaggregated prefill->decode smoke for ``launch_inference_server.py``.
-
-Same high-level-API server as ``gpt_inference_server_smoke``, but launched with
-``--inference-shards "tp=1,role=prefill+tp=1,role=decode"`` so the 2-rank job is
-split into one prefill shard (rank 0) and one decode shard (rank 1). The HTTP
-frontend runs on the primary rank and submits to the shared coordinator, which
-2-hop routes each request (prefill -> KV handoff -> decode). We tail stdout for
-the readiness banner, send one OpenAI-compatible ``/v1/completions`` request,
-and assert a 200 with non-empty ``choices[0].text``.
-
-No golden values: a pass/fail HTTP smoke of the disaggregated control plane
-(REGISTER_ROLE, 2-hop routing, KV handoff over NCCL, request round-trip).
-"""
+"""Disaggregated prefill->decode HTTP smoke for ``launch_inference_server.py``:
+launch the 2-rank prefill/decode server (``--inference-shards``) and assert one
+``/v1/completions`` request returns 200 with non-empty text."""
 
 import argparse
 import json

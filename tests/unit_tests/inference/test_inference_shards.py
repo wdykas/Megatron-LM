@@ -1,14 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Shard spec parsing (incl. role + dp), role-layout validation, the
-pg_collection->layout factory, and deterministic decode assignment.
-
-The pure parsing/partition logic needs no runtime. The layout factory
-reads sizes/ranks off a ProcessGroupCollection via get_pg_size/
-get_pg_rank; we fake a collection and monkeypatch those helpers (no
-torch.distributed init) to assert the layout maps each group to the
-right KVShardLayout field.
-"""
+"""Shard spec parsing/validation, the pg_collection->layout factory, and
+deterministic decode assignment (CPU; fake pg_collection, no torch.distributed)."""
 
 import pytest
 

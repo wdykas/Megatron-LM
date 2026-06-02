@@ -1,17 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""End-to-end offline disagg orchestration over real process groups (fake engine).
-
-Exercises the SPMD orchestration path on CPU: ``--inference-shards`` parsing ->
-``build_inference_pg_collections_for_shards`` (real ``dist.new_group``) ->
-``setup_disagg`` (layout from pg_collection + handshake) ->
-``run_prefill_replica`` / ``run_decode_replica`` (prefill ships KV, decode
-imports + "generates"). 3 gloo ranks, CPU: prefill TP2 {0,1} -> decode TP1 {2},
-which also reshards the KV TP2->TP1 on the way. The LLM forward is stubbed;
-everything else is the real coordinator + transport + reshard. The
-coordinator-native online path (``MegatronAsyncLLM(inference_shards=)``) is
-covered by the GPU e2e (test_disagg_coordinator_e2e) and the functional test.
-"""
+"""Offline disagg orchestration (setup_disagg + run_*_replica) over real process
+groups, prefill TP2 -> decode TP1 with a KV reshard (3 gloo ranks, CPU, fake engine)."""
 
 import os
 

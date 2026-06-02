@@ -1,27 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Framework-agnostic primitives for heterogeneous inference sharding.
-
-Use these when you want to stand up one or more inference models whose
-parallelism differs from training, and (optionally) have each inference model
-use a *different* parallelism configuration. The building blocks compose:
-
-- :func:`build_inference_pg_collection` — one ``ProcessGroupCollection`` for a
-  contiguous window of global ranks with specified TP/PP/CP/EP/ExptTP sizes.
-  Suitable for both collocated (same ranks as training) and non-collocated
-  (distinct rank window via ``rank_offset``) setups.
-- :class:`InferenceShard` — one entry in a shard layout: the spec, the rank
-  window, and (populated only on ranks that own the shard) a
-  ``ProcessGroupCollection``.
-- :func:`build_inference_pg_collections_for_shards` — partitions the global
-  world into N contiguous shards with per-shard parallelism specs. Every rank
-  must call this simultaneously because ``dist.new_group`` is world-collective.
-
-These utilities have no RL dependency. Megatron-LM's RL stack registers shards
-via :mod:`megatron.rl.parallel_utils`, but any downstream framework
-(NeMo-RL, verl, etc.) can consume them directly by passing shard lists
-explicitly.
-"""
+"""Framework-agnostic primitives for heterogeneous inference sharding: build a
+``ProcessGroupCollection`` per shard, each over a contiguous rank window at its
+own parallelism."""
 
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Union

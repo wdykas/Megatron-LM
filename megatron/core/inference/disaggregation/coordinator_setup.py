@@ -1,14 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Wiring for native (coordinator-driven) online disaggregated serving.
-
-Configures this rank's prefill/decode shard engine for the shared DP inference
-coordinator (role + layouts + identity + sizing), so a single
-``InferenceClient`` (or the HTTP frontend) can submit requests and the
-coordinator 2-hop routes them (prefill -> KV handoff -> decode).
-:func:`configure_prebuilt_disagg_engine` is what ``MegatronAsyncLLM`` calls when
-constructed with ``inference_shards`` -- the serving / eval / RL path.
-"""
+"""Configure a prefill/decode shard engine for the shared DP inference
+coordinator (role + KV layouts + identity); called by ``MegatronAsyncLLM`` when
+given ``inference_shards``."""
 
 from __future__ import annotations
 
