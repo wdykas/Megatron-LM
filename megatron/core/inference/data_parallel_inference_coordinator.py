@@ -172,19 +172,14 @@ class DataParallelInferenceCoordinator:
         logging.info("Inference Coordinator: waiting for connections from data parallel ranks...")
         # First wait for all data parallel ranks to establish connections.
         self.identities_of_data_parallel_ranks = deque([])
-        # Disaggregation: engines register with a role ("prefill"/"decode") and
-        # the full KV layout of their instance (all tp/pp ranks), so the
-        # coordinator can 2-hop route and build reshard plans. ``_disagg`` holds
-        # the routing policy; ``_engine_layouts`` maps engine identity -> its
-        # instance's layout dicts; ``_req_meta`` stashes prompt+sampling per
-        # request for the RECV_KV forward.
         # Disaggregation: engines register dynamically in the start() loop via
-        # REGISTER_ROLE (role + the full KV layout of their instance), rather
-        # than the blocking count below -- this is robust to engines and the
-        # client connecting in any order. Spawn the disagg coordinator with
-        # data_parallel_size=0. ``_disagg`` holds the routing policy;
-        # ``_engine_layouts`` maps engine identity -> its instance's layout
-        # dicts; ``_req_meta`` stashes prompt+sampling per request for RECV_KV.
+        # REGISTER_ROLE (their role + their instance's full KV layout across all
+        # tp/pp ranks), so the coordinator can 2-hop route and plan reshards --
+        # robust to engines/client connecting in any order (the disagg
+        # coordinator spawns with data_parallel_size=0, not the blocking count
+        # below). ``_disagg`` is the routing policy; ``_engine_layouts`` maps
+        # engine identity -> its instance's layout dicts; ``_req_meta`` stashes
+        # prompt+sampling per request for the RECV_KV hop.
         self.disaggregated = disaggregated
         self._disagg = DisaggRouting() if disaggregated else None
         self._engine_layouts: dict = {}
