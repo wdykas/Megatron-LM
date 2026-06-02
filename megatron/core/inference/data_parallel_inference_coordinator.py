@@ -277,6 +277,11 @@ class DataParallelInferenceCoordinator:
     def _remove_engine(self, identity):
         """Remove a disconnected engine from the routing pool."""
         self.identities_of_data_parallel_ranks.remove(identity)
+        # Disaggregated: also drop it from the prefill/decode pools so it isn't
+        # handed further requests.
+        if self.disaggregated:
+            self._disagg.remove(identity)
+            self._engine_layouts.pop(identity, None)
         logging.warning(
             "Coordinator: removed engine %s (now %d engines)",
             identity,
@@ -303,11 +308,32 @@ class DataParallelInferenceCoordinator:
         """Hop 2: a prefill engine staged a request's KV. Pick a decode engine,
         tell prefill where to ship the KV (SEND_KV) and decode where to receive
         it + the prompt to admit (RECV_KV). The KV bytes move engine->engine via
-        the transport backend; only control flows through the coordinator."""
-        prefill_id, decode_id = self._disagg.route_prefill_done(request_id)
-        prompt, sampling_params = self._req_meta[request_id]
-        src_layouts = self._engine_layouts[prefill_id]
-        dst_layouts = self._engine_layouts[decode_id]
+        the transport backend; only control flows through the coordinator.
+
+        Drops the request (with a logged warning) rather than crashing the
+        coordinator loop if its state is missing -- e.g. a duplicate/late
+        PREFILL_DONE, or the chosen decode engine disconnected before it could
+        be routed. The coordinator is shared by the whole job, so an unhandled
+        exception here would take every engine down with it.
+        """
+        meta = self._req_meta.get(request_id)
+        if meta is None:
+            logging.warning("Coordinator: PREFILL_DONE for unknown request %s; dropping", request_id)
+            return
+        try:
+            prefill_id, decode_id = self._disagg.route_prefill_done(request_id)
+        except RuntimeError as e:
+            logging.error("Coordinator: cannot route request %s to decode: %s", request_id, e)
+            return
+        prompt, sampling_params = meta
+        src_layouts = self._engine_layouts.get(prefill_id)
+        dst_layouts = self._engine_layouts.get(decode_id)
+        if src_layouts is None or dst_layouts is None:
+            logging.error(
+                "Coordinator: missing KV layouts for request %s (prefill=%s, decode=%s); dropping",
+                request_id, prefill_id, decode_id,
+            )
+            return
         self._disagg_send(prefill_id, Headers.SEND_KV, request_id, dst_layouts)
         self._disagg_send(
             decode_id, Headers.RECV_KV, request_id, src_layouts, prompt, sampling_params
