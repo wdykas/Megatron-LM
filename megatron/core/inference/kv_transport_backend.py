@@ -25,15 +25,19 @@ Design (kept deliberately small for a first MR):
       point-to-point (``isend`` / ``irecv``). Works with the ``nccl``
       backend on GPU and ``gloo`` on CPU, so it runs in CI without any
       special hardware. This is the default.
-    - :class:`NvshmemTransportBackend` — adapts the branch's tested
-      NVSHMEM activation transport (``activation_transport`` /
-      ``nvshmem_runtime``) to move KV blobs. Import-safe without
+    - :class:`NvshmemTransportBackend` — bulk KV transfer built directly
+      on the shared ``nvshmem_runtime`` primitives (symmetric slot/flag
+      pools + ``put_signal`` / ``signal_wait``). Import-safe without
       NVSHMEM; raises a clear error at :meth:`init` if the runtime is
-      absent.
+      absent. It deliberately does NOT use ``activation_transport`` —
+      that is the per-layer per-token mover for layer-kind
+      disaggregation (a separate, deferred feature); a KV handoff is a
+      few bulk transfers per request, which the runtime's put/signal
+      serves directly.
 
 Larger pieces from ``hetero-inference`` (route DAG dispatcher,
-compiled routes, hetero-TP / MoE routing) are intentionally left for
-future MRs.
+compiled routes, layer-wise activation transport) are intentionally
+left for future MRs.
 """
 
 from __future__ import annotations
@@ -189,53 +193,86 @@ class NcclTransportBackend(KVTransportBackend):
 
 
 class NvshmemTransportBackend(KVTransportBackend):
-    """Adapts the branch's NVSHMEM activation transport to move KV blobs.
+    """Bulk KV transfer over NVSHMEM, built directly on the shared
+    :mod:`nvshmem_runtime` primitives (init + symmetric slot/flag pools +
+    ``put_signal`` / ``signal_wait``).
 
-    Treats a KV staging tensor as a ``hidden`` payload and routes it
-    through ``activation_transport.send_hidden`` / ``receive_hidden``.
-    NVSHMEM has no separate non-blocking API exposed here, so
-    ``isend`` / ``irecv`` fall back to stream-ordered blocking ops on
-    the transport's dedicated stream (still off the compute stream).
+    This is a *bulk* point-to-point mover -- a few large transfers per
+    request -- which is what a prefill->decode KV handoff needs. It does
+    **not** use ``activation_transport`` (that is the per-layer
+    per-token ring-buffer mover for layer-kind disaggregation, a
+    separate, deferred feature).
+
+    Addressing: symmetric memory is addressed by handle, so a transfer
+    from PE ``s`` lands in the destination's slot/flag at index ``s``.
+    Slot/flag pools are sized to ``n_pes`` (one inbound channel per
+    source PE), so transfers between *distinct* (src, dst) pairs run
+    concurrently. The limitation is **one in-flight transfer per (src,
+    dst) pair** -- single-buffered per channel; the KV handoff sends one
+    sub-block per pair per request, so this suffices. Multi-buffering
+    per pair is a future MR.
+
+    NOTE: requires the ``nvshmem`` package + NVSHMEM-capable interconnect;
+    it is import-safe without them but raises at :meth:`init`. It is not
+    exercised in CPU CI (no NVSHMEM there) -- the NCCL backend is the
+    CI-tested default.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, slot_bytes: int = 256 * 1024 * 1024) -> None:
         self._init = False
+        self._slot_bytes = slot_bytes
+        self._slots = None       # symmetric uint8 slot tensors, one per src PE
+        self._flag_t = None      # flag tensors (for local zero/read)
+        self._flag_b = None      # flag cuda.core Buffers (for the NVSHMEM call)
+        self._stream = None
+        self._my_pe = -1
 
     def is_initialized(self) -> bool:
-        try:
-            from megatron.core.inference import activation_transport as _at
-        except Exception:
-            return False
-        return self._init and _at.is_initialized()
+        return self._init
 
-    def init(self, *, group: Optional[object] = None, **kwargs) -> None:
-        from megatron.core.inference import activation_transport as _at
+    def init(self, *, group: Optional[object] = None, slot_bytes: Optional[int] = None, **kwargs) -> None:
         from megatron.core.inference import nvshmem_runtime as _nv
 
         if not getattr(_nv, "_HAVE_NVSHMEM", False):
             raise RuntimeError(
-                "NvshmemTransportBackend.init: the 'nvshmem' Python package is not "
-                "available. Build NVSHMEM, or use NcclTransportBackend instead."
+                "NvshmemTransportBackend.init: the 'nvshmem' package is not "
+                "available. Install nvidia-nvshmem-cu12, or use "
+                "NcclTransportBackend (the default)."
             )
-        _at.maybe_init_activation_transport(group=group, **kwargs)
+        if slot_bytes is not None:
+            self._slot_bytes = slot_bytes
+        _nv.maybe_init_nvshmem(group=group)
+        n = _nv.n_pes()
+        self._my_pe = _nv.my_pe()
+        # One inbound channel per source PE -> distinct pairs don't collide.
+        self._slots = _nv.allocate_slot_pool(n, self._slot_bytes)
+        self._flag_t, self._flag_b = _nv.allocate_flag_pool(n)
+        self._stream = torch.cuda.Stream()
+        _nv.barrier_all_and_sync()
         self._init = True
 
     def stream(self) -> Optional[torch.cuda.Stream]:
-        from megatron.core.inference import activation_transport as _at
+        return self._stream
 
-        return _at.activation_stream()
+    def _check(self, nbytes: int) -> None:
+        if nbytes > self._slot_bytes:
+            raise RuntimeError(
+                f"NvshmemTransportBackend: payload {nbytes} B exceeds slot_bytes "
+                f"{self._slot_bytes}. Re-init with a larger slot_bytes."
+            )
 
     def send(self, tensor: torch.Tensor, dst: int, tag: int = 0) -> None:
-        from megatron.core.inference import activation_transport as _at
-        import torch.distributed as dist
+        from megatron.core.inference import nvshmem_runtime as _nv
 
-        my_pe = dist.get_rank()
-        _at.send_hidden(
-            my_pe=my_pe,
-            dst_pe=dst,
-            hidden=tensor.contiguous(),
-            payload_nbytes=tensor.numel() * tensor.element_size(),
-            stream=self.stream(),
+        t = tensor.contiguous()
+        nbytes = t.numel() * t.element_size()
+        self._check(nbytes)
+        # Write into our own slot[my_pe]; put_signal lands it in dst's
+        # slot[my_pe] (same symmetric handle) and sets dst's flag[my_pe].
+        slot = self._slots[self._my_pe]
+        slot[:nbytes].copy_(t.reshape(-1).view(torch.uint8))
+        _nv.put_signal(
+            slot, self._flag_b[self._my_pe], dst, nbytes=nbytes, stream=self._stream
         )
 
     def recv(
@@ -247,25 +284,21 @@ class NvshmemTransportBackend(KVTransportBackend):
         *,
         device: Optional[torch.device] = None,
     ) -> torch.Tensor:
-        from megatron.core.inference import activation_transport as _at
-        import torch.distributed as dist
+        from megatron.core.inference import nvshmem_runtime as _nv
 
-        my_pe = dist.get_rank()
         nbytes = _nbytes(shape, dtype)
-        return _at.receive_hidden(
-            my_pe=my_pe,
-            src_pe=src,
-            hidden_shape=shape,
-            hidden_dtype=dtype,
-            payload_nbytes=nbytes,
-            stream=self.stream(),
+        self._check(nbytes)
+        _nv.signal_wait(self._flag_b[src], expected_value=1, stream=self._stream)
+        self._stream.synchronize()
+        out = (
+            self._slots[src][:nbytes].view(dtype).reshape(shape).clone()
         )
+        self._flag_t[src].zero_()  # recycle the channel for the next transfer
+        return out
 
     def isend(self, tensor: torch.Tensor, dst: int, tag: int = 0) -> TransferHandle:
-        # Stream-ordered put; "wait" syncs the transport stream.
-        self.send(tensor, dst, tag)
-        strm = self.stream()
-        return TransferHandle(wait_fn=(strm.synchronize if strm is not None else None))
+        self.send(tensor, dst, tag)  # stream-ordered put
+        return TransferHandle(wait_fn=self._stream.synchronize)
 
     def irecv(
         self,
@@ -277,10 +310,7 @@ class NvshmemTransportBackend(KVTransportBackend):
         device: Optional[torch.device] = None,
     ) -> TransferHandle:
         t = self.recv(shape, dtype, src, tag, device=device)
-        strm = self.stream()
-        return TransferHandle(
-            wait_fn=(strm.synchronize if strm is not None else None), tensor=t
-        )
+        return TransferHandle(wait_fn=None, tensor=t)
 
 
 def _nbytes(shape: Tuple[int, ...], dtype: torch.dtype) -> int:
