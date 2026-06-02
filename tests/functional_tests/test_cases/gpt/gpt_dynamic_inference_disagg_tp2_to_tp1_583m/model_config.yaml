@@ -51,8 +51,8 @@ MODEL_ARGS:
   --num-tokens-to-generate: 30
   --inference-dynamic-batching-buffer-size-gb: 20
   --inference-dynamic-batching-prefix-caching: true
-  --disagg-prefill-tensor-model-parallel-size: 2
-  --disagg-decode-tensor-model-parallel-size: 1
+  --disagg-prefill-parallelism: tp=2
+  --disagg-decode-parallelism: tp=1
   --dist-ckpt-strictness: log_unexpected
   --inference-ckpt-non-strict: true
   --output-path: ${INFERENCE_OUTPUT_PATH}

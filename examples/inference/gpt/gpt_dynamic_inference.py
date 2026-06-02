@@ -277,28 +277,11 @@ def run_inference(
     }
 
 
-def _build_disagg_parallel_config(args):
-    """Per-replica parallelism from the --disagg-* args. Expert sizes fall
-    back to the model's expert config (or 1) when not explicitly set."""
-    from megatron.core.inference.disaggregation.pg_setup import DisaggParallelConfig
-
-    model_ep = getattr(args, "expert_model_parallel_size", 1) or 1
-    model_etp = getattr(args, "expert_tensor_parallel_size", 1) or 1
-    return DisaggParallelConfig(
-        prefill_tp=args.disagg_prefill_tensor_model_parallel_size,
-        prefill_pp=args.disagg_prefill_pipeline_model_parallel_size,
-        decode_tp=args.disagg_decode_tensor_model_parallel_size,
-        decode_pp=args.disagg_decode_pipeline_model_parallel_size,
-        prefill_ep=args.disagg_prefill_expert_model_parallel_size or model_ep,
-        prefill_etp=args.disagg_prefill_expert_tensor_parallel_size or model_etp,
-        decode_ep=args.disagg_decode_expert_model_parallel_size or model_ep,
-        decode_etp=args.disagg_decode_expert_tensor_parallel_size or model_etp,
-    )
-
-
 def _build_engine_for(args, tokenizer, sampling_params, requests, pg_collection):
     """Build a DynamicInferenceEngine for one replica at the parallelism of
-    ``pg_collection`` (which may differ from the launched/global layout)."""
+    ``pg_collection``. This is the only framework-specific step (model +
+    checkpoint); the disaggregation flow itself lives in core
+    (megatron.core.inference.disaggregation.orchestration)."""
     model = get_model_for_inference(pg_collection=pg_collection)
     inference_config = get_inference_config_from_model_and_args(model, args)
     inference_config.pg_collection = pg_collection
@@ -312,91 +295,72 @@ def _build_engine_for(args, tokenizer, sampling_params, requests, pg_collection)
 
 
 def run_disaggregated_inference(args, tokenizer, sampling_params, requests):
-    """Non-collocated prefill->decode disaggregation.
+    """Thin example wrapper over the core disaggregation orchestration.
 
-    Prefill and decode run as two independent replicas on disjoint rank
-    sets (ranks ``[0, Wp)`` and ``[Wp, Wp+Wd)``), each built against its
-    own ``ProcessGroupCollection`` at its own TP/PP/EP/ETP. Prefill
-    computes the KV, hands it to decode (resharding across any TP/PP
-    mismatch); decode admits each request by importing the KV (which
-    registers the prefix-cache blocks) and calling ``add_request`` -- the
-    prompt matches the cache, prefill is skipped, and generation
-    continues. ``requests`` is seeded/identical on every rank, so decode
-    recovers each prompt by id.
+    All the orchestration -- topology, building the two meshes, the
+    coordinator handshake, and the prefill/decode loops -- lives in
+    ``megatron.core.inference.disaggregation``; here we only adapt the
+    example's requests, supply a (Megatron-specific) engine builder, and
+    write the output JSON for the colocated golden-value comparison.
     """
-    from megatron.core.inference.disaggregation.disagg_coordinator import DisaggCoordinator
-    from megatron.core.inference.disaggregation.kv_transport_backend import NcclTransportBackend
-    from megatron.core.inference.disaggregation.pg_setup import (
-        build_role_pg_collection,
-        layout_from_pg_collection,
+    from megatron.core.inference.disaggregation.orchestration import (
+        DisaggRequest,
+        run_decode_replica,
+        run_prefill_replica,
+        setup_disagg,
     )
+    from megatron.core.inference.disaggregation.pg_setup import DisaggTopology
 
-    cfg = _build_disagg_parallel_config(args)
-    world = torch.distributed.get_world_size()
-    if world != cfg.required_world:
-        raise RuntimeError(
-            f"disaggregation needs exactly prefill_world + decode_world = "
-            f"{cfg.prefill_world} + {cfg.decode_world} = {cfg.required_world} ranks "
-            f"(no idle ranks, since the handoff handshake spans the whole world); "
-            f"got world_size={world}. Set GPUS_PER_NODE accordingly."
-        )
-
-    # All ranks build both meshes (collective); keep this rank's own.
-    role, pg = build_role_pg_collection(cfg)
-    replica_id = "prefill" if role == "prefill" else "decode0"
+    topo = DisaggTopology.from_specs(
+        args.disagg_prefill_parallelism, args.disagg_decode_parallelism
+    )
     num_heads = getattr(args, "num_query_groups", None) or args.num_attention_heads
-    layout = layout_from_pg_collection(pg, args.num_layers, num_heads)
+    disagg_requests = [
+        DisaggRequest(i, r.prompt_text, r.prompt_tokens, r.sampling_params)
+        for i, r in enumerate(requests)
+    ]
 
-    engine = _build_engine_for(args, tokenizer, sampling_params, requests, pg)
-    backend = NcclTransportBackend()
-    backend.init()
-    coord = DisaggCoordinator(
-        role=role, replica_id=replica_id, my_layout=layout, backend=backend
+    setup = setup_disagg(
+        topo,
+        engine_builder=lambda pg: _build_engine_for(
+            args, tokenizer, sampling_params, requests, pg
+        ),
+        num_layers=args.num_layers,
+        num_heads=num_heads,
     )
-    coord.handshake()
 
-    if role == "prefill":
-        for i, req in enumerate(requests):
-            engine.add_request(i, req.prompt_text, req.sampling_params)
-        handed = set()
-        while len(handed) < len(requests):
-            engine.step_modern()
-            for i, req in enumerate(requests):
-                if i not in handed:
-                    ho = coord.prefill_handoff(engine, i, req.prompt_tokens)
-                    if ho is not None:
-                        ho.wait()
-                    handed.add(i)
+    if setup.role == "prefill":
+        run_prefill_replica(setup.coordinator, setup.engine, disagg_requests)
         return
 
-    # decode replica: intake KV, admit (prefix-cache match), generate
-    for _ in range(len(requests)):
-        rid, _imported = coord.decode_intake(engine)
-        req = requests[rid]
-        engine.add_request(rid, req.prompt_text, req.sampling_params)
-    finished = {}
-    while len(finished) < len(requests):
-        result = engine.step_modern()
-        for rec in result.get("finished_request_records", []):
-            merged = rec.merge()
-            finished[merged.request_id] = merged
+    finished = run_decode_replica(setup.coordinator, setup.engine, disagg_requests)
+    _write_disagg_output(args, topo, setup, finished)
 
-    # The decode replica's representative rank (tp0/pp0) writes the output.
-    is_decode_writer = layout.tp_rank == 0 and layout.pp_rank == 0
-    if args.output_path and is_decode_writer:
-        out = {}
-        for rid, m in sorted(finished.items()):
-            gt = m.generated_tokens
-            d = {
-                "input_prompt": m.prompt,
-                "generated_text": m.generated_text,
-                "generated_tokens": gt.tolist() if torch.is_tensor(gt) else gt,
-            }
-            if getattr(m.sampling_params, "return_log_probs", False):
-                d["logprobs"] = getattr(m, "generated_log_probs", None)
-            out[str(rid)] = d
-        with open(args.output_path, "w") as f:
-            json.dump(out, f, indent=1)
+
+def _write_disagg_output(args, topo, setup, finished):
+    """Decode representative rank (tp0/pp0) writes its replica's outputs.
+    With one decode replica this is the whole result (matches the colocated
+    golden values); with several, each replica writes its own subset to a
+    per-replica path."""
+    layout = setup.coordinator.my_layout
+    if not args.output_path or layout.tp_rank != 0 or layout.pp_rank != 0:
+        return
+    path = args.output_path
+    if topo.num_decode_replicas > 1:
+        path = f"{path}.{setup.replica_id}"
+    out = {}
+    for rid, m in sorted(finished.items()):
+        gt = m.generated_tokens
+        d = {
+            "input_prompt": m.prompt,
+            "generated_text": m.generated_text,
+            "generated_tokens": gt.tolist() if torch.is_tensor(gt) else gt,
+        }
+        if getattr(m.sampling_params, "return_log_probs", False):
+            d["logprobs"] = getattr(m, "generated_log_probs", None)
+        out[str(rid)] = d
+    with open(path, "w") as f:
+        json.dump(out, f, indent=1)
 
 
 @torch.inference_mode()

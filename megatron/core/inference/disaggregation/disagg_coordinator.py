@@ -158,6 +158,23 @@ class DisaggCoordinator:
     def router(self):
         return self._router
 
+    def assigned_request_ids(self, request_infos: List["RequestInfo"]) -> List[int]:
+        """(decode side) Request ids that route to THIS decode replica.
+
+        Replays the deterministic router over all requests -- every worker
+        independently reaches the same assignment, so a decode replica
+        knows exactly how many handoffs to expect without extra signaling.
+        Requires a deterministic router (the default 'sticky'); stateful
+        policies would not match the prefill side's per-request choices.
+        """
+        assert self.role == DECODE
+        router = make_router(self.router_name, self.decode_targets)
+        return [
+            info.request_id
+            for info in request_infos
+            if router.select(info).target_id == self.replica_id
+        ]
+
     # --- prefill side ------------------------------------------------------
 
     def prefill_handoff(

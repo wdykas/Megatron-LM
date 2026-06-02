@@ -6,18 +6,24 @@ import argparse
 import dataclasses
 import json
 import os
-from pathlib import Path
 import re
 import types
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from packaging.version import Version as PkgVersion
 
+from megatron.core.activations import squared_relu
 from megatron.core.dist_checkpointing.validation import StrictHandling
+from megatron.core.fusions.fused_bias_geglu import quick_gelu
+from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.core.quantization.utils import (
+    kitchen_quantization_recipe_config,
+    load_quantization_recipe,
+)
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
-from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
     get_deprecated_cuda_graph_modules_migration,
@@ -30,29 +36,22 @@ from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig,
     MLPConfig,
 )
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.utils import (
     get_torch_version,
     is_flashinfer_min_version,
     is_te_min_version,
     is_torch_min_version,
 )
-from megatron.core.activations import squared_relu
-from megatron.core.fusions.fused_bias_geglu import quick_gelu
+from megatron.training.argument_utils import ArgumentGroupFactory, core_transformer_config_from_args
 from megatron.training.global_vars import set_global_variables
 from megatron.training.utils import (
     get_device_arch_version,
-    update_use_dist_ckpt,
     print_rank_0,
+    update_use_dist_ckpt,
     warn_rank_0,
 )
-from megatron.core.msc_utils import MultiStorageClientFeature
 
-from megatron.core.quantization.utils import (
-    kitchen_quantization_recipe_config,
-    load_quantization_recipe,
-)
-
-from megatron.training.argument_utils import ArgumentGroupFactory, core_transformer_config_from_args
 
 def add_megatron_arguments(parser: argparse.ArgumentParser):
     """"Add Megatron-LM arguments to the given parser."""
@@ -409,8 +408,9 @@ def validate_args(args, defaults={}):
         'Currently only global and local checkpoints are supported'
     if args.non_persistent_ckpt_type == 'local':
         try:
-            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import \
-                LocalCheckpointManager
+            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
+                LocalCheckpointManager,
+            )
         except ModuleNotFoundError as e:
             raise RuntimeError('nvidia_resiliency_ext is required for local checkpointing') from e
 
@@ -756,8 +756,10 @@ def validate_args(args, defaults={}):
         )
 
     from megatron.core.models.hybrid.hybrid_layer_allocation import (
-        Symbols, parse_hybrid_pattern, get_hybrid_total_layer_count,
+        Symbols,
+        get_hybrid_total_layer_count,
         get_hybrid_total_pipeline_segment_count,
+        parse_hybrid_pattern,
     )
     sep = Symbols.MTP_SEPARATOR
 
@@ -1762,20 +1764,17 @@ def validate_args(args, defaults={}):
         assert args.num_experts is not None, "MoE latent projections are applicable only for MoE models."
 
     # Disaggregated prefill->decode inference. Enabled iff both prefill and
-    # decode tensor-parallel sizes are given. ``args.disaggregation`` is the
-    # single switch the inference/RL paths check.
-    _p_tp = getattr(args, 'disagg_prefill_tensor_model_parallel_size', None)
-    _d_tp = getattr(args, 'disagg_decode_tensor_model_parallel_size', None)
-    args.disaggregation = _p_tp is not None and _d_tp is not None
-    if (_p_tp is None) != (_d_tp is None):
+    # decode parallelism specs are given. ``args.disaggregation`` is the
+    # single switch the inference/RL paths check; spec parsing/validation
+    # happens where the topology is built (disaggregation.pg_setup).
+    _p_par = getattr(args, 'disagg_prefill_parallelism', None)
+    _d_par = getattr(args, 'disagg_decode_parallelism', None)
+    args.disaggregation = bool(_p_par) and bool(_d_par)
+    if bool(_p_par) != bool(_d_par):
         raise AssertionError(
-            'disaggregation requires BOTH --disagg-prefill-tensor-model-parallel-size '
-            'and --disagg-decode-tensor-model-parallel-size to be set.'
+            'disaggregation requires BOTH --disagg-prefill-parallelism and '
+            '--disagg-decode-parallelism to be set.'
         )
-    if args.disaggregation:
-        assert _p_tp > 0 and _d_tp > 0, 'disagg prefill/decode TP sizes must be > 0.'
-        assert args.disagg_prefill_pipeline_model_parallel_size > 0
-        assert args.disagg_decode_pipeline_model_parallel_size > 0
 
     # Print arguments.
     _print_args("arguments", args)
@@ -2014,38 +2013,28 @@ def _add_inference_args(parser):
                        help='Skip the EP-group consensus all-reduce in the inference engine control loop and step on local state only. '
                             'Pause/unpause take effect as soon as the signal is delivered to a rank. '
                             'Only safe when EP coordination is not required (e.g. ep_world_size == 1).')
-    # Disaggregated prefill->decode inference. Setting the prefill AND decode
-    # tensor-parallel sizes turns disaggregation on (``args.disaggregation``,
+    # Disaggregated prefill->decode inference. Each replica's parallelism is
+    # given as a "tp=N[,pp=N][,ep=N][,etp=N]" spec. Setting BOTH prefill and
+    # decode parallelism turns disaggregation on (``args.disaggregation``,
     # derived in validate_args): prefill and decode run as separate model
-    # replicas and KV is handed off between them. Shared by the inference
-    # examples and the RL rollout path. Pipeline sizes default to 1.
-    # (Heterogeneous prefill/decode parallelism is accepted here but the
-    # cross-layout process-group construction lands in a follow-up; matched
-    # sizes are supported today.)
-    group.add_argument('--disagg-prefill-tensor-model-parallel-size', type=int, default=None,
-                       help='Tensor-parallel size of the prefill replica(s). Setting this '
-                            'and --disagg-decode-tensor-model-parallel-size enables '
-                            'disaggregated prefill->decode inference.')
-    group.add_argument('--disagg-prefill-pipeline-model-parallel-size', type=int, default=1,
-                       help='Pipeline-parallel size of the prefill replica(s). Default 1.')
-    group.add_argument('--disagg-decode-tensor-model-parallel-size', type=int, default=None,
-                       help='Tensor-parallel size of the decode replica(s). Setting this '
-                            'and --disagg-prefill-tensor-model-parallel-size enables '
-                            'disaggregated prefill->decode inference.')
-    group.add_argument('--disagg-decode-pipeline-model-parallel-size', type=int, default=1,
-                       help='Pipeline-parallel size of the decode replica(s). Default 1.')
-    # Expert (EP) / expert-tensor (ETP) parallelism per replica. These are
-    # KV-replica dimensions (they shard the MoE FFN, not the attention KV),
-    # so they may differ between prefill and decode without changing the KV
-    # handoff. Default None -> fall back to the model's expert sizes (or 1).
-    group.add_argument('--disagg-prefill-expert-model-parallel-size', type=int, default=None,
-                       help='Expert-parallel size of the prefill replica(s) (MoE only).')
-    group.add_argument('--disagg-prefill-expert-tensor-parallel-size', type=int, default=None,
-                       help='Expert-tensor-parallel size of the prefill replica(s) (MoE only).')
-    group.add_argument('--disagg-decode-expert-model-parallel-size', type=int, default=None,
-                       help='Expert-parallel size of the decode replica(s) (MoE only).')
-    group.add_argument('--disagg-decode-expert-tensor-parallel-size', type=int, default=None,
-                       help='Expert-tensor-parallel size of the decode replica(s) (MoE only).')
+    # replicas (on disjoint ranks, at independent parallelism) and KV is
+    # handed off between them. The decode side is a pool -- pass one spec per
+    # decode replica, and replicas may differ in parallelism (requests are
+    # routed across them). EP/ETP are KV-replica dimensions (they shard the
+    # MoE FFN, not the attention KV), so they may differ freely between
+    # replicas without changing the handoff. Shared by the inference examples
+    # and the RL rollout path.
+    group.add_argument('--disagg-prefill-parallelism', type=str, nargs='+', default=None,
+                       metavar='SPEC',
+                       help='Prefill replica parallelism as "tp=N[,pp=N][,ep=N][,etp=N]". '
+                            'Setting this and --disagg-decode-parallelism enables '
+                            'disaggregated inference. (One prefill replica today; pass a '
+                            'single spec.)')
+    group.add_argument('--disagg-decode-parallelism', type=str, nargs='+', default=None,
+                       metavar='SPEC',
+                       help='Decode pool parallelism: one "tp=N[,pp=N][,ep=N][,etp=N]" spec '
+                            'per decode replica (repeatable). Replicas may differ; requests '
+                            'are routed across them.')
     return parser
 
 
@@ -2549,8 +2538,7 @@ def _add_rl_args(parser):
     return parser
 
 def _add_training_args(parser):
-    from megatron.training.config import TrainingConfig
-    from megatron.training.config import ProfilingConfig
+    from megatron.training.config import ProfilingConfig, TrainingConfig
 
     prof_factory = ArgumentGroupFactory(ProfilingConfig)
     prof_group = prof_factory.build_group(parser, "profiling")
@@ -3386,7 +3374,7 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
     If kitchen isn't available, nothing to do here, return unchanged parser
     """
     try:
-        from megatron.core.extensions.kitchen import KitchenSpecProvider, HAVE_KITCHEN
+        from megatron.core.extensions.kitchen import HAVE_KITCHEN, KitchenSpecProvider
 
     except (ImportError, ModuleNotFoundError):
         HAVE_KITCHEN = False
