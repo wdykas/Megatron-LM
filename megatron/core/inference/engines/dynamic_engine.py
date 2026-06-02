@@ -454,6 +454,45 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.capture_stats = capture_stats
 
+        # Disaggregation config (None role => normal aggregated engine). Set via
+        # set_disaggregation_config() before start_listening_to_data_parallel_coordinator.
+        self.disagg_role = None
+        self.disagg_instance_layouts = None
+        self.disagg_identity = None
+        self.disagg_total_instances = None
+        self.disagg_world_group = None
+        self.disagg_spawn_coordinator = False
+        # Per-request KV staged on a prefill engine, held until SEND_KV. Keyed
+        # by request_id; one staging payload per (this rank's) shard.
+        self._disagg_staged_kv = {}
+
+    def set_disaggregation_config(
+        self, *, role, instance_layouts, identity, total_instances,
+        world_group, spawn_coordinator,
+    ):
+        """Mark this engine as a disaggregated prefill/decode shard.
+
+        Call before :meth:`start_listening_to_data_parallel_coordinator`.
+
+        Args:
+            role: ``"prefill"`` or ``"decode"``.
+            instance_layouts: KV-shard layout dicts for every rank of this
+                instance (so the coordinator can build reshard plans).
+            identity: unique ZMQ identity for this instance's MP-coordinator
+                (must differ across shards/instances).
+            total_instances: total prefill+decode instances (coordinator sizing).
+            world_group: process group spanning all disagg ranks (used to
+                broadcast the coordinator address across shards).
+            spawn_coordinator: whether THIS rank spawns the single coordinator.
+        """
+        assert role in ("prefill", "decode")
+        self.disagg_role = role
+        self.disagg_instance_layouts = instance_layouts
+        self.disagg_identity = identity
+        self.disagg_total_instances = total_instances
+        self.disagg_world_group = world_group
+        self.disagg_spawn_coordinator = spawn_coordinator
+
     @internal_api
     async def start_listening_to_data_parallel_coordinator(
         self,
@@ -535,8 +574,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
         local_ip = hostname or socket.gethostname()
 
-        # Spawn a DP coordinator process and get the connection info.
-        if launch_inference_coordinator and self.is_dp_coordinator:
+        disagg = self.disagg_role is not None
+        # Disaggregated: ONE coordinator for the whole job, sized to the total
+        # prefill+decode instance count, spawned by the designated rank (the
+        # prefill instance's coordinator). Otherwise: one coordinator per DP
+        # group, spawned by each DP coordinator rank.
+        should_spawn = self.disagg_spawn_coordinator if disagg else self.is_dp_coordinator
+        if launch_inference_coordinator and should_spawn:
             spawn_context = multiprocessing.get_context('spawn')
             deterministic_mode = torch.are_deterministic_algorithms_enabled()
             dp_pipe, dp_process_pipe = spawn_context.Pipe()
@@ -546,7 +590,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 kwargs={
                     "pipe_connection": dp_process_pipe,
                     "ready_event": coordinator_ready_event,
-                    "data_parallel_size": get_pg_size(self.pg_collection.dp),
+                    "data_parallel_size": (
+                        self.disagg_total_instances if disagg else get_pg_size(self.pg_collection.dp)
+                    ),
                     "tokenizer": self.controller.tokenizer,
                     "max_requests": self.context.max_requests,
                     "inference_coordinator_port": inference_coordinator_port,
@@ -557,6 +603,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     "prefix_caching_routing_alpha": self.context.prefix_caching_routing_alpha,
                     "schedule_output_path": coordinator_schedule_output_path,
                     "hostname": hostname,
+                    "disaggregated": disagg,
                 },
             )
             self.inference_coordinator_process.start()
@@ -586,15 +633,22 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             mp_req_addr = None
 
-        # Broadcast addresses to respective ranks.
+        # Broadcast the coordinator address. Disaggregated: the single
+        # coordinator is shared across shards, so broadcast over the whole
+        # disagg group from the spawner (global rank 0). Otherwise: within the
+        # DP group from its source rank.
         bcast = [dp_addr]
-        torch.distributed.broadcast_object_list(bcast, src=dp_src, group=dp_group)
+        if disagg:
+            torch.distributed.broadcast_object_list(bcast, src=0, group=self.disagg_world_group)
+        else:
+            torch.distributed.broadcast_object_list(bcast, src=dp_src, group=dp_group)
         [dp_addr] = bcast
+        # MP (intra-instance) publisher address is always group-local.
         bcast = [mp_req_addr]
         torch.distributed.broadcast_object_list(bcast, src=mp_src, group=mp_group)
         [mp_req_addr] = bcast
 
-        identity = f'mp-coord-{dp_rank}'
+        identity = self.disagg_identity if disagg else f'mp-coord-{dp_rank}'
         if self.is_mp_coordinator:
             # 1. Create dealer sockets where tp_rank = 0 and pp_rank = 0
             #    These will receive requests from an InferenceCoordinator.
@@ -603,8 +657,18 @@ class DynamicInferenceEngine(AbstractEngine):
             self.socket_for_receiving_requests.setsockopt(zmq.IDENTITY, identity.encode('utf-8'))
             self.socket_for_receiving_requests.connect(dp_addr)
 
-            # send empty string. this is used to register with the coordinator.
-            self.socket_for_receiving_requests.send(b"")
+            # Register with the coordinator. Disaggregated: announce role + this
+            # instance's KV layouts so the coordinator can 2-hop route + plan
+            # reshards. Otherwise: an empty string is the registration ping.
+            if disagg:
+                self.socket_for_receiving_requests.send(
+                    msgpack.packb(
+                        [Headers.REGISTER_ROLE.value, self.disagg_role, self.disagg_instance_layouts],
+                        use_bin_type=True,
+                    )
+                )
+            else:
+                self.socket_for_receiving_requests.send(b"")
 
             # 2. Create a publisher socket. This is used to publish or broadcast
             #    requests within the model parallel group
