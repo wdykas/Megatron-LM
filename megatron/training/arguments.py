@@ -1763,12 +1763,18 @@ def validate_args(args, defaults={}):
         assert args.moe_latent_size > 0, "MoE latent projection dimension has to be greater than zero."
         assert args.num_experts is not None, "MoE latent projections are applicable only for MoE models."
 
-    # Disaggregated prefill->decode inference. Enabled iff --inference-shards
-    # tags shards with prefill/decode roles. ``args.disaggregation`` is the
-    # single switch the inference/RL paths check; the spec is fully parsed +
-    # validated where the topology is built (inference.shards_spec).
+    # Disaggregated prefill->decode inference. ``--inference-shards`` is more
+    # general than disagg -- without role tags it's plain multi-shard / data-
+    # parallel inference (no handoff). A run is disaggregated iff some shard
+    # carries a ``role=`` key. ``args.disaggregation`` is the single switch the
+    # inference/RL paths check; the spec is fully parsed + validated where the
+    # topology is built, once world_size is known (inference.shards_spec).
     _shards = getattr(args, 'inference_shards', None)
-    args.disaggregation = bool(_shards) and ('role=' in _shards)
+    args.disaggregation = bool(_shards) and any(
+        kv.strip().startswith('role=')
+        for shard in _shards.replace('+', ';').split(';')
+        for kv in shard.split(',')
+    )
 
     # Print arguments.
     _print_args("arguments", args)
