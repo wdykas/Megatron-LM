@@ -304,7 +304,6 @@ def run_disaggregated_inference(args, tokenizer, sampling_params, requests):
     output JSON for the colocated golden-value comparison.
     """
     from megatron.core.inference.disaggregation.disagg_llm import MegatronDisaggLLM
-    from megatron.core.inference.disaggregation.orchestration import DisaggRequest
 
     num_heads = getattr(args, "num_query_groups", None) or args.num_attention_heads
     llm = MegatronDisaggLLM(
@@ -315,11 +314,11 @@ def run_disaggregated_inference(args, tokenizer, sampling_params, requests):
         num_layers=args.num_layers,
         num_heads=num_heads,
     )
-    disagg_requests = [
-        DisaggRequest(i, r.prompt_text, r.prompt_tokens, r.sampling_params)
-        for i, r in enumerate(requests)
-    ]
-    finished = llm.generate(disagg_requests)
+    # Pass the already-tokenized prompts so disagg uses the exact same tokens
+    # as the colocated golden run; one shared sampling_params (the batch is
+    # uniform here), mirroring MegatronLLM.generate.
+    prompts = [list(r.prompt_tokens) for r in requests]
+    finished = llm.generate(prompts, sampling_params)
     if llm.is_decode:
         _write_disagg_output(args, llm, finished)
 
@@ -336,7 +335,7 @@ def _write_disagg_output(args, llm, finished):
     if llm.num_decode_instances > 1:
         path = f"{path}.{llm.replica_id}"
     out = {}
-    for rid, m in sorted(finished.items()):
+    for m in finished:
         gt = m.generated_tokens
         d = {
             "input_prompt": m.prompt,
@@ -345,7 +344,7 @@ def _write_disagg_output(args, llm, finished):
         }
         if getattr(m.sampling_params, "return_log_probs", False):
             d["logprobs"] = getattr(m, "generated_log_probs", None)
-        out[str(rid)] = d
+        out[str(m.request_id)] = d
     with open(path, "w") as f:
         json.dump(out, f, indent=1)
 

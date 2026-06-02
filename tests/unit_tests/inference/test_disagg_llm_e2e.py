@@ -108,7 +108,6 @@ def _worker(rank, world, port, q):
     dist.init_process_group("gloo", rank=rank, world_size=world)
     try:
         from megatron.core.inference.disaggregation.disagg_llm import MegatronDisaggLLM
-        from megatron.core.inference.disaggregation.orchestration import DisaggRequest
 
         llm = MegatronDisaggLLM(
             "tp=2,role=prefill+tp=1,role=decode",
@@ -116,13 +115,16 @@ def _worker(rank, world, port, q):
             num_layers=L,
             num_heads=H,
         )
-        reqs = [DisaggRequest(7, "p", PROMPT, object())]
-        finished = llm.generate(reqs)
+        # generate() takes prompts like MegatronLLM; one token-id prompt here
+        # (avoids needing a tokenizer in the fake engine). sampling_params is
+        # opaque to the fake engine.
+        finished = llm.generate([PROMPT], object())
 
         if llm.is_decode:
             imported = llm.engine.context.imported
             ok = (
-                set(finished) == {7}
+                len(finished) == 1
+                and finished[0].request_id == 0
                 and imported is not None
                 and torch.equal(imported, _global_kv_staging())
             )
