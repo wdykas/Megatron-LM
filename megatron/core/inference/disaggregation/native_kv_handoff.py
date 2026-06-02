@@ -246,7 +246,40 @@ def send_request_kv_resharded(
     return PrefillHandoff(handles=handles, keepalive=keep)
 
 
-def recv_request_kv_resharded(
+@dataclass
+class DecodeRecv:
+    """In-flight decode receive: the irecv handles + the staging buffer they
+    fill. :meth:`finish` waits the transfers, assembles the local KV tensor and
+    imports it. Lets the caller post the receive and defer completion (so the
+    transfer overlaps with an engine step) instead of blocking inline."""
+
+    meta: dict
+    staging: torch.Tensor
+    pending: List[tuple]  # [(ReshardTransfer, TransferHandle)]
+    my_layout: Any
+
+    def finish(self, engine: Any) -> Optional[dict]:
+        """Wait the receives, assemble the staging tensor, and import it."""
+        for t, h in self.pending:
+            sub = h.wait()
+            self.staging[
+                :, :, t.dst_layer_slice(self.my_layout), :, t.dst_head_slice(self.my_layout), :
+            ] = sub
+        m = self.meta
+        payload = {
+            "layout": "std_attn_v1",
+            "block_count": m["block_count"],
+            "block_size_tokens": m["block_size_tokens"],
+            "num_layers": self.my_layout.local_num_layers(),
+            "num_heads_per_partition": self.my_layout.local_num_heads(),
+            "hidden_per_head": m["hidden_per_head"],
+            "block_hashes": list(m.get("block_hashes") or []),
+            "staging_tensor": self.staging,
+        }
+        return engine.context.import_request_kv(payload)
+
+
+def post_recv_request_kv_resharded(
     engine: Any,
     my_layout,
     src_layouts: list,
@@ -254,13 +287,13 @@ def recv_request_kv_resharded(
     prompt_token_ids,
     *,
     backend: Optional[KVTransportBackend] = None,
-    group: Optional[object] = None,
     base_tag: int = 0,
     device: Optional[torch.device] = None,
-) -> Optional[dict]:
-    """Hetero-layout decode receive: pull the KV sub-blocks covering this
-    rank's (layer x head) rectangle and assemble the local staging
-    tensor, then import. Header-free (schema derived from config+prompt)."""
+) -> Optional["DecodeRecv"]:
+    """Hetero-layout decode receive (non-blocking): post the irecv for every
+    KV sub-block covering this rank's (layer x head) rectangle and return a
+    :class:`DecodeRecv` to complete later. Header-free (schema from config +
+    prompt). Returns ``None`` if there is no KV to receive."""
     from megatron.core.inference.disaggregation.kv_shard_layout import (
         plan_kv_reshard,
         transfers_for_dst,
@@ -271,9 +304,7 @@ def recv_request_kv_resharded(
     if meta is None:
         return None
     if meta["has_mamba"]:
-        raise NotImplementedError(
-            "hetero KV reshard supports attention KV only in this MR"
-        )
+        raise NotImplementedError("hetero KV reshard supports attention KV only in this MR")
 
     bc = meta["block_count"]
     bs = meta["block_size_tokens"]
@@ -283,10 +314,9 @@ def recv_request_kv_resharded(
         mb = getattr(engine.context, "memory_buffer", None)
         device = mb.device if mb is not None else None
 
-    local_layers = my_layout.local_num_layers()
-    local_heads = my_layout.local_num_heads()
     staging = torch.empty(
-        bc, 2, local_layers, bs, local_heads, hd, dtype=dtype, device=device
+        bc, 2, my_layout.local_num_layers(), bs, my_layout.local_num_heads(), hd,
+        dtype=dtype, device=device,
     )
 
     plan = plan_kv_reshard(src_layouts, dst_layouts)
@@ -300,23 +330,30 @@ def recv_request_kv_resharded(
             (bc, 2, n_lay, bs, n_head, hd), dtype, src=t.src_rank, tag=tag, device=device
         )
         pending.append((t, h))
-    for t, h in pending:
-        sub = h.wait()
-        staging[
-            :, :, t.dst_layer_slice(my_layout), :, t.dst_head_slice(my_layout), :
-        ] = sub
+    return DecodeRecv(meta=meta, staging=staging, pending=pending, my_layout=my_layout)
 
-    payload = {
-        "layout": "std_attn_v1",
-        "block_count": bc,
-        "block_size_tokens": bs,
-        "num_layers": local_layers,
-        "num_heads_per_partition": local_heads,
-        "hidden_per_head": hd,
-        "block_hashes": list(meta.get("block_hashes") or []),
-        "staging_tensor": staging,
-    }
-    return engine.context.import_request_kv(payload)
+
+def recv_request_kv_resharded(
+    engine: Any,
+    my_layout,
+    src_layouts: list,
+    dst_layouts: list,
+    prompt_token_ids,
+    *,
+    backend: Optional[KVTransportBackend] = None,
+    group: Optional[object] = None,
+    base_tag: int = 0,
+    device: Optional[torch.device] = None,
+) -> Optional[dict]:
+    """Blocking decode receive: :func:`post_recv_request_kv_resharded` then
+    :meth:`DecodeRecv.finish` (post + wait + import) in one call."""
+    recv = post_recv_request_kv_resharded(
+        engine, my_layout, src_layouts, dst_layouts, prompt_token_ids,
+        backend=backend, base_tag=base_tag, device=device,
+    )
+    if recv is None:
+        return None
+    return recv.finish(engine)
 
 
 def _send_object(obj, dst: int, group) -> None:

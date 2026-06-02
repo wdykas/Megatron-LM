@@ -466,6 +466,12 @@ class DynamicInferenceEngine(AbstractEngine):
         # by request_id; one staging payload per (this rank's) shard.
         self._disagg_staged_kv = {}
         self._disagg_backend = None  # lazily-created KV transport backend
+        # In-flight KV transfers, completed one step after they are posted so
+        # the transfer overlaps with the engine step. Reaped in
+        # _disagg_complete_pending (collective: the pending set is identical
+        # across MP ranks since coordinator messages are TP-broadcast).
+        self._disagg_pending_sends = {}  # request_id -> PrefillHandoff
+        self._disagg_pending_recvs = {}  # request_id -> (DecodeRecv, prompt, sampling_params)
 
     def set_disaggregation_config(
         self, *, role, instance_layouts, identity, total_instances,
@@ -493,6 +499,10 @@ class DynamicInferenceEngine(AbstractEngine):
             self._disagg_staged_kv = {}
         if not hasattr(self, "_disagg_backend"):
             self._disagg_backend = None
+        if not hasattr(self, "_disagg_pending_sends"):
+            self._disagg_pending_sends = {}
+        if not hasattr(self, "_disagg_pending_recvs"):
+            self._disagg_pending_recvs = {}
         self.disagg_role = role
         self.disagg_instance_layouts = instance_layouts
         self.disagg_identity = identity
@@ -525,9 +535,19 @@ class DynamicInferenceEngine(AbstractEngine):
             self._disagg_backend.init()
         return self._disagg_backend
 
+    def _disagg_base_tag(self, request_id):
+        """Request-scoped transport tag base, so concurrent in-flight transfers
+        between the same rank pair don't alias on a tag-respecting backend
+        (gloo). NCCL ignores the P2P tag and matches by post-order; the modulus
+        keeps the value within the backend's tag range."""
+        my = self._disagg_my_layout()
+        return (request_id % 4096) * (my.num_layers * my.num_heads)
+
     def _disagg_send_kv(self, request_id, dst_layout_dicts):
-        """(prefill) ship the staged KV for ``request_id`` to the decode
-        instance, resharded to its layout."""
+        """(prefill) post the staged KV for ``request_id`` to the decode
+        instance (resharded to its layout). Non-blocking: the send is reaped a
+        step later in :meth:`_disagg_complete_pending` so the transfer overlaps
+        the engine step."""
         from megatron.core.inference.disaggregation.native_kv_handoff import (
             send_request_kv_resharded,
         )
@@ -538,26 +558,51 @@ class DynamicInferenceEngine(AbstractEngine):
             self._disagg_layouts(self.disagg_instance_layouts),
             self._disagg_layouts(dst_layout_dicts),
             backend=self._disagg_get_backend(), payload=staged,
+            base_tag=self._disagg_base_tag(request_id),
         )
         if handoff is not None:
-            handoff.wait()
+            self._disagg_pending_sends[request_id] = handoff
 
     def _disagg_recv_kv(self, request_id, src_layout_dicts, prompt, sampling_params):
-        """(decode) receive ``request_id``'s KV, import it (registers the
-        prefix-cache blocks), then admit it -- add_request prefix-hits and skips
-        prefill, continuing generation from the imported KV."""
+        """(decode) post the receive of ``request_id``'s KV. Non-blocking: the
+        receive is reaped a step later in :meth:`_disagg_complete_pending`, which
+        imports the KV (registers the prefix-cache blocks) and admits the
+        request -- add_request prefix-hits and continues generation."""
         from megatron.core.inference.disaggregation.native_kv_handoff import (
-            recv_request_kv_resharded,
+            post_recv_request_kv_resharded,
         )
 
-        recv_request_kv_resharded(
+        recv = post_recv_request_kv_resharded(
             self, self._disagg_my_layout(),
             self._disagg_layouts(src_layout_dicts),
             self._disagg_layouts(self.disagg_instance_layouts),
             prompt, backend=self._disagg_get_backend(),
+            base_tag=self._disagg_base_tag(request_id),
         )
-        sp = SamplingParams.deserialize(sampling_params)
-        self.add_request(request_id, prompt, sampling_params=sp)
+        if recv is None:
+            # No KV to receive (shouldn't happen header-free): admit directly.
+            sp = SamplingParams.deserialize(sampling_params)
+            self.add_request(request_id, prompt, sampling_params=sp)
+            return
+        self._disagg_pending_recvs[request_id] = (recv, prompt, sampling_params)
+
+    def _disagg_complete_pending(self):
+        """Reap KV transfers posted on the previous step.
+
+        Collective across the MP group: the pending sets were populated from
+        TP-broadcast coordinator messages, so every rank completes the same
+        requests in the same (insertion) order. Prefill: wait each send and
+        release its staged KV. Decode: wait each receive, import the KV
+        (registers the prefix-cache blocks) and admit the request."""
+        if getattr(self, "disagg_role", None) is None:
+            return
+        for request_id in list(self._disagg_pending_sends):
+            self._disagg_pending_sends.pop(request_id).wait()
+        for request_id in list(self._disagg_pending_recvs):
+            recv, prompt, sampling_params = self._disagg_pending_recvs.pop(request_id)
+            recv.finish(self)
+            sp = SamplingParams.deserialize(sampling_params)
+            self.add_request(request_id, prompt, sampling_params=sp)
 
     @internal_api
     async def start_listening_to_data_parallel_coordinator(
@@ -2261,6 +2306,10 @@ class DynamicInferenceEngine(AbstractEngine):
         Returns:
             int: The number of messages that were received and processed in this batch.
         """
+
+        # Reap KV transfers posted on the previous step before admitting this
+        # step's batch (no-op unless disaggregated; collective across MP ranks).
+        self._disagg_complete_pending()
 
         nvtx_range_push("drain_zmq_socket")
         all_messages = []
