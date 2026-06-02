@@ -13,16 +13,12 @@ DECODE = "decode"
 class DisaggRouting:
     """Sequences a request prefill-engine -> (KV handoff) -> decode-engine.
 
-    The :class:`DataParallelInferenceCoordinator` delegates routing decisions
-    here so the policy is isolated and unit-testable without ZMQ. Engines are
-    identified by their opaque transport identity (bytes for ZMQ; any hashable
-    in tests). This object holds no sockets and does no I/O -- it only decides
-    *which* engine each hop goes to and remembers the per-request pairing so
-    the final reply can be routed home.
-
-    Selection is round-robin within each role (deterministic given the
-    registration order); a prefix/load-aware decode policy can replace
-    :meth:`_pick_decode` later without changing callers.
+    Engines are identified by their opaque transport identity (bytes for ZMQ;
+    any hashable in tests). Holds no sockets and does no I/O -- it only decides
+    *which* engine each hop goes to and remembers the per-request pairing so the
+    final reply can be routed home. Selection is round-robin within each role
+    (deterministic given registration order); swap :meth:`_pick_decode` for a
+    prefix/load-aware policy later.
     """
 
     def __init__(self) -> None:
