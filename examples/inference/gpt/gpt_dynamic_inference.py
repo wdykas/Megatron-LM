@@ -51,6 +51,31 @@ import megatron
 from megatron.core.utils import configure_nvtx_profiling
 from megatron.training import get_args, get_tokenizer, initialize_megatron
 
+
+def add_disaggregation_args(parser):
+    """Wrap ``add_inference_args`` with the prefill->decode disagg flags.
+
+    Used as the ``extra_args_provider`` so the same driver runs both the
+    colocated and disaggregated paths (the latter gated entirely behind
+    ``--disaggregation``)."""
+    parser = add_inference_args(parser)
+    group = parser.add_argument_group(title="Disaggregation")
+    group.add_argument(
+        "--disaggregation",
+        action="store_true",
+        default=False,
+        help="Run prefill->decode disaggregated across data-parallel size 2 "
+        "(replica 0 = prefill, replica 1 = decode), handing KV over the "
+        "DisaggCoordinator. Output is identical to the colocated run.",
+    )
+    group.add_argument(
+        "--disagg-decode-replica-id",
+        type=str,
+        default="decode0",
+        help="Replica id for the decode data-parallel replica.",
+    )
+    return parser
+
 torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
@@ -276,12 +301,101 @@ def run_inference(
     }
 
 
+def run_disaggregated_inference(args, engine, requests):
+    """Prefill on data-parallel replica 0, hand KV to replica 1, decode there.
+
+    Reuses the already-built ``engine`` and the deterministic ``requests``
+    list (identical on every rank, since ``build_requests`` is seeded), so
+    the decode side recovers each request's prompt by id. The decode
+    replica admits a request by importing its KV (which registers the
+    prefix-cache blocks) and calling ``add_request(prompt)`` -- the prompt
+    matches the cache, prefill is skipped, and generation continues, so
+    output is identical to the colocated run.
+    """
+    from megatron.core import parallel_state as ps
+    from megatron.core.inference.disagg_coordinator import DisaggCoordinator
+    from megatron.core.inference.kv_shard_layout import KVShardLayout, is_matched
+    from megatron.core.inference.kv_transport_backend import NcclTransportBackend
+
+    if ps.get_data_parallel_world_size() != 2:
+        raise RuntimeError(
+            "--disaggregation expects data-parallel size 2 (replica 0=prefill, "
+            f"replica 1=decode); got {ps.get_data_parallel_world_size()}."
+        )
+    role = "prefill" if ps.get_data_parallel_rank() == 0 else "decode"
+    replica_id = "prefill" if role == "prefill" else args.disagg_decode_replica_id
+    num_heads = getattr(args, "num_query_groups", None) or args.num_attention_heads
+    layout = KVShardLayout(
+        num_layers=args.num_layers,
+        num_heads=num_heads,
+        tp_size=ps.get_tensor_model_parallel_world_size(),
+        tp_rank=ps.get_tensor_model_parallel_rank(),
+        pp_size=ps.get_pipeline_model_parallel_world_size(),
+        pp_rank=ps.get_pipeline_model_parallel_rank(),
+        global_rank=torch.distributed.get_rank(),
+    )
+    backend = NcclTransportBackend()
+    backend.init()
+    coord = DisaggCoordinator(
+        role=role, replica_id=replica_id, my_layout=layout, backend=backend
+    )
+    coord.handshake()
+    for tgt in coord.decode_targets:
+        if any(not is_matched(layout, dl) for dl in tgt.layouts):
+            raise NotImplementedError(
+                "--disaggregation supports matched prefill/decode TP/PP only; "
+                "heterogeneous layouts need the inference process-group "
+                "construction (separate MR)."
+            )
+
+    if role == "prefill":
+        for i, req in enumerate(requests):
+            engine.add_request(i, req.prompt_text, req.sampling_params)
+        handed = set()
+        while len(handed) < len(requests):
+            engine.step_modern()
+            for i, req in enumerate(requests):
+                if i not in handed:
+                    ho = coord.prefill_handoff(engine, i, req.prompt_tokens)
+                    if ho is not None:
+                        ho.wait()
+                    handed.add(i)
+        return
+
+    # decode replica: intake KV, admit (prefix-cache match), generate
+    for _ in range(len(requests)):
+        rid, _imported = coord.decode_intake(engine)
+        req = requests[rid]
+        engine.add_request(rid, req.prompt_text, req.sampling_params)
+    finished = {}
+    while len(finished) < len(requests):
+        result = engine.step_modern()
+        for rec in result.get("finished_request_records", []):
+            merged = rec.merge()
+            finished[merged.request_id] = merged
+
+    if args.output_path and torch.distributed.get_rank() == ps.get_data_parallel_src_rank():
+        out = {}
+        for rid, m in sorted(finished.items()):
+            gt = m.generated_tokens
+            d = {
+                "input_prompt": m.prompt,
+                "generated_text": m.generated_text,
+                "generated_tokens": gt.tolist() if torch.is_tensor(gt) else gt,
+            }
+            if getattr(m.sampling_params, "return_log_probs", False):
+                d["logprobs"] = getattr(m, "generated_log_probs", None)
+            out[str(rid)] = d
+        with open(args.output_path, "w") as f:
+            json.dump(out, f, indent=1)
+
+
 @torch.inference_mode()
 def main():
     """Run dynamic inference."""
     # Initialize Megatron.
     args = parse_and_validate_args(
-        extra_args_provider=add_inference_args,
+        extra_args_provider=add_disaggregation_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
     initialize_megatron()
@@ -349,6 +463,14 @@ def main():
     print("~~~")
     print(setup_prefix)
     print("~~~")
+
+    # Disaggregated path: prefill on replica 0, decode on replica 1. Gated
+    # entirely behind --disaggregation so the colocated path below is
+    # untouched. Writes the same output JSON, so it validates against the
+    # colocated golden values.
+    if args.disaggregation:
+        run_disaggregated_inference(args, engine, requests)
+        return
 
     # Run and time test, optionally `args.inference_repeat_n` times.
     throughputs = []

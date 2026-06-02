@@ -49,6 +49,7 @@ MODEL_ARGS:
   --num-tokens-to-generate: 30
   --inference-dynamic-batching-buffer-size-gb: 20
   --inference-dynamic-batching-prefix-caching: true
+  --disaggregation: true
   --dist-ckpt-strictness: log_unexpected
   --inference-ckpt-non-strict: true
   --output-path: ${INFERENCE_OUTPUT_PATH}
