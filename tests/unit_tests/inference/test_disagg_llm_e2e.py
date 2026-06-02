@@ -124,10 +124,15 @@ def _worker(rank, world, port, q):
             "tp=2,role=prefill+tp=1,role=decode",
             engine_builder=_FakeEngine,
         )
-        # generate() takes prompts like MegatronLLM; one token-id prompt here
-        # (avoids needing a tokenizer in the fake engine). sampling_params is
-        # opaque to the fake engine.
-        finished = llm.generate([PROMPT], object())
+        # generate() consumes the same request objects build_requests yields
+        # (.prompt_text / .prompt_tokens / .sampling_params); request id is the
+        # position. sampling_params is opaque to the fake engine.
+        class _Req:
+            prompt_text = "p"
+            prompt_tokens = PROMPT
+            sampling_params = object()
+
+        finished = llm.generate([_Req()])
 
         if llm.is_decode:
             imported = llm.engine.context.imported

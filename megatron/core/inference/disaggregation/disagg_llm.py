@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, List, Optional, Sequence, Union
 
 from megatron.core.inference.disaggregation.disagg_coordinator import DisaggCoordinator
 from megatron.core.inference.disaggregation.kv_transport_backend import KVTransportBackend
@@ -16,7 +16,6 @@ from megatron.core.inference.disaggregation.orchestration import (
     run_prefill_replica,
     setup_disagg,
 )
-from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.shards_spec import InferenceShardSpec, normalize_shard_specs
 
 
@@ -101,63 +100,32 @@ class MegatronDisaggLLM:
 
     # --- run ---------------------------------------------------------------
 
-    def generate(
-        self,
-        prompts: Union[str, List[int], List[str], List[List[int]]],
-        sampling_params: Optional[SamplingParams] = None,
-    ) -> List[Any]:
-        """Run disaggregated inference -- same signature as ``MegatronLLM.generate``.
+    def generate(self, requests: Sequence[Any]) -> List[Any]:
+        """Run disaggregated inference over ``requests``.
 
-        Accepts one prompt or a batch (text or token ids); must be identical on
-        every rank (SPMD). Tokenization is deterministic, so prefill and decode
-        derive the same tokens. Returns the finished requests for THIS decode
-        instance in input order; an empty list on prefill ranks (they ship KV
-        and produce no output). With a single decode instance this is the whole
-        batch; with several, each instance returns its routed subset.
+        ``requests`` is the same sequence the regular path builds (e.g. from
+        ``build_requests``): each item exposes ``prompt_text``,
+        ``prompt_tokens`` and ``sampling_params``. It must be identical on
+        every rank (SPMD); the request id is its position in the sequence, so
+        prefill and decode agree. Returns the finished
+        ``DynamicInferenceRequest`` records for THIS decode instance in input
+        order; an empty list on prefill ranks (they ship KV, produce no
+        output). With a single decode instance this is the whole batch; with
+        several, each instance returns its routed subset.
         """
-        if sampling_params is None:
-            sampling_params = SamplingParams()
-        normalized, _ = self._normalize_prompts(prompts)
-
-        requests = [
+        disagg = [
             DisaggRequest(
                 request_id=i,
-                prompt_text=p,
-                prompt_tokens=self._prompt_tokens(p, sampling_params),
-                sampling_params=sampling_params,
+                prompt_text=r.prompt_text,
+                prompt_tokens=r.prompt_tokens,
+                sampling_params=r.sampling_params,
             )
-            for i, p in enumerate(normalized)
+            for i, r in enumerate(requests)
         ]
-        if not requests:
+        if not disagg:
             return []
-
         if self._setup.role == PREFILL:
-            run_prefill_replica(self._setup.coordinator, self._setup.engine, requests)
+            run_prefill_replica(self._setup.coordinator, self._setup.engine, disagg)
             return []
-        finished = run_decode_replica(self._setup.coordinator, self._setup.engine, requests)
+        finished = run_decode_replica(self._setup.coordinator, self._setup.engine, disagg)
         return [finished[i] for i in sorted(finished)]
-
-    # --- helpers -----------------------------------------------------------
-
-    @staticmethod
-    def _normalize_prompts(prompts) -> Tuple[list, bool]:
-        """``(list, is_batch)`` -- mirrors ``MegatronLLM._normalize_prompts``."""
-        if isinstance(prompts, str):
-            return [prompts], False
-        if isinstance(prompts, list) and prompts and isinstance(prompts[0], int):
-            return [prompts], False  # a single token-id prompt
-        return list(prompts), True
-
-    def _prompt_tokens(self, prompt, sampling_params) -> List[int]:
-        """Token ids for ``prompt`` (used for routing + header-free schema).
-        Token-id prompts pass through; text is tokenized like the engine's
-        ``add_request`` so both sides agree."""
-        if isinstance(prompt, (list, tuple)):
-            return list(prompt)
-        controller = self._setup.engine.controller
-        try:
-            return controller.tokenize_prompt(
-                controller.tokenizer, prompt, sampling_params.add_BOS
-            )
-        except TypeError:
-            return controller.tokenize_prompt(controller.tokenizer, prompt)

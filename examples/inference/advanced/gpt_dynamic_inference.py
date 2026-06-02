@@ -2,6 +2,7 @@
 
 # pylint: disable=bad-builtin
 
+import copy
 import hashlib
 import io
 import json
@@ -24,6 +25,7 @@ from examples.inference.utils import (
     Request,
     build_dynamic_engine_setup_prefix,
     build_requests,
+    dump_inference_results_to_json,
     get_curr_time,
     get_global_peak_memory_stats_bytes,
 )
@@ -305,46 +307,36 @@ def run_disaggregated_inference(args, tokenizer, sampling_params, requests):
     """
     from megatron.core.inference.disaggregation.disagg_llm import MegatronDisaggLLM
 
-    # num_layers/num_heads are derived from the built engine's model config.
+    # Same request flow as the colocated path -- build_requests output goes
+    # straight in. num_layers/num_heads are derived from the engine.
     llm = MegatronDisaggLLM(
         args.inference_shards,
         engine_builder=lambda pg: _build_engine_for(
             args, tokenizer, sampling_params, requests, pg
         ),
     )
-    # Pass the already-tokenized prompts so disagg uses the exact same tokens
-    # as the colocated golden run; one shared sampling_params (the batch is
-    # uniform here), mirroring MegatronLLM.generate.
-    prompts = [list(r.prompt_tokens) for r in requests]
-    finished = llm.generate(prompts, sampling_params)
+    finished = llm.generate(requests)
     if llm.is_decode:
         _write_disagg_output(args, llm, finished)
 
 
 def _write_disagg_output(args, llm, finished):
-    """Decode representative rank (tp0/pp0) writes its instance's outputs.
-    With one decode instance this is the whole result (matches the colocated
-    golden values); with several, each instance writes its own subset to a
-    per-instance path."""
+    """Write outputs via the shared results writer -- ``generate`` returns the
+    same ``DynamicInferenceRequest`` records the regular high-level path does,
+    so it reuses ``dump_inference_results_to_json`` for an identical format.
+    Only the decode representative rank (tp0/pp0) writes; with several decode
+    instances each writes its subset to a per-instance path."""
     layout = llm.coordinator.my_layout
     if not args.output_path or layout.tp_rank != 0 or layout.pp_rank != 0:
         return
-    path = args.output_path
     if llm.num_decode_instances > 1:
-        path = f"{path}.{llm.replica_id}"
-    out = {}
-    for m in finished:
-        gt = m.generated_tokens
-        d = {
-            "input_prompt": m.prompt,
-            "generated_text": m.generated_text,
-            "generated_tokens": gt.tolist() if torch.is_tensor(gt) else gt,
-        }
-        if getattr(m.sampling_params, "return_log_probs", False):
-            d["logprobs"] = getattr(m, "generated_log_probs", None)
-        out[str(m.request_id)] = d
-    with open(path, "w") as f:
-        json.dump(out, f, indent=1)
+        args = copy.copy(args)
+        args.output_path = f"{args.output_path}.{llm.replica_id}"
+    ctx = llm.engine.context
+    dump_inference_results_to_json(
+        args, finished, throughputs=[], peak_mem_stats=get_global_peak_memory_stats_bytes(),
+        step_count=ctx.step_count, lifetime_prefill_token_count=ctx.lifetime_prefill_token_count,
+    )
 
 
 @torch.inference_mode()
