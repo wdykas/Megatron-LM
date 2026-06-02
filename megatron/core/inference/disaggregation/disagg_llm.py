@@ -42,10 +42,8 @@ class MegatronDisaggLLM:
             :class:`~megatron.core.inference.shards_spec.InferenceShardSpec`.
             Shards must be tagged ``role=prefill`` / ``role=decode``.
         engine_builder: ``pg_collection -> engine``; builds this rank's engine
-            (model + checkpoint) against the shard's process groups.
-        num_layers, num_heads: Global attention layer / KV-head counts.
-            Optional -- derived from the engine's model config by default;
-            pass them only for engines without ``controller.model_config``.
+            (model + checkpoint) against the shard's process groups. The global
+            layer / KV-head counts are read from the engine's model config.
         backend: KV transport backend (default: NCCL/P2P).
         router_name: Decode router policy; must be deterministic (default
             ``"sticky"``).
@@ -56,8 +54,6 @@ class MegatronDisaggLLM:
         inference_shards: Union[str, Sequence[InferenceShardSpec]],
         *,
         engine_builder: Callable[[Any], Any],
-        num_layers: Optional[int] = None,
-        num_heads: Optional[int] = None,
         backend: Optional[KVTransportBackend] = None,
         router_name: str = "sticky",
         group: Optional[object] = None,
@@ -68,8 +64,6 @@ class MegatronDisaggLLM:
         self._setup = setup_disagg(
             specs,
             engine_builder=engine_builder,
-            num_layers=num_layers,
-            num_heads=num_heads,
             backend=backend,
             router_name=router_name,
             group=group,

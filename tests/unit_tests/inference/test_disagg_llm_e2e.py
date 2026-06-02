@@ -81,11 +81,22 @@ class _FakeCtx:
         return {"block_ids": list(range(payload["block_count"])), "ok": True}
 
 
+class _FakeModelConfig:
+    num_layers = L
+    num_query_groups = H        # KV heads (setup_disagg reads these for the layout)
+    num_attention_heads = H
+
+
+class _FakeController:
+    model_config = _FakeModelConfig()
+
+
 class _FakeEngine:
     """Minimal DynamicInferenceEngine surface the run loops use."""
 
     def __init__(self, pg):
         self.context = _FakeCtx(pg)
+        self.controller = _FakeController()
         self._added = []
 
     def add_request(self, request_id, prompt_text, sampling_params):
@@ -112,8 +123,6 @@ def _worker(rank, world, port, q):
         llm = MegatronDisaggLLM(
             "tp=2,role=prefill+tp=1,role=decode",
             engine_builder=_FakeEngine,
-            num_layers=L,
-            num_heads=H,
         )
         # generate() takes prompts like MegatronLLM; one token-id prompt here
         # (avoids needing a tokenizer in the fake engine). sampling_params is

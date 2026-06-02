@@ -107,8 +107,6 @@ def setup_disagg(
     specs: List[dict],
     *,
     engine_builder: Callable[[Any], Any],
-    num_layers: Optional[int] = None,
-    num_heads: Optional[int] = None,
     backend: Optional[KVTransportBackend] = None,
     router_name: str = "sticky",
     group: Optional[object] = None,
@@ -121,10 +119,9 @@ def setup_disagg(
             each tagged ``role=prefill``/``role=decode``.
         engine_builder: ``pg_collection -> engine``. Called once for this
             rank's shard; the caller owns model construction / checkpoint
-            loading (the only framework-specific step).
-        num_layers, num_heads: Global attention layer / KV-head counts. Default
-            ``None`` -> derived from the built engine's model config; pass them
-            only for engines that don't expose ``controller.model_config``.
+            loading (the only framework-specific step). The global layer /
+            KV-head counts for the shard layout are read from the built
+            engine's ``controller.model_config``.
         backend: KV transport backend (default: NCCL/P2P).
         router_name: Decode router policy. Must be deterministic for
             per-worker routing (default 'sticky').
@@ -154,8 +151,7 @@ def setup_disagg(
         replica_id = _decode_replica_id(my.index, get_pg_rank(pg.dp))
 
     engine = engine_builder(pg)
-    if num_layers is None or num_heads is None:
-        num_layers, num_heads = _global_kv_dims(engine)
+    num_layers, num_heads = _global_kv_dims(engine)
     layout = layout_from_pg_collection(pg, num_layers, num_heads)
 
     backend = backend or NcclTransportBackend()
