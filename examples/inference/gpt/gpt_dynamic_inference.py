@@ -318,6 +318,18 @@ def run_disaggregated_inference(args, engine, requests):
     role = "prefill" if ps.get_data_parallel_rank() == 0 else "decode"
     replica_id = "prefill" if role == "prefill" else "decode0"
     num_heads = getattr(args, "num_query_groups", None) or args.num_attention_heads
+
+    # Expert (EP) / expert-tensor (ETP) parallelism are KV-replica dimensions
+    # -- they shard the MoE FFN weights, never the attention KV -- but we pass
+    # them so the handoff dedupes replicated KV to one source per attention
+    # shard. Default to 1/0 for dense models (getters absent / EP disabled).
+    def _safe(getter, default):
+        fn = getattr(ps, getter, None)
+        try:
+            return fn() if fn is not None else default
+        except Exception:
+            return default
+
     layout = KVShardLayout(
         num_layers=args.num_layers,
         num_heads=num_heads,
@@ -326,6 +338,10 @@ def run_disaggregated_inference(args, engine, requests):
         pp_size=ps.get_pipeline_model_parallel_world_size(),
         pp_rank=ps.get_pipeline_model_parallel_rank(),
         global_rank=torch.distributed.get_rank(),
+        ep_size=_safe("get_expert_model_parallel_world_size", 1),
+        ep_rank=_safe("get_expert_model_parallel_rank", 0),
+        etp_size=_safe("get_expert_tensor_parallel_world_size", 1),
+        etp_rank=_safe("get_expert_tensor_parallel_rank", 0),
     )
     backend = NcclTransportBackend()
     backend.init()

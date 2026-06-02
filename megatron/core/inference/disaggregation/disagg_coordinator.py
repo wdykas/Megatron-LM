@@ -71,7 +71,8 @@ def _layout_from(e: dict) -> KVShardLayout:
         tp_size=e["tp_size"], tp_rank=e["tp_rank"],
         pp_size=e["pp_size"], pp_rank=e["pp_rank"],
         global_rank=e["global_rank"], ep_size=e.get("ep_size", 1),
-        ep_rank=e.get("ep_rank", 0),
+        ep_rank=e.get("ep_rank", 0), etp_size=e.get("etp_size", 1),
+        etp_rank=e.get("etp_rank", 0),
     )
 
 
@@ -121,6 +122,7 @@ class DisaggCoordinator:
             "tp_size": self.my_layout.tp_size, "tp_rank": self.my_layout.tp_rank,
             "pp_size": self.my_layout.pp_size, "pp_rank": self.my_layout.pp_rank,
             "ep_size": self.my_layout.ep_size, "ep_rank": self.my_layout.ep_rank,
+            "etp_size": self.my_layout.etp_size, "etp_rank": self.my_layout.etp_rank,
             "max_prompt_tokens": self.max_prompt_tokens,
         }
         entries = _gather_layouts(entry, self.group)

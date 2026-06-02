@@ -47,19 +47,21 @@ def _shard_of(global_kv, lay: KVShardLayout):
     return sub.permute(2, 0, 1, 3, 4, 5).contiguous()  # [BC,2,ll,BS,hh,HD]
 
 
-def _make_layouts(tp, pp, ep=1):
+def _make_layouts(tp, pp, ep=1, etp=1):
     outs = []
     rank = 0
     for p in range(pp):
         for t in range(tp):
             for e in range(ep):
-                outs.append(
-                    KVShardLayout(
-                        num_layers=L, num_heads=Hh, tp_size=tp, tp_rank=t,
-                        pp_size=pp, pp_rank=p, global_rank=rank, ep_size=ep, ep_rank=e,
+                for et in range(etp):
+                    outs.append(
+                        KVShardLayout(
+                            num_layers=L, num_heads=Hh, tp_size=tp, tp_rank=t,
+                            pp_size=pp, pp_rank=p, global_rank=rank,
+                            ep_size=ep, ep_rank=e, etp_size=etp, etp_rank=et,
+                        )
                     )
-                )
-                rank += 1
+                    rank += 1
     return outs
 
 
@@ -112,16 +114,39 @@ def test_reshard_matches_direct_split(src, dst):
         assert (got != -999.0).all(), "some dst entries never received"
 
 
-def test_ep_replication_picks_single_source():
-    """EP-replicated sources: only ep_rank 0 sources; every dst (any EP
-    replica) still gets correct, complete data."""
-    src_layouts = _make_layouts(tp=2, pp=1, ep=2)  # 2 EP replicas per (tp,pp)
-    dst_layouts = _make_layouts(tp=2, pp=1, ep=2)
-    plan = plan_kv_reshard(src_layouts, dst_layouts)
-    # no transfer should originate from a non-representative replica
+def _assert_one_source_per_shard(plan, src_layouts):
+    """Each attention shard (tp_rank, pp_rank) must be sourced by exactly
+    one rank -- no duplicate sends from EP/ETP replicas."""
     src_by_rank = {s.global_rank: s for s in src_layouts}
+    shard_sources = {}
     for t in plan:
-        assert src_by_rank[t.src_rank].ep_rank == 0
+        s = src_by_rank[t.src_rank]
+        shard_sources.setdefault(s.kv_shard_key(), set()).add(t.src_rank)
+    for key, ranks in shard_sources.items():
+        assert len(ranks) == 1, f"shard {key} sourced by {ranks}"
+
+
+@pytest.mark.parametrize("ep,etp", [(2, 1), (1, 2), (2, 2)])
+def test_expert_replication_picks_single_source(ep, etp):
+    """EP- and/or ETP-replicated sources: each attention shard is sourced
+    once; every dst (any EP/ETP replica) still gets correct, complete data.
+    EP and ETP shard the expert FFN, not the KV, so they're pure replicas."""
+    src_layouts = _make_layouts(tp=2, pp=1, ep=ep, etp=etp)
+    dst_layouts = _make_layouts(tp=2, pp=1, ep=ep, etp=etp)
+    plan = plan_kv_reshard(src_layouts, dst_layouts)
+    _assert_one_source_per_shard(plan, src_layouts)
+    g, out = _run_reshard(src_layouts, dst_layouts)
+    for d in dst_layouts:
+        assert torch.equal(out[d.global_rank], _shard_of(g, d))
+
+
+def test_hetero_tp_with_expert_replication():
+    """Hetero attention TP merge (4->2) while sources are also ETP-replicated:
+    the reshard still merges heads correctly and dedupes the ETP replicas."""
+    src_layouts = _make_layouts(tp=4, pp=1, etp=2)   # 8 ranks, 4 attn shards x2
+    dst_layouts = _make_layouts(tp=2, pp=1)
+    plan = plan_kv_reshard(src_layouts, dst_layouts)
+    _assert_one_source_per_shard(plan, src_layouts)
     g, out = _run_reshard(src_layouts, dst_layouts)
     for d in dst_layouts:
         assert torch.equal(out[d.global_rank], _shard_of(g, d))

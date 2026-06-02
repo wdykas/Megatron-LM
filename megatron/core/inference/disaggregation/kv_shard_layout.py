@@ -10,12 +10,18 @@ handoff must reshard it:
   ``t`` of ``Tp`` owns global heads ``[t*H/Tp, (t+1)*H/Tp)``.
 * **Pipeline parallel (PP)** partitions by layers: PP rank ``p`` of
   ``Pp`` owns global layers ``[p*L/Pp, (p+1)*L/Pp)``.
-* **Expert parallel (EP)** shards MoE experts, **not** the attention KV
-  cache -- the KV is EP-replicated. So hetero-EP needs no data
-  re-partition: it reduces to *replica selection* (one EP replica is the
-  representative source; every destination EP replica pulls the same
-  bytes). We therefore ignore ``ep_rank`` for KV data and only use it to
-  pick a single source replica.
+* **Expert parallel (EP)** and **expert tensor parallel (ETP)** shard the
+  MoE expert FFN weights, **not** the attention KV cache. The KV lives in
+  the attention layers, which are partitioned by the *attention* TP/PP
+  only; across the EP and ETP dimensions the KV is fully **replicated**.
+  So hetero-EP/ETP needs no data re-partition -- it reduces to *replica
+  selection*: a single representative rank per attention shard sources the
+  KV, and every destination replica of that shard pulls the same bytes.
+  Rather than special-case ``ep_rank``/``etp_rank``, we group source ranks
+  by their attention shard ``(tp_rank, pp_rank)`` and source from the one
+  with the smallest ``global_rank``. This is correct for EP, ETP, any
+  combination of them, and any future KV-replica dimension, with no
+  per-dimension logic.
 
 The resharding primitive is **range intersection** in *global*
 coordinates. A destination rank owns a ``(layer_range x head_range)``
@@ -52,8 +58,13 @@ class KVShardLayout:
     pp_size: int
     pp_rank: int
     global_rank: int
+    # Expert dimensions. KV-replica dimensions only: they shard the MoE
+    # expert weights, never the attention KV cache, so they don't affect
+    # head_range/layer_range -- only representative (source) selection.
     ep_size: int = 1
     ep_rank: int = 0
+    etp_size: int = 1
+    etp_rank: int = 0
 
     def __post_init__(self) -> None:
         # Standard Megatron requirement: TP divides heads. PP usually
@@ -69,11 +80,10 @@ class KVShardLayout:
                 f"num_layers={self.num_layers} not divisible by pp_size={self.pp_size}"
             )
 
-    @property
-    def is_kv_source_replica(self) -> bool:
-        """Whether this rank is the representative EP replica for its KV.
-        Only ep_rank 0 sources KV; other EP replicas hold identical bytes."""
-        return self.ep_rank == 0
+    def kv_shard_key(self) -> Tuple[int, int]:
+        """The attention shard this rank holds: ``(tp_rank, pp_rank)``.
+        Ranks sharing a key hold identical KV (EP/ETP replicas of it)."""
+        return (self.tp_rank, self.pp_rank)
 
     def layer_range(self) -> Tuple[int, int]:
         per = self.num_layers // self.pp_size
@@ -146,17 +156,31 @@ def plan_kv_reshard(
 
     Both sides compute the same plan from the same layouts and filter to
     their own rank (``transfers_for_src`` / ``transfers_for_dst``).
-    Only the representative EP replica (``ep_rank == 0``) sources KV.
+
+    KV is replicated across the EP and ETP dimensions, so each attention
+    shard ``(tp_rank, pp_rank)`` may be held by several source ranks. We
+    source each shard from exactly one of them -- the smallest
+    ``global_rank`` -- which avoids duplicate sends and is independent of
+    how EP/ETP map onto ranks.
     """
     if srcs and dsts:
         if srcs[0].num_layers != dsts[0].num_layers or srcs[0].num_heads != dsts[0].num_heads:
             raise ValueError("src and dst describe different global models")
 
+    # One representative source rank per attention shard (dedupe EP/ETP
+    # replicas that hold identical KV).
+    rep_rank: dict = {}
+    for s in srcs:
+        key = s.kv_shard_key()
+        if key not in rep_rank or s.global_rank < rep_rank[key]:
+            rep_rank[key] = s.global_rank
+    source_ranks = set(rep_rank.values())
+
     transfers: List[ReshardTransfer] = []
     for d in dsts:
         dl, dh = d.layer_range(), d.head_range()
         for s in srcs:
-            if not s.is_kv_source_replica:
+            if s.global_rank not in source_ranks:
                 continue
             li = _intersect(s.layer_range(), dl)
             if li is None:
@@ -187,7 +211,8 @@ def transfers_for_src(plan: List[ReshardTransfer], src_rank: int) -> List[Reshar
 
 def is_matched(src: KVShardLayout, dst: KVShardLayout) -> bool:
     """Whether the two layouts are identical in the dims that affect KV
-    sharding (TP heads + PP layers). EP is irrelevant to KV."""
+    sharding (TP heads + PP layers). EP and ETP are KV-replica dimensions
+    and so are irrelevant here."""
     return (
         src.num_layers == dst.num_layers
         and src.num_heads == dst.num_heads
