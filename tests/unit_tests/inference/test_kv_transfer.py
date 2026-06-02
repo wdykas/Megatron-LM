@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Round-trip test for the native prefill->decode KV handoff.
+"""Round-trip test for the prefill->decode KV transfer.
 
 Runs two gloo ranks on CPU (CI-friendly, no CUDA / NVSHMEM needed):
 rank 0 = prefill, rank 1 = decode. A minimal fake engine context
@@ -117,11 +117,11 @@ def _worker(rank, world, port, rid, header_free, q):
     import torch.distributed as dist
 
     dist.init_process_group("gloo", rank=rank, world_size=world)
-    from megatron.core.inference.disaggregation import native_kv_handoff as h
-    from megatron.core.inference.disaggregation.kv_transport_backend import (
-        NcclTransportBackend,
+    from megatron.core.inference.disaggregation import kv_transfer as h
+    from megatron.core.inference.disaggregation.transfer_backends.base import (
         set_kv_transport_backend,
     )
+    from megatron.core.inference.disaggregation.transfer_backends.nccl import NcclTransportBackend
 
     backend = NcclTransportBackend()
     backend.init()

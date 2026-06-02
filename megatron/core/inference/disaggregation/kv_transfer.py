@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Native prefill->decode KV handoff: stage, transport, import."""
+"""Prefill->decode KV transfer: stage, move, import."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from typing import Any, List, Optional
 
 import torch
 
-from megatron.core.inference.disaggregation.kv_transport_backend import (
+from megatron.core.inference.disaggregation.transfer_backends.base import (
     KVTransportBackend,
     TransferHandle,
     get_kv_transport_backend,

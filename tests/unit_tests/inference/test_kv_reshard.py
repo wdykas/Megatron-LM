@@ -183,8 +183,8 @@ def test_is_matched():
 # import) driven single-process by an in-memory loopback backend.
 # --------------------------------------------------------------------------
 
-from megatron.core.inference.disaggregation import native_kv_handoff as H  # noqa: E402
-from megatron.core.inference.disaggregation.kv_transport_backend import (  # noqa: E402
+from megatron.core.inference.disaggregation import kv_transfer as H  # noqa: E402
+from megatron.core.inference.disaggregation.transfer_backends.base import (  # noqa: E402
     KVTransportBackend,
     TransferHandle,
 )

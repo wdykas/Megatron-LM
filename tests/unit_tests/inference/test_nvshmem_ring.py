@@ -13,7 +13,7 @@ simulator -- no NVSHMEM hardware needed. Verifies:
 import pytest
 import torch
 
-from megatron.core.inference.disaggregation.kv_transport_backend import (
+from megatron.core.inference.disaggregation.transfer_backends.nvshmem import (
     NvshmemSymmetricOps,
     NvshmemTransportBackend,
 )

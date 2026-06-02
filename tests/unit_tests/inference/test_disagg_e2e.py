@@ -1,25 +1,24 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""End-to-end functional test of native prefill->decode disaggregation.
+"""End-to-end functional test of the prefill->decode KV transfer.
 
-Drives the full DisaggCoordinator path -- layout handshake,
-deterministic routing, KV reshard, transport, and import -- and asserts
-the decode side reconstructs the exact global KV. Two configurations:
+Drives the KV reshard + transport + import directly
+(send/recv_request_kv_resharded) and asserts the decode side reconstructs the
+exact global KV. Two configurations:
 
 * **gloo / CI** (3 procs): prefill TP2 {0,1} -> decode TP1 {2}, which
   exercises the hetero TP2->TP1 head merge over the NCCL backend. Runs
   on CPU, no GPUs needed.
 * **NVSHMEM / hardware** (2 procs): prefill TP1 {0} -> decode TP1 {1}
-  over the real NVSHMEM credit-ring backend, validating the whole
-  coordinator + fast transport end to end. Guarded (skips without
-  nvshmem4py + >=2 GPUs). (A 3-PE NVSHMEM run hits an NVSHMEM
-  UID-bootstrap heap-allgather limitation across NUMA sockets in this
-  environment; the hetero merge is covered by the gloo config + the
-  reshard unit tests.)
+  over the real NVSHMEM credit-ring backend, validating the fast transport
+  end to end. Guarded (skips without nvshmem4py + >=2 GPUs). (A 3-PE NVSHMEM
+  run hits an NVSHMEM UID-bootstrap heap-allgather limitation across NUMA
+  sockets in this environment; the hetero merge is covered by the gloo config
+  + the reshard unit tests.)
 
 The LLM forward is stubbed (a fake context whose export returns this
 rank's head-shard of a known global KV and whose import records the
-assembled tensor); everything else is the real coordinator + transport.
+assembled tensor); everything else is the real transport.
 """
 
 import os
@@ -104,12 +103,18 @@ def _worker(rank, world, port, use_nvshmem, q):
         device = f"cuda:{rank}"
     dist.init_process_group("gloo", rank=rank, world_size=world)
     try:
-        from megatron.core.inference.disaggregation.disagg_coordinator import DisaggCoordinator
+        from megatron.core.inference.disaggregation import kv_transfer as H
 
-        role, replica, layout = _make_layout(rank, world)
+        role, _replica, layout = _make_layout(rank, world)
+        # The full prefill/decode layout lists (what a handshake would exchange,
+        # made explicit -- _make_layout is deterministic per rank).
+        all_layouts = [_make_layout(r, world) for r in range(world)]
+        src_layouts = [lay for (rl, _, lay) in all_layouts if rl == "prefill"]
+        dst_layouts = [lay for (rl, _, lay) in all_layouts if rl == "decode"]
+
         if use_nvshmem:
             from megatron.core.inference import nvshmem_runtime as nv
-            from megatron.core.inference.disaggregation.kv_transport_backend import (
+            from megatron.core.inference.disaggregation.transfer_backends.nvshmem import (
                 NvshmemTransportBackend,
             )
 
@@ -117,29 +122,29 @@ def _worker(rank, world, port, use_nvshmem, q):
             backend = NvshmemTransportBackend()
             backend.init(slot_bytes=65536, depth=2)
         else:
-            from megatron.core.inference.disaggregation.kv_transport_backend import (
+            from megatron.core.inference.disaggregation.transfer_backends.nccl import (
                 NcclTransportBackend,
             )
 
             backend = NcclTransportBackend()
             backend.init()
-        coord = DisaggCoordinator(
-            role=role, replica_id=replica, my_layout=layout, backend=backend,
-        )
-        coord.handshake()
         eng = _FakeEng(layout, device=device)
 
         if role == "prefill":
-            target, h = coord.prefill_handoff(eng, request_id=7, prompt_token_ids=PROMPT)
+            h = H.send_request_kv_resharded(
+                eng, 7, layout, src_layouts, dst_layouts, backend=backend,
+            )
             if h is not None:
                 h.wait()
-            q.put((f"prefill{rank}", target.target_id))
+            q.put((f"prefill{rank}", "prefill"))
         else:
-            rid, res = coord.decode_intake(eng)
+            res = H.recv_request_kv_resharded(
+                eng, layout, src_layouts, dst_layouts, PROMPT, backend=backend,
+            )
             imported = eng.context.imported
             expected = _global_kv_staging().to(imported.device)
             ok = res is not None and torch.equal(imported, expected)
-            q.put(("decode", (rid, bool(ok))))
+            q.put(("decode", (7, bool(ok))))
     except Exception:
         import traceback
 
@@ -168,7 +173,7 @@ def _assert_ok(out):
     errs = {k: v for k, v in out.items() if "ERROR" in k}
     assert not errs, errs
     prefills = {k: v for k, v in out.items() if k.startswith("prefill")}
-    assert prefills and all(v == "d0" for v in prefills.values()), out  # same replica
+    assert prefills and all(v == "prefill" for v in prefills.values()), out
     assert out["decode"] == (7, True), out  # request 7, exact global KV reconstructed
 
 

@@ -1,157 +1,25 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Pluggable KV transport backend (NCCL default, NVSHMEM fast path)."""
+"""NVSHMEM depth-k credit-ring KV transfer backend (fast path)."""
 
 from __future__ import annotations
 
 import abc
-from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
 
-
-@dataclass
-class TransferHandle:
-    """Opaque handle for an in-flight non-blocking transfer.
-
-    ``wait()`` blocks until the transfer completes and, for receives,
-    returns the received tensor. Backends populate ``tensor`` for
-    receives so the caller need not pre-know where the bytes landed.
-    """
-
-    wait_fn: object  # Callable[[], None]
-    tensor: Optional[torch.Tensor] = None
-
-    def wait(self) -> Optional[torch.Tensor]:
-        if self.wait_fn is not None:
-            self.wait_fn()
-        return self.tensor
+from megatron.core.inference.disaggregation.transfer_backends.base import (
+    KVTransportBackend,
+    TransferHandle,
+)
 
 
-class KVTransportBackend(abc.ABC):
-    """Backend interface for moving KV-cache blobs between workers.
-
-    PE identity is the backend's choice (NCCL uses the process group's
-    rank space; NVSHMEM uses global PE ids — equal in our setup). All
-    ops are point-to-point between a ``(src, dst)`` pair and tagged so
-    multiple per-layer / per-request transfers can be multiplexed.
-    """
-
-    @abc.abstractmethod
-    def is_initialized(self) -> bool:
-        """Whether :meth:`init` has run."""
-
-    @abc.abstractmethod
-    def init(self, *, group: Optional[object] = None, **kwargs) -> None:
-        """One-shot, idempotent init. ``group`` scopes the collective
-        for backends that need it (NCCL); ignored otherwise."""
-
-    @abc.abstractmethod
-    def send(self, tensor: torch.Tensor, dst: int, tag: int = 0) -> None:
-        """Blocking send of ``tensor`` to ``dst``."""
-
-    @abc.abstractmethod
-    def recv(
-        self,
-        shape: Tuple[int, ...],
-        dtype: torch.dtype,
-        src: int,
-        tag: int = 0,
-        *,
-        device: Optional[torch.device] = None,
-    ) -> torch.Tensor:
-        """Blocking receive of a tensor of the given shape/dtype."""
-
-    @abc.abstractmethod
-    def isend(self, tensor: torch.Tensor, dst: int, tag: int = 0) -> TransferHandle:
-        """Non-blocking send; returns a handle to wait on. The caller
-        must keep ``tensor`` alive until the handle completes."""
-
-    @abc.abstractmethod
-    def irecv(
-        self,
-        shape: Tuple[int, ...],
-        dtype: torch.dtype,
-        src: int,
-        tag: int = 0,
-        *,
-        device: Optional[torch.device] = None,
-    ) -> TransferHandle:
-        """Non-blocking receive; ``handle.wait()`` returns the tensor."""
-
-    def stream(self) -> Optional[torch.cuda.Stream]:
-        """Optional dedicated stream; default ``None`` (use current)."""
-        return None
-
-
-class NcclTransportBackend(KVTransportBackend):
-    """``torch.distributed`` point-to-point transport.
-
-    Uses ``isend`` / ``irecv`` so it works identically under the
-    ``nccl`` backend (GPU) and ``gloo`` backend (CPU/CI). Tensors are
-    moved on whatever device they live on; the receive side allocates
-    the destination buffer.
-    """
-
-    def __init__(self, group: Optional[object] = None) -> None:
-        self._group = group
-        self._init = False
-
-    def is_initialized(self) -> bool:
-        return self._init
-
-    def init(self, *, group: Optional[object] = None, **kwargs) -> None:
-        import torch.distributed as dist
-
-        if not dist.is_available() or not dist.is_initialized():
-            raise RuntimeError(
-                "NcclTransportBackend.init: torch.distributed is not initialized; "
-                "the prefill/decode workers must share a process group."
-            )
-        if group is not None:
-            self._group = group
-        self._init = True
-
-    def _dist(self):
-        import torch.distributed as dist
-
-        return dist
-
-    def send(self, tensor: torch.Tensor, dst: int, tag: int = 0) -> None:
-        self._dist().send(tensor.contiguous(), dst=dst, tag=tag, group=self._group)
-
-    def recv(
-        self,
-        shape: Tuple[int, ...],
-        dtype: torch.dtype,
-        src: int,
-        tag: int = 0,
-        *,
-        device: Optional[torch.device] = None,
-    ) -> torch.Tensor:
-        buf = torch.empty(shape, dtype=dtype, device=device)
-        self._dist().recv(buf, src=src, tag=tag, group=self._group)
-        return buf
-
-    def isend(self, tensor: torch.Tensor, dst: int, tag: int = 0) -> TransferHandle:
-        t = tensor.contiguous()
-        work = self._dist().isend(t, dst=dst, tag=tag, group=self._group)
-        # Keep a reference to ``t`` so it isn't freed before the send drains.
-        return TransferHandle(wait_fn=lambda _t=t, _w=work: _w.wait())
-
-    def irecv(
-        self,
-        shape: Tuple[int, ...],
-        dtype: torch.dtype,
-        src: int,
-        tag: int = 0,
-        *,
-        device: Optional[torch.device] = None,
-    ) -> TransferHandle:
-        buf = torch.empty(shape, dtype=dtype, device=device)
-        work = self._dist().irecv(buf, src=src, tag=tag, group=self._group)
-        return TransferHandle(wait_fn=work.wait, tensor=buf)
+def _nbytes(shape: Tuple[int, ...], dtype: torch.dtype) -> int:
+    n = 1
+    for s in shape:
+        n *= int(s)
+    return n * torch.empty((), dtype=dtype).element_size()
 
 
 class NvshmemSymmetricOps(abc.ABC):
@@ -387,30 +255,3 @@ class NvshmemTransportBackend(KVTransportBackend):
     ) -> TransferHandle:
         t = self.recv(shape, dtype, src, tag, device=device)
         return TransferHandle(wait_fn=None, tensor=t)
-
-
-def _nbytes(shape: Tuple[int, ...], dtype: torch.dtype) -> int:
-    n = 1
-    for s in shape:
-        n *= int(s)
-    return n * torch.empty((), dtype=dtype).element_size()
-
-
-# Module-level singleton. Defaults to NCCL (portable / CI-friendly).
-_backend: Optional[KVTransportBackend] = None
-
-
-def get_kv_transport_backend() -> KVTransportBackend:
-    """Return the active backend, constructing the default (NCCL) on
-    first call."""
-    global _backend
-    if _backend is None:
-        _backend = NcclTransportBackend()
-    return _backend
-
-
-def set_kv_transport_backend(backend: Optional[KVTransportBackend]) -> None:
-    """Override the active backend. ``None`` resets to the NCCL default
-    on next access. Used by tests, or to select NVSHMEM at startup."""
-    global _backend
-    _backend = backend

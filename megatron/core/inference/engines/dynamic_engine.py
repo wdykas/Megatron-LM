@@ -528,7 +528,9 @@ class DynamicInferenceEngine(AbstractEngine):
         raise RuntimeError(f"rank {rank} not found in its disagg instance layouts")
 
     def _disagg_get_backend(self):
-        from megatron.core.inference.disaggregation.kv_transport_backend import NcclTransportBackend
+        from megatron.core.inference.disaggregation.transfer_backends.nccl import (
+            NcclTransportBackend,
+        )
 
         if self._disagg_backend is None:
             self._disagg_backend = NcclTransportBackend()
@@ -548,9 +550,7 @@ class DynamicInferenceEngine(AbstractEngine):
         instance (resharded to its layout). Non-blocking: the send is reaped a
         step later in :meth:`_disagg_complete_pending` so the transfer overlaps
         the engine step."""
-        from megatron.core.inference.disaggregation.native_kv_handoff import (
-            send_request_kv_resharded,
-        )
+        from megatron.core.inference.disaggregation.kv_transfer import send_request_kv_resharded
 
         staged = self._disagg_staged_kv.pop(request_id, None)
         handoff = send_request_kv_resharded(
@@ -568,7 +568,7 @@ class DynamicInferenceEngine(AbstractEngine):
         receive is reaped a step later in :meth:`_disagg_complete_pending`, which
         imports the KV (registers the prefix-cache blocks) and admits the
         request -- add_request prefix-hits and continues generation."""
-        from megatron.core.inference.disaggregation.native_kv_handoff import (
+        from megatron.core.inference.disaggregation.kv_transfer import (
             post_recv_request_kv_resharded,
         )
 
