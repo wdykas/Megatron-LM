@@ -112,7 +112,7 @@ def test_prefill_decode_single_instance():
     out = _run("tp=1,role=prefill+tp=1,role=decode", world=2)
     # rank 0 -> prefill (spawns coordinator, owns the client)
     assert out[0]["role"] == "prefill"
-    assert out[0]["identity"] == "prefill"
+    assert out[0]["identity"] == "prefill_s0_dp0"
     assert out[0]["is_primary"] and out[0]["spawn"]
     assert out[0]["layout_ranks"] == [0]
     # rank 1 -> the single decode instance
@@ -129,10 +129,23 @@ def test_prefill_decode_single_instance():
 def test_decode_dp_is_independent_instances():
     # prefill {0}; decode dp=2 -> two independent decode instances {1}, {2}.
     out = _run("tp=1,role=prefill+tp=1,dp=2,role=decode", world=3)
-    assert out[0]["role"] == "prefill" and out[0]["identity"] == "prefill"
+    assert out[0]["role"] == "prefill" and out[0]["identity"] == "prefill_s0_dp0"
     assert out[1]["replica_id"] == "decode_s1_dp0" and out[1]["layout_ranks"] == [1]
     assert out[2]["replica_id"] == "decode_s1_dp1" and out[2]["layout_ranks"] == [2]
     # three instances total: one prefill + two decode.
+    for r in (0, 1, 2):
+        assert out[r]["total_instances"] == 3
+
+
+@pytest.mark.skipif(not torch.distributed.is_available(), reason="torch.distributed unavailable")
+def test_prefill_dp_is_independent_instances():
+    # prefill dp=2 -> two independent prefill instances {0}, {1}; decode {2}.
+    out = _run("tp=1,dp=2,role=prefill+tp=1,role=decode", world=3)
+    assert out[0]["role"] == "prefill" and out[0]["identity"] == "prefill_s0_dp0"
+    assert out[1]["role"] == "prefill" and out[1]["identity"] == "prefill_s0_dp1"
+    assert out[0]["layout_ranks"] == [0] and out[1]["layout_ranks"] == [1]
+    assert out[2]["role"] == "decode" and out[2]["identity"] == "decode_s1_dp0"
+    # three instances total: two prefill + one decode.
     for r in (0, 1, 2):
         assert out[r]["total_instances"] == 3
 

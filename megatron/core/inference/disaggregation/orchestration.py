@@ -39,7 +39,13 @@ def layout_from_pg_collection(pg, num_layers: int, num_heads: int) -> KVShardLay
 
 
 def _validate_disagg_specs(specs: List[InferenceShardSpec]) -> int:
-    """Check the role layout; return the number of decode instances."""
+    """Check the role layout; return the number of decode instances.
+
+    Any number of prefill and decode instances is allowed (each instance --
+    a shard's dp replica -- is an independent routing target). The coordinator
+    round-robins submits across prefill instances and remembers, per request,
+    which prefill held its KV, so the decode side pulls from the right source.
+    """
     prefill = [s for s in specs if s.role == PREFILL]
     decode = [s for s in specs if s.role == DECODE]
     untagged = [s for s in specs if s.role not in (PREFILL, DECODE)]
@@ -49,13 +55,6 @@ def _validate_disagg_specs(specs: List[InferenceShardSpec]) -> int:
     )
     assert prefill and decode, (
         "disaggregation needs at least one prefill shard and one decode shard."
-    )
-    prefill_instances = sum(s.dp for s in prefill)
-    assert len(prefill) == 1 and prefill_instances == 1, (
-        "exactly one prefill instance is supported today (one prefill shard "
-        f"with dp=1); got {len(prefill)} prefill shard(s) totalling "
-        f"{prefill_instances} instance(s). Data-parallel prefill needs "
-        "per-request prefill-instance scoping (a follow-up)."
     )
     return sum(s.dp for s in decode)
 

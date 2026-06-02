@@ -12,7 +12,6 @@ from typing import Any, List
 import torch.distributed as dist
 
 from megatron.core.inference.disaggregation.orchestration import (
-    PREFILL,
     _global_kv_dims,
     _validate_disagg_specs,
     layout_from_pg_collection,
@@ -45,7 +44,7 @@ def configure_prebuilt_disagg_engine(
     contiguity assumption).
     """
     total_instances = sum(s.dp for s in specs)
-    _validate_disagg_specs(specs)  # role layout / single-prefill-instance checks
+    _validate_disagg_specs(specs)  # role-layout checks
     rank = dist.get_rank()
 
     # Locate this rank's shard. Shard windows are contiguous (tp*pp*dp ranks
@@ -68,7 +67,10 @@ def configure_prebuilt_disagg_engine(
     layouts = [None] * get_pg_size(pg.mp)
     dist.all_gather_object(layouts, my_layout, group=pg.mp)
 
-    replica_id = PREFILL if role == PREFILL else f"decode_s{my_index}_dp{dp_rank}"
+    # Unique per instance (shard index + dp replica) so each prefill/decode
+    # replica gets a distinct ZMQ identity + layout key -- this is what lets the
+    # coordinator address multiple prefill replicas, not just one.
+    replica_id = f"{role}_s{my_index}_dp{dp_rank}"
     engine.set_disaggregation_config(
         role=role,
         instance_layouts=layouts,

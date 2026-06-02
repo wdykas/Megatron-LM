@@ -40,6 +40,16 @@ def test_submit_goes_to_prefill_then_prefill_done_picks_decode_round_robin():
     assert r.decode_of(1) == "d1"
 
 
+def test_submit_round_robins_across_multiple_prefill():
+    r = _routing(n_prefill=2, n_decode=2)
+    # submits fan across the prefill pool...
+    assert [r.route_submit(i) for i in range(4)] == ["p0", "p1", "p0", "p1"]
+    # ...and each request's KV is sourced from the prefill that actually ran it.
+    assert r.route_prefill_done(0)[0] == "p0"
+    assert r.route_prefill_done(1)[0] == "p1"
+    assert r.route_prefill_done(2)[0] == "p0"
+
+
 def test_reply_accounting_and_forget():
     r = _routing()
     r.route_submit(7)
