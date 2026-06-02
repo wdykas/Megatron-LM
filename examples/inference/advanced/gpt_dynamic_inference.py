@@ -305,14 +305,12 @@ def run_disaggregated_inference(args, tokenizer, sampling_params, requests):
     """
     from megatron.core.inference.disaggregation.disagg_llm import MegatronDisaggLLM
 
-    num_heads = getattr(args, "num_query_groups", None) or args.num_attention_heads
+    # num_layers/num_heads are derived from the built engine's model config.
     llm = MegatronDisaggLLM(
         args.inference_shards,
         engine_builder=lambda pg: _build_engine_for(
             args, tokenizer, sampling_params, requests, pg
         ),
-        num_layers=args.num_layers,
-        num_heads=num_heads,
     )
     # Pass the already-tokenized prompts so disagg uses the exact same tokens
     # as the colocated golden run; one shared sampling_params (the batch is
