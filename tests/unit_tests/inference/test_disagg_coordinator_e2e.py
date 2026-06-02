@@ -13,8 +13,6 @@ reshard/transport is covered by test_disagg_e2e).
 """
 
 import asyncio
-import multiprocessing
-import os
 
 import pytest
 import torch
@@ -24,9 +22,6 @@ from tests.unit_tests.test_utilities import Utils
 zmq = pytest.importorskip("zmq")
 msgpack = pytest.importorskip("msgpack")
 
-from megatron.core.inference.data_parallel_inference_coordinator import (
-    DataParallelInferenceCoordinator,
-)
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import Status
@@ -34,7 +29,6 @@ from megatron.core.inference.sampling_params import SamplingParams
 from tests.unit_tests.inference.test_data_parallel_inference_coordinator import (
     DummyContext,
     DummyEngine,
-    DummyTokenizer,
     cleanup_engine,
 )
 
@@ -58,6 +52,9 @@ class _FakeKVContext(DummyContext):
         self.cache_mla_latent = False
         self.is_hybrid_model = False
         self.block_size_tokens = BS
+        # Read by start_listening when spawning the coordinator.
+        self.max_requests = 16
+        self.prefix_caching_routing_alpha = 0.5
         # memory_buffer shape drives derive_decode_schema (local dims; TP1 -> H).
         self.memory_buffer = torch.zeros(2, L, BC, BS, H, HD, device=self._dev)
         self.imported = None
@@ -137,59 +134,17 @@ def init_mp(monkeypatch):
     Utils.destroy_model_parallel()
 
 
-@pytest.fixture
-def disagg_coordinator():
-    """Rank 0 spawns the disaggregated coordinator (2 instances: prefill+decode)."""
-    rank = int(os.environ.get("RANK", "0"))
-    proc = None
-    if rank == 0:
-        ctx = multiprocessing.get_context("spawn")
-        parent, child = ctx.Pipe()
-        ready = ctx.Event()
-        proc = ctx.Process(
-            target=DataParallelInferenceCoordinator.entrypoint,
-            kwargs=dict(pipe_connection=child, ready_event=ready, data_parallel_size=0,
-                        tokenizer=DummyTokenizer(), max_requests=16,
-                        inference_coordinator_port=PORT, disaggregated=True),
-        )
-        proc.start()
-        while not parent.poll(timeout=0.1):
-            assert proc.is_alive()
-        dp_addr = parent.recv()
-        parent.close()
-    else:
-        dp_addr = f"tcp://localhost:{PORT}"
-    yield dp_addr
-    if rank == 0 and proc is not None and proc.is_alive():
-        proc.terminate()
-        proc.join(timeout=10.0)
-
-
 @pytest.mark.internal
-@pytest.mark.skip(
-    reason="WIP: native coordinator-driven disagg e2e. The control plane is "
-    "unit-tested (test_disagg_coordinator_routing / _2hop); this multi-GPU "
-    "harness still needs robust coordinator addressing/cleanup before it's "
-    "reliable in CI."
-)
-def test_native_disagg_prefill_to_decode(init_mp, disagg_coordinator):
+def test_native_disagg_prefill_to_decode(init_mp):
     if Utils.world_size != 2:
         pytest.skip("native disagg e2e needs exactly 2 ranks (prefill + decode)")
-    asyncio.run(_run_disagg_e2e(disagg_coordinator))
+    asyncio.run(_run_disagg_e2e())
 
 
-async def _run_disagg_e2e(dp_addr):
+async def _run_disagg_e2e():
     rank = torch.distributed.get_rank()
     role = "prefill" if rank == 0 else "decode"
 
-    def trace(msg):
-        line = f"[rank{rank}/{role}] {msg}\n"
-        print(line, end="", flush=True)
-        with open(f"/tmp/dtrace_{rank}.log", "a") as _f:
-            _f.write(line)
-            _f.flush()
-
-    trace("building engine")
     engine = DisaggDummyEngine()
     engine.set_disaggregation_config(
         role=role,
@@ -197,16 +152,16 @@ async def _run_disagg_e2e(dp_addr):
         identity="prefill" if role == "prefill" else "decode_s1_dp0",
         total_instances=2,
         world_group=None,
-        spawn_coordinator=False,  # the fixture already spawned it
+        spawn_coordinator=(rank == 0),  # rank 0's engine spawns the shared coordinator
     )
-    trace("start_listening...")
-    await engine.start_listening_to_data_parallel_coordinator(
-        inference_coordinator_port=PORT, launch_inference_coordinator=False
+    # Engine-owned spawn (rank 0) + cross-shard broadcast of the *actual*
+    # coordinator address (robust to the requested port being taken).
+    dp_addr = await engine.start_listening_to_data_parallel_coordinator(
+        inference_coordinator_port=PORT
     )
-    trace("registered (start_listening done)")
 
-    # Both engines have sent REGISTER_ROLE; let the coordinator process them
-    # before the client submits (avoids racing decode registration).
+    # Both engines have registered (REGISTER_ROLE); let the coordinator process
+    # them before the client submits (avoids racing decode registration).
     torch.distributed.barrier()
     await asyncio.sleep(1.0)
 
@@ -215,17 +170,18 @@ async def _run_disagg_e2e(dp_addr):
         if rank == 0:
             client = InferenceClient(dp_addr)
             client.start()
-            trace("submitting request")
             fut = client.add_request(
                 prompt=[1, 2, 3, 4],
                 sampling_params=SamplingParams(num_tokens_to_generate=2),
             )
             result = await asyncio.wait_for(fut, timeout=30.0)
-            trace(f"got result: {result.get('status')}")
             assert result["status"] == Status.COMPLETED.name, result
         # Keep the decode engine's loop alive (asyncio task runs concurrently
         # with this sleep) until the prefill rank's request has completed.
         await asyncio.sleep(2.0 if rank == 0 else 25.0)
     finally:
-        trace("cleanup")
         await cleanup_engine(engine, client)
+        proc = getattr(engine, "inference_coordinator_process", None)
+        if proc is not None and proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=10.0)
