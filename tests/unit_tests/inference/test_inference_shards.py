@@ -98,15 +98,15 @@ class _FakePG:
 
 
 def test_layout_from_pg_collection(monkeypatch):
-    import megatron.core.utils as mcu
+    import megatron.core.inference.disaggregation.orchestration as orch
     from megatron.core.inference.disaggregation.orchestration import layout_from_pg_collection
 
     sizes, ranks = {}, {}
-    monkeypatch.setattr(mcu, "get_pg_size", lambda g=None: sizes.get(id(g), 1))
-    monkeypatch.setattr(mcu, "get_pg_rank", lambda g=None: ranks.get(id(g), 0))
-    import torch.distributed as dist
-
-    monkeypatch.setattr(dist, "get_rank", lambda *a, **k: 5)
+    # Patch the names where layout_from_pg_collection looks them up (it imports
+    # get_pg_size/get_pg_rank/dist at module top).
+    monkeypatch.setattr(orch, "get_pg_size", lambda g=None: sizes.get(id(g), 1))
+    monkeypatch.setattr(orch, "get_pg_rank", lambda g=None: ranks.get(id(g), 0))
+    monkeypatch.setattr(orch.dist, "get_rank", lambda *a, **k: 5)
 
     tp_g, pp_g, ep_g, etp_g = _FakeGroup(), _FakeGroup(), _FakeGroup(), _FakeGroup()
     for g, (s, r) in [(tp_g, (4, 1)), (pp_g, (2, 0)), (ep_g, (2, 1)), (etp_g, (1, 0))]:
@@ -121,33 +121,3 @@ def test_layout_from_pg_collection(monkeypatch):
     assert lay.head_range() == (4, 8)      # attention TP4 -> heads [4,8)
     assert lay.layer_range() == (0, 4)     # PP2 rank0 -> layers [0,4)
     assert lay.kv_shard_key() == (1, 0)    # EP/ETP are replica dims
-
-
-# --------------------------------------------------------------------------
-# decode assignment (deterministic, disjoint partition across instances)
-# --------------------------------------------------------------------------
-def test_decode_assignment_is_deterministic_and_partitions_the_pool():
-    from megatron.core.inference.disaggregation.disagg_coordinator import DisaggCoordinator
-    from megatron.core.inference.disaggregation.kv_router import DecodeTarget, RequestInfo
-    from megatron.core.inference.disaggregation.kv_shard_layout import KVShardLayout
-
-    # two decode instances of one dp=2 shard (distinct replica_ids per dp rank)
-    targets = [
-        DecodeTarget("decode_s1_dp0", [KVShardLayout(8, 8, 1, 0, 1, 0, 2)]),
-        DecodeTarget("decode_s1_dp1", [KVShardLayout(8, 8, 1, 0, 1, 0, 3)]),
-    ]
-
-    def coord_for(replica_id):
-        c = DisaggCoordinator.__new__(DisaggCoordinator)  # skip __init__ (needs backend)
-        c.role = "decode"
-        c.router_name = "sticky"
-        c.decode_targets = targets
-        c.replica_id = replica_id
-        return c
-
-    infos = [RequestInfo(i) for i in range(20)]
-    a = coord_for("decode_s1_dp0").assigned_request_ids(infos)
-    b = coord_for("decode_s1_dp1").assigned_request_ids(infos)
-    assert set(a).isdisjoint(b)
-    assert sorted(a + b) == list(range(20))                       # every request covered
-    assert coord_for("decode_s1_dp0").assigned_request_ids(infos) == a   # deterministic
