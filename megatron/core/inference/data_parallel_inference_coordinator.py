@@ -178,6 +178,13 @@ class DataParallelInferenceCoordinator:
         # the routing policy; ``_engine_layouts`` maps engine identity -> its
         # instance's layout dicts; ``_req_meta`` stashes prompt+sampling per
         # request for the RECV_KV forward.
+        # Disaggregation: engines register dynamically in the start() loop via
+        # REGISTER_ROLE (role + the full KV layout of their instance), rather
+        # than the blocking count below -- this is robust to engines and the
+        # client connecting in any order. Spawn the disagg coordinator with
+        # data_parallel_size=0. ``_disagg`` holds the routing policy;
+        # ``_engine_layouts`` maps engine identity -> its instance's layout
+        # dicts; ``_req_meta`` stashes prompt+sampling per request for RECV_KV.
         self.disaggregated = disaggregated
         self._disagg = DisaggRouting() if disaggregated else None
         self._engine_layouts: dict = {}
@@ -187,15 +194,6 @@ class DataParallelInferenceCoordinator:
             identity, payload = self.router_socket.recv_multipart()
             assert identity not in self.identities_of_data_parallel_ranks
             self.identities_of_data_parallel_ranks.append(identity)
-            if disaggregated:
-                # payload = msgpack([REGISTER_ROLE, role, layout_dicts])
-                reg = msgpack.unpackb(payload, raw=False)
-                assert Headers(reg[0]) == Headers.REGISTER_ROLE, (
-                    f"disaggregated coordinator expects REGISTER_ROLE; got {reg[0]}"
-                )
-                _, role, layouts = reg
-                self._disagg.register(identity, role)
-                self._engine_layouts[identity] = layouts
         logging.info("Inference Coordinator: Connected with data parallel ranks...")
 
         # In deterministic mode, sort identities for consistent scheduling order.
@@ -448,6 +446,17 @@ class DataParallelInferenceCoordinator:
 
             deserialized_payload = msgpack.unpackb(serialized_payload, raw=False)
             header = Headers(deserialized_payload[0])
+
+            if header == Headers.REGISTER_ROLE:
+                # Disaggregated engine registration (dynamic, order-independent):
+                # role + this instance's KV layouts.
+                _, role, layouts = deserialized_payload
+                if sender_identity not in self.identities_of_data_parallel_ranks:
+                    self.identities_of_data_parallel_ranks.append(sender_identity)
+                    self._register_rank_identity(sender_identity)
+                self._disagg.register(sender_identity, role)
+                self._engine_layouts[sender_identity] = layouts
+                continue
 
             if header == Headers.CONNECT:
                 if sender_identity in known_clients:

@@ -487,6 +487,12 @@ class DynamicInferenceEngine(AbstractEngine):
             spawn_coordinator: whether THIS rank spawns the single coordinator.
         """
         assert role in ("prefill", "decode")
+        # Defensive init (engines built without __init__ -- e.g. test doubles --
+        # still get the disagg per-request state).
+        if not hasattr(self, "_disagg_staged_kv"):
+            self._disagg_staged_kv = {}
+        if not hasattr(self, "_disagg_backend"):
+            self._disagg_backend = None
         self.disagg_role = role
         self.disagg_instance_layouts = instance_layouts
         self.disagg_identity = identity
@@ -650,8 +656,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 kwargs={
                     "pipe_connection": dp_process_pipe,
                     "ready_event": coordinator_ready_event,
+                    # Disagg engines register dynamically (REGISTER_ROLE in the
+                    # coordinator loop, order-independent), so spawn with size 0
+                    # -- no blocking registration count in the coordinator init.
                     "data_parallel_size": (
-                        self.disagg_total_instances if disagg else get_pg_size(self.pg_collection.dp)
+                        0 if disagg else get_pg_size(self.pg_collection.dp)
                     ),
                     "tokenizer": self.controller.tokenizer,
                     "max_requests": self.context.max_requests,
