@@ -2,12 +2,12 @@
 
 """Wiring for native (coordinator-driven) online disaggregated serving.
 
-Builds this rank's prefill/decode shard engine, configures it for the
-shared DP inference coordinator (role + layouts + identity + sizing), so a
-single ``InferenceClient`` can submit requests and the coordinator 2-hop
-routes them (prefill -> KV handoff -> decode). Unlike the offline SPMD
-:class:`~megatron.core.inference.disaggregation.disagg_llm.MegatronDisaggLLM`,
-requests arrive dynamically from one client -- the serving / eval / RL path.
+Configures this rank's prefill/decode shard engine for the shared DP inference
+coordinator (role + layouts + identity + sizing), so a single
+``InferenceClient`` (or the HTTP frontend) can submit requests and the
+coordinator 2-hop routes them (prefill -> KV handoff -> decode).
+:func:`configure_prebuilt_disagg_engine` is what ``MegatronAsyncLLM`` calls when
+constructed with ``inference_shards`` -- the serving / eval / RL path.
 """
 
 from __future__ import annotations

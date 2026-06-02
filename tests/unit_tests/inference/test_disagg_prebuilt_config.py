@@ -1,7 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 """configure_prebuilt_disagg_engine derives the disagg config from a pre-built
-engine + its shard process groups (the path MegatronDisaggLLM uses).
+engine + its shard process groups (the path MegatronAsyncLLM(inference_shards=)
+uses).
 
 Validates, over real ``dist.new_group`` (gloo, CPU), that for a given
 ``--inference-shards`` layout each rank gets the right role / identity /
@@ -87,7 +88,18 @@ def _worker(rank, world, spec_str, port, q):
             dist.destroy_process_group()
 
 
-def _run(spec_str, world, port):
+def _free_port():
+    import socket
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _run(spec_str, world, port=None):
+    port = port or _free_port()
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     procs = [ctx.Process(target=_worker, args=(r, world, spec_str, port, q)) for r in range(world)]
@@ -106,7 +118,7 @@ def _run(spec_str, world, port):
 
 @pytest.mark.skipif(not torch.distributed.is_available(), reason="torch.distributed unavailable")
 def test_prefill_decode_single_instance():
-    out = _run("tp=1,role=prefill+tp=1,role=decode", world=2, port=29651)
+    out = _run("tp=1,role=prefill+tp=1,role=decode", world=2)
     # rank 0 -> prefill (spawns coordinator, owns the client)
     assert out[0]["role"] == "prefill"
     assert out[0]["identity"] == "prefill"
@@ -125,7 +137,7 @@ def test_prefill_decode_single_instance():
 @pytest.mark.skipif(not torch.distributed.is_available(), reason="torch.distributed unavailable")
 def test_decode_dp_is_independent_instances():
     # prefill {0}; decode dp=2 -> two independent decode instances {1}, {2}.
-    out = _run("tp=1,role=prefill+tp=1,dp=2,role=decode", world=3, port=29652)
+    out = _run("tp=1,role=prefill+tp=1,dp=2,role=decode", world=3)
     assert out[0]["role"] == "prefill" and out[0]["identity"] == "prefill"
     assert out[1]["replica_id"] == "decode_s1_dp0" and out[1]["layout_ranks"] == [1]
     assert out[2]["replica_id"] == "decode_s1_dp1" and out[2]["layout_ranks"] == [2]
@@ -138,7 +150,7 @@ def test_decode_dp_is_independent_instances():
 def test_prefill_tp2_instance_layout_gathered():
     # prefill tp=2 {0,1} -> decode tp=1 {2}. The prefill instance layout must
     # gather both of its ranks over pg.mp.
-    out = _run("tp=2,role=prefill+tp=1,role=decode", world=3, port=29653)
+    out = _run("tp=2,role=prefill+tp=1,role=decode", world=3)
     assert out[0]["role"] == "prefill" and out[1]["role"] == "prefill"
     assert out[0]["layout_ranks"] == [0, 1] and out[1]["layout_ranks"] == [0, 1]
     assert out[2]["role"] == "decode" and out[2]["layout_ranks"] == [2]

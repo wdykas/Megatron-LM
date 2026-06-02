@@ -260,9 +260,13 @@ class _MegatronLLMBase:
         use_coordinator: bool = False,
         coordinator_host: Optional[str] = None,
         coordinator_port: Optional[int] = None,
+        inference_shards=None,
     ) -> None:
         if (coordinator_host is not None or coordinator_port is not None) and not use_coordinator:
             raise ValueError("coordinator_host/port require use_coordinator=True")
+
+        if inference_shards is not None and not use_coordinator:
+            raise ValueError("inference_shards (disaggregation) requires use_coordinator=True")
 
         if not use_coordinator:
             from megatron.core import parallel_state
@@ -296,12 +300,24 @@ class _MegatronLLMBase:
         self._loop_manager: "Optional[_EventLoopManager]" = None
         self._coord_runtime: "Optional[_CoordinatorRuntime]" = None
         self._shutdown_called: bool = False
+        self._disagg_setup = None
 
-        # Hook for subclasses to configure the freshly-built engine before the
-        # coordinator runtime starts (e.g. disaggregation sets role + KV
-        # layouts via engine.set_disaggregation_config, which must happen before
-        # start_listening_to_data_parallel_coordinator). Default: no-op.
-        self._post_build_engine()
+        # Disaggregation: when the caller passes a role-tagged shard layout, mark
+        # this engine as a prefill/decode shard before the coordinator runtime
+        # starts. The shard's process groups arrive via inference_config (so the
+        # engine already runs on them); we only derive role + KV layouts here and
+        # call engine.set_disaggregation_config, which must precede
+        # start_listening_to_data_parallel_coordinator.
+        if inference_shards is not None:
+            from megatron.core.inference.disaggregation.coordinator_setup import (
+                configure_prebuilt_disagg_engine,
+            )
+            from megatron.core.inference.shards_spec import normalize_shard_specs
+
+            specs = normalize_shard_specs(inference_shards, dist.get_world_size())
+            self._disagg_setup = configure_prebuilt_disagg_engine(
+                engine, engine.pg_collection, specs
+            )
 
         if use_coordinator:
             loop_manager = _EventLoopManager()
@@ -326,20 +342,17 @@ class _MegatronLLMBase:
             self._loop_manager = loop_manager
             self._coord_runtime = coord_runtime
 
-    def _post_build_engine(self) -> None:
-        """Configure the engine after it is built, before runtime setup.
-
-        Default no-op. Subclasses (e.g. the disaggregation API) override this
-        to set engine state that must exist before
-        ``start_listening_to_data_parallel_coordinator`` runs.
-        """
-
     # ---- properties ----
 
     @property
     def is_primary_rank(self) -> bool:
         """Whether ``generate`` may be called on this rank."""
         return self._is_primary_rank
+
+    @property
+    def disagg_role(self) -> Optional[str]:
+        """``"prefill"`` / ``"decode"`` if this is a disaggregated shard, else None."""
+        return self._disagg_setup.role if self._disagg_setup is not None else None
 
     @property
     def engine(self) -> "DynamicInferenceEngine":

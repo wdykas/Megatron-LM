@@ -2,7 +2,6 @@
 
 # pylint: disable=bad-builtin
 
-import copy
 import hashlib
 import io
 import json
@@ -12,10 +11,9 @@ import warnings
 from collections import defaultdict
 from typing import Dict, List, Optional
 
+from megatron.training.arguments import parse_and_validate_args
 import torch
 from tqdm import tqdm
-
-from megatron.training.arguments import parse_and_validate_args
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -25,7 +23,6 @@ from examples.inference.utils import (
     Request,
     build_dynamic_engine_setup_prefix,
     build_requests,
-    dump_inference_results_to_json,
     get_curr_time,
     get_global_peak_memory_stats_bytes,
 )
@@ -279,63 +276,6 @@ def run_inference(
     }
 
 
-def run_disaggregated_inference(args, tokenizer, sampling_params, requests):
-    """Disaggregated prefill->decode inference, shaped like the regular path.
-
-    The only difference from colocated inference is that the caller builds the
-    per-shard process groups first (so each rank's model is built at its
-    shard's parallelism) and hands the model to :class:`MegatronDisaggLLM`. From
-    there it is regular coordinator-mode inference: ``generate`` on the primary
-    rank submits prompts through one client and the shared coordinator 2-hop
-    routes them (prefill -> KV handoff -> decode). The KV transport / reshard /
-    routing all live in :mod:`megatron.core.inference.disaggregation`.
-    """
-    import torch.distributed as dist
-
-    from megatron.core.inference.disaggregation.disagg_llm import MegatronDisaggLLM
-    from megatron.core.inference.shards import build_inference_pg_collections_for_shards
-    from megatron.core.inference.shards_spec import parse_inference_shards_spec
-
-    world = dist.get_world_size()
-    specs = parse_inference_shards_spec(args.inference_shards, world)
-    shards = build_inference_pg_collections_for_shards(world, specs)
-    my = next(s for s in shards if s.pg_collection is not None)
-
-    # Build this rank's model against its shard's groups -- the only
-    # framework-specific step, exactly like the regular get_model_for_inference().
-    model = get_model_for_inference(pg_collection=my.pg_collection)
-    inference_config = get_inference_config_from_model_and_args(model, args)
-    max_gen_length = sampling_params.num_tokens_to_generate
-    max_context_length = max(len(r.prompt_tokens) for r in requests)
-    inference_config.max_sequence_length = max_context_length + max_gen_length
-
-    llm = MegatronDisaggLLM(
-        model=model, tokenizer=tokenizer, inference_config=inference_config,
-        inference_shards=specs, pg_collection=my.pg_collection,
-    )
-    try:
-        if llm.is_primary_rank:
-            prompts = [r.prompt_tokens for r in requests]
-            finished = llm.generate(prompts, sampling_params)
-            _write_disagg_output(args, llm, finished)
-    finally:
-        llm.shutdown()
-
-
-def _write_disagg_output(args, llm, finished):
-    """Write outputs via the shared results writer. ``generate`` returns the
-    same ``DynamicInferenceRequest`` records the regular high-level path does,
-    so it reuses ``dump_inference_results_to_json`` for an identical format.
-    Only the primary rank (which owns the client) reaches here."""
-    if not args.output_path:
-        return
-    ctx = llm.engine.context
-    dump_inference_results_to_json(
-        args, finished, throughputs=[], peak_mem_stats=get_global_peak_memory_stats_bytes(),
-        step_count=ctx.step_count, lifetime_prefill_token_count=ctx.lifetime_prefill_token_count,
-    )
-
-
 @torch.inference_mode()
 def main():
     """Run dynamic inference."""
@@ -376,24 +316,10 @@ def main():
         stop_words=args.stop_words,
     )
 
-    # Requests (seeded -> identical on every rank).
-    requests = build_requests(args, tokenizer, sampling_params)
-
-    # Disaggregated path: when --inference-shards tags shards with
-    # prefill/decode roles, prefill and decode are built as independent
-    # replicas at their own parallelism, on disjoint ranks. Decided here
-    # (before the global model) so each replica instantiates its model
-    # against its own process groups. Writes the same output JSON, so it
-    # validates against the colocated golden values.
-    from megatron.core.inference.shards_spec import spec_declares_disaggregation
-
-    if spec_declares_disaggregation(args.inference_shards):
-        run_disaggregated_inference(args, tokenizer, sampling_params, requests)
-        return
-
     model = get_model_for_inference()
 
-    # Context, controller.
+    # Requests, context, controller.
+    requests = build_requests(args, tokenizer, sampling_params)
     inference_config = get_inference_config_from_model_and_args(model, args)
 
     # Calculate max_sequence_length from requests

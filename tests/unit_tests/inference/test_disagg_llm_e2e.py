@@ -9,8 +9,8 @@ Exercises the SPMD orchestration path on CPU: ``--inference-shards`` parsing ->
 imports + "generates"). 3 gloo ranks, CPU: prefill TP2 {0,1} -> decode TP1 {2},
 which also reshards the KV TP2->TP1 on the way. The LLM forward is stubbed;
 everything else is the real coordinator + transport + reshard. The
-coordinator-native ``MegatronDisaggLLM`` wrapper is covered by the GPU e2e
-(test_disagg_coordinator_e2e) and the functional test.
+coordinator-native online path (``MegatronAsyncLLM(inference_shards=)``) is
+covered by the GPU e2e (test_disagg_coordinator_e2e) and the functional test.
 """
 
 import os
