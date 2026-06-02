@@ -1,131 +1,123 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""High-level prefill->decode disaggregation API (offline / SPMD)."""
+"""High-level prefill->decode disaggregation API (coordinator-native)."""
 
 from __future__ import annotations
 
-from typing import Any, Callable, List, Optional, Sequence, Union
+from typing import Optional, Sequence, Union
 
-from megatron.core.inference.disaggregation.disagg_coordinator import DisaggCoordinator
-from megatron.core.inference.disaggregation.kv_transport_backend import KVTransportBackend
-from megatron.core.inference.disaggregation.orchestration import (
-    DECODE,
-    PREFILL,
-    DisaggRequest,
-    run_decode_replica,
-    run_prefill_replica,
-    setup_disagg,
-)
+from megatron.core.inference.apis.llm import MegatronLLM
+from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.shards_spec import InferenceShardSpec, normalize_shard_specs
 
 
-class MegatronDisaggLLM:
-    """Offline prefill->decode disaggregated inference, shaped like ``MegatronLLM``.
+class MegatronDisaggLLM(MegatronLLM):
+    """Coordinator-native prefill->decode disaggregated inference.
 
-    Every rank constructs this object (SPMD, like the offline example): it
-    builds this rank's inference shard + engine and completes the layout
-    handshake. :meth:`generate` then runs the role-appropriate loop -- prefill
-    ships KV to the decode pool; decode imports KV and generates. Each decode
-    instance returns the subset of requests routed to it (sticky-hash), so
-    callers gather across instances if they want the full set.
+    This is :class:`~megatron.core.inference.apis.llm.MegatronLLM` in
+    coordinator mode, with the engine additionally marked as a prefill or
+    decode shard. Construction and usage are therefore identical to regular
+    coordinator-mode inference -- :meth:`generate` (inherited unchanged) submits
+    prompts through one :class:`InferenceClient` on the primary rank, and the
+    shared coordinator 2-hop routes them: SUBMIT -> prefill engine -> KV handoff
+    -> decode engine -> reply. The KV transport / reshard / routing machinery
+    lives in :mod:`megatron.core.inference.disaggregation`.
 
-    The KV handoff (transport, reshard, routing) is the tested machinery in
-    :mod:`megatron.core.inference.disaggregation`; this class only packages it
-    behind a single object so disaggregated inference is as close to regular
-    offline inference as the split allows. Building the per-shard engine is the
-    one framework-specific step, supplied via ``engine_builder``.
+    Like ``MegatronLLM``, the model is built **outside** and passed in. The one
+    extra step versus regular inference is that the caller builds the per-shard
+    process groups first (so each rank's model is built against its shard's
+    parallelism) and passes that shard's ``pg_collection`` here::
+
+        specs  = parse_inference_shards_spec(args.inference_shards, world)
+        shards = build_inference_pg_collections_for_shards(world, specs)
+        my     = next(s for s in shards if s.pg_collection is not None)
+        model  = get_model_for_inference(pg_collection=my.pg_collection)
+
+        llm = MegatronDisaggLLM(
+            model=model, tokenizer=tokenizer, inference_config=cfg,
+            inference_shards=specs, pg_collection=my.pg_collection,
+        )
+        if llm.is_primary_rank:
+            results = llm.generate(prompts, sampling_params)
+        llm.shutdown()
 
     Args:
+        model: This rank's model, already built against ``pg_collection``
+            (eval mode), exactly as for ``MegatronLLM``.
+        tokenizer: Tokenizer for the controller.
+        inference_config: Inference config. ``pg_collection`` is overridden with
+            the shard's groups so the engine runs on this shard, not global mpu.
         inference_shards: Shard layout -- a spec string
             (``"tp=2,role=prefill+tp=1,role=decode"``) or a list of
             :class:`~megatron.core.inference.shards_spec.InferenceShardSpec`.
-            Shards must be tagged ``role=prefill`` / ``role=decode``.
-        engine_builder: ``pg_collection -> engine``; builds this rank's engine
-            (model + checkpoint) against the shard's process groups. The global
-            layer / KV-head counts are read from the engine's model config.
-        backend: KV transport backend (default: NCCL/P2P).
-        router_name: Decode router policy; must be deterministic (default
-            ``"sticky"``).
+            Every shard must be tagged ``role=prefill`` / ``role=decode``.
+        pg_collection: This rank's shard ``ProcessGroupCollection`` (the one the
+            model was built against).
+        coordinator_host / coordinator_port: optional coordinator bind address.
     """
 
     def __init__(
         self,
-        inference_shards: Union[str, Sequence[InferenceShardSpec]],
         *,
-        engine_builder: Callable[[Any], Any],
-        backend: Optional[KVTransportBackend] = None,
-        router_name: str = "sticky",
-        group: Optional[object] = None,
+        model,
+        tokenizer,
+        inference_shards: Union[str, Sequence[InferenceShardSpec]],
+        pg_collection,
+        inference_config: Optional[InferenceConfig] = None,
+        coordinator_host: Optional[str] = None,
+        coordinator_port: Optional[int] = None,
     ) -> None:
         import torch.distributed as dist
 
-        specs = normalize_shard_specs(inference_shards, dist.get_world_size())
-        self._setup = setup_disagg(
-            specs,
-            engine_builder=engine_builder,
-            backend=backend,
-            router_name=router_name,
-            group=group,
+        # Stash for the _post_build_engine hook (runs inside super().__init__()).
+        self._disagg_specs = normalize_shard_specs(inference_shards, dist.get_world_size())
+        self._disagg_pg = pg_collection
+        self._disagg_setup = None
+
+        if inference_config is None:
+            inference_config = InferenceConfig()
+        # The engine must run on THIS shard's process groups, not global mpu.
+        inference_config.pg_collection = pg_collection
+
+        # Disaggregation is coordinator-native: one client submits, the shared
+        # coordinator routes prefill -> decode. Direct mode does not apply.
+        super().__init__(
+            model=model,
+            tokenizer=tokenizer,
+            inference_config=inference_config,
+            use_coordinator=True,
+            coordinator_host=coordinator_host,
+            coordinator_port=coordinator_port,
         )
 
-    # --- properties (mirror MegatronLLM's accessors) ----------------------
+    def _post_build_engine(self) -> None:
+        # Mark the freshly-built engine as a prefill/decode shard before the
+        # coordinator runtime (start_listening) brings it up.
+        from megatron.core.inference.disaggregation.coordinator_setup import (
+            configure_prebuilt_disagg_engine,
+        )
+
+        self._disagg_setup = configure_prebuilt_disagg_engine(
+            self._engine, self._disagg_pg, self._disagg_specs
+        )
+
+    # --- disagg-specific accessors ----------------------------------------
 
     @property
     def role(self) -> str:
         """``"prefill"`` or ``"decode"`` for this rank's shard."""
-        return self._setup.role
+        return self._disagg_setup.role
 
     @property
     def replica_id(self) -> str:
         """This shard's replica id (``"prefill"`` / ``"decode_s{i}_dp{k}"``)."""
-        return self._setup.replica_id
+        return self._disagg_setup.replica_id
 
     @property
     def is_decode(self) -> bool:
-        return self._setup.role == DECODE
+        return self._disagg_setup.role == "decode"
 
     @property
-    def engine(self):
-        """The underlying ``DynamicInferenceEngine`` for this rank's shard."""
-        return self._setup.engine
-
-    @property
-    def coordinator(self) -> DisaggCoordinator:
-        """The disaggregation coordinator (layouts, router, handoff)."""
-        return self._setup.coordinator
-
-    @property
-    def num_decode_instances(self) -> int:
-        return self._setup.num_decode_instances
-
-    # --- run ---------------------------------------------------------------
-
-    def generate(self, requests: Sequence[Any]) -> List[Any]:
-        """Run disaggregated inference over ``requests``.
-
-        ``requests`` is the same sequence the regular path builds (e.g. from
-        ``build_requests``): each item exposes ``prompt_text``,
-        ``prompt_tokens`` and ``sampling_params``. It must be identical on
-        every rank (SPMD); the request id is its position in the sequence, so
-        prefill and decode agree. Returns the finished
-        ``DynamicInferenceRequest`` records for THIS decode instance in input
-        order; an empty list on prefill ranks (they ship KV, produce no
-        output). With a single decode instance this is the whole batch; with
-        several, each instance returns its routed subset.
-        """
-        disagg = [
-            DisaggRequest(
-                request_id=i,
-                prompt_text=r.prompt_text,
-                prompt_tokens=r.prompt_tokens,
-                sampling_params=r.sampling_params,
-            )
-            for i, r in enumerate(requests)
-        ]
-        if not disagg:
-            return []
-        if self._setup.role == PREFILL:
-            run_prefill_replica(self._setup.coordinator, self._setup.engine, disagg)
-            return []
-        finished = run_decode_replica(self._setup.coordinator, self._setup.engine, disagg)
-        return [finished[i] for i in sorted(finished)]
+    def num_instances(self) -> int:
+        """Total prefill + decode instances in this job."""
+        return self._disagg_setup.total_instances

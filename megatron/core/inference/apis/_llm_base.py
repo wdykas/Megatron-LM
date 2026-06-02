@@ -297,6 +297,12 @@ class _MegatronLLMBase:
         self._coord_runtime: "Optional[_CoordinatorRuntime]" = None
         self._shutdown_called: bool = False
 
+        # Hook for subclasses to configure the freshly-built engine before the
+        # coordinator runtime starts (e.g. disaggregation sets role + KV
+        # layouts via engine.set_disaggregation_config, which must happen before
+        # start_listening_to_data_parallel_coordinator). Default: no-op.
+        self._post_build_engine()
+
         if use_coordinator:
             loop_manager = _EventLoopManager()
             loop_manager.start()
@@ -319,6 +325,14 @@ class _MegatronLLMBase:
                 raise
             self._loop_manager = loop_manager
             self._coord_runtime = coord_runtime
+
+    def _post_build_engine(self) -> None:
+        """Configure the engine after it is built, before runtime setup.
+
+        Default no-op. Subclasses (e.g. the disaggregation API) override this
+        to set engine state that must exist before
+        ``start_listening_to_data_parallel_coordinator`` runs.
+        """
 
     # ---- properties ----
 

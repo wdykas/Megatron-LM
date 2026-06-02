@@ -279,59 +279,56 @@ def run_inference(
     }
 
 
-def _build_engine_for(args, tokenizer, sampling_params, requests, pg_collection):
-    """Build a DynamicInferenceEngine for one replica at the parallelism of
-    ``pg_collection``. This is the only framework-specific step (model +
-    checkpoint); the disaggregation flow itself lives in core
-    (megatron.core.inference.disaggregation.orchestration)."""
-    model = get_model_for_inference(pg_collection=pg_collection)
+def run_disaggregated_inference(args, tokenizer, sampling_params, requests):
+    """Disaggregated prefill->decode inference, shaped like the regular path.
+
+    The only difference from colocated inference is that the caller builds the
+    per-shard process groups first (so each rank's model is built at its
+    shard's parallelism) and hands the model to :class:`MegatronDisaggLLM`. From
+    there it is regular coordinator-mode inference: ``generate`` on the primary
+    rank submits prompts through one client and the shared coordinator 2-hop
+    routes them (prefill -> KV handoff -> decode). The KV transport / reshard /
+    routing all live in :mod:`megatron.core.inference.disaggregation`.
+    """
+    import torch.distributed as dist
+
+    from megatron.core.inference.disaggregation.disagg_llm import MegatronDisaggLLM
+    from megatron.core.inference.shards import build_inference_pg_collections_for_shards
+    from megatron.core.inference.shards_spec import parse_inference_shards_spec
+
+    world = dist.get_world_size()
+    specs = parse_inference_shards_spec(args.inference_shards, world)
+    shards = build_inference_pg_collections_for_shards(world, specs)
+    my = next(s for s in shards if s.pg_collection is not None)
+
+    # Build this rank's model against its shard's groups -- the only
+    # framework-specific step, exactly like the regular get_model_for_inference().
+    model = get_model_for_inference(pg_collection=my.pg_collection)
     inference_config = get_inference_config_from_model_and_args(model, args)
-    inference_config.pg_collection = pg_collection
     max_gen_length = sampling_params.num_tokens_to_generate
     max_context_length = max(len(r.prompt_tokens) for r in requests)
     inference_config.max_sequence_length = max_context_length + max_gen_length
-    context = DynamicInferenceContext(model.config, inference_config)
-    wrapped_model = GPTInferenceWrapper(model, context)
-    controller = TextGenerationController(wrapped_model, tokenizer)
-    return DynamicInferenceEngine(controller, context)
 
-
-def run_disaggregated_inference(args, tokenizer, sampling_params, requests):
-    """Thin example wrapper over the core disaggregation API.
-
-    The whole flow -- shard layout, building each shard's process groups, the
-    handshake, and the prefill/decode loops -- lives behind
-    :class:`MegatronDisaggLLM` in core; here we only adapt the example's
-    requests, supply a (Megatron-specific) engine builder, and write the
-    output JSON for the colocated golden-value comparison.
-    """
-    from megatron.core.inference.disaggregation.disagg_llm import MegatronDisaggLLM
-
-    # Same request flow as the colocated path -- build_requests output goes
-    # straight in. num_layers/num_heads are derived from the engine.
     llm = MegatronDisaggLLM(
-        args.inference_shards,
-        engine_builder=lambda pg: _build_engine_for(
-            args, tokenizer, sampling_params, requests, pg
-        ),
+        model=model, tokenizer=tokenizer, inference_config=inference_config,
+        inference_shards=specs, pg_collection=my.pg_collection,
     )
-    finished = llm.generate(requests)
-    if llm.is_decode:
-        _write_disagg_output(args, llm, finished)
+    try:
+        if llm.is_primary_rank:
+            prompts = [r.prompt_tokens for r in requests]
+            finished = llm.generate(prompts, sampling_params)
+            _write_disagg_output(args, llm, finished)
+    finally:
+        llm.shutdown()
 
 
 def _write_disagg_output(args, llm, finished):
-    """Write outputs via the shared results writer -- ``generate`` returns the
+    """Write outputs via the shared results writer. ``generate`` returns the
     same ``DynamicInferenceRequest`` records the regular high-level path does,
     so it reuses ``dump_inference_results_to_json`` for an identical format.
-    Only the decode representative rank (tp0/pp0) writes; with several decode
-    instances each writes its subset to a per-instance path."""
-    layout = llm.coordinator.my_layout
-    if not args.output_path or layout.tp_rank != 0 or layout.pp_rank != 0:
+    Only the primary rank (which owns the client) reaches here."""
+    if not args.output_path:
         return
-    if llm.num_decode_instances > 1:
-        args = copy.copy(args)
-        args.output_path = f"{args.output_path}.{llm.replica_id}"
     ctx = llm.engine.context
     dump_inference_results_to_json(
         args, finished, throughputs=[], peak_mem_stats=get_global_peak_memory_stats_bytes(),

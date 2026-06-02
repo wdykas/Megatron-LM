@@ -1,14 +1,16 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""End-to-end MegatronDisaggLLM over real process groups (fake engine).
+"""End-to-end offline disagg orchestration over real process groups (fake engine).
 
-Exercises the whole wrapper path that the lower-level e2e test skips:
-``--inference-shards`` parsing -> ``build_inference_pg_collections_for_shards``
-(real ``dist.new_group``) -> ``setup_disagg`` (layout from pg_collection +
-handshake) -> ``MegatronDisaggLLM.generate`` (prefill ships KV, decode imports
-+ "generates"). 3 gloo ranks, CPU: prefill TP2 {0,1} -> decode TP1 {2},
+Exercises the SPMD orchestration path on CPU: ``--inference-shards`` parsing ->
+``build_inference_pg_collections_for_shards`` (real ``dist.new_group``) ->
+``setup_disagg`` (layout from pg_collection + handshake) ->
+``run_prefill_replica`` / ``run_decode_replica`` (prefill ships KV, decode
+imports + "generates"). 3 gloo ranks, CPU: prefill TP2 {0,1} -> decode TP1 {2},
 which also reshards the KV TP2->TP1 on the way. The LLM forward is stubbed;
-everything else is the real wrapper + coordinator + transport + reshard.
+everything else is the real coordinator + transport + reshard. The
+coordinator-native ``MegatronDisaggLLM`` wrapper is covered by the GPU e2e
+(test_disagg_coordinator_e2e) and the functional test.
 """
 
 import os
@@ -118,33 +120,38 @@ def _worker(rank, world, port, q):
 
     dist.init_process_group("gloo", rank=rank, world_size=world)
     try:
-        from megatron.core.inference.disaggregation.disagg_llm import MegatronDisaggLLM
-
-        llm = MegatronDisaggLLM(
-            "tp=2,role=prefill+tp=1,role=decode",
-            engine_builder=_FakeEngine,
+        from megatron.core.inference.disaggregation.orchestration import (
+            DECODE,
+            DisaggRequest,
+            run_decode_replica,
+            run_prefill_replica,
+            setup_disagg,
         )
-        # generate() consumes the same request objects build_requests yields
-        # (.prompt_text / .prompt_tokens / .sampling_params); request id is the
-        # position. sampling_params is opaque to the fake engine.
-        class _Req:
-            prompt_text = "p"
-            prompt_tokens = PROMPT
-            sampling_params = object()
+        from megatron.core.inference.shards_spec import parse_inference_shards_spec
 
-        finished = llm.generate([_Req()])
+        specs = parse_inference_shards_spec("tp=2,role=prefill+tp=1,role=decode", world)
+        setup = setup_disagg(specs, engine_builder=_FakeEngine)
 
-        if llm.is_decode:
-            imported = llm.engine.context.imported
+        reqs = [
+            DisaggRequest(
+                request_id=0, prompt_text="p", prompt_tokens=PROMPT, sampling_params=object()
+            )
+        ]
+
+        if setup.role == DECODE:
+            finished = run_decode_replica(setup.coordinator, setup.engine, reqs)
+            imported = setup.engine.context.imported
             ok = (
                 len(finished) == 1
+                and 0 in finished
                 and finished[0].request_id == 0
                 and imported is not None
                 and torch.equal(imported, _global_kv_staging())
             )
-            q.put(("decode", (llm.replica_id, bool(ok))))
+            q.put(("decode", (setup.replica_id, bool(ok))))
         else:
-            q.put((f"prefill{rank}", llm.role))
+            run_prefill_replica(setup.coordinator, setup.engine, reqs)
+            q.put((f"prefill{rank}", setup.role))
     except Exception:
         import traceback
 
@@ -155,7 +162,7 @@ def _worker(rank, world, port, q):
 
 
 @pytest.mark.skipif(not torch.distributed.is_available(), reason="torch.distributed unavailable")
-def test_megatron_disagg_llm_tp2_to_tp1_gloo():
+def test_disagg_orchestration_tp2_to_tp1_gloo():
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     procs = [ctx.Process(target=_worker, args=(r, 3, 29610, q)) for r in range(3)]
