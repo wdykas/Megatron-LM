@@ -15,12 +15,18 @@ import sys
 from argparse import ArgumentParser
 
 import torch
+import torch.distributed as dist
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
 
 from megatron.core.inference.apis import MegatronAsyncLLM, ServeConfig
+from megatron.core.inference.shards import build_inference_pg_collections_for_shards
+from megatron.core.inference.shards_spec import (
+    parse_inference_shards_spec,
+    spec_declares_disaggregation,
+)
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import configure_nvtx_profiling
 from megatron.inference.utils import (
@@ -63,14 +69,7 @@ def _build_model_and_inference_config(args):
     ``(model, inference_config, inference_shards)`` where ``inference_shards`` is
     the parsed spec list for disagg, else ``None``.
     """
-    from megatron.core.inference.shards_spec import spec_declares_disaggregation
-
     if args.inference_shards and spec_declares_disaggregation(args.inference_shards):
-        import torch.distributed as dist
-
-        from megatron.core.inference.shards import build_inference_pg_collections_for_shards
-        from megatron.core.inference.shards_spec import parse_inference_shards_spec
-
         world = dist.get_world_size()
         specs = parse_inference_shards_spec(args.inference_shards, world)
         shards = build_inference_pg_collections_for_shards(world, specs)

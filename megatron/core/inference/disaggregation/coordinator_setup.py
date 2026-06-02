@@ -12,15 +12,19 @@ constructed with ``inference_shards`` -- the serving / eval / RL path.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Callable, List
+
+import torch.distributed as dist
 
 from megatron.core.inference.disaggregation.orchestration import (
     PREFILL,
     _global_kv_dims,
     _validate_disagg_specs,
+    layout_from_pg_collection,
 )
 from megatron.core.inference.shards import InferenceShard, build_inference_pg_collections_for_shards
+from megatron.core.utils import get_pg_rank, get_pg_size
 
 
 def instance_layout_dicts(
@@ -72,8 +76,6 @@ def configure_disagg_engine(
     spawns the coordinator (handled inside that call via the disagg config)
     and drives an ``InferenceClient``.
     """
-    import torch.distributed as dist
-
     total_instances = sum(s.get("dp", 1) for s in specs)
     _validate_disagg_specs(specs)  # role layout / single-prefill-instance checks
 
@@ -120,13 +122,6 @@ def configure_prebuilt_disagg_engine(
     per-instance layout is gathered over the instance's MP group (tp x pp), so
     it is correct for any tp/dp/pp rank ordering (no contiguity assumption).
     """
-    import dataclasses
-
-    import torch.distributed as dist
-
-    from megatron.core.inference.disaggregation.orchestration import layout_from_pg_collection
-    from megatron.core.utils import get_pg_rank, get_pg_size
-
     total_instances = sum(s.get("dp", 1) for s in specs)
     _validate_disagg_specs(specs)  # role layout / single-prefill-instance checks
     rank = dist.get_rank()
@@ -147,7 +142,7 @@ def configure_prebuilt_disagg_engine(
 
     num_layers, num_heads = _global_kv_dims(engine)
     dp_rank = get_pg_rank(pg.dp)
-    my_layout = dataclasses.asdict(layout_from_pg_collection(pg, num_layers, num_heads))
+    my_layout = asdict(layout_from_pg_collection(pg, num_layers, num_heads))
     # Gather every rank of this instance (the MP group spans exactly tp x pp).
     layouts = [None] * get_pg_size(pg.mp)
     dist.all_gather_object(layouts, my_layout, group=pg.mp)

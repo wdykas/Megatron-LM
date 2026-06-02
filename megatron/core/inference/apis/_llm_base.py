@@ -18,12 +18,16 @@ import torch.distributed as dist
 
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.disaggregation.coordinator_setup import (
+    configure_prebuilt_disagg_engine,
+)
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.shards_spec import normalize_shard_specs
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -309,11 +313,6 @@ class _MegatronLLMBase:
         # call engine.set_disaggregation_config, which must precede
         # start_listening_to_data_parallel_coordinator.
         if inference_shards is not None:
-            from megatron.core.inference.disaggregation.coordinator_setup import (
-                configure_prebuilt_disagg_engine,
-            )
-            from megatron.core.inference.shards_spec import normalize_shard_specs
-
             specs = normalize_shard_specs(inference_shards, dist.get_world_size())
             self._disagg_setup = configure_prebuilt_disagg_engine(
                 engine, engine.pg_collection, specs
