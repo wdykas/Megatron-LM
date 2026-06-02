@@ -514,7 +514,8 @@ class DynamicInferenceEngine(AbstractEngine):
     def _disagg_layouts(self, dicts):
         from megatron.core.inference.disaggregation.kv_shard_layout import KVShardLayout
 
-        return [KVShardLayout(**d) for d in dicts]
+        # Strip the optional hybrid ``mamba`` sub-dict; it's a separate layout.
+        return [KVShardLayout(**{k: v for k, v in d.items() if k != "mamba"}) for d in dicts]
 
     def _disagg_my_layout(self):
         import torch.distributed as dist
@@ -524,8 +525,26 @@ class DynamicInferenceEngine(AbstractEngine):
         rank = dist.get_rank()
         for d in self.disagg_instance_layouts:
             if d["global_rank"] == rank:
-                return KVShardLayout(**d)
+                return KVShardLayout(**{k: v for k, v in d.items() if k != "mamba"})
         raise RuntimeError(f"rank {rank} not found in its disagg instance layouts")
+
+    def _disagg_mamba_layouts(self, dicts):
+        """MambaShardLayout list for the hybrid dicts that carry a ``mamba``
+        sub-dict (empty for non-hybrid models)."""
+        from megatron.core.inference.disaggregation.mamba_reshard import MambaShardLayout
+
+        return [MambaShardLayout(**d["mamba"]) for d in dicts if d.get("mamba")]
+
+    def _disagg_my_mamba_layout(self):
+        import torch.distributed as dist
+
+        from megatron.core.inference.disaggregation.mamba_reshard import MambaShardLayout
+
+        rank = dist.get_rank()
+        for d in self.disagg_instance_layouts:
+            if d["global_rank"] == rank and d.get("mamba"):
+                return MambaShardLayout(**d["mamba"])
+        return None  # non-hybrid model
 
     def _disagg_get_backend(self):
         from megatron.core.inference.disaggregation.transfer_backends.nccl import (
@@ -559,6 +578,9 @@ class DynamicInferenceEngine(AbstractEngine):
             self._disagg_layouts(dst_layout_dicts),
             backend=self._disagg_get_backend(), payload=staged,
             base_tag=self._disagg_base_tag(request_id),
+            my_mamba_layout=self._disagg_my_mamba_layout(),
+            src_mamba_layouts=self._disagg_mamba_layouts(self.disagg_instance_layouts),
+            dst_mamba_layouts=self._disagg_mamba_layouts(dst_layout_dicts),
         )
         if handoff is not None:
             self._disagg_pending_sends[request_id] = handoff
@@ -578,6 +600,9 @@ class DynamicInferenceEngine(AbstractEngine):
             self._disagg_layouts(self.disagg_instance_layouts),
             prompt, backend=self._disagg_get_backend(),
             base_tag=self._disagg_base_tag(request_id),
+            my_mamba_layout=self._disagg_my_mamba_layout(),
+            src_mamba_layouts=self._disagg_mamba_layouts(src_layout_dicts),
+            dst_mamba_layouts=self._disagg_mamba_layouts(self.disagg_instance_layouts),
         )
         if recv is None:
             # No KV to receive (shouldn't happen header-free): admit directly.

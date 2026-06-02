@@ -108,3 +108,64 @@ def test_mamba_reshard_reconstructs_destination(src, dst):
         want_conv, want_ssm = _shard(conv_g, ssm_g, lay)
         assert torch.equal(dst_t[rk][0], want_conv), f"conv mismatch at rank {rk} ({src}->{dst})"
         assert torch.equal(dst_t[rk][1], want_ssm), f"ssm mismatch at rank {rk} ({src}->{dst})"
+
+
+class _Store:
+    """Single-process transport stand-in: send stashes by (cur,dst,tag), recv
+    pops by (src,cur,tag). ``cur`` is the acting rank."""
+
+    def __init__(self):
+        from megatron.core.inference.disaggregation.transfer_backends.base import TransferHandle
+
+        self._TH = TransferHandle
+        self.store = {}
+        self.cur = -1
+
+    def send(self, t, dst, tag=0):
+        self.store[(self.cur, dst, tag)] = t.clone()
+        return self._TH(wait_fn=None)
+
+    def recv(self, shape, dtype, src, tag=0, *, device=None):
+        return self._TH(wait_fn=None, tensor=self.store.pop((src, self.cur, tag)))
+
+
+@pytest.mark.parametrize("src,dst", [((2, 1), (1, 1)), ((2, 2), (1, 1)), ((1, 1), (2, 2))])
+def test_mamba_transport_wiring_roundtrip(src, dst):
+    """Drive the real send/recv wiring (_send_mamba_resharded /
+    _post_recv_mamba_resharded) over the store transport and assert each decode
+    rank's assembled conv/ssm matches a direct shard."""
+    from megatron.core.inference.disaggregation.kv_transfer import (
+        DecodeRecv,
+        _post_recv_mamba_resharded,
+        _send_mamba_resharded,
+    )
+
+    conv_g, ssm_g = _global_state()
+    src_lay, dst_lay = _layouts(*src), _layouts(*dst)
+    src_list, dst_list = list(src_lay.values()), list(dst_lay.values())
+    backend = _Store()
+    meta = {"has_mamba": True, "mamba": {"conv_dtype": torch.float32, "ssm_dtype": torch.float32}}
+
+    # Prefill ranks post their conv/ssm sub-blocks.
+    for rk, lay in src_lay.items():
+        conv_l, ssm_l = _shard(conv_g, ssm_g, lay)
+        backend.cur = rk
+        _send_mamba_resharded(
+            {"conv_states_tensor": conv_l, "ssm_states_tensor": ssm_l},
+            lay, src_list, dst_list, backend, 0, [], [],
+        )
+
+    # Decode ranks receive + assemble, then must match a direct shard.
+    for rk, lay in dst_lay.items():
+        backend.cur = rk
+        recv = DecodeRecv(meta=meta, staging=None, pending=[], my_layout=None)
+        _post_recv_mamba_resharded(recv, meta, lay, src_list, dst_list, backend, 0, None)
+        for t, h in recv.mamba_pending:
+            sub = h.wait()
+            if t.is_conv:
+                recv.mamba_conv[t.dst_layer, t.dst_lo:t.dst_hi, :] = sub
+            else:
+                recv.mamba_ssm[t.dst_layer, t.dst_lo:t.dst_hi, :, :] = sub
+        want_conv, want_ssm = _shard(conv_g, ssm_g, lay)
+        assert torch.equal(recv.mamba_conv, want_conv), f"conv wiring mismatch rank {rk}"
+        assert torch.equal(recv.mamba_ssm, want_ssm), f"ssm wiring mismatch rank {rk}"

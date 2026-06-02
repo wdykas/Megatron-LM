@@ -20,6 +20,44 @@ from megatron.core.inference.shards_spec import InferenceShardSpec
 from megatron.core.utils import get_pg_rank, get_pg_size
 
 
+def _mamba_layout_dict(engine, pg):
+    """This rank's Mamba shard layout (or ``None`` for non-hybrid models).
+
+    Structural dims come from the local conv/ssm shapes + ``tp`` (d_inner =
+    nheads*headdim, so ngroups follows from conv_dim_local). The global Mamba-
+    layer offset is the prefix sum of per-PP-stage local counts (stages are
+    contiguous in global layer order), via an all-gather over the PP group.
+    """
+    ctx = getattr(engine, "context", None)
+    if ctx is None or not getattr(ctx, "is_hybrid_model", False):
+        return None
+    conv_shape = getattr(ctx, "mamba_conv_states_shape", None)
+    ssm_shape = getattr(ctx, "mamba_ssm_states_shape", None)
+    if conv_shape is None or ssm_shape is None:
+        return None
+
+    nheads_local, headdim, d_state = (int(x) for x in ssm_shape)
+    conv_dim_local, d_conv = int(conv_shape[0]), int(conv_shape[1])
+    tp = get_pg_size(pg.tp)
+    tp_rank = get_pg_rank(pg.tp)
+    d_inner_local = nheads_local * headdim
+    ngroups_local = (conv_dim_local - d_inner_local) // (2 * d_state)
+
+    num_local = int(ctx.num_mamba_layers)
+    pp = get_pg_size(pg.pp)
+    pp_rank = get_pg_rank(pg.pp)
+    counts = [0] * pp
+    dist.all_gather_object(counts, num_local, group=pg.pp)
+    layer_start = sum(counts[:pp_rank])
+
+    return dict(
+        global_rank=dist.get_rank(), tp_size=tp, tp_rank=tp_rank,
+        layer_start=layer_start, num_layers=num_local,
+        nheads=nheads_local * tp, headdim=headdim, d_state=d_state,
+        ngroups=ngroups_local * tp, d_conv=d_conv,
+    )
+
+
 @dataclass
 class DisaggCoordinatorSetup:
     """This rank's place in a coordinator-native disagg job."""
@@ -63,6 +101,11 @@ def configure_prebuilt_disagg_engine(
     num_layers, num_heads = _global_kv_dims(engine)
     dp_rank = get_pg_rank(pg.dp)
     my_layout = asdict(layout_from_pg_collection(pg, num_layers, num_heads))
+    # Hybrid models: attach this rank's Mamba shard layout so conv/ssm state can
+    # be resharded alongside the attention KV.
+    mamba = _mamba_layout_dict(engine, pg)
+    if mamba is not None:
+        my_layout["mamba"] = mamba
     # Gather every rank of this instance (the MP group spans exactly tp x pp).
     layouts = [None] * get_pg_size(pg.mp)
     dist.all_gather_object(layouts, my_layout, group=pg.mp)

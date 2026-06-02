@@ -187,6 +187,12 @@ class PrefillHandoff:
         self.keepalive.clear()
 
 
+# Tag-space offset so Mamba transfers never collide with attention transfers
+# within a request (NCCL ignores the tag and matches by post-order; gloo/tests
+# respect it).
+_MAMBA_TAG_OFFSET = 1 << 28
+
+
 def send_request_kv_resharded(
     engine: Any,
     request_id: int,
@@ -198,15 +204,19 @@ def send_request_kv_resharded(
     group: Optional[object] = None,
     base_tag: int = 0,
     payload: Optional[dict] = None,
+    my_mamba_layout=None,
+    src_mamba_layouts: Optional[list] = None,
+    dst_mamba_layouts: Optional[list] = None,
 ) -> Optional["PrefillHandoff"]:
     """Hetero-layout prefill send: reshard this rank's KV sub-blocks to
     the decode layout via global-coordinate range intersection.
 
     ``my_layout`` is this prefill rank's :class:`KVShardLayout`;
-    ``src_layouts`` / ``dst_layouts`` are the full prefill / decode
-    layout lists (known from a one-time config handshake). Attention KV
-    only in this MR -- a hybrid request raises ``NotImplementedError``.
-    Header-free: the decode side derives shapes from config + prompt.
+    ``src_layouts`` / ``dst_layouts`` are the full prefill / decode attention
+    layout lists. For hybrid models the analogous Mamba layouts
+    (:class:`MambaShardLayout`) are passed too, and the conv/ssm state is
+    resharded alongside the attention KV. Header-free: the decode side derives
+    shapes from config + prompt.
 
     ``payload`` may be a previously exported KV staging dict (from
     ``export_request_kv``); when given it is shipped instead of re-exporting
@@ -225,10 +235,10 @@ def send_request_kv_resharded(
         raise ValueError(
             f"send_request_kv_resharded: request {request_id} has no exportable KV"
         )
-    if payload.get("mamba_payload") is not None:
+    if payload.get("mamba_payload") is not None and my_mamba_layout is None:
         raise NotImplementedError(
-            "hetero KV reshard supports attention KV only in this MR; "
-            "hybrid/Mamba hetero handoff is a future MR"
+            "hybrid (Mamba) hetero handoff requires Mamba shard layouts; "
+            "the coordinator-native path supplies them."
         )
 
     attn = payload["staging_tensor"]  # [BC, 2, local_layers, BS, local_heads, HD]
@@ -243,7 +253,32 @@ def send_request_kv_resharded(
         keep.append(sub)
         tag = t.tag(my_layout.num_layers, my_layout.num_heads, base_tag)
         handles.append(backend.send(sub, dst=t.dst_rank, tag=tag))
+
+    if payload.get("mamba_payload") is not None:
+        _send_mamba_resharded(
+            payload["mamba_payload"], my_mamba_layout, src_mamba_layouts, dst_mamba_layouts,
+            backend, base_tag + _MAMBA_TAG_OFFSET, handles, keep,
+        )
     return PrefillHandoff(handles=handles, keepalive=keep)
+
+
+def _send_mamba_resharded(mp, my_mamba, src_mamba, dst_mamba, backend, base_tag, handles, keep):
+    """Reshard + send this rank's conv/ssm sub-blocks (one per Mamba transfer)."""
+    from megatron.core.inference.disaggregation.mamba_reshard import (
+        plan_mamba_reshard,
+        transfers_for_src,
+    )
+
+    conv = mp["conv_states_tensor"]  # (local_layers, conv_dim_local, d_conv)
+    ssm = mp["ssm_states_tensor"]    # (local_layers, nheads_local, headdim, d_state)
+    plan = plan_mamba_reshard(src_mamba, dst_mamba)
+    for t in transfers_for_src(plan, my_mamba.global_rank):
+        if t.is_conv:
+            sub = conv[t.src_layer, t.src_lo:t.src_hi, :].contiguous()
+        else:
+            sub = ssm[t.src_layer, t.src_lo:t.src_hi, :, :].contiguous()
+        keep.append(sub)
+        handles.append(backend.send(sub, dst=t.dst_rank, tag=t.tag(base_tag)))
 
 
 @dataclass
@@ -257,9 +292,14 @@ class DecodeRecv:
     staging: torch.Tensor
     pending: List[tuple]  # [(ReshardTransfer, TransferHandle)]
     my_layout: Any
+    # Mamba (hybrid only): the local conv/ssm buffers + their pending receives.
+    mamba_conv: Optional[torch.Tensor] = None
+    mamba_ssm: Optional[torch.Tensor] = None
+    mamba_pending: Optional[List[tuple]] = None  # [(MambaTransfer, TransferHandle)]
+    my_mamba_layout: Any = None
 
     def finish(self, engine: Any) -> Optional[dict]:
-        """Wait the receives, assemble the staging tensor, and import it."""
+        """Wait the receives, assemble the staging tensor(s), and import them."""
         for t, h in self.pending:
             sub = h.wait()
             self.staging[
@@ -276,6 +316,24 @@ class DecodeRecv:
             "block_hashes": list(m.get("block_hashes") or []),
             "staging_tensor": self.staging,
         }
+        if self.mamba_pending is not None:
+            for t, h in self.mamba_pending:
+                sub = h.wait()
+                if t.is_conv:
+                    self.mamba_conv[t.dst_layer, t.dst_lo:t.dst_hi, :] = sub
+                else:
+                    self.mamba_ssm[t.dst_layer, t.dst_lo:t.dst_hi, :, :] = sub
+            ml = self.my_mamba_layout
+            payload["layout"] = "hybrid_v1"
+            payload["mamba_payload"] = {
+                "num_mamba_layers": ml.num_layers,
+                "conv_states_shape": [ml.conv_dim_local, ml.d_conv],
+                "ssm_states_shape": [ml.nheads_local, ml.headdim, ml.d_state],
+                "conv_states_dtype": str(self.mamba_conv.dtype),
+                "ssm_states_dtype": str(self.mamba_ssm.dtype),
+                "conv_states_tensor": self.mamba_conv,
+                "ssm_states_tensor": self.mamba_ssm,
+            }
         return engine.context.import_request_kv(payload)
 
 
@@ -289,11 +347,15 @@ def post_recv_request_kv_resharded(
     backend: Optional[KVTransportBackend] = None,
     base_tag: int = 0,
     device: Optional[torch.device] = None,
+    my_mamba_layout=None,
+    src_mamba_layouts: Optional[list] = None,
+    dst_mamba_layouts: Optional[list] = None,
 ) -> Optional["DecodeRecv"]:
     """Hetero-layout decode receive (non-blocking): post the irecv for every
     KV sub-block covering this rank's (layer x head) rectangle and return a
-    :class:`DecodeRecv` to complete later. Header-free (schema from config +
-    prompt). Returns ``None`` if there is no KV to receive."""
+    :class:`DecodeRecv` to complete later. For hybrid models the conv/ssm
+    sub-blocks are posted too (Mamba layouts supplied). Header-free (schema from
+    config + prompt). Returns ``None`` if there is no KV to receive."""
     from megatron.core.inference.disaggregation.kv_shard_layout import (
         plan_kv_reshard,
         transfers_for_dst,
@@ -303,8 +365,11 @@ def post_recv_request_kv_resharded(
     meta = derive_decode_schema(engine, prompt_token_ids)
     if meta is None:
         return None
-    if meta["has_mamba"]:
-        raise NotImplementedError("hetero KV reshard supports attention KV only in this MR")
+    if meta["has_mamba"] and my_mamba_layout is None:
+        raise NotImplementedError(
+            "hybrid (Mamba) hetero handoff requires Mamba shard layouts; "
+            "the coordinator-native path supplies them."
+        )
 
     bc = meta["block_count"]
     bs = meta["block_size_tokens"]
@@ -330,7 +395,44 @@ def post_recv_request_kv_resharded(
             (bc, 2, n_lay, bs, n_head, hd), dtype, src=t.src_rank, tag=tag, device=device
         )
         pending.append((t, h))
-    return DecodeRecv(meta=meta, staging=staging, pending=pending, my_layout=my_layout)
+
+    recv = DecodeRecv(meta=meta, staging=staging, pending=pending, my_layout=my_layout)
+    if meta["has_mamba"]:
+        _post_recv_mamba_resharded(
+            recv, meta, my_mamba_layout, src_mamba_layouts, dst_mamba_layouts,
+            backend, base_tag + _MAMBA_TAG_OFFSET, device,
+        )
+    return recv
+
+
+def _post_recv_mamba_resharded(recv, meta, my_mamba, src_mamba, dst_mamba, backend, base_tag, device):
+    """Allocate the decode conv/ssm buffers + post the Mamba sub-block receives."""
+    from megatron.core.inference.disaggregation.mamba_reshard import (
+        plan_mamba_reshard,
+        transfers_for_dst,
+    )
+
+    ml = my_mamba
+    conv_dtype = meta["mamba"]["conv_dtype"]
+    ssm_dtype = meta["mamba"]["ssm_dtype"]
+    recv.my_mamba_layout = ml
+    recv.mamba_conv = torch.zeros(
+        ml.num_layers, ml.conv_dim_local, ml.d_conv, dtype=conv_dtype, device=device
+    )
+    recv.mamba_ssm = torch.zeros(
+        ml.num_layers, ml.nheads_local, ml.headdim, ml.d_state, dtype=ssm_dtype, device=device
+    )
+    plan = plan_mamba_reshard(src_mamba, dst_mamba)
+    recv.mamba_pending = []
+    for t in transfers_for_dst(plan, ml.global_rank):
+        if t.is_conv:
+            shape = (t.dst_hi - t.dst_lo, ml.d_conv)
+            dt = conv_dtype
+        else:
+            shape = (t.dst_hi - t.dst_lo, ml.headdim, ml.d_state)
+            dt = ssm_dtype
+        h = backend.recv(shape, dt, src=t.src_rank, tag=t.tag(base_tag), device=device)
+        recv.mamba_pending.append((t, h))
 
 
 def recv_request_kv_resharded(
