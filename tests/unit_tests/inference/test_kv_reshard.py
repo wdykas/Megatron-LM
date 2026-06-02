@@ -127,6 +127,24 @@ def test_ep_replication_picks_single_source():
         assert torch.equal(out[d.global_rank], _shard_of(g, d))
 
 
+def test_one_prefill_to_multiple_decode_targets_of_different_parallelism():
+    """A single prefill source set reshards correctly to several decode
+    targets that each use a DIFFERENT (Tp,Pp) -- e.g. a heterogeneous
+    decode pool. Each target is an independent reshard (one plan call per
+    target replica); the planner imposes no shared parallelism across
+    targets."""
+    src_layouts = _make_layouts(tp=2, pp=2)          # prefill: TP2 x PP2
+    targets = [(4, 1), (2, 1), (1, 3), (4, 3)]        # decode replicas, all different
+    g = _global_kv()
+    for tp_d, pp_d in targets:
+        dst_layouts = _make_layouts(tp_d, pp_d)
+        _, out = _run_reshard(src_layouts, dst_layouts)
+        for d in dst_layouts:
+            assert torch.equal(out[d.global_rank], _shard_of(g, d)), (
+                f"decode target TP{tp_d}xPP{pp_d} rank {d.global_rank} mismatch"
+            )
+
+
 def test_is_matched():
     a = KVShardLayout(L, Hh, 2, 0, 1, 0, 0)
     b = KVShardLayout(L, Hh, 2, 1, 1, 0, 1, ep_size=4, ep_rank=2)
