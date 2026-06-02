@@ -242,7 +242,7 @@ def send_request_kv_resharded(
         ].contiguous()
         keep.append(sub)
         tag = t.tag(my_layout.num_layers, my_layout.num_heads, base_tag)
-        handles.append(backend.isend(sub, dst=t.dst_rank, tag=tag))
+        handles.append(backend.send(sub, dst=t.dst_rank, tag=tag))
     return PrefillHandoff(handles=handles, keepalive=keep)
 
 
@@ -326,7 +326,7 @@ def post_recv_request_kv_resharded(
         n_lay = t.g_layer1 - t.g_layer0
         n_head = t.g_head1 - t.g_head0
         tag = t.tag(my_layout.num_layers, my_layout.num_heads, base_tag)
-        h = backend.irecv(
+        h = backend.recv(
             (bc, 2, n_lay, bs, n_head, hd), dtype, src=t.src_rank, tag=tag, device=device
         )
         pending.append((t, h))
@@ -414,7 +414,7 @@ def send_request_kv(
 
     tensors = _ordered_tensors(payload, meta)
     handles = [
-        backend.isend(t, dst=dst, tag=base_tag + i) for i, t in enumerate(tensors)
+        backend.send(t, dst=dst, tag=base_tag + i) for i, t in enumerate(tensors)
     ]
     return PrefillHandoff(handles=handles, keepalive=tensors)
 
@@ -463,7 +463,7 @@ def recv_request_kv(
     for i in range(len(slots)):
         shape, dtype = _slot_shape_dtype(meta, i)
         handles.append(
-            backend.irecv(shape, dtype, src=src, tag=base_tag + i, device=device)
+            backend.recv(shape, dtype, src=src, tag=base_tag + i, device=device)
         )
     recvd = [h.wait() for h in handles]
 

@@ -48,8 +48,10 @@ class KVTransportBackend(abc.ABC):
         for backends that need it (NCCL); ignored otherwise."""
 
     @abc.abstractmethod
-    def send(self, tensor: torch.Tensor, dst: int, tag: int = 0) -> None:
-        """Blocking send of ``tensor`` to ``dst``."""
+    def send(self, tensor: torch.Tensor, dst: int, tag: int = 0) -> TransferHandle:
+        """Send ``tensor`` to ``dst`` (non-blocking). Returns a handle whose
+        ``wait()`` ensures the transfer has drained; the caller must keep
+        ``tensor`` alive until then."""
 
     @abc.abstractmethod
     def recv(
@@ -60,25 +62,9 @@ class KVTransportBackend(abc.ABC):
         tag: int = 0,
         *,
         device: Optional[torch.device] = None,
-    ) -> torch.Tensor:
-        """Blocking receive of a tensor of the given shape/dtype."""
-
-    @abc.abstractmethod
-    def isend(self, tensor: torch.Tensor, dst: int, tag: int = 0) -> TransferHandle:
-        """Non-blocking send; returns a handle to wait on. The caller
-        must keep ``tensor`` alive until the handle completes."""
-
-    @abc.abstractmethod
-    def irecv(
-        self,
-        shape: Tuple[int, ...],
-        dtype: torch.dtype,
-        src: int,
-        tag: int = 0,
-        *,
-        device: Optional[torch.device] = None,
     ) -> TransferHandle:
-        """Non-blocking receive; ``handle.wait()`` returns the tensor."""
+        """Receive a tensor of the given shape/dtype from ``src`` (non-blocking).
+        ``handle.wait()`` returns the received tensor."""
 
     def stream(self) -> Optional[torch.cuda.Stream]:
         """Optional dedicated stream; default ``None`` (use current)."""

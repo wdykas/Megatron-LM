@@ -206,16 +206,10 @@ class _Loopback(KVTransportBackend):
 
     def send(self, t, dst, tag=0):
         self.store[(self.cur, dst, tag)] = t.clone()
-
-    def recv(self, shape, dtype, src, tag=0, *, device=None):
-        return self.store.pop((src, self.cur, tag))
-
-    def isend(self, t, dst, tag=0):
-        self.send(t, dst, tag)
         return TransferHandle(wait_fn=None)
 
-    def irecv(self, shape, dtype, src, tag=0, *, device=None):
-        return TransferHandle(wait_fn=None, tensor=self.recv(shape, dtype, src, tag))
+    def recv(self, shape, dtype, src, tag=0, *, device=None):
+        return TransferHandle(wait_fn=None, tensor=self.store.pop((src, self.cur, tag)))
 
 
 class _FakeCtxShard:

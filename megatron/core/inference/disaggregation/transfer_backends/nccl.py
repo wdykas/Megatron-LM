@@ -47,29 +47,13 @@ class NcclTransportBackend(KVTransportBackend):
 
         return dist
 
-    def send(self, tensor: torch.Tensor, dst: int, tag: int = 0) -> None:
-        self._dist().send(tensor.contiguous(), dst=dst, tag=tag, group=self._group)
-
-    def recv(
-        self,
-        shape: Tuple[int, ...],
-        dtype: torch.dtype,
-        src: int,
-        tag: int = 0,
-        *,
-        device: Optional[torch.device] = None,
-    ) -> torch.Tensor:
-        buf = torch.empty(shape, dtype=dtype, device=device)
-        self._dist().recv(buf, src=src, tag=tag, group=self._group)
-        return buf
-
-    def isend(self, tensor: torch.Tensor, dst: int, tag: int = 0) -> TransferHandle:
+    def send(self, tensor: torch.Tensor, dst: int, tag: int = 0) -> TransferHandle:
         t = tensor.contiguous()
         work = self._dist().isend(t, dst=dst, tag=tag, group=self._group)
         # Keep a reference to ``t`` so it isn't freed before the send drains.
         return TransferHandle(wait_fn=lambda _t=t, _w=work: _w.wait())
 
-    def irecv(
+    def recv(
         self,
         shape: Tuple[int, ...],
         dtype: torch.dtype,

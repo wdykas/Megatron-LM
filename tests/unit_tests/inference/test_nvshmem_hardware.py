@@ -53,11 +53,11 @@ def _worker(rank, world, port, q):
         n = 4
         if rank == 0:
             for i in range(n):
-                be.isend(torch.full((4,), float(i), device=dev), dst=1).wait()
+                be.send(torch.full((4,), float(i), device=dev), dst=1).wait()
             q.put(("send", "ok"))
         else:
             got = [
-                be.irecv((4,), torch.float32, src=0).wait().float().mean().item()
+                be.recv((4,), torch.float32, src=0).wait().float().mean().item()
                 for _ in range(n)
             ]
             q.put(("recv", got))
