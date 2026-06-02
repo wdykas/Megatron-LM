@@ -197,6 +197,7 @@ def send_request_kv_resharded(
     backend: Optional[KVTransportBackend] = None,
     group: Optional[object] = None,
     base_tag: int = 0,
+    payload: Optional[dict] = None,
 ) -> Optional["PrefillHandoff"]:
     """Hetero-layout prefill send: reshard this rank's KV sub-blocks to
     the decode layout via global-coordinate range intersection.
@@ -206,6 +207,11 @@ def send_request_kv_resharded(
     layout lists (known from a one-time config handshake). Attention KV
     only in this MR -- a hybrid request raises ``NotImplementedError``.
     Header-free: the decode side derives shapes from config + prompt.
+
+    ``payload`` may be a previously exported KV staging dict (from
+    ``export_request_kv``); when given it is shipped instead of re-exporting
+    from the live context -- used by the coordinator-native path, which
+    exports + holds the KV at prefill completion and ships it later on SEND_KV.
     """
     from megatron.core.inference.disaggregation.kv_shard_layout import (
         plan_kv_reshard,
@@ -213,7 +219,8 @@ def send_request_kv_resharded(
     )
 
     backend = backend or get_kv_transport_backend()
-    payload = engine.context.export_request_kv(request_id)
+    if payload is None:
+        payload = engine.context.export_request_kv(request_id)
     if payload is None:
         raise ValueError(
             f"send_request_kv_resharded: request {request_id} has no exportable KV"

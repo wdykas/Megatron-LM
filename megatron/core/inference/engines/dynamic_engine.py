@@ -465,6 +465,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Per-request KV staged on a prefill engine, held until SEND_KV. Keyed
         # by request_id; one staging payload per (this rank's) shard.
         self._disagg_staged_kv = {}
+        self._disagg_backend = None  # lazily-created KV transport backend
 
     def set_disaggregation_config(
         self, *, role, instance_layouts, identity, total_instances,
@@ -492,6 +493,65 @@ class DynamicInferenceEngine(AbstractEngine):
         self.disagg_total_instances = total_instances
         self.disagg_world_group = world_group
         self.disagg_spawn_coordinator = spawn_coordinator
+
+    # --- disaggregated KV handoff (coordinator-driven) -------------------
+    def _disagg_layouts(self, dicts):
+        from megatron.core.inference.disaggregation.kv_shard_layout import KVShardLayout
+
+        return [KVShardLayout(**d) for d in dicts]
+
+    def _disagg_my_layout(self):
+        import torch.distributed as dist
+
+        from megatron.core.inference.disaggregation.kv_shard_layout import KVShardLayout
+
+        rank = dist.get_rank()
+        for d in self.disagg_instance_layouts:
+            if d["global_rank"] == rank:
+                return KVShardLayout(**d)
+        raise RuntimeError(f"rank {rank} not found in its disagg instance layouts")
+
+    def _disagg_get_backend(self):
+        from megatron.core.inference.disaggregation.kv_transport_backend import NcclTransportBackend
+
+        if self._disagg_backend is None:
+            self._disagg_backend = NcclTransportBackend()
+            self._disagg_backend.init()
+        return self._disagg_backend
+
+    def _disagg_send_kv(self, request_id, dst_layout_dicts):
+        """(prefill) ship the staged KV for ``request_id`` to the decode
+        instance, resharded to its layout."""
+        from megatron.core.inference.disaggregation.native_kv_handoff import (
+            send_request_kv_resharded,
+        )
+
+        staged = self._disagg_staged_kv.pop(request_id, None)
+        handoff = send_request_kv_resharded(
+            self, request_id, self._disagg_my_layout(),
+            self._disagg_layouts(self.disagg_instance_layouts),
+            self._disagg_layouts(dst_layout_dicts),
+            backend=self._disagg_get_backend(), payload=staged,
+        )
+        if handoff is not None:
+            handoff.wait()
+
+    def _disagg_recv_kv(self, request_id, src_layout_dicts, prompt, sampling_params):
+        """(decode) receive ``request_id``'s KV, import it (registers the
+        prefix-cache blocks), then admit it -- add_request prefix-hits and skips
+        prefill, continuing generation from the imported KV."""
+        from megatron.core.inference.disaggregation.native_kv_handoff import (
+            recv_request_kv_resharded,
+        )
+
+        recv_request_kv_resharded(
+            self, self._disagg_my_layout(),
+            self._disagg_layouts(src_layout_dicts),
+            self._disagg_layouts(self.disagg_instance_layouts),
+            prompt, backend=self._disagg_get_backend(),
+        )
+        sp = SamplingParams.deserialize(sampling_params)
+        self.add_request(request_id, prompt, sampling_params=sp)
 
     @internal_api
     async def start_listening_to_data_parallel_coordinator(
@@ -1309,6 +1369,15 @@ class DynamicInferenceEngine(AbstractEngine):
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
                     request.add_event_finish()
+                    if self.disagg_role == "prefill":
+                        # Prefill-only: capture this rank's KV shard now, while
+                        # the request's blocks are still allocated (they're
+                        # freed on pop below). Held until the coordinator's
+                        # SEND_KV names the decode target. export returns a
+                        # copy, so it survives the free.
+                        staged = self.context.export_request_kv(request_id)
+                        if staged is not None:
+                            self._disagg_staged_kv[request_id] = staged
                     finished_entry = self.requests.pop(request_id)
                     finished_request = finished_entry.record[-1]
                     finished_request.generated_length = len(finished_request.generated_tokens)
@@ -1917,7 +1986,20 @@ class DynamicInferenceEngine(AbstractEngine):
             records_to_send = [
                 r for r in finished_request_records if r.requests[-1].status != Status.FAILED
             ]
-            if records_to_send:
+            if records_to_send and self.disagg_role == "prefill":
+                # Prefill-only: don't reply to the client. Tell the coordinator
+                # each request finished prefill (KV staged); it will name the
+                # decode target via SEND_KV/RECV_KV.
+                nvtx_range_push("coordinator_communication")
+                for r in records_to_send:
+                    self.socket_for_receiving_requests.send(
+                        msgpack.packb(
+                            [Headers.PREFILL_DONE.value, r.requests[-1].request_id],
+                            use_bin_type=True,
+                        )
+                    )
+                nvtx_range_pop("coordinator_communication")
+            elif records_to_send:
                 nvtx_range_push("coordinator_communication")
                 payload = msgpack.packb(
                     [Headers.ENGINE_REPLY.value, [r.merge().serialize() for r in records_to_send]],
@@ -2199,9 +2281,24 @@ class DynamicInferenceEngine(AbstractEngine):
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
                 sampling_params = SamplingParams.deserialize(sampling_params)
+                if self.disagg_role == "prefill":
+                    # Prefill-only: run prefill (which populates the prompt KV)
+                    # and stop right after, so the request leaves this engine
+                    # with its prompt-block KV intact for the handoff. The few
+                    # generated tokens are discarded; decode regenerates from
+                    # the prompt (prefix-cache hit on the imported KV).
+                    sampling_params.num_tokens_to_generate = 1
                 nvtx_range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
                 nvtx_range_pop("add_request")
+            elif header == Headers.SEND_KV:
+                # (prefill) ship a staged request's KV to the chosen decode
+                # instance, resharded to its layout.
+                self._disagg_send_kv(data[1], data[2])
+            elif header == Headers.RECV_KV:
+                # (decode) receive a request's KV, import it (registers the
+                # prefix-cache blocks), then admit it for generation.
+                self._disagg_recv_kv(data[1], data[2], data[3], data[4])
             elif header == Headers.SET_GENERATION_EPOCH:
                 new_generation_epoch = data[1]
             else:
