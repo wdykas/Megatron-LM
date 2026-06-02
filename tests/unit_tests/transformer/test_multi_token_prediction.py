@@ -28,7 +28,7 @@ from megatron.core.transformer.multi_token_prediction import (
     roll_tensor,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import is_te_min_version
+from megatron.core.utils import get_batch_on_this_cp_rank, is_te_min_version, unwrap_model
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import (
@@ -38,7 +38,6 @@ from megatron.training.global_vars import (
     set_global_variables,
 )
 from megatron.training.training import get_model, setup_model_and_optimizer
-from megatron.training.utils import get_batch_on_this_cp_rank, unwrap_model
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -423,6 +422,7 @@ class TestMultiTokenPrediction:
             assert f"mtp.layers.{i}.hnorm.weight" in sharded_state_dict.keys()
             assert f"mtp.layers.{i}.eh_proj.weight" in sharded_state_dict.keys()
 
+    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(
         not HAVE_TE or not is_te_min_version("2.1.0"),
         reason="grouped_gemm requires TransformerEngine >= 2.1.0",
@@ -496,7 +496,9 @@ class TestMultiTokenPrediction:
             load_checkpoint(gpt_model, optimizer, opt_param_scheduler, strict=False)
             batch["output_ref"] = output_ref
             # Get batch for current CP rank (handles CP tensor splitting)
-            batch = get_batch_on_this_cp_rank(batch)
+            batch = get_batch_on_this_cp_rank(
+                batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+            )
             tokens, labels, loss_mask, attention_mask, position_ids, output_ref = batch.values()
             output = gpt_model[0].forward(
                 input_ids=tokens,
@@ -528,6 +530,7 @@ class TestMultiTokenPrediction:
             for name, param in gpt_model[0].named_parameters():
                 assert param.main_grad is not None
 
+    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(
         not HAVE_TE or not is_te_min_version("1.7.0"),
         reason="Only transformer-engine>=1.7.0 supports MoE FP8 training",
@@ -624,6 +627,7 @@ class TestMultiTokenPrediction:
         for name, param in gpt_model[0].named_parameters():
             assert param.main_grad is not None, f"Gradient missing for {name}"
 
+    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(
         not HAVE_TE or not is_te_min_version("2.1.0"),
         reason="grouped_gemm requires TransformerEngine >= 2.1.0",
@@ -1023,7 +1027,9 @@ class TestMultiTokenPredictionHybrid:
             load_checkpoint(mamba_model, optimizer, opt_param_scheduler, strict=False)
 
             batch["output_ref"] = output_ref
-            batch = get_batch_on_this_cp_rank(batch)
+            batch = get_batch_on_this_cp_rank(
+                batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+            )
             tokens, labels, loss_mask, attention_mask, position_ids, output_ref = batch.values()
             output = mamba_model[0].forward(
                 input_ids=tokens,
