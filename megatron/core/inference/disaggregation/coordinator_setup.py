@@ -2,22 +2,72 @@
 
 """Configure a prefill/decode shard engine for the shared DP inference
 coordinator (role + KV layouts + identity); called by ``MegatronAsyncLLM`` when
-given ``inference_shards``."""
+given ``inference_shards``. Also holds the shared shard helpers (KV-shard layout
+from process groups, role-layout validation, global KV dims)."""
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any, List
+from typing import Any, List, Tuple
 
 import torch.distributed as dist
 
-from megatron.core.inference.disaggregation.orchestration import (
-    _global_kv_dims,
-    _validate_disagg_specs,
-    layout_from_pg_collection,
-)
+from megatron.core.inference.disaggregation.kv_shard_layout import KVShardLayout
 from megatron.core.inference.shards_spec import InferenceShardSpec
 from megatron.core.utils import get_pg_rank, get_pg_size
+
+PREFILL = "prefill"
+DECODE = "decode"
+
+
+def layout_from_pg_collection(pg, num_layers: int, num_heads: int) -> KVShardLayout:
+    """Build a :class:`KVShardLayout` from a shard's ``ProcessGroupCollection``.
+
+    Reads attention TP/PP (which shard the KV) and EP/ETP (KV-replica
+    dimensions, used only for source dedup) from the collection's groups.
+    """
+    return KVShardLayout(
+        num_layers=num_layers,
+        num_heads=num_heads,
+        tp_size=get_pg_size(pg.tp),
+        tp_rank=get_pg_rank(pg.tp),
+        pp_size=get_pg_size(pg.pp),
+        pp_rank=get_pg_rank(pg.pp),
+        global_rank=dist.get_rank(),
+        ep_size=get_pg_size(getattr(pg, "ep", None)),
+        ep_rank=get_pg_rank(getattr(pg, "ep", None)),
+        etp_size=get_pg_size(getattr(pg, "expt_tp", None)),
+        etp_rank=get_pg_rank(getattr(pg, "expt_tp", None)),
+    )
+
+
+def _validate_disagg_specs(specs: List[InferenceShardSpec]) -> int:
+    """Check the role layout; return the number of decode instances.
+
+    Any number of prefill and decode instances is allowed (each instance --
+    a shard's dp replica -- is an independent routing target). The coordinator
+    round-robins submits across prefill instances and remembers, per request,
+    which prefill held its KV, so the decode side pulls from the right source.
+    """
+    prefill = [s for s in specs if s.role == PREFILL]
+    decode = [s for s in specs if s.role == DECODE]
+    untagged = [s for s in specs if s.role not in (PREFILL, DECODE)]
+    assert not untagged, (
+        f"every shard must declare role=prefill or role=decode for "
+        f"disaggregation; {len(untagged)} shard(s) had none: {untagged}"
+    )
+    assert prefill and decode, (
+        "disaggregation needs at least one prefill shard and one decode shard."
+    )
+    return sum(s.dp for s in decode)
+
+
+def _global_kv_dims(engine) -> Tuple[int, int]:
+    """Global (num_layers, KV-head count) read off the built engine's model
+    config. KV heads = num_query_groups for GQA, else num_attention_heads."""
+    cfg = engine.controller.model_config
+    num_heads = getattr(cfg, "num_query_groups", None) or cfg.num_attention_heads
+    return cfg.num_layers, num_heads
 
 
 def _mamba_layout_dict(engine, pg):

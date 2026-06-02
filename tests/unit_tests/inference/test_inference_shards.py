@@ -62,7 +62,7 @@ def test_plus_and_semicolon_separators_equivalent():
 # role-layout validation + decode-instance count
 # --------------------------------------------------------------------------
 def test_validate_specs_counts_decode_instances():
-    from megatron.core.inference.disaggregation.orchestration import _validate_disagg_specs
+    from megatron.core.inference.disaggregation.coordinator_setup import _validate_disagg_specs
 
     # one prefill + a decode pool: a dp=2 shard is 2 instances, plus 1 more = 3
     specs = parse_inference_shards_spec(
@@ -71,12 +71,12 @@ def test_validate_specs_counts_decode_instances():
     assert _validate_disagg_specs(specs) == 3
 
 
-def test_validate_specs_rejects_multi_instance_prefill_and_untagged():
-    from megatron.core.inference.disaggregation.orchestration import _validate_disagg_specs
+def test_validate_specs_allows_multi_prefill_rejects_untagged_and_no_decode():
+    from megatron.core.inference.disaggregation.coordinator_setup import _validate_disagg_specs
 
-    with pytest.raises(AssertionError):  # dp>1 prefill = multiple prefill instances
-        _validate_disagg_specs(parse_inference_shards_spec(
-            "tp=1,dp=2,role=prefill+tp=1,role=decode", world_size=3))
+    # Multiple prefill instances are allowed (dp>1 prefill = a prefill pool).
+    assert _validate_disagg_specs(parse_inference_shards_spec(
+        "tp=1,dp=2,role=prefill+tp=1,role=decode", world_size=3)) == 1
     with pytest.raises(AssertionError):  # an untagged shard
         _validate_disagg_specs(parse_inference_shards_spec(
             "tp=1,role=prefill+tp=1", world_size=2))
@@ -98,8 +98,8 @@ class _FakePG:
 
 
 def test_layout_from_pg_collection(monkeypatch):
-    import megatron.core.inference.disaggregation.orchestration as orch
-    from megatron.core.inference.disaggregation.orchestration import layout_from_pg_collection
+    import megatron.core.inference.disaggregation.coordinator_setup as orch
+    from megatron.core.inference.disaggregation.coordinator_setup import layout_from_pg_collection
 
     sizes, ranks = {}, {}
     # Patch the names where layout_from_pg_collection looks them up (it imports
