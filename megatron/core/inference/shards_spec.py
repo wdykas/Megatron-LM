@@ -32,11 +32,51 @@ Examples for a 4-rank world:
     "tp=4,dp=1"               -> single shard over all 4 ranks
 """
 
-from typing import List
+from dataclasses import dataclass
+from typing import List, Optional, Sequence, Union
 
 VALID_INT_KEYS = ("tp", "pp", "ep", "expt_tp", "dp")
 VALID_ROLES = ("prefill", "decode")
 VALID_KEYS = (*VALID_INT_KEYS, "role")
+
+
+@dataclass(frozen=True)
+class InferenceShardSpec:
+    """One inference shard's parallelism -- the programmatic form of a shard
+    spec string. ``expt_tp`` defaults to ``tp``; ``role`` is ``"prefill"`` /
+    ``"decode"`` for disaggregation, else ``None``."""
+
+    tp: int
+    pp: int = 1
+    ep: int = 1
+    dp: int = 1
+    expt_tp: Optional[int] = None
+    role: Optional[str] = None
+
+    def __post_init__(self):
+        if self.role is not None and self.role not in VALID_ROLES:
+            raise ValueError(f"role must be one of {VALID_ROLES} or None; got {self.role!r}")
+
+    def to_dict(self) -> dict:
+        d = {"tp": self.tp, "pp": self.pp, "ep": self.ep, "dp": self.dp,
+             "expt_tp": self.expt_tp if self.expt_tp is not None else self.tp}
+        if self.role is not None:
+            d["role"] = self.role
+        return d
+
+
+def normalize_shard_specs(
+    shards: Union[str, Sequence["InferenceShardSpec"], Sequence[dict]], world_size: int
+) -> List[dict]:
+    """Coerce the public shard-spec input (a spec string, a list of
+    :class:`InferenceShardSpec`, or a list of raw dicts) into the validated
+    dict list the shard builders consume."""
+    if isinstance(shards, str):
+        return parse_inference_shards_spec(shards, world_size)
+    out: List[dict] = []
+    for s in shards:
+        out.append(s.to_dict() if isinstance(s, InferenceShardSpec) else dict(s))
+    return _finalize_and_validate(out, world_size)
 
 
 def spec_declares_disaggregation(spec_str: str) -> bool:
@@ -80,7 +120,6 @@ def parse_inference_shards_spec(spec_str: str, world_size: int) -> List[dict]:
             the parsed list alone.
     """
     parsed: List[dict] = []
-    total_ranks = 0
     # ``+`` is convenient from shell recipes where ``;`` would otherwise
     # be treated as a command terminator. Normalize before splitting.
     shards_raw = spec_str.replace("+", ";")
@@ -114,6 +153,21 @@ def parse_inference_shards_spec(spec_str: str, world_size: int) -> List[dict]:
                 spec[k] = role
             else:
                 spec[k] = int(v)
+        parsed.append(spec)
+
+    return _finalize_and_validate(parsed, world_size)
+
+
+def _finalize_and_validate(specs: List[dict], world_size: int) -> List[dict]:
+    """Apply per-shard defaults and assert the shards partition the world.
+
+    Shared by the string parser and the object path (:func:`normalize_shard_specs`).
+    Idle ranks are rejected so any world-collective consumer can enumerate
+    every rank's shard membership from the list alone.
+    """
+    assert specs, "--inference-shards was empty."
+    total_ranks = 0
+    for spec in specs:
         # Defaults: integer keys default to 1; expt_tp defaults to tp.
         spec.setdefault("tp", 1)
         spec.setdefault("pp", 1)
@@ -128,12 +182,10 @@ def parse_inference_shards_spec(spec_str: str, world_size: int) -> List[dict]:
             f"expt_tp*ep*pp={expert_block} does not divide it; "
             f"choose compatible sizes."
         )
-        parsed.append(spec)
         total_ranks += shard_world
 
-    assert parsed, "--inference-shards was empty after parsing."
     assert total_ranks == world_size, (
         f"--inference-shards consumes {total_ranks} ranks but world size is "
         f"{world_size}; specs must partition the full world."
     )
-    return parsed
+    return specs

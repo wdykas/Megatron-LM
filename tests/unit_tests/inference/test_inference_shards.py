@@ -12,7 +12,25 @@ right KVShardLayout field.
 
 import pytest
 
-from megatron.core.inference.shards_spec import parse_inference_shards_spec
+from megatron.core.inference.shards_spec import (
+    InferenceShardSpec,
+    normalize_shard_specs,
+    parse_inference_shards_spec,
+)
+
+
+def test_shard_spec_objects_match_string_parsing():
+    objs = [InferenceShardSpec(tp=2, role="prefill"),
+            InferenceShardSpec(tp=1, dp=2, role="decode")]
+    assert normalize_shard_specs(objs, 4) == parse_inference_shards_spec(
+        "tp=2,role=prefill+tp=1,dp=2,role=decode", 4
+    )
+    # expt_tp defaults to tp; raw dicts also accepted
+    assert InferenceShardSpec(tp=4).to_dict()["expt_tp"] == 4
+    assert normalize_shard_specs([{"tp": 1, "role": "prefill"}, {"tp": 1, "role": "decode"}], 2)
+    # bad role rejected at construction
+    with pytest.raises(ValueError):
+        InferenceShardSpec(tp=1, role="both")
 
 
 # --------------------------------------------------------------------------
