@@ -24,6 +24,7 @@ from megatron.core.inference.disaggregation.orchestration import (
     layout_from_pg_collection,
 )
 from megatron.core.inference.shards import InferenceShard, build_inference_pg_collections_for_shards
+from megatron.core.inference.shards_spec import InferenceShardSpec
 from megatron.core.utils import get_pg_rank, get_pg_size
 
 
@@ -39,8 +40,8 @@ def instance_layout_dicts(
     KV-replica dims (don't affect head/layer ranges) and are left at 0 here --
     each ``(tp_rank, pp_rank)`` appears once per instance.
     """
-    tp, pp, dp = shard.spec["tp"], shard.spec["pp"], shard.spec["dp"]
-    ep, etp = shard.spec["ep"], shard.spec["expt_tp"]
+    tp, pp, dp = shard.spec.tp, shard.spec.pp, shard.spec.dp
+    ep, etp = shard.spec.ep, shard.spec.expt_tp
     per_instance = tp * pp
     base = shard.rank_offset + dp_rank * per_instance
     out = []
@@ -68,7 +69,7 @@ class DisaggCoordinatorSetup:
 
 
 def configure_disagg_engine(
-    specs: List[dict], *, engine_builder: Callable[[Any], Any]
+    specs: List[InferenceShardSpec], *, engine_builder: Callable[[Any], Any]
 ) -> DisaggCoordinatorSetup:
     """Build this rank's shard engine and configure it for the shared
     coordinator. The caller then runs the engine's coordinator loop
@@ -76,20 +77,20 @@ def configure_disagg_engine(
     spawns the coordinator (handled inside that call via the disagg config)
     and drives an ``InferenceClient``.
     """
-    total_instances = sum(s.get("dp", 1) for s in specs)
+    total_instances = sum(s.dp for s in specs)
     _validate_disagg_specs(specs)  # role layout / single-prefill-instance checks
 
     world = dist.get_world_size()
     rank = dist.get_rank()
     shards: List[InferenceShard] = build_inference_pg_collections_for_shards(world, specs)
     my = next(s for s in shards if s.pg_collection is not None)
-    role = my.spec["role"]
+    role = my.spec.role
 
     engine = engine_builder(my.pg_collection)
     num_layers, num_heads = _global_kv_dims(engine)
 
     # which dp replica of this shard am I? (rank within the shard / instance size)
-    per_instance = my.spec["tp"] * my.spec["pp"]
+    per_instance = my.spec.tp * my.spec.pp
     dp_rank = (rank - my.rank_offset) // per_instance
     layouts = instance_layout_dicts(my, dp_rank, num_layers, num_heads)
     replica_id = PREFILL if role == PREFILL else f"decode_s{my.index}_dp{dp_rank}"
@@ -109,7 +110,7 @@ def configure_disagg_engine(
 
 
 def configure_prebuilt_disagg_engine(
-    engine: Any, pg: Any, specs: List[dict]
+    engine: Any, pg: Any, specs: List[InferenceShardSpec]
 ) -> DisaggCoordinatorSetup:
     """Configure an already-built engine for the shared coordinator.
 
@@ -122,7 +123,7 @@ def configure_prebuilt_disagg_engine(
     per-instance layout is gathered over the instance's MP group (tp x pp), so
     it is correct for any tp/dp/pp rank ordering (no contiguity assumption).
     """
-    total_instances = sum(s.get("dp", 1) for s in specs)
+    total_instances = sum(s.dp for s in specs)
     _validate_disagg_specs(specs)  # role layout / single-prefill-instance checks
     rank = dist.get_rank()
 
@@ -132,13 +133,12 @@ def configure_prebuilt_disagg_engine(
     my_index = None
     my_spec = None
     for i, s in enumerate(specs):
-        shard_world = s["tp"] * s["pp"] * s.get("dp", 1)
-        if offset <= rank < offset + shard_world:
+        if offset <= rank < offset + s.world_size:
             my_index, my_spec = i, s
             break
-        offset += shard_world
+        offset += s.world_size
     assert my_spec is not None, f"rank {rank} not in any disagg shard window"
-    role = my_spec["role"]
+    role = my_spec.role
 
     num_layers, num_heads = _global_kv_dims(engine)
     dp_rank = get_pg_rank(pg.dp)

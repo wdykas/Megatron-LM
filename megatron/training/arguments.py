@@ -2000,20 +2000,14 @@ def _add_inference_args(parser):
                        help='Skip the EP-group consensus all-reduce in the inference engine control loop and step on local state only. '
                             'Pause/unpause take effect as soon as the signal is delivered to a rank. '
                             'Only safe when EP coordination is not required (e.g. ep_world_size == 1).')
-    # Heterogeneous inference shards. One CLI string partitions the world
-    # into independent inference models, each with its own parallelism:
-    # "tp=2,dp=1,role=prefill+tp=1,dp=2,role=decode" (shards separated by
-    # '+' or ';'; per-shard keys tp/pp/ep/expt_tp/dp, default 1). Tagging
-    # shards role=prefill / role=decode selects disaggregated inference --
-    # prefill shards hand KV to the decode pool; a dp>1 decode shard is
-    # several independent decode instances. Parsed/validated where the
-    # topology is built (megatron.core.inference.shards_spec); shared by
-    # the inference examples and the RL rollout path.
     group.add_argument('--inference-shards', type=str, default=None, metavar='SPEC',
-                       help='Heterogeneous inference shard layout, e.g. '
-                            '"tp=2,role=prefill+tp=1,dp=2,role=decode". Per-shard keys: '
-                            'tp,pp,ep,expt_tp,dp (default 1) and role=prefill|decode. '
-                            'Tagging prefill/decode roles enables disaggregated inference.')
+                       help='Partition the world into independent inference models, each with '
+                            'its own parallelism, e.g. "tp=2,role=prefill+tp=1,dp=2,role=decode". '
+                            'Shards are separated by "+" or ";"; per-shard keys are '
+                            'tp,pp,ep,expt_tp,dp (each defaults to 1) and must partition the full '
+                            'world. Tagging shards role=prefill|decode enables disaggregated '
+                            'inference (prefill hands KV to the decode pool); a dp>1 decode shard '
+                            'is several independent decode instances.')
     return parser
 
 

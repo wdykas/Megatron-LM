@@ -24,12 +24,13 @@ explicitly.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Sequence, Union
 
 import torch.distributed as dist
 
 from megatron.core import mpu
 from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.inference.shards_spec import InferenceShardSpec, normalize_shard_specs
 from megatron.core.process_groups_config import ProcessGroupCollection
 
 
@@ -191,8 +192,9 @@ class InferenceShard:
 
     Attributes:
         index: Position of this shard in the shards list.
-        spec: Parsed spec dict with keys ``tp``, ``pp``, ``ep``, ``expt_tp``,
-            ``dp``, and optionally a ``role`` (``prefill``/``decode``).
+        spec: This shard's :class:`~megatron.core.inference.shards_spec.InferenceShardSpec`
+            (``tp``/``pp``/``ep``/``expt_tp``/``dp`` and optional
+            ``role`` = ``prefill``/``decode``).
         rank_offset: First global rank belonging to this shard.
         world_size: Number of ranks in this shard (tp*pp*dp).
         pg_collection: The shard's ProcessGroupCollection if the current rank
@@ -205,7 +207,7 @@ class InferenceShard:
     """
 
     index: int
-    spec: dict
+    spec: InferenceShardSpec
     rank_offset: int
     world_size: int
     pg_collection: Optional[ProcessGroupCollection]
@@ -224,7 +226,7 @@ class InferenceShard:
 
 def build_inference_pg_collections_for_shards(
     total_world_size: int,
-    shards: List[dict],
+    shards: Union[str, Sequence[InferenceShardSpec], Sequence[dict]],
     use_tp_pp_dp_mapping: bool = False,
 ) -> List[InferenceShard]:
     """Build one ProcessGroupCollection per heterogeneous inference shard.
@@ -241,18 +243,20 @@ def build_inference_pg_collections_for_shards(
     Args:
         total_world_size: Full world size across training + all inference
             shards.
-        shards: Parsed shard specs (each a dict with tp/pp/ep/expt_tp/dp keys).
+        shards: Shard layout in any form ``normalize_shard_specs`` accepts -- a
+            spec string, a list of :class:`InferenceShardSpec`, or a list of
+            raw dicts. Normalized internally to validated specs.
         use_tp_pp_dp_mapping: Passed through to ``build_inference_pg_collection``.
 
     Returns:
         List of :class:`InferenceShard`, one per input spec.
     """
+    specs = normalize_shard_specs(shards, total_world_size)
     rank = dist.get_rank()
     results: List[InferenceShard] = []
     offset = 0
-    for i, spec in enumerate(shards):
-        tp = spec["tp"]; pp = spec["pp"]; ep = spec["ep"]
-        expt_tp = spec["expt_tp"]; dp = spec["dp"]
+    for i, spec in enumerate(specs):
+        tp, pp, ep, expt_tp, dp = spec.tp, spec.pp, spec.ep, spec.expt_tp, spec.dp
         shard_world = tp * pp * dp
         assert offset + shard_world <= total_world_size, (
             f"Shard {i} ({spec}) runs out of ranks: needs "

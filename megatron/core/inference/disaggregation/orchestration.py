@@ -15,6 +15,7 @@ from megatron.core.inference.disaggregation.kv_transport_backend import (
     NcclTransportBackend,
 )
 from megatron.core.inference.shards import InferenceShard, build_inference_pg_collections_for_shards
+from megatron.core.inference.shards_spec import InferenceShardSpec
 
 PREFILL = "prefill"
 DECODE = "decode"
@@ -73,11 +74,11 @@ def _decode_replica_id(shard_index: int, dp_rank: int) -> str:
     return f"decode_s{shard_index}_dp{dp_rank}"
 
 
-def _validate_disagg_specs(specs: List[dict]) -> int:
+def _validate_disagg_specs(specs: List[InferenceShardSpec]) -> int:
     """Check the role layout; return the number of decode instances."""
-    prefill = [s for s in specs if s.get("role") == PREFILL]
-    decode = [s for s in specs if s.get("role") == DECODE]
-    untagged = [s for s in specs if s.get("role") not in (PREFILL, DECODE)]
+    prefill = [s for s in specs if s.role == PREFILL]
+    decode = [s for s in specs if s.role == DECODE]
+    untagged = [s for s in specs if s.role not in (PREFILL, DECODE)]
     assert not untagged, (
         f"every shard must declare role=prefill or role=decode for "
         f"disaggregation; {len(untagged)} shard(s) had none: {untagged}"
@@ -85,14 +86,14 @@ def _validate_disagg_specs(specs: List[dict]) -> int:
     assert prefill and decode, (
         "disaggregation needs at least one prefill shard and one decode shard."
     )
-    prefill_instances = sum(s.get("dp", 1) for s in prefill)
+    prefill_instances = sum(s.dp for s in prefill)
     assert len(prefill) == 1 and prefill_instances == 1, (
         "exactly one prefill instance is supported today (one prefill shard "
         f"with dp=1); got {len(prefill)} prefill shard(s) totalling "
         f"{prefill_instances} instance(s). Data-parallel prefill needs "
         "per-request prefill-instance scoping (a follow-up)."
     )
-    return sum(s.get("dp", 1) for s in decode)
+    return sum(s.dp for s in decode)
 
 
 def _global_kv_dims(engine) -> Tuple[int, int]:
@@ -142,7 +143,7 @@ def setup_disagg(
         "(shard specs must partition the world exactly)."
     )
     my = my_shards[0]
-    role = my.spec["role"]
+    role = my.spec.role
 
     pg = my.pg_collection
     if role == PREFILL:

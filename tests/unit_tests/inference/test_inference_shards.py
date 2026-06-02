@@ -38,8 +38,11 @@ def test_shard_spec_objects_match_string_parsing():
 # --------------------------------------------------------------------------
 def test_parse_defaults_and_dp_and_role():
     specs = parse_inference_shards_spec("tp=2,role=prefill+tp=1,dp=2,role=decode", world_size=4)
-    assert specs[0] == {"tp": 2, "pp": 1, "ep": 1, "dp": 1, "expt_tp": 2, "role": "prefill"}
-    assert specs[1] == {"tp": 1, "pp": 1, "ep": 1, "dp": 2, "expt_tp": 1, "role": "decode"}
+    # parser returns InferenceShardSpec with defaults filled (expt_tp -> tp).
+    assert specs[0] == InferenceShardSpec(tp=2, role="prefill")
+    assert specs[1] == InferenceShardSpec(tp=1, dp=2, role="decode")
+    # dict form (serialization / external consumers) carries the resolved keys.
+    assert specs[0].to_dict() == {"tp": 2, "pp": 1, "ep": 1, "dp": 1, "expt_tp": 2, "role": "prefill"}
 
 
 def test_parse_partitions_world_with_dp():
