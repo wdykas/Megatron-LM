@@ -21,6 +21,11 @@ class Headers(Enum):
     DISCONNECT = auto()
     SHUTDOWN = auto()
     TP_BROADCAST = auto()
+    # Disaggregated prefill->decode (engine roles + 2-hop KV handoff).
+    REGISTER_ROLE = auto()  # engine -> coord: declare role + KV layout at registration
+    PREFILL_DONE = auto()   # prefill engine -> coord: request finished prefill, KV staged
+    SEND_KV = auto()        # coord -> prefill engine: ship request's KV to a decode instance
+    RECV_KV = auto()        # coord -> decode engine: receive KV then admit + generate
 
 
 class UnknownHeaderError(Exception):
