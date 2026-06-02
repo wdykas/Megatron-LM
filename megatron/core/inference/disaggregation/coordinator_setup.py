@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from typing import Any, Callable, List
 
 from megatron.core.inference.disaggregation.orchestration import (
-    DECODE,
     PREFILL,
     _global_kv_dims,
     _validate_disagg_specs,
