@@ -1,24 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Pluggable decode-replica router for disaggregated prefill->decode.
-
-Decides *which decode replica* a request's KV is handed to. A replica is
-one internally-uniform model instance (its own TP/PP); the pool may be
-heterogeneous (replicas of different parallelism), and the KV is
-resharded to whichever replica is chosen via
-:func:`kv_shard_layout.plan_kv_reshard`.
-
-Swappable by design, mirroring the ``RouteSelector`` shape on the
-``hetero-inference`` branch: a narrow :class:`DecodeRouter` ABC with one
-required method, :meth:`select`. Concrete policies ship here
-(round-robin, sticky-affinity, least-loaded, prompt-length-tiered) and
-custom routers register via :func:`register_router`. Load-aware routers
-use the optional :meth:`on_admit` / :meth:`on_complete` hooks.
-
-Routing (which replica) is intentionally separate from transport (how
-the KV moves) and resharding (how it is re-partitioned): they compose
-via :func:`route_and_plan`.
-"""
+"""Pluggable decode-replica router for disaggregated prefill->decode."""
 
 from __future__ import annotations
 

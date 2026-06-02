@@ -1,44 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Pluggable transport backend for native disaggregated KV handoff.
-
-This is the minimal, KV-blob-oriented sibling of the activation
-transport backend on the ``hetero-inference`` branch. Where that one
-moves per-layer *hidden states* between layer-kind shards
-(``send_hidden`` / ``receive_hidden``), this one moves *KV-cache
-blobs* between a prefill worker and a decode worker for
-prefill->decode disaggregation, reusing the existing
-``DynamicInferenceContext.export_request_kv`` /
-``import_request_kv`` staging hooks.
-
-Design (kept deliberately small for a first MR):
-
-* The interface is a narrow tensor point-to-point: blocking
-  ``send`` / ``recv`` plus non-blocking ``isend`` / ``irecv`` that
-  return a :class:`TransferHandle` the caller waits on later. The
-  non-blocking pair is what makes request migration non-blocking:
-  the prefill engine stages + ``isend``s a request's KV and keeps
-  generating while the bytes are in flight; the decode engine
-  ``irecv``s and waits only when it is ready to admit the request.
-* Two backends ship here:
-    - :class:`NcclTransportBackend` — built on ``torch.distributed``
-      point-to-point (``isend`` / ``irecv``). Works with the ``nccl``
-      backend on GPU and ``gloo`` on CPU, so it runs in CI without any
-      special hardware. This is the default.
-    - :class:`NvshmemTransportBackend` — bulk KV transfer built directly
-      on the shared ``nvshmem_runtime`` primitives (symmetric slot/flag
-      pools + ``put_signal`` / ``signal_wait``). Import-safe without
-      NVSHMEM; raises a clear error at :meth:`init` if the runtime is
-      absent. It deliberately does NOT use ``activation_transport`` —
-      that is the per-layer per-token mover for layer-kind
-      disaggregation (a separate, deferred feature); a KV handoff is a
-      few bulk transfers per request, which the runtime's put/signal
-      serves directly.
-
-Larger pieces from ``hetero-inference`` (route DAG dispatcher,
-compiled routes, layer-wise activation transport) are intentionally
-left for future MRs.
-"""
+"""Pluggable KV transport backend (NCCL default, NVSHMEM fast path)."""
 
 from __future__ import annotations
 

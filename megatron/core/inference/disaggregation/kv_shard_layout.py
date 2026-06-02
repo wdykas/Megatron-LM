@@ -1,40 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Heterogeneous TP/PP/EP resharding for the native KV handoff.
-
-When the prefill and decode workers use *different* parallel layouts,
-the KV cache is physically sharded differently on each side and the
-handoff must reshard it:
-
-* **Tensor parallel (TP)** shards the KV by attention/KV heads: TP rank
-  ``t`` of ``Tp`` owns global heads ``[t*H/Tp, (t+1)*H/Tp)``.
-* **Pipeline parallel (PP)** partitions by layers: PP rank ``p`` of
-  ``Pp`` owns global layers ``[p*L/Pp, (p+1)*L/Pp)``.
-* **Expert parallel (EP)** and **expert tensor parallel (ETP)** shard the
-  MoE expert FFN weights, **not** the attention KV cache. The KV lives in
-  the attention layers, which are partitioned by the *attention* TP/PP
-  only; across the EP and ETP dimensions the KV is fully **replicated**.
-  So hetero-EP/ETP needs no data re-partition -- it reduces to *replica
-  selection*: a single representative rank per attention shard sources the
-  KV, and every destination replica of that shard pulls the same bytes.
-  Rather than special-case ``ep_rank``/``etp_rank``, we group source ranks
-  by their attention shard ``(tp_rank, pp_rank)`` and source from the one
-  with the smallest ``global_rank``. This is correct for EP, ETP, any
-  combination of them, and any future KV-replica dimension, with no
-  per-dimension logic.
-
-The resharding primitive is **range intersection** in *global*
-coordinates. A destination rank owns a ``(layer_range x head_range)``
-rectangle; each source rank owns another. The two exchange exactly the
-intersection sub-block (if non-empty). This is fully general -- it
-handles divisible *and* non-divisible TP/PP ratios and any PP change --
-and it is derivable on both sides from the two layouts alone (exchanged
-once at setup), so per-request transfers stay header-free.
-
-Scope (first MR): attention KV resharding. Mamba/hybrid state has a
-different sharding semantics and is left on the matched-layout path for
-a future MR.
-"""
+"""TP/PP/EP/ETP KV-shard layouts and the range-intersection reshard planner."""
 
 from __future__ import annotations
 

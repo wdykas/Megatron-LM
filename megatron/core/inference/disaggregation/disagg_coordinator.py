@@ -1,34 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""End-to-end orchestration for native prefill->decode disaggregation.
-
-Ties together the pieces built separately -- layout/reshard
-(:mod:`kv_shard_layout`), routing (:mod:`kv_router`), transport
-(:mod:`kv_transport_backend`), and the KV staging hooks
-(``DynamicInferenceContext.export_request_kv`` / ``import_request_kv``
-via :mod:`native_kv_handoff`) -- into one coordinator so a request's KV
-flows from a prefill worker to a decode worker automatically.
-
-Design (static pool, optimized for cleanliness + speed):
-
-* **Layout handshake.** One all-gather at startup over the global group:
-  every worker contributes ``(role, replica_id, layout)`` and ends up
-  with the full prefill ``src_layouts`` and the decode pool grouped into
-  :class:`~kv_router.DecodeTarget` replicas. No hand-passing of layouts.
-* **Per-worker routing.** Each prefill worker runs the same deterministic
-  router over the shared registry -- no central-coordinator hop.
-* **Push notification.** The prefill replica leader sends a tiny
-  ``(request_id, prompt_token_ids)`` control message to the chosen
-  decode replica; the header-free data plane derives shapes from the
-  prompt, so nothing else crosses the control plane.
-* **Transport-agnostic.** Bulk KV moves over the injected
-  :class:`KVTransportBackend` (NVSHMEM credit-ring for the fast static
-  path; NCCL for portability/CI).
-
-Control plane = ``torch.distributed`` object messaging; data plane = the
-backend. The two are kept separate so the backend stays a pure tensor
-mover.
-"""
+"""Coordinator that routes a request's KV from prefill workers to a decode replica."""
 
 from __future__ import annotations
 

@@ -1,36 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""High-level driver for prefill->decode disaggregation over inference shards.
-
-Disaggregation is layered on the generic shard abstraction
-(:mod:`megatron.core.inference.shards`): the world is partitioned into
-independent inference shards, each at its own TP/PP/EP/ETP/**DP**, and a
-shard is tagged ``role=prefill`` or ``role=decode`` in its spec. Prefill
-shards compute KV and hand it (resharded across any TP/PP mismatch) to
-the decode pool; the decode side is data-parallel -- each decode
-*instance* (one per ``dp`` rank of a decode shard) is a distinct routing
-target that takes a subset of requests.
-
-This module is the reusable entry point: given parsed shard specs and a
-callable that builds an inference engine for a process-group collection,
-it stands up this rank's shard (engine + coordinator) and runs the
-prefill or decode loop. The only framework-specific dependency is the
-engine the caller passes in. A serving layer, RL rollout, or Dynamo
-backend can use it without copying orchestration into their own tree::
-
-    specs = parse_inference_shards_spec("tp=2,role=prefill+tp=1,dp=2,role=decode", world)
-    setup = setup_disagg(specs, engine_builder=build_my_engine,
-                         num_layers=L, num_heads=H)
-    if setup.role == "prefill":
-        run_prefill_replica(setup.coordinator, setup.engine, requests)
-    else:
-        outputs = run_decode_replica(setup.coordinator, setup.engine, requests)
-
-``requests`` is any sequence of objects exposing ``request_id``,
-``prompt_text``, ``prompt_tokens`` and ``sampling_params`` (see
-:class:`DisaggRequest`); it must be identical on every rank (decode
-replays the deterministic router to learn its share).
-"""
+"""High-level prefill->decode disaggregation driver over inference shards."""
 
 from __future__ import annotations
 

@@ -1,58 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Native prefill->decode KV handoff for disaggregated inference.
-
-Minimal coordinator/engine hook that ties together two existing pieces:
-
-* ``DynamicInferenceContext.export_request_kv`` / ``import_request_kv``
-  (the KV / Mamba staging hooks added for the Dynamo integration), and
-* a pluggable :mod:`kv_transport_backend` (NCCL or NVSHMEM).
-
-It performs a *non-blocking* request migration: the prefill worker
-stages a finished request's KV, ships it to the decode worker, and is
-free to keep generating; the decode worker receives the blobs and
-imports them so its engine resumes the request without re-prefilling.
-
-Two planes:
-
-* **Control plane** — a small Python metadata dict (layout, shapes,
-  dtypes, block hashes, presence flags) sent via
-  ``torch.distributed`` object messaging. Works for every backend and
-  keeps the data-plane backend a pure tensor mover.
-* **Data plane** — the KV staging tensors, moved via the active
-  :class:`KVTransportBackend` (``isend`` / ``irecv``).
-
-The wire ordering of tensors is fixed and mirrored on both sides:
-``[attn_staging, (mamba_conv, mamba_ssm), (snap_conv, snap_ssm)]``.
-
-**Header-free by default.** Following the same principle Dynamo's
-vLLM/TRT-LLM connectors use -- they derive the KV *schema* (shapes,
-dtypes, layout) from the shared model config and only thread the
-*non-derivable transport addressing* (``kv_transfer_params``:
-remote_block_ids / engine_id / transfer_id) prefill->decode -- this
-module derives the entire schema on the decode side from the model
-config plus the prompt tokens it already holds:
-
-* shapes / dtypes / layout / hybrid-ness  -> static model config,
-  identical on both workers;
-* ``block_count``                          -> ``ceil(prompt_len / block_size)``;
-* ``block_hashes``                         -> ``compute_block_hashes_batched``
-  over the prompt tokens (a pure function, byte-identical on both sides).
-
-So with the two-sided NCCL backend (addressing implicit in rank+tag
-matching) the control plane disappears entirely -- no metadata object,
-no pickling, no ``headers.py`` -- and the data plane is pure KV bytes.
-A one-sided pull transport (NIXL / NVSHMEM-get) still needs the remote
-descriptor, exactly as Dynamo's NIXL connector ships ``remote_block_ids``;
-for that, set ``header_free=False`` to fall back to the explicit
-metadata path (and a future MR carries the descriptor in it). The
-header-free path assumes homogeneous prefill/decode and a fresh prefill
-(no cross-request prefix-cache reuse on the prefill side).
-
-This is intentionally small. The full route-DAG dispatcher and the
-bulk request-state migration on ``hetero-inference`` are future MRs;
-this gets one prefill->decode KV handoff working natively end to end.
-"""
+"""Native prefill->decode KV handoff: stage, transport, import."""
 
 from __future__ import annotations
 
