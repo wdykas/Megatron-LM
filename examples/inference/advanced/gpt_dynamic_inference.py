@@ -295,60 +295,46 @@ def _build_engine_for(args, tokenizer, sampling_params, requests, pg_collection)
 
 
 def run_disaggregated_inference(args, tokenizer, sampling_params, requests):
-    """Thin example wrapper over the core disaggregation orchestration.
+    """Thin example wrapper over the core disaggregation API.
 
-    All the orchestration -- parsing the shard layout, building each
-    shard's process groups, the coordinator handshake, and the
-    prefill/decode loops -- lives in core (inference.shards{,_spec} +
-    inference.disaggregation); here we only adapt the example's requests,
-    supply a (Megatron-specific) engine builder, and write the output JSON
-    for the colocated golden-value comparison.
+    The whole flow -- shard layout, building each shard's process groups, the
+    handshake, and the prefill/decode loops -- lives behind
+    :class:`MegatronDisaggLLM` in core; here we only adapt the example's
+    requests, supply a (Megatron-specific) engine builder, and write the
+    output JSON for the colocated golden-value comparison.
     """
-    from megatron.core.inference.disaggregation.orchestration import (
-        DisaggRequest,
-        run_decode_replica,
-        run_prefill_replica,
-        setup_disagg,
-    )
-    from megatron.core.inference.shards_spec import parse_inference_shards_spec
+    from megatron.core.inference.disaggregation.disagg_llm import MegatronDisaggLLM
+    from megatron.core.inference.disaggregation.orchestration import DisaggRequest
 
-    specs = parse_inference_shards_spec(
-        args.inference_shards, torch.distributed.get_world_size()
-    )
     num_heads = getattr(args, "num_query_groups", None) or args.num_attention_heads
-    disagg_requests = [
-        DisaggRequest(i, r.prompt_text, r.prompt_tokens, r.sampling_params)
-        for i, r in enumerate(requests)
-    ]
-
-    setup = setup_disagg(
-        specs,
+    llm = MegatronDisaggLLM(
+        args.inference_shards,
         engine_builder=lambda pg: _build_engine_for(
             args, tokenizer, sampling_params, requests, pg
         ),
         num_layers=args.num_layers,
         num_heads=num_heads,
     )
+    disagg_requests = [
+        DisaggRequest(i, r.prompt_text, r.prompt_tokens, r.sampling_params)
+        for i, r in enumerate(requests)
+    ]
+    finished = llm.generate(disagg_requests)
+    if llm.is_decode:
+        _write_disagg_output(args, llm, finished)
 
-    if setup.role == "prefill":
-        run_prefill_replica(setup.coordinator, setup.engine, disagg_requests)
-        return
 
-    finished = run_decode_replica(setup.coordinator, setup.engine, disagg_requests)
-    _write_disagg_output(args, setup, finished)
-
-
-def _write_disagg_output(args, setup, finished):
+def _write_disagg_output(args, llm, finished):
     """Decode representative rank (tp0/pp0) writes its instance's outputs.
     With one decode instance this is the whole result (matches the colocated
     golden values); with several, each instance writes its own subset to a
     per-instance path."""
-    layout = setup.coordinator.my_layout
+    layout = llm.coordinator.my_layout
     if not args.output_path or layout.tp_rank != 0 or layout.pp_rank != 0:
         return
     path = args.output_path
-    if setup.num_decode_instances > 1:
-        path = f"{path}.{setup.replica_id}"
+    if llm.num_decode_instances > 1:
+        path = f"{path}.{llm.replica_id}"
     out = {}
     for rid, m in sorted(finished.items()):
         gt = m.generated_tokens
