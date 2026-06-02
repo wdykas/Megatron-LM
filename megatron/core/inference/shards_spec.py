@@ -39,6 +39,23 @@ VALID_ROLES = ("prefill", "decode")
 VALID_KEYS = (*VALID_INT_KEYS, "role")
 
 
+def spec_declares_disaggregation(spec_str: str) -> bool:
+    """Whether a shard spec tags any shard with a ``role=`` (prefill/decode).
+
+    A role tag is what marks the layout as a prefill->decode handoff rather
+    than plain multi-shard / data-parallel inference. Cheap and world_size-
+    free, so it can be checked at arg-validation time; full parsing +
+    validation is :func:`parse_inference_shards_spec`.
+    """
+    if not spec_str:
+        return False
+    return any(
+        kv.strip().startswith("role=")
+        for shard in spec_str.replace("+", ";").split(";")
+        for kv in shard.split(",")
+    )
+
+
 def parse_inference_shards_spec(spec_str: str, world_size: int) -> List[dict]:
     """Parse + validate the ``--inference-shards`` string.
 

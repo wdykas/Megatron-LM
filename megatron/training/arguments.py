@@ -1763,19 +1763,6 @@ def validate_args(args, defaults={}):
         assert args.moe_latent_size > 0, "MoE latent projection dimension has to be greater than zero."
         assert args.num_experts is not None, "MoE latent projections are applicable only for MoE models."
 
-    # Disaggregated prefill->decode inference. ``--inference-shards`` is more
-    # general than disagg -- without role tags it's plain multi-shard / data-
-    # parallel inference (no handoff). A run is disaggregated iff some shard
-    # carries a ``role=`` key. ``args.disaggregation`` is the single switch the
-    # inference/RL paths check; the spec is fully parsed + validated where the
-    # topology is built, once world_size is known (inference.shards_spec).
-    _shards = getattr(args, 'inference_shards', None)
-    args.disaggregation = bool(_shards) and any(
-        kv.strip().startswith('role=')
-        for shard in _shards.replace('+', ';').split(';')
-        for kv in shard.split(',')
-    )
-
     # Print arguments.
     _print_args("arguments", args)
 
@@ -2017,12 +2004,11 @@ def _add_inference_args(parser):
     # into independent inference models, each with its own parallelism:
     # "tp=2,dp=1,role=prefill+tp=1,dp=2,role=decode" (shards separated by
     # '+' or ';'; per-shard keys tp/pp/ep/expt_tp/dp, default 1). Tagging
-    # shards role=prefill / role=decode turns on disaggregated inference
-    # (``args.disaggregation``, derived in validate_args): prefill shards
-    # hand KV to the decode pool. A dp>1 decode shard is several independent
-    # decode instances. Parsed where the topology is built
-    # (megatron.core.inference.shards_spec); shared by the inference
-    # examples and the RL rollout path.
+    # shards role=prefill / role=decode selects disaggregated inference --
+    # prefill shards hand KV to the decode pool; a dp>1 decode shard is
+    # several independent decode instances. Parsed/validated where the
+    # topology is built (megatron.core.inference.shards_spec); shared by
+    # the inference examples and the RL rollout path.
     group.add_argument('--inference-shards', type=str, default=None, metavar='SPEC',
                        help='Heterogeneous inference shard layout, e.g. '
                             '"tp=2,role=prefill+tp=1,dp=2,role=decode". Per-shard keys: '

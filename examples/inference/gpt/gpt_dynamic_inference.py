@@ -407,13 +407,15 @@ def main():
     # Requests (seeded -> identical on every rank).
     requests = build_requests(args, tokenizer, sampling_params)
 
-    # Disaggregated path: prefill and decode are built as two independent
-    # replicas at their own parallelism (--disagg-* args), on disjoint rank
-    # sets. Gated entirely behind --disaggregation; the colocated path below
-    # is untouched. Writes the same output JSON, so it validates against the
-    # colocated golden values. Built here (before the global model) so each
-    # replica instantiates its model against its own process groups.
-    if args.disaggregation:
+    # Disaggregated path: when --inference-shards tags shards with
+    # prefill/decode roles, prefill and decode are built as independent
+    # replicas at their own parallelism, on disjoint ranks. Decided here
+    # (before the global model) so each replica instantiates its model
+    # against its own process groups. Writes the same output JSON, so it
+    # validates against the colocated golden values.
+    from megatron.core.inference.shards_spec import spec_declares_disaggregation
+
+    if spec_declares_disaggregation(args.inference_shards):
         run_disaggregated_inference(args, tokenizer, sampling_params, requests)
         return
 
