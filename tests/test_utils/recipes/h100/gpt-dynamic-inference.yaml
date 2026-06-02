@@ -176,3 +176,17 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
+  # Disaggregated prefill->decode (same driver, --disagg-* args; GPUS_PER_NODE
+  # in model_config sets the DP=2 split). Golden values copied from the
+  # colocated prefix_caching test (disagg is token-identical). Kept -broken
+  # until goldens are confirmed; hetero also needs the inference PG MR.
+  - test_case: [gpt_dynamic_inference_disagg_tp1_pp1_583m]
+    products:
+      - environment: [dev]
+        scope: [mr-broken, mr-github-broken] # enable after confirming golden values
+        platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_disagg_tp2_to_tp1_583m]
+    products:
+      - environment: [dev]
+        scope: [mr-broken, mr-github-broken] # needs inference PG construction (separate MR)
+        platforms: [dgx_h100]

@@ -117,11 +117,11 @@ def _worker(rank, world, port, rid, header_free, q):
     import torch.distributed as dist
 
     dist.init_process_group("gloo", rank=rank, world_size=world)
-    from megatron.core.inference.kv_transport_backend import (
+    from megatron.core.inference.disaggregation import native_kv_handoff as h
+    from megatron.core.inference.disaggregation.kv_transport_backend import (
         NcclTransportBackend,
         set_kv_transport_backend,
     )
-    from megatron.core.inference import native_kv_handoff as h
 
     backend = NcclTransportBackend()
     backend.init()

@@ -5,8 +5,7 @@
 import pytest
 import torch
 
-from megatron.core.inference.kv_shard_layout import KVShardLayout
-from megatron.core.inference.kv_router import (
+from megatron.core.inference.disaggregation.kv_router import (
     DecodeRouter,
     DecodeTarget,
     LeastLoadedRouter,
@@ -18,6 +17,7 @@ from megatron.core.inference.kv_router import (
     register_router,
     route_and_plan,
 )
+from megatron.core.inference.disaggregation.kv_shard_layout import KVShardLayout
 
 L, Hh = 8, 8
 

@@ -80,7 +80,7 @@ class _FakeEng:
 
 
 def _make_layout(rank, world):
-    from megatron.core.inference.kv_shard_layout import KVShardLayout
+    from megatron.core.inference.disaggregation.kv_shard_layout import KVShardLayout
 
     if world == 3:
         # hetero: prefill TP2 {0,1} -> decode TP1 {2} (exercises head merge)
@@ -104,18 +104,22 @@ def _worker(rank, world, port, use_nvshmem, q):
         device = f"cuda:{rank}"
     dist.init_process_group("gloo", rank=rank, world_size=world)
     try:
-        from megatron.core.inference.disagg_coordinator import DisaggCoordinator
+        from megatron.core.inference.disaggregation.disagg_coordinator import DisaggCoordinator
 
         role, replica, layout = _make_layout(rank, world)
         if use_nvshmem:
             from megatron.core.inference import nvshmem_runtime as nv
-            from megatron.core.inference.kv_transport_backend import NvshmemTransportBackend
+            from megatron.core.inference.disaggregation.kv_transport_backend import (
+                NvshmemTransportBackend,
+            )
 
             nv.maybe_init_nvshmem()
             backend = NvshmemTransportBackend()
             backend.init(slot_bytes=65536, depth=2)
         else:
-            from megatron.core.inference.kv_transport_backend import NcclTransportBackend
+            from megatron.core.inference.disaggregation.kv_transport_backend import (
+                NcclTransportBackend,
+            )
 
             backend = NcclTransportBackend()
             backend.init()

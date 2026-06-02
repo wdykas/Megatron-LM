@@ -11,9 +11,10 @@ import warnings
 from collections import defaultdict
 from typing import Dict, List, Optional
 
-from megatron.training.arguments import parse_and_validate_args
 import torch
 from tqdm import tqdm
+
+from megatron.training.arguments import parse_and_validate_args
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -50,31 +51,6 @@ import logging
 import megatron
 from megatron.core.utils import configure_nvtx_profiling
 from megatron.training import get_args, get_tokenizer, initialize_megatron
-
-
-def add_disaggregation_args(parser):
-    """Wrap ``add_inference_args`` with the prefill->decode disagg flags.
-
-    Used as the ``extra_args_provider`` so the same driver runs both the
-    colocated and disaggregated paths (the latter gated entirely behind
-    ``--disaggregation``)."""
-    parser = add_inference_args(parser)
-    group = parser.add_argument_group(title="Disaggregation")
-    group.add_argument(
-        "--disaggregation",
-        action="store_true",
-        default=False,
-        help="Run prefill->decode disaggregated across data-parallel size 2 "
-        "(replica 0 = prefill, replica 1 = decode), handing KV over the "
-        "DisaggCoordinator. Output is identical to the colocated run.",
-    )
-    group.add_argument(
-        "--disagg-decode-replica-id",
-        type=str,
-        default="decode0",
-        help="Replica id for the decode data-parallel replica.",
-    )
-    return parser
 
 torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
@@ -313,17 +289,34 @@ def run_disaggregated_inference(args, engine, requests):
     output is identical to the colocated run.
     """
     from megatron.core import parallel_state as ps
-    from megatron.core.inference.disagg_coordinator import DisaggCoordinator
-    from megatron.core.inference.kv_shard_layout import KVShardLayout, is_matched
-    from megatron.core.inference.kv_transport_backend import NcclTransportBackend
+    from megatron.core.inference.disaggregation.disagg_coordinator import DisaggCoordinator
+    from megatron.core.inference.disaggregation.kv_shard_layout import KVShardLayout, is_matched
+    from megatron.core.inference.disaggregation.kv_transport_backend import NcclTransportBackend
 
+    # Matched layouts are supported today; the disagg prefill/decode TP/PP
+    # args must equal the engine's actual TP/PP (heterogeneous layouts need
+    # the cross-layout process-group construction, a follow-up MR).
+    tp = ps.get_tensor_model_parallel_world_size()
+    pp = ps.get_pipeline_model_parallel_world_size()
+    if (
+        args.disagg_prefill_tensor_model_parallel_size != tp
+        or args.disagg_decode_tensor_model_parallel_size != tp
+        or args.disagg_prefill_pipeline_model_parallel_size != pp
+        or args.disagg_decode_pipeline_model_parallel_size != pp
+    ):
+        raise NotImplementedError(
+            "disaggregated inference currently supports matched prefill/decode "
+            "TP/PP (equal to the launched layout); heterogeneous prefill/decode "
+            "parallelism needs the inference process-group construction (follow-up MR)."
+        )
     if ps.get_data_parallel_world_size() != 2:
         raise RuntimeError(
-            "--disaggregation expects data-parallel size 2 (replica 0=prefill, "
-            f"replica 1=decode); got {ps.get_data_parallel_world_size()}."
+            "matched disaggregation expects data-parallel size 2 (replica "
+            f"0=prefill, replica 1=decode); got {ps.get_data_parallel_world_size()}. "
+            "Set GPUS_PER_NODE so world_size = 2 * TP * PP."
         )
     role = "prefill" if ps.get_data_parallel_rank() == 0 else "decode"
-    replica_id = "prefill" if role == "prefill" else args.disagg_decode_replica_id
+    replica_id = "prefill" if role == "prefill" else "decode0"
     num_heads = getattr(args, "num_query_groups", None) or args.num_attention_heads
     layout = KVShardLayout(
         num_layers=args.num_layers,
@@ -395,7 +388,7 @@ def main():
     """Run dynamic inference."""
     # Initialize Megatron.
     args = parse_and_validate_args(
-        extra_args_provider=add_disaggregation_args,
+        extra_args_provider=add_inference_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
     initialize_megatron()

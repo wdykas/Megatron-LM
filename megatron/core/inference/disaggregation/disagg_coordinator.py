@@ -36,18 +36,18 @@ import logging
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-from megatron.core.inference.kv_router import (
+from megatron.core.inference.disaggregation import native_kv_handoff as _handoff
+from megatron.core.inference.disaggregation.kv_router import (
     DecodeTarget,
     RequestInfo,
     make_router,
     route_and_plan,
 )
-from megatron.core.inference.kv_shard_layout import KVShardLayout
-from megatron.core.inference.kv_transport_backend import (
+from megatron.core.inference.disaggregation.kv_shard_layout import KVShardLayout
+from megatron.core.inference.disaggregation.kv_transport_backend import (
     KVTransportBackend,
     get_kv_transport_backend,
 )
-from megatron.core.inference import native_kv_handoff as _handoff
 
 logger = logging.getLogger(__name__)
 

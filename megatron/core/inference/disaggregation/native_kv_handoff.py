@@ -62,7 +62,7 @@ from typing import Any, List, Optional
 
 import torch
 
-from megatron.core.inference.kv_transport_backend import (
+from megatron.core.inference.disaggregation.kv_transport_backend import (
     KVTransportBackend,
     TransferHandle,
     get_kv_transport_backend,
@@ -259,7 +259,7 @@ def send_request_kv_resharded(
     only in this MR -- a hybrid request raises ``NotImplementedError``.
     Header-free: the decode side derives shapes from config + prompt.
     """
-    from megatron.core.inference.kv_shard_layout import (
+    from megatron.core.inference.disaggregation.kv_shard_layout import (
         plan_kv_reshard,
         transfers_for_src,
     )
@@ -306,7 +306,7 @@ def recv_request_kv_resharded(
     """Hetero-layout decode receive: pull the KV sub-blocks covering this
     rank's (layer x head) rectangle and assemble the local staging
     tensor, then import. Header-free (schema derived from config+prompt)."""
-    from megatron.core.inference.kv_shard_layout import (
+    from megatron.core.inference.disaggregation.kv_shard_layout import (
         plan_kv_reshard,
         transfers_for_dst,
     )

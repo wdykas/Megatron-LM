@@ -28,7 +28,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple, Type
 
-from megatron.core.inference.kv_shard_layout import KVShardLayout
+from megatron.core.inference.disaggregation.kv_shard_layout import KVShardLayout
 
 
 @dataclass(frozen=True)
@@ -184,7 +184,7 @@ def route_and_plan(
     KV reshard plan prefill(``src_layouts``) -> that replica. Returns
     ``(target, transfers)``. The caller drives the transport with the
     transfers and calls ``router.on_admit`` once the request is accepted."""
-    from megatron.core.inference.kv_shard_layout import plan_kv_reshard
+    from megatron.core.inference.disaggregation.kv_shard_layout import plan_kv_reshard
 
     target = router.select(request)
     transfers = plan_kv_reshard(src_layouts, target.layouts)

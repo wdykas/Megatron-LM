@@ -9,6 +9,7 @@ ENV_VARS:
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Ring
   CUBLAS_WORKSPACE_CONFIG: :4096:8
+  GPUS_PER_NODE: 3
 TEST_TYPE: frozen-start
 MODE: inference
 MODEL_ARGS:
@@ -49,7 +50,8 @@ MODEL_ARGS:
   --num-tokens-to-generate: 30
   --inference-dynamic-batching-buffer-size-gb: 20
   --inference-dynamic-batching-prefix-caching: true
-  --disaggregation: true
+  --disagg-prefill-tensor-model-parallel-size: 2
+  --disagg-decode-tensor-model-parallel-size: 1
   --dist-ckpt-strictness: log_unexpected
   --inference-ckpt-non-strict: true
   --output-path: ${INFERENCE_OUTPUT_PATH}

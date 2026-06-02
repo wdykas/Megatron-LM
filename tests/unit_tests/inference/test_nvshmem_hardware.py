@@ -42,7 +42,7 @@ def _worker(rank, world, port, q):
     dist.init_process_group("gloo", rank=rank, world_size=world)
     try:
         from megatron.core.inference import nvshmem_runtime as nv
-        from megatron.core.inference.kv_transport_backend import (
+        from megatron.core.inference.disaggregation.kv_transport_backend import (
             NvshmemTransportBackend,
         )
 

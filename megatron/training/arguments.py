@@ -1761,6 +1761,22 @@ def validate_args(args, defaults={}):
         assert args.moe_latent_size > 0, "MoE latent projection dimension has to be greater than zero."
         assert args.num_experts is not None, "MoE latent projections are applicable only for MoE models."
 
+    # Disaggregated prefill->decode inference. Enabled iff both prefill and
+    # decode tensor-parallel sizes are given. ``args.disaggregation`` is the
+    # single switch the inference/RL paths check.
+    _p_tp = getattr(args, 'disagg_prefill_tensor_model_parallel_size', None)
+    _d_tp = getattr(args, 'disagg_decode_tensor_model_parallel_size', None)
+    args.disaggregation = _p_tp is not None and _d_tp is not None
+    if (_p_tp is None) != (_d_tp is None):
+        raise AssertionError(
+            'disaggregation requires BOTH --disagg-prefill-tensor-model-parallel-size '
+            'and --disagg-decode-tensor-model-parallel-size to be set.'
+        )
+    if args.disaggregation:
+        assert _p_tp > 0 and _d_tp > 0, 'disagg prefill/decode TP sizes must be > 0.'
+        assert args.disagg_prefill_pipeline_model_parallel_size > 0
+        assert args.disagg_decode_pipeline_model_parallel_size > 0
+
     # Print arguments.
     _print_args("arguments", args)
 
@@ -1998,6 +2014,26 @@ def _add_inference_args(parser):
                        help='Skip the EP-group consensus all-reduce in the inference engine control loop and step on local state only. '
                             'Pause/unpause take effect as soon as the signal is delivered to a rank. '
                             'Only safe when EP coordination is not required (e.g. ep_world_size == 1).')
+    # Disaggregated prefill->decode inference. Setting the prefill AND decode
+    # tensor-parallel sizes turns disaggregation on (``args.disaggregation``,
+    # derived in validate_args): prefill and decode run as separate model
+    # replicas and KV is handed off between them. Shared by the inference
+    # examples and the RL rollout path. Pipeline sizes default to 1.
+    # (Heterogeneous prefill/decode parallelism is accepted here but the
+    # cross-layout process-group construction lands in a follow-up; matched
+    # sizes are supported today.)
+    group.add_argument('--disagg-prefill-tensor-model-parallel-size', type=int, default=None,
+                       help='Tensor-parallel size of the prefill replica(s). Setting this '
+                            'and --disagg-decode-tensor-model-parallel-size enables '
+                            'disaggregated prefill->decode inference.')
+    group.add_argument('--disagg-prefill-pipeline-model-parallel-size', type=int, default=1,
+                       help='Pipeline-parallel size of the prefill replica(s). Default 1.')
+    group.add_argument('--disagg-decode-tensor-model-parallel-size', type=int, default=None,
+                       help='Tensor-parallel size of the decode replica(s). Setting this '
+                            'and --disagg-prefill-tensor-model-parallel-size enables '
+                            'disaggregated prefill->decode inference.')
+    group.add_argument('--disagg-decode-pipeline-model-parallel-size', type=int, default=1,
+                       help='Pipeline-parallel size of the decode replica(s). Default 1.')
     return parser
 
 
