@@ -277,7 +277,19 @@ def create_unified_mempool() -> "MemPool":
             + details
         )
     else:
-        return MemPool(allocator=_alloc)
+        try:
+            return MemPool(allocator=_alloc)
+        except RuntimeError as e:
+            # torch.cuda.MemPool refuses to coexist with the expandable-segments
+            # allocator (PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True), and a
+            # large model can create expandable segments during load before we get
+            # here. Surface it as UnifiedMemoryUnsupportedError so the caller falls
+            # back to non-UVM allocation instead of crashing.
+            raise UnifiedMemoryUnsupportedError(
+                "Could not create the UVM mempool (likely PYTORCH_CUDA_ALLOC_CONF="
+                "expandable_segments:True, which torch.cuda.MemPool does not support): "
+                + str(e)
+            ) from e
 
 
 def _get_ctypes_lib() -> "ctypes.CDLL":
