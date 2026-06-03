@@ -235,30 +235,3 @@ def maybe_init_nvshmem(group: Optional[dist.ProcessGroup] = None) -> None:
     _initialized = True
 
     logger.info("[nvshmem-runtime] initialized: PE %d/%d", _my_pe, _n_pes)
-
-
-# ---- Test hooks -----------------------------------------------------------
-
-
-def _init_state_for_test(*, n_pes: int) -> None:
-    """Set up the runtime-level state (``_my_pe``, ``_n_pes``,
-    ``_initialized``) without actually starting NVSHMEM. Tests that
-    exercise pure-Python addressing in the transport modules use this
-    in place of :func:`maybe_init_nvshmem`."""
-    global _initialized, _n_pes, _my_pe
-    if _initialized:
-        raise RuntimeError(
-            "nvshmem_runtime already initialized; call "
-            "_reset_state_for_test() first."
-        )
-    _my_pe = 0
-    _n_pes = n_pes
-    _initialized = True
-
-
-def _reset_state_for_test() -> None:
-    """Tear down whatever ``_init_state_for_test`` set up. Idempotent."""
-    global _initialized, _my_pe, _n_pes
-    _initialized = False
-    _my_pe = -1
-    _n_pes = -1
