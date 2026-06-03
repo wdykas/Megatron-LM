@@ -471,20 +471,13 @@ class DynamicInferenceEngine(AbstractEngine):
         self.disagg_world_group = None
         self.disagg_spawn_coordinator = False
         self.disagg_router_name = "round_robin"  # routing policy the coordinator resolves
-        # Per-request KV staged on a prefill engine, held until SEND_KV. Keyed
-        # by request_id; one staging payload per (this rank's) shard.
-        self._disagg_staged_kv = {}
-        self._disagg_backend = None  # lazily-created KV transport backend
-        # In-flight KV transfers, completed one step after they are posted so
-        # the transfer overlaps with the engine step. Reaped in
-        # _disagg_complete_pending (collective: the pending set is identical
-        # across MP ranks since coordinator messages are TP-broadcast).
-        self._disagg_pending_sends = {}  # request_id -> PrefillHandoff
-        self._disagg_pending_recvs = {}  # request_id -> (DecodeRecv, prompt, sampling_params)
-        # Depth window bounding concurrent in-flight hand-offs (and thus the
-        # extra staged-KV memory): now that transfers are async, block on the
-        # oldest once this many are in flight so prefill can't outrun decode.
-        self._disagg_max_inflight = 8
+        # Immutable per-rank/instance layouts, precomputed in
+        # set_disaggregation_config (None/empty until then).
+        self._disagg_my_layout = None
+        self._disagg_my_mamba_layout = None
+        self._disagg_instance_kv_layouts = []
+        self._disagg_instance_mamba_layouts = []
+        self._disagg_init_state()
 
     def set_disaggregation_config(
         self, *, role, instance_layouts, identity, total_instances,
@@ -508,49 +501,59 @@ class DynamicInferenceEngine(AbstractEngine):
                 (registered via ``register_disagg_router``; default round-robin).
         """
         assert role in ("prefill", "decode")
-        self.disagg_router_name = disagg_router
-        # Defensive init (engines built without __init__ -- e.g. test doubles --
-        # still get the disagg per-request state).
-        if not hasattr(self, "_disagg_staged_kv"):
-            self._disagg_staged_kv = {}
-        if not hasattr(self, "_disagg_backend"):
-            self._disagg_backend = None
-        if not hasattr(self, "_disagg_pending_sends"):
-            self._disagg_pending_sends = {}
-        if not hasattr(self, "_disagg_pending_recvs"):
-            self._disagg_pending_recvs = {}
-        if not hasattr(self, "_disagg_max_inflight"):
-            self._disagg_max_inflight = 8
+        self._disagg_init_state()  # also covers engine doubles that skip __init__
         self.disagg_role = role
         self.disagg_instance_layouts = instance_layouts
         self.disagg_identity = identity
         self.disagg_total_instances = total_instances
         self.disagg_world_group = world_group
         self.disagg_spawn_coordinator = spawn_coordinator
+        self.disagg_router_name = disagg_router
+        # Precompute the immutable per-rank/instance layouts once: they're fixed
+        # for the engine's life, so building them here (instead of rescanning +
+        # rebuilding on every hand-off) keeps the send/recv path cheap.
+        rank = dist.get_rank()
+        self._disagg_instance_kv_layouts = self._disagg_layouts(instance_layouts)
+        self._disagg_instance_mamba_layouts = self._disagg_mamba_layouts(instance_layouts)
+        self._disagg_my_layout = next(
+            (l for l in self._disagg_instance_kv_layouts if l.global_rank == rank), None
+        )
+        assert (
+            self._disagg_my_layout is not None
+        ), f"rank {rank} not found in its disagg instance layouts"
+        self._disagg_my_mamba_layout = next(
+            (m for m in self._disagg_instance_mamba_layouts if m.global_rank == rank), None
+        )
+
+    def _disagg_init_state(self):
+        """Per-request KV hand-off state. Called from ``__init__`` and from
+        :meth:`set_disaggregation_config` (so engine doubles that skip
+        ``__init__`` still get it).
+
+        - ``_disagg_staged_kv``: prefill holds each finished request's exported
+          KV here until SEND_KV.
+        - ``_disagg_pending_{sends,recvs}``: in-flight transfers, completed one
+          step later in :meth:`_disagg_complete_pending` (collective across MP
+          ranks since coordinator messages are TP-broadcast), so the transfer
+          overlaps the engine step.
+        - ``_disagg_max_inflight``: depth window bounding concurrent hand-offs
+          (and staged-KV memory) so prefill can't outrun decode.
+        """
+        self._disagg_staged_kv = {}
+        self._disagg_backend = None  # lazily-created KV transport backend
+        self._disagg_pending_sends = {}  # request_id -> PrefillHandoff
+        self._disagg_pending_recvs = {}  # request_id -> (DecodeRecv, prompt, sampling_params)
+        self._disagg_max_inflight = 8
 
     # --- disaggregated KV handoff (coordinator-driven) -------------------
     def _disagg_layouts(self, dicts):
         # Strip the optional hybrid ``mamba`` sub-dict; it's a separate layout.
         return [KVShardLayout(**{k: v for k, v in d.items() if k != "mamba"}) for d in dicts]
 
-    def _disagg_my_layout(self):
-        rank = dist.get_rank()
-        for d in self.disagg_instance_layouts:
-            if d["global_rank"] == rank:
-                return KVShardLayout(**{k: v for k, v in d.items() if k != "mamba"})
-        raise RuntimeError(f"rank {rank} not found in its disagg instance layouts")
-
     def _disagg_mamba_layouts(self, dicts):
         """MambaShardLayout list for the hybrid dicts that carry a ``mamba``
         sub-dict (empty for non-hybrid models)."""
         return [MambaShardLayout(**d["mamba"]) for d in dicts if d.get("mamba")]
-
-    def _disagg_my_mamba_layout(self):
-        rank = dist.get_rank()
-        for d in self.disagg_instance_layouts:
-            if d["global_rank"] == rank and d.get("mamba"):
-                return MambaShardLayout(**d["mamba"])
-        return None  # non-hybrid model
 
     def _disagg_get_backend(self):
         if self._disagg_backend is None:
@@ -563,7 +566,7 @@ class DynamicInferenceEngine(AbstractEngine):
         between the same rank pair don't alias on a tag-respecting backend
         (gloo). NCCL ignores the P2P tag and matches by post-order; the modulus
         keeps the value within the backend's tag range."""
-        my = self._disagg_my_layout()
+        my = self._disagg_my_layout
         return (request_id % 4096) * (my.num_layers * my.num_heads)
 
     def _disagg_send_kv(self, request_id, dst_layout_dicts):
@@ -581,13 +584,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
         staged = self._disagg_staged_kv.pop(request_id, None)
         handoff = send_request_kv_resharded(
-            self, request_id, self._disagg_my_layout(),
-            self._disagg_layouts(self.disagg_instance_layouts),
+            self, request_id, self._disagg_my_layout,
+            self._disagg_instance_kv_layouts,
             self._disagg_layouts(dst_layout_dicts),
             backend=self._disagg_get_backend(), payload=staged,
             base_tag=self._disagg_base_tag(request_id),
-            my_mamba_layout=self._disagg_my_mamba_layout(),
-            src_mamba_layouts=self._disagg_mamba_layouts(self.disagg_instance_layouts),
+            my_mamba_layout=self._disagg_my_mamba_layout,
+            src_mamba_layouts=self._disagg_instance_mamba_layouts,
             dst_mamba_layouts=self._disagg_mamba_layouts(dst_layout_dicts),
         )
         if handoff is not None:
@@ -607,14 +610,14 @@ class DynamicInferenceEngine(AbstractEngine):
             self.add_request(oldest, p, sampling_params=SamplingParams.deserialize(sp))
 
         recv = post_recv_request_kv_resharded(
-            self, self._disagg_my_layout(),
+            self, self._disagg_my_layout,
             self._disagg_layouts(src_layout_dicts),
-            self._disagg_layouts(self.disagg_instance_layouts),
+            self._disagg_instance_kv_layouts,
             prompt, backend=self._disagg_get_backend(),
             base_tag=self._disagg_base_tag(request_id),
-            my_mamba_layout=self._disagg_my_mamba_layout(),
+            my_mamba_layout=self._disagg_my_mamba_layout,
             src_mamba_layouts=self._disagg_mamba_layouts(src_layout_dicts),
-            dst_mamba_layouts=self._disagg_mamba_layouts(self.disagg_instance_layouts),
+            dst_mamba_layouts=self._disagg_instance_mamba_layouts,
         )
         if recv is None:
             # No KV to receive (shouldn't happen header-free): admit directly.
