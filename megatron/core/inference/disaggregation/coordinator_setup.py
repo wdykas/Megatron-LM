@@ -133,6 +133,16 @@ def configure_prebuilt_disagg_engine(
     """
     total_instances = sum(s.dp for s in specs)
     _validate_disagg_specs(specs)  # role-layout checks
+    # Disaggregation requires prefix caching: the decode side admits the
+    # handed-off KV via a prefix-cache hit (import registers the block hashes).
+    # Without it the imported blocks aren't matched and decode silently
+    # re-prefills, wasting the hand-off.
+    ctx = getattr(engine, "context", None)
+    if ctx is not None:
+        assert getattr(ctx, "enable_prefix_caching", False), (
+            "disaggregation requires prefix caching (enable_prefix_caching=True); "
+            "the decode side admits handed-off KV via a prefix-cache hit."
+        )
     rank = dist.get_rank()
 
     # Locate this rank's shard. Shard windows are contiguous (tp*pp*dp ranks

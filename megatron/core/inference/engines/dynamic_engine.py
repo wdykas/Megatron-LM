@@ -472,6 +472,10 @@ class DynamicInferenceEngine(AbstractEngine):
         # across MP ranks since coordinator messages are TP-broadcast).
         self._disagg_pending_sends = {}  # request_id -> PrefillHandoff
         self._disagg_pending_recvs = {}  # request_id -> (DecodeRecv, prompt, sampling_params)
+        # Depth window bounding concurrent in-flight hand-offs (and thus the
+        # extra staged-KV memory): now that transfers are async, block on the
+        # oldest once this many are in flight so prefill can't outrun decode.
+        self._disagg_max_inflight = 8
 
     def set_disaggregation_config(
         self, *, role, instance_layouts, identity, total_instances,
@@ -503,6 +507,8 @@ class DynamicInferenceEngine(AbstractEngine):
             self._disagg_pending_sends = {}
         if not hasattr(self, "_disagg_pending_recvs"):
             self._disagg_pending_recvs = {}
+        if not hasattr(self, "_disagg_max_inflight"):
+            self._disagg_max_inflight = 8
         self.disagg_role = role
         self.disagg_instance_layouts = instance_layouts
         self.disagg_identity = identity
@@ -571,6 +577,14 @@ class DynamicInferenceEngine(AbstractEngine):
         the engine step."""
         from megatron.core.inference.disaggregation.kv_transfer import send_request_kv_resharded
 
+        # Backpressure: block on the oldest in-flight send once the window is
+        # full, so prefill doesn't run arbitrarily far ahead of decode. The
+        # pending set is identical across MP ranks (TP-broadcast messages), so
+        # the drain decision is collective.
+        while len(self._disagg_pending_sends) >= self._disagg_max_inflight:
+            oldest = next(iter(self._disagg_pending_sends))
+            self._disagg_pending_sends.pop(oldest).wait()
+
         staged = self._disagg_staged_kv.pop(request_id, None)
         handoff = send_request_kv_resharded(
             self, request_id, self._disagg_my_layout(),
@@ -593,6 +607,14 @@ class DynamicInferenceEngine(AbstractEngine):
         from megatron.core.inference.disaggregation.kv_transfer import (
             post_recv_request_kv_resharded,
         )
+
+        # Backpressure: complete + admit the oldest in-flight receive once the
+        # window is full (collective: identical pending set across MP ranks).
+        while len(self._disagg_pending_recvs) >= self._disagg_max_inflight:
+            oldest = next(iter(self._disagg_pending_recvs))
+            rv, p, sp = self._disagg_pending_recvs.pop(oldest)
+            rv.finish(self)
+            self.add_request(oldest, p, sampling_params=SamplingParams.deserialize(sp))
 
         recv = post_recv_request_kv_resharded(
             self, self._disagg_my_layout(),
