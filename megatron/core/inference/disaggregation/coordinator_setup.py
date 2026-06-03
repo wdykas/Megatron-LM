@@ -92,11 +92,23 @@ def disagg_refit_pools(inference_shards, world_size: int, rank: int = None) -> T
     raise RuntimeError(f"rank {rank} not in any disagg shard window")
 
 
-def _global_kv_dims(engine) -> Tuple[int, int]:
-    """Global (num_layers, KV-head count) read off the built engine's model
-    config. KV heads = num_query_groups for GQA, else num_attention_heads."""
+def _global_kv_dims(engine, pg) -> Tuple[int, int]:
+    """Global (num_layers, KV-head count) for the *attention* KV cache.
+
+    num_layers is the number of attention layers in the KV cache -- NOT
+    ``cfg.num_layers``: a hybrid Mamba-attention model's ``cfg.num_layers``
+    counts Mamba layers too, but only attention layers have a KV cache, so
+    using the total would make the reshard plan span layers the cache doesn't
+    have (mismatched transfers -> NCCL abort on the hand-off). Read the local
+    attention-layer count off the context's ``memory_buffer`` (shape
+    ``(2, local_layers, ...)``) and scale to global by the PP size. KV heads =
+    num_query_groups for GQA, else num_attention_heads.
+    """
     cfg = engine.controller.model_config
     num_heads = getattr(cfg, "num_query_groups", None) or cfg.num_attention_heads
+    mb = getattr(getattr(engine, "context", None), "memory_buffer", None)
+    if mb is not None:
+        return int(mb.shape[1]) * get_pg_size(pg.pp), num_heads
     return cfg.num_layers, num_heads
 
 
@@ -188,7 +200,7 @@ def configure_prebuilt_disagg_engine(
     assert my_spec is not None, f"rank {rank} not in any disagg shard window"
     role = my_spec.role
 
-    num_layers, num_heads = _global_kv_dims(engine)
+    num_layers, num_heads = _global_kv_dims(engine, pg)
     dp_rank = get_pg_rank(pg.dp)
     my_layout = asdict(layout_from_pg_collection(pg, num_layers, num_heads))
     # Hybrid models: attach this rank's Mamba shard layout so conv/ssm state can
