@@ -366,6 +366,16 @@ def swap_model_weights(
     for pool in range(num_dst_pools):
         target = target_model if pool == dst_pool_index else None
 
+        # Multi-pool: the plan-build is collective (gather_object), but the cache
+        # key for a source-only rank (target=None -> dst_config=None) is constant
+        # across passes. Without clearing, a rank that was source-only in an
+        # earlier pass cache-hits and SKIPS the collective while target ranks
+        # MISS and call it -> ranks desync and deadlock (seen with multiple
+        # identical-layout pools). Clear so every rank rebuilds this pass's plan
+        # in lockstep. Cheap: multi-pool refit runs once per rollout.
+        if num_dst_pools > 1:
+            clear_plan_cache()
+
         # Auto-resolve MXFP8 transform from the cached plan when no explicit
         # transform was provided (re-resolved per pool: the target differs).
         pass_transform = transform
