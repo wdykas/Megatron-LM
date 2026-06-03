@@ -251,7 +251,12 @@ class DecodeRecv:
                 "conv_states_tensor": self.mamba_conv,
                 "ssm_states_tensor": self.mamba_ssm,
             }
-        return engine.context.import_request_kv(payload)
+        # import_request_kv writes the received KV into the cache + block
+        # bookkeeping (inference tensors), but runs from the engine's message
+        # loop (schedule_requests), outside the inference_mode the model step
+        # uses -- re-enter it so the in-place writes are permitted.
+        with torch.inference_mode():
+            return engine.context.import_request_kv(payload)
 
 
 def post_recv_request_kv_resharded(

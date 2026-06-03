@@ -524,14 +524,22 @@ class DynamicInferenceEngine(AbstractEngine):
         self._disagg_my_mamba_layout = next(
             (m for m in self._disagg_instance_mamba_layouts if m.global_rank == rank), None
         )
+        # The prefill controller stages each finished request's KV into the
+        # context (while the slot is still valid) -- the engine's finish loop
+        # runs after the context has freed the slot. _disagg_send_kv drains it.
+        if self.context is not None:
+            self.context.disagg_stage_prefill_kv = role == "prefill"
+            self.context.disagg_staged_kv = {}
 
     def _disagg_init_state(self):
         """Per-request KV hand-off state. Called from ``__init__`` and from
         :meth:`set_disaggregation_config` (so engine doubles that skip
         ``__init__`` still get it).
 
-        - ``_disagg_staged_kv``: prefill holds each finished request's exported
-          KV here until SEND_KV.
+        Prefill KV staging lives on the context (``context.disagg_staged_kv``,
+        populated by the controller before the slot is freed); _disagg_send_kv
+        drains it. This holds only the in-flight transfer state:
+
         - ``_disagg_pending_{sends,recvs}``: in-flight transfers, completed one
           step later in :meth:`_disagg_complete_pending` (collective across MP
           ranks since coordinator messages are TP-broadcast), so the transfer
@@ -539,7 +547,6 @@ class DynamicInferenceEngine(AbstractEngine):
         - ``_disagg_max_inflight``: depth window bounding concurrent hand-offs
           (and staged-KV memory) so prefill can't outrun decode.
         """
-        self._disagg_staged_kv = {}
         self._disagg_backend = None  # lazily-created KV transport backend
         self._disagg_pending_sends = {}  # request_id -> PrefillHandoff
         self._disagg_pending_recvs = {}  # request_id -> (DecodeRecv, prompt, sampling_params)
@@ -582,7 +589,7 @@ class DynamicInferenceEngine(AbstractEngine):
             oldest = next(iter(self._disagg_pending_sends))
             self._disagg_pending_sends.pop(oldest).wait()
 
-        staged = self._disagg_staged_kv.pop(request_id, None)
+        staged = self.context.disagg_staged_kv.pop(request_id, None)
         handoff = send_request_kv_resharded(
             self, request_id, self._disagg_my_layout,
             self._disagg_instance_kv_layouts,
@@ -862,7 +869,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.zmq_context, process_group=None, hostname=hostname
             )
 
-        if launch_inference_coordinator and self.is_dp_coordinator:
+        if launch_inference_coordinator and should_spawn:
             await await_process_call(
                 coordinator_ready_event.wait, self.inference_coordinator_process
             )
@@ -1464,15 +1471,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
                     request.add_event_finish()
-                    if self.disagg_role == "prefill":
-                        # Prefill-only: capture this rank's KV shard now, while
-                        # the request's blocks are still allocated (they're
-                        # freed on pop below). Held until the coordinator's
-                        # SEND_KV names the decode target. export returns a
-                        # copy, so it survives the free.
-                        staged = self.context.export_request_kv(request_id)
-                        if staged is not None:
-                            self._disagg_staged_kv[request_id] = staged
+                    # Prefill-only disagg: the request's KV was staged by the
+                    # controller before the context freed its slot (see
+                    # disagg_stage_prefill_kv); _disagg_send_kv drains it on
+                    # SEND_KV. Nothing to capture here.
                     finished_entry = self.requests.pop(request_id)
                     finished_request = finished_entry.record[-1]
                     finished_request.generated_length = len(finished_request.generated_tokens)

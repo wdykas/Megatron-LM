@@ -3850,8 +3850,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             return None
         return int(matches[0, 0].item())
 
-    def export_request_kv(self, request_id: int) -> Optional[Dict[str, Any]]:
+    def export_request_kv(
+        self, request_id: int, internal_idx: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
         """Stage a request's KV (and Mamba state) for off-GPU transfer.
+
+        ``internal_idx`` overrides the request_id->slot reverse lookup -- the
+        caller passes the still-valid slot when exporting *before* the slot is
+        recycled (the disaggregation prefill hand-off stages here, since the
+        context frees the slot during the step before the engine's finish loop).
 
         Returns ``None`` when the request is unknown, has no KV blocks,
         or uses the MLA latent cache (which we don't yet support).
@@ -3871,7 +3878,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         if getattr(self, "cache_mla_latent", False):
             return None
 
-        internal_idx = self._resolve_internal_request_slot(request_id)
+        if internal_idx is None:
+            internal_idx = self._resolve_internal_request_slot(request_id)
         if internal_idx is None:
             return None
 

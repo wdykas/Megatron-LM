@@ -1668,6 +1668,19 @@ class TextGenerationController:
                 if valid:
                     finished_routing_block_ids[req_id] = valid
 
+        # Disaggregation (prefill engine): capture each finished request's KV
+        # shard now, while its slot is still valid -- update_requests below frees
+        # the slot during the step, before the engine's finish loop runs, so the
+        # request_id->slot lookup there would miss. Held until the coordinator's
+        # SEND_KV names the decode target.
+        if getattr(context, "disagg_stage_prefill_kv", False) and finished_idxs.numel() > 0:
+            staged_kv = context.disagg_staged_kv
+            for fidx in finished_idxs.tolist():
+                req_id = int(context.request_ids[fidx].item())
+                payload = context.export_request_kv(req_id, internal_idx=int(fidx))
+                if payload is not None:
+                    staged_kv[req_id] = payload
+
         # Clone needed: update_requests mutates next_tokens in-place via tensor_swap,
         # which would corrupt the reused buffer.
         new_sample_copy = sampled_tokens_cpu.clone()
