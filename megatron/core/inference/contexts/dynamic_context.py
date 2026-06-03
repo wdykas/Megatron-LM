@@ -3827,25 +3827,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             'max_requests': int(self.max_requests),
         }
 
-    # ------------------------------------------------------------------
-    # Disaggregated-serving hooks
-    #
-    # The two methods below extract a request's KV blocks from this
-    # context's GPU buffer into a contiguous staging tensor, and inject
-    # such a payload back into a fresh request on a peer worker. They
-    # exist so a Dynamo (or other framework) prefill→decode pipeline can
-    # ship KV over an RDMA transport (NIXL, etc.) without re-running
-    # prefill on the decode peer.
-    #
-    # Constraints (v1):
-    #   * standard attention only; MLA latent caches and Mamba states
-    #     fall through to the existing prefix-cache + re-prefill path.
-    #   * the staging buffer is sized per request and lives only for the
-    #     duration of one export/import — no pool, no double-buffering.
-    #   * the caller is responsible for ensuring both peers run the same
-    #     model topology (layer count, head dim, dtype) so the staging
-    #     shape matches.
-    # ------------------------------------------------------------------
+    # --- Disaggregated KV export / import (prefill -> decode handoff) ---
 
     def _resolve_internal_request_slot(self, request_id: int) -> Optional[int]:
         """Reverse-lookup the engine-internal slot index for ``request_id``.
