@@ -3903,6 +3903,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             block_hashes = [-1] * block_count
 
+        # Wire-format tag for the staged payload (versioned). The importer
+        # checks it before reading the bytes, so an external consumer -- e.g. a
+        # Dynamo prefill/decode pipeline shipping this payload over NIXL --
+        # interops on the KV format by this tag, and a format change bumps the
+        # version (std_attn_v2/...) instead of silently mis-reading.
         layout = "std_attn_v1"
         mamba_payload: Optional[Dict[str, Any]] = None
 

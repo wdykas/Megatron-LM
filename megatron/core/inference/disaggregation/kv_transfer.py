@@ -22,13 +22,14 @@ logger = logging.getLogger(__name__)
 def derive_decode_schema(engine: Any, prompt_token_ids) -> Optional[dict]:
     """Reconstruct the KV schema on the decode side with no control message.
 
-    Returns the same metadata dict :func:`_build_metadata` produces, but
-    computed locally from the engine's static config + the prompt tokens
-    the decode worker already holds. Returns ``None`` for the MLA latent
-    cache (not header-free in this MR; use ``header_free=False``).
+    Header-free: the metadata (tensor shapes/dtypes, block count, optional
+    Mamba dims) is computed locally from the engine's static config + the prompt
+    tokens the decode worker already holds, so only KV tensors cross the wire --
+    no descriptor header. Returns ``None`` for the MLA latent cache, which isn't
+    derivable this way; MLA disaggregation is unsupported.
 
-    Assumes a homogeneous, fresh prefill: ``block_count`` and the
-    snapshot count follow directly from the prompt length and block size.
+    Assumes a homogeneous, fresh prefill: ``block_count`` and the snapshot count
+    follow directly from the prompt length and block size.
     """
     from megatron.core.inference.inference_request import compute_block_hashes_batched
 
