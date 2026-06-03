@@ -404,6 +404,23 @@ def build_centralized_reshard_plan(
             dst_rank_params = dst_param_metadata_by_rank.get(dst_rank, {})
             for resolved_name, dst_metadata in dst_rank_params.items():
                 src_meta_list = src_param_metadata.get(resolved_name)
+                if not src_meta_list and resolved_name.endswith("output_layer.weight"):
+                    # Tied embeddings: the source shares the output projection with
+                    # the input embedding, so it exposes no separate
+                    # output_layer.weight. This shows up when the destination
+                    # splits embedding and output across pipeline stages (which
+                    # forces a distinct output_layer.weight) while the source does
+                    # not -- e.g. a pp=1 (tied) -> pp=2 reshard. Source it from the
+                    # embedding weight instead (identical shape + vocab/TP shard);
+                    # the same source tensor then feeds both the destination
+                    # embedding and output_layer.
+                    for emb_name in (
+                        "embedding.word_embeddings.weight",
+                        "word_embeddings.weight",
+                    ):
+                        src_meta_list = src_param_metadata.get(emb_name)
+                        if src_meta_list:
+                            break
                 if not src_meta_list:
                     raise RuntimeError(
                         f"Destination parameter '{resolved_name}' on rank {dst_rank} "
