@@ -278,15 +278,20 @@ def create_unified_mempool() -> "MemPool":
         )
     else:
         try:
-            return MemPool(allocator=_alloc)
+            pool = MemPool(allocator=_alloc)
+            # torch.cuda.MemPool can't coexist with the expandable-segments
+            # allocator (PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True, which
+            # train_grpo sets), but the failure only surfaces on the first
+            # allocation into the pool, not at construction. Probe with a tiny
+            # allocation now so the incompatibility is detected here and the
+            # caller falls back to non-UVM allocation instead of crashing
+            # mid-buffer-setup (hit with the 12B hybrid model).
+            with torch.cuda.use_mem_pool(pool):
+                _ = torch.empty(1, dtype=torch.uint8, device="cuda")
+            return pool
         except RuntimeError as e:
-            # torch.cuda.MemPool refuses to coexist with the expandable-segments
-            # allocator (PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True), and a
-            # large model can create expandable segments during load before we get
-            # here. Surface it as UnifiedMemoryUnsupportedError so the caller falls
-            # back to non-UVM allocation instead of crashing.
             raise UnifiedMemoryUnsupportedError(
-                "Could not create the UVM mempool (likely PYTORCH_CUDA_ALLOC_CONF="
+                "UVM mempool unusable (likely PYTORCH_CUDA_ALLOC_CONF="
                 "expandable_segments:True, which torch.cuda.MemPool does not support): "
                 + str(e)
             ) from e
