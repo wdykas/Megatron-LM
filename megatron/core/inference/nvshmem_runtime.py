@@ -1,21 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Shared NVSHMEM runtime layer.
-
-Process-wide NVSHMEM init (one PE identity per rank), symmetric pool
-builders, and the ``put_signal`` / ``signal_wait`` wrappers used by
-every NVSHMEM-based transport. The two transports built on top —
-:mod:`migration_transport` (bulk request state) and
-:mod:`activation_transport` (per-layer hidden states) — own their
-own pools, streams, and addressing; this module owns only the bits
-they share.
-
-KV / Mamba buffers and activation slots must themselves live on the
-symmetric heap (allocated via :func:`nvshmem.core.interop.torch.bytetensor`
-or the like) so that put_signal can write them directly. That means
-:func:`maybe_init_nvshmem` must run *before* engine construction; both
-transports' own init functions call this first as a hard prerequisite.
-"""
+"""Shared NVSHMEM runtime: process-wide init, symmetric-heap pool builders, and
+the ``put_signal`` / ``signal_wait`` wrappers used by every NVSHMEM transport."""
 
 from __future__ import annotations
 
