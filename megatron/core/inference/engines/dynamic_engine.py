@@ -270,6 +270,26 @@ class DynamicInferenceEngine(AbstractEngine):
         # Mark the inference engine as active. Cleared in `suspend()` and re-set in `resume()`.
         InferenceMode.set_active()
 
+        # Disaggregation config (None role => normal aggregated engine). Set via
+        # set_disaggregation_config() before start_listening_to_data_parallel_coordinator.
+        # Lives here (not create_cuda_graphs, which early-returns when cuda graphs
+        # are disabled -- e.g. hybrid models -- and re-runs on recapture) so every
+        # engine always has it.
+        self.disagg_role = None
+        self.disagg_instance_layouts = None
+        self.disagg_identity = None
+        self.disagg_total_instances = None
+        self.disagg_world_group = None
+        self.disagg_spawn_coordinator = False
+        self.disagg_router_name = "round_robin"  # routing policy the coordinator resolves
+        # Immutable per-rank/instance layouts, precomputed in
+        # set_disaggregation_config (None/empty until then).
+        self._disagg_my_layout = None
+        self._disagg_my_mamba_layout = None
+        self._disagg_instance_kv_layouts = []
+        self._disagg_instance_mamba_layouts = []
+        self._disagg_init_state()
+
         # Create cuda graphs.
         self.create_cuda_graphs()
 
@@ -461,23 +481,6 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
         self.capture_stats = capture_stats
-
-        # Disaggregation config (None role => normal aggregated engine). Set via
-        # set_disaggregation_config() before start_listening_to_data_parallel_coordinator.
-        self.disagg_role = None
-        self.disagg_instance_layouts = None
-        self.disagg_identity = None
-        self.disagg_total_instances = None
-        self.disagg_world_group = None
-        self.disagg_spawn_coordinator = False
-        self.disagg_router_name = "round_robin"  # routing policy the coordinator resolves
-        # Immutable per-rank/instance layouts, precomputed in
-        # set_disaggregation_config (None/empty until then).
-        self._disagg_my_layout = None
-        self._disagg_my_mamba_layout = None
-        self._disagg_instance_kv_layouts = []
-        self._disagg_instance_mamba_layouts = []
-        self._disagg_init_state()
 
     def set_disaggregation_config(
         self, *, role, instance_layouts, identity, total_instances,
