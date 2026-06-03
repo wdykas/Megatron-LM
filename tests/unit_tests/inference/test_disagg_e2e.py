@@ -79,7 +79,7 @@ class _FakeEng:
 
 
 def _make_layout(rank, world):
-    from megatron.core.inference.disaggregation.kv_shard_layout import KVShardLayout
+    from megatron.core.inference.disaggregation.kv_reshard import KVShardLayout
 
     if world == 3:
         # hetero: prefill TP2 {0,1} -> decode TP1 {2} (exercises head merge)

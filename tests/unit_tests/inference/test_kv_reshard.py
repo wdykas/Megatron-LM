@@ -15,7 +15,7 @@ import itertools
 import pytest
 import torch
 
-from megatron.core.inference.disaggregation.kv_shard_layout import (
+from megatron.core.inference.disaggregation.kv_reshard import (
     KVShardLayout,
     is_matched,
     plan_kv_reshard,

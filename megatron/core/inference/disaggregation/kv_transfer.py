@@ -19,87 +19,6 @@ from megatron.core.inference.disaggregation.transfer_backends.base import (
 logger = logging.getLogger(__name__)
 
 
-# Tensor wire order. Each entry: (top_key, sub_key_or_None, tensor_field).
-# ``sub`` None means the tensor lives directly under the payload's
-# ``mamba_payload``; otherwise under ``mamba_payload[sub]``.
-def _tensor_slots(meta: dict) -> List[tuple]:
-    slots = [("attn", None)]
-    if meta.get("has_mamba"):
-        slots.append(("mamba_conv", None))
-        slots.append(("mamba_ssm", None))
-        if meta.get("has_snapshots"):
-            slots.append(("snap_conv", "snapshots"))
-            slots.append(("snap_ssm", "snapshots"))
-    return slots
-
-
-def _build_metadata(payload: dict) -> dict:
-    """Strip tensors out of an export payload into a picklable metadata
-    dict carrying shapes/dtypes so the receiver can allocate buffers."""
-    meta: dict = {
-        "layout": payload["layout"],
-        "block_count": payload["block_count"],
-        "block_size_tokens": payload["block_size_tokens"],
-        "num_layers": payload["num_layers"],
-        "num_heads_per_partition": payload.get("num_heads_per_partition"),
-        "hidden_per_head": payload.get("hidden_per_head"),
-        "block_hashes": list(payload.get("block_hashes") or []),
-        "attn_shape": tuple(payload["staging_tensor"].shape),
-        "attn_dtype": payload["staging_tensor"].dtype,
-        "has_mamba": False,
-        "has_snapshots": False,
-    }
-    mp = payload.get("mamba_payload")
-    if mp is not None:
-        meta["has_mamba"] = True
-        meta["mamba"] = {
-            "num_mamba_layers": mp["num_mamba_layers"],
-            "conv_shape": tuple(mp["conv_states_tensor"].shape),
-            "conv_dtype": mp["conv_states_tensor"].dtype,
-            "ssm_shape": tuple(mp["ssm_states_tensor"].shape),
-            "ssm_dtype": mp["ssm_states_tensor"].dtype,
-        }
-        snaps = mp.get("snapshots")
-        if snaps is not None:
-            meta["has_snapshots"] = True
-            meta["snapshots"] = {
-                "block_hashes": list(snaps.get("block_hashes") or []),
-                "conv_shape": tuple(snaps["conv_states_tensor"].shape),
-                "conv_dtype": snaps["conv_states_tensor"].dtype,
-                "ssm_shape": tuple(snaps["ssm_states_tensor"].shape),
-                "ssm_dtype": snaps["ssm_states_tensor"].dtype,
-            }
-    return meta
-
-
-def _ordered_tensors(payload: dict, meta: dict) -> List[torch.Tensor]:
-    out = [payload["staging_tensor"]]
-    if meta["has_mamba"]:
-        mp = payload["mamba_payload"]
-        out.append(mp["conv_states_tensor"])
-        out.append(mp["ssm_states_tensor"])
-        if meta["has_snapshots"]:
-            out.append(mp["snapshots"]["conv_states_tensor"])
-            out.append(mp["snapshots"]["ssm_states_tensor"])
-    return out
-
-
-def _slot_shape_dtype(meta: dict, idx: int):
-    slots = _tensor_slots(meta)
-    name, _ = slots[idx]
-    if name == "attn":
-        return meta["attn_shape"], meta["attn_dtype"]
-    if name == "mamba_conv":
-        return meta["mamba"]["conv_shape"], meta["mamba"]["conv_dtype"]
-    if name == "mamba_ssm":
-        return meta["mamba"]["ssm_shape"], meta["mamba"]["ssm_dtype"]
-    if name == "snap_conv":
-        return meta["snapshots"]["conv_shape"], meta["snapshots"]["conv_dtype"]
-    if name == "snap_ssm":
-        return meta["snapshots"]["ssm_shape"], meta["snapshots"]["ssm_dtype"]
-    raise KeyError(name)
-
-
 def derive_decode_schema(engine: Any, prompt_token_ids) -> Optional[dict]:
     """Reconstruct the KV schema on the decode side with no control message.
 
@@ -223,7 +142,7 @@ def send_request_kv_resharded(
     from the live context -- used by the coordinator-native path, which
     exports + holds the KV at prefill completion and ships it later on SEND_KV.
     """
-    from megatron.core.inference.disaggregation.kv_shard_layout import (
+    from megatron.core.inference.disaggregation.kv_reshard import (
         plan_kv_reshard,
         transfers_for_src,
     )
@@ -356,7 +275,7 @@ def post_recv_request_kv_resharded(
     :class:`DecodeRecv` to complete later. For hybrid models the conv/ssm
     sub-blocks are posted too (Mamba layouts supplied). Header-free (schema from
     config + prompt). Returns ``None`` if there is no KV to receive."""
-    from megatron.core.inference.disaggregation.kv_shard_layout import (
+    from megatron.core.inference.disaggregation.kv_reshard import (
         plan_kv_reshard,
         transfers_for_dst,
     )
@@ -456,150 +375,3 @@ def recv_request_kv_resharded(
     if recv is None:
         return None
     return recv.finish(engine)
-
-
-def _send_object(obj, dst: int, group) -> None:
-    import torch.distributed as dist
-
-    dist.send_object_list([obj], dst=dst, group=group)
-
-
-def _recv_object(src: int, group):
-    import torch.distributed as dist
-
-    holder = [None]
-    dist.recv_object_list(holder, src=src, group=group)
-    return holder[0]
-
-
-def send_request_kv(
-    engine: Any,
-    request_id: int,
-    dst: int,
-    *,
-    backend: Optional[KVTransportBackend] = None,
-    group: Optional[object] = None,
-    base_tag: int = 0,
-    header_free: bool = True,
-) -> Optional[PrefillHandoff]:
-    """Prefill side: stage ``request_id``'s KV and ship it to ``dst``.
-
-    Non-blocking on the data plane: returns a :class:`PrefillHandoff`
-    whose ``wait()`` the caller can defer (e.g. until after the next
-    engine step).
-
-    With ``header_free=True`` (default) no metadata is sent -- the
-    decode side reconstructs the schema from config + prompt; only the
-    KV tensors go on the wire. With ``header_free=False`` a metadata
-    object is sent first (the fallback for one-sided / hetero cases).
-
-    Returns ``None`` if the request has no exportable KV (zero-length /
-    MLA): in ``header_free`` mode this raises, since the contract is
-    that a valid KV exists; in object mode it signals the decode side.
-    """
-    backend = backend or get_kv_transport_backend()
-    payload = engine.context.export_request_kv(request_id)
-    if payload is None:
-        if header_free:
-            raise ValueError(
-                f"send_request_kv(header_free=True): request {request_id} has no "
-                "exportable KV (MLA / zero-length). Use header_free=False or "
-                "re-prefill on the decode side."
-            )
-        _send_object({"empty": True}, dst, group)  # signal nothing to receive
-        return None
-
-    meta = _build_metadata(payload)
-    meta["empty"] = False
-    if not header_free:
-        _send_object(meta, dst, group)  # control plane (small, blocking)
-
-    tensors = _ordered_tensors(payload, meta)
-    handles = [
-        backend.send(t, dst=dst, tag=base_tag + i) for i, t in enumerate(tensors)
-    ]
-    return PrefillHandoff(handles=handles, keepalive=tensors)
-
-
-def recv_request_kv(
-    engine: Any,
-    src: int,
-    *,
-    backend: Optional[KVTransportBackend] = None,
-    group: Optional[object] = None,
-    base_tag: int = 0,
-    device: Optional[torch.device] = None,
-    header_free: bool = True,
-    prompt_token_ids=None,
-) -> Optional[dict]:
-    """Decode side: receive a request's KV from ``src`` and import it.
-
-    With ``header_free=True`` (default) the schema is derived locally
-    from config + ``prompt_token_ids`` (required) -- no control message
-    is received. With ``header_free=False`` the metadata object is
-    received from the prefill side.
-
-    Returns the dict from :meth:`import_request_kv` (``block_ids`` etc.)
-    on success, or ``None`` if the prefill side had nothing to send or
-    the import was refused (caller then re-prefills).
-    """
-    backend = backend or get_kv_transport_backend()
-    if device is None:
-        mb = getattr(engine.context, "memory_buffer", None)
-        device = mb.device if mb is not None else None
-
-    if header_free:
-        if prompt_token_ids is None:
-            raise ValueError(
-                "recv_request_kv(header_free=True) requires prompt_token_ids "
-                "to derive the KV schema."
-            )
-        meta = derive_decode_schema(engine, prompt_token_ids)
-    else:
-        meta = _recv_object(src, group)
-    if meta is None or meta.get("empty", True):
-        return None
-
-    slots = _tensor_slots(meta)
-    handles = []
-    for i in range(len(slots)):
-        shape, dtype = _slot_shape_dtype(meta, i)
-        handles.append(
-            backend.recv(shape, dtype, src=src, tag=base_tag + i, device=device)
-        )
-    recvd = [h.wait() for h in handles]
-
-    # Reassemble the payload import_request_kv expects.
-    payload: dict = {
-        "layout": meta["layout"],
-        "block_count": meta["block_count"],
-        "block_size_tokens": meta["block_size_tokens"],
-        "num_layers": meta["num_layers"],
-        "num_heads_per_partition": meta["num_heads_per_partition"],
-        "hidden_per_head": meta["hidden_per_head"],
-        "block_hashes": list(meta.get("block_hashes") or []),
-        "staging_tensor": recvd[0],
-    }
-    if meta["has_mamba"]:
-        mp = {
-            "num_mamba_layers": meta["mamba"]["num_mamba_layers"],
-            "conv_states_shape": list(meta["mamba"]["conv_shape"]),
-            "ssm_states_shape": list(meta["mamba"]["ssm_shape"]),
-            "conv_states_dtype": str(meta["mamba"]["conv_dtype"]),
-            "ssm_states_dtype": str(meta["mamba"]["ssm_dtype"]),
-            "conv_states_tensor": recvd[1],
-            "ssm_states_tensor": recvd[2],
-        }
-        if meta["has_snapshots"]:
-            mp["snapshots"] = {
-                "block_hashes": list(meta["snapshots"].get("block_hashes") or []),
-                "conv_states_shape": list(meta["snapshots"]["conv_shape"]),
-                "ssm_states_shape": list(meta["snapshots"]["ssm_shape"]),
-                "conv_states_dtype": str(meta["snapshots"]["conv_dtype"]),
-                "ssm_states_dtype": str(meta["snapshots"]["ssm_dtype"]),
-                "conv_states_tensor": recvd[3],
-                "ssm_states_tensor": recvd[4],
-            }
-        payload["mamba_payload"] = mp
-
-    return engine.context.import_request_kv(payload)

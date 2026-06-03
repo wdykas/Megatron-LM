@@ -12,7 +12,7 @@ from typing import Any, List, Tuple
 
 import torch.distributed as dist
 
-from megatron.core.inference.disaggregation.kv_shard_layout import KVShardLayout
+from megatron.core.inference.disaggregation.kv_reshard import KVShardLayout
 from megatron.core.inference.shards_spec import InferenceShardSpec
 from megatron.core.utils import get_pg_rank, get_pg_size
 

@@ -512,7 +512,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
     # --- disaggregated KV handoff (coordinator-driven) -------------------
     def _disagg_layouts(self, dicts):
-        from megatron.core.inference.disaggregation.kv_shard_layout import KVShardLayout
+        from megatron.core.inference.disaggregation.kv_reshard import KVShardLayout
 
         # Strip the optional hybrid ``mamba`` sub-dict; it's a separate layout.
         return [KVShardLayout(**{k: v for k, v in d.items() if k != "mamba"}) for d in dicts]
@@ -520,7 +520,7 @@ class DynamicInferenceEngine(AbstractEngine):
     def _disagg_my_layout(self):
         import torch.distributed as dist
 
-        from megatron.core.inference.disaggregation.kv_shard_layout import KVShardLayout
+        from megatron.core.inference.disaggregation.kv_reshard import KVShardLayout
 
         rank = dist.get_rank()
         for d in self.disagg_instance_layouts:
