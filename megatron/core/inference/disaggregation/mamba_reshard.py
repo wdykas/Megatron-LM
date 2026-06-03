@@ -1,25 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Heterogeneous TP/PP reshard for Mamba conv/ssm state.
-
-Attention KV reshards on a flat ``(layer x head)`` grid. Mamba state shards
-differently (see :mod:`megatron.core.ssm.mamba_mixer`):
-
-- **PP** splits the Mamba layers across stages. Each rank holds a contiguous
-  range of *global* Mamba layers (PP stages are contiguous in global layer
-  order), recovered via a prefix-sum of per-stage layer counts.
-- **TP** splits each layer's channels. The per-layer ``conv`` state is
-  ``(conv_dim_local, d_conv)`` whose channel axis is a concatenation of three
-  independently TP-sharded bands ``[x | B | C]`` of global sizes ``d_inner``,
-  ``ngroups*d_state`` and ``ngroups*d_state``; the per-layer ``ssm`` state is
-  ``(nheads_local, headdim, d_state)`` sharded on the head axis. ``d_inner`` and
-  ``ngroups`` are derivable from the local shapes + ``tp`` (``d_inner =
-  nheads*headdim``), so no extra structural metadata is needed.
-
-The reshard is therefore a per-band range intersection: for each global Mamba
-layer both a source and destination rank touch, and each channel band, move the
-overlapping channel slice.
-"""
+"""Heterogeneous TP/PP reshard of Mamba conv/ssm state between prefill and
+decode shard layouts (the Mamba analog of the attention KV reshard)."""
 
 from __future__ import annotations
 
