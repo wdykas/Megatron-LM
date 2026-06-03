@@ -103,7 +103,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         if is_disagg_rollout(args):
             # Disaggregated rollouts: ``model`` is this rank's prefill/decode shard
             # model (built on its shard groups in setup_model_and_optimizer and
-            # kept fresh by disagg_refit). Tag its role + spawn the shared
+            # kept fresh by the per-pool refit). Tag its role + spawn the shared
             # coordinator (2-hop prefill -> KV -> decode). Same --inference-shards
             # flag as the serving entrypoint; the colocated path is unchanged.
             configure_disagg_engine(inference_engine, model)

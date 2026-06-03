@@ -41,7 +41,8 @@ from megatron.core.transformer.utils import (
     transition_moe_cudagraphs,
 )
 from megatron.core.inference.utils import set_decode_expert_padding
-from megatron.rl.inference.disagg import disagg_refit, is_disagg_rollout
+from megatron.core.inference.disaggregation.coordinator_setup import disagg_refit_pools
+from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.inference.unified_memory import (
     advise_managed_module_parameters_preferred_location,
     prefetch_managed_module_parameters,
@@ -624,10 +625,14 @@ def get_environment_rollouts(
         with nvtx_range("rl/prefetch-weights-to-gpu", time=True):
             inf_core = unwrap_model(inference_model[0])
             _maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
-        disagg_refit(model, inference_model, args.refit_method)
-        if args.rl_verify_model_weights_swap and not is_disagg_rollout(args):
-            # Disagg refits per pool with possibly-different parallelism; the
-            # single train-vs-inference verify below doesn't model that split.
+        num_dst_pools, dst_pool_index = disagg_refit_pools(args.inference_shards, args.world_size)
+        swap_model_weights(
+            model, inference_model, args.refit_method,
+            num_dst_pools=num_dst_pools, dst_pool_index=dst_pool_index,
+        )
+        if args.rl_verify_model_weights_swap and num_dst_pools == 1:
+            # Multi-pool (disagg) refits per pool with possibly-different
+            # parallelism; the single train-vs-inference verify doesn't model it.
             verify_model_weights_swap(
                 train_model=model,
                 inference_model=inference_model,

@@ -211,6 +211,8 @@ from megatron.core.rerun_state_machine import (
     destroy_rerun_state_machine,
     get_rerun_state_machine,
 )
+from megatron.core.inference.disaggregation.coordinator_setup import disagg_refit_pools
+from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
@@ -1264,7 +1266,8 @@ def pretrain(
 
         if is_disagg_rollout(args):
             # Disaggregated rollouts: build this rank's prefill/decode shard model
-            # on its shard groups. disagg_refit keeps it fresh from the policy and
+            # on its shard groups. The per-pool refit (swap_model_weights via
+            # disagg_refit_pools) keeps it fresh from the policy and
             # MegatronLocalServer.launch wraps it + configures the coordinator.
             inference_model = build_disagg_inference_model(
                 args, model_provider, model_type, model_cfg, get_model,
@@ -1436,7 +1439,11 @@ def pretrain(
                 # If separate inference and training models, swap training weights
                 # back to the inference model for RL evaluation.
                 rl_utils._maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
-                rl_utils.disagg_refit(model, inference_model, args.refit_method)
+                num_dst_pools, dst_pool_index = disagg_refit_pools(args.inference_shards, args.world_size)
+                swap_model_weights(
+                    model, inference_model, args.refit_method,
+                    num_dst_pools=num_dst_pools, dst_pool_index=dst_pool_index,
+                )
                 rl_eval_model = inference_model
                 rl_training_model = model
             rl_utils.evaluate_and_print_results_rl(
@@ -3715,7 +3722,13 @@ def train(
                     rl_utils._maybe_prefetch_separate_inference_model_weights(
                         inf_core, to_cpu=False
                     )
-                    rl_utils.disagg_refit(model, inference_model, args.refit_method)
+                    num_dst_pools, dst_pool_index = disagg_refit_pools(
+                        args.inference_shards, args.world_size
+                    )
+                    swap_model_weights(
+                        model, inference_model, args.refit_method,
+                        num_dst_pools=num_dst_pools, dst_pool_index=dst_pool_index,
+                    )
                     rl_eval_model = inference_model
                     rl_training_model = model
                 rl_utils.evaluate_and_print_results_rl(

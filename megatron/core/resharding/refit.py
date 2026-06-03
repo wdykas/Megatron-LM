@@ -326,6 +326,8 @@ def swap_model_weights(
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
     transform: Optional[ReshardTransform] = None,
+    num_dst_pools: int = 1,
+    dst_pool_index: int = 0,
 ):
     """
     Orchestrate weight swap/refit.
@@ -345,6 +347,14 @@ def swap_model_weights(
         transform: Optional ReshardTransform for custom format conversion.
             If None, the cached transform (from prepare_swap_model_weights)
             is used automatically when the receiver needs MXFP8 conversion.
+        num_dst_pools / dst_pool_index: refit into ``num_dst_pools`` disjoint
+            destination pools (e.g. disaggregated prefill/decode instances on
+            separate rank windows). One collective pass per pool, in lockstep
+            across all ranks; this rank receives into ``target_model`` only on
+            its own pool's pass (``pool == dst_pool_index``) and is a pure
+            source (``None`` target) otherwise. Defaults ``(1, 0)`` reproduce
+            the single-destination behavior exactly. Use ``dst_pool_index < 0``
+            for a source-only rank that belongs to no pool.
     """
     if isinstance(refit_method, str):
         service = get_or_create_service(refit_method, group=group)
@@ -353,24 +363,28 @@ def swap_model_weights(
     else:
         raise TypeError("refit_method must be a str backend name or a CopyService instance")
 
-    # Auto-resolve MXFP8 transform from the cached plan when no
-    # explicit transform was provided.
-    if transform is None:
-        src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target_model)
-        plan = _build_or_get_plan(
-            src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset
-        )
-        transform = plan.transform
+    for pool in range(num_dst_pools):
+        target = target_model if pool == dst_pool_index else None
 
-    reshard_model_weights(
-        src_model,
-        target_model,
-        service=service,
-        group=group,
-        src_rank_offset=src_rank_offset,
-        dst_rank_offset=dst_rank_offset,
-        transform=transform,
-    )
+        # Auto-resolve MXFP8 transform from the cached plan when no explicit
+        # transform was provided (re-resolved per pool: the target differs).
+        pass_transform = transform
+        if pass_transform is None:
+            src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target)
+            plan = _build_or_get_plan(
+                src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset
+            )
+            pass_transform = plan.transform
+
+        reshard_model_weights(
+            src_model,
+            target,
+            service=service,
+            group=group,
+            src_rank_offset=src_rank_offset,
+            dst_rank_offset=dst_rank_offset,
+            transform=pass_transform,
+        )
 
 
 def _harmonize_buffer_dtypes(plan, src_core, tgt_core, group=None):

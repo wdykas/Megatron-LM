@@ -4,10 +4,11 @@
 
 Hooks the coordinator-native prefill/decode split into RL's existing separate-
 inference-model lifecycle: build this rank's shard model on its shard groups
-(``build_disagg_inference_model``), refit live policy weights into each pool
-(``disagg_refit``, a drop-in for ``swap_model_weights``), and configure the
-shared coordinator on the engine that wraps it (``configure_disagg_engine``).
-All gated on ``--inference-shards`` declaring ``role=`` tags; off otherwise."""
+(``build_disagg_inference_model``) and configure the shared coordinator on the
+engine that wraps it (``configure_disagg_engine``). Refit into the shard pools
+goes through the core ``swap_model_weights`` (one pass per pool, driven by
+``disagg_refit_pools``). All gated on ``--inference-shards`` declaring ``role=``
+tags; off otherwise."""
 
 import copy
 from contextlib import nullcontext
@@ -21,7 +22,6 @@ from megatron.core.inference.shards_spec import (
     parse_inference_shards_spec,
     spec_declares_disaggregation,
 )
-from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.utils import get_attr_wrapped_model
 from megatron.rl.parallel_utils import build_inference_pg_collection
 
@@ -54,9 +54,10 @@ def build_disagg_inference_model(
     Every rank builds *every* shard's process groups -- ``new_group`` is
     collective, so non-members must call it too -- but instantiates the model
     only on its own shard's groups, at that shard's parallelism. The result is
-    the refit target (see :func:`disagg_refit`) and what the engine wraps (see
-    :func:`configure_disagg_engine`); placing it on the shard groups is the only
-    difference from RL's existing separate-inference-model build.
+    the refit target (``swap_model_weights`` driven by ``disagg_refit_pools``)
+    and what the engine wraps (see :func:`configure_disagg_engine`); placing it
+    on the shard groups is the only difference from RL's existing separate-
+    inference-model build.
 
     ``model_alloc_ctx`` is the weight-allocation context (UVM / saver region for
     idle-offload); the caller supplies the same one the colocated path uses so
@@ -104,30 +105,6 @@ def build_disagg_inference_model(
         )
     model[0].eval()
     return model
-
-
-def disagg_refit(src_model, inference_model, refit_method):
-    """Refit live policy weights into the prefill/decode pools. Drop-in for
-    ``swap_model_weights`` -- identical when disaggregation is off.
-
-    With disagg, each shard is its own collection (possibly at different
-    parallelism), so one collective swap can't target them all. We run one pass
-    per shard window: every rank is a source (training spans the world) but
-    receives only into ``inference_model`` if it belongs to that shard, else
-    passes ``None`` (source-only / idle -- supported by reshard's non-colocated
-    path). The shard ``pg_collection`` already carries global ranks (built with
-    ``rank_offset``), so no rank-offset is needed here.
-    """
-    from megatron.training.global_vars import get_args
-
-    args = get_args()
-    if not is_disagg_rollout(args):
-        swap_model_weights(src_model, inference_model, refit_method)
-        return
-
-    rank = dist.get_rank()
-    for _, _, mine in _iter_shard_windows(_specs(args), rank):
-        swap_model_weights(src_model, inference_model if mine else None, refit_method)
 
 
 def configure_disagg_engine(engine, inference_model, *, disagg_router="round_robin"):
