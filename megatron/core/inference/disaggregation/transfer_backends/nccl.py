@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Optional, Tuple
 
 import torch
+import torch.distributed as dist
 
 from megatron.core.inference.disaggregation.transfer_backends.base import (
     KVTransportBackend,
@@ -31,8 +32,6 @@ class NcclTransportBackend(KVTransportBackend):
         return self._init
 
     def init(self, *, group: Optional[object] = None, **kwargs) -> None:
-        import torch.distributed as dist
-
         if not dist.is_available() or not dist.is_initialized():
             raise RuntimeError(
                 "NcclTransportBackend.init: torch.distributed is not initialized; "
@@ -42,14 +41,9 @@ class NcclTransportBackend(KVTransportBackend):
             self._group = group
         self._init = True
 
-    def _dist(self):
-        import torch.distributed as dist
-
-        return dist
-
     def send(self, tensor: torch.Tensor, dst: int, tag: int = 0) -> TransferHandle:
         t = tensor.contiguous()
-        work = self._dist().isend(t, dst=dst, tag=tag, group=self._group)
+        work = dist.isend(t, dst=dst, tag=tag, group=self._group)
         # Keep a reference to ``t`` so it isn't freed before the send drains.
         return TransferHandle(wait_fn=lambda _t=t, _w=work: _w.wait())
 
@@ -63,5 +57,5 @@ class NcclTransportBackend(KVTransportBackend):
         device: Optional[torch.device] = None,
     ) -> TransferHandle:
         buf = torch.empty(shape, dtype=dtype, device=device)
-        work = self._dist().irecv(buf, src=src, tag=tag, group=self._group)
+        work = dist.irecv(buf, src=src, tag=tag, group=self._group)
         return TransferHandle(wait_fn=work.wait, tensor=buf)

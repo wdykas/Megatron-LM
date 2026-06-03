@@ -17,6 +17,7 @@ from itertools import repeat
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
+import torch.distributed as dist
 from torch import Tensor
 
 from megatron.core.inference.config import KVCacheManagementMode
@@ -29,6 +30,13 @@ from megatron.core.inference.contexts.dynamic_context import (
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
+from megatron.core.inference.disaggregation.kv_reshard import KVShardLayout
+from megatron.core.inference.disaggregation.kv_transfer import (
+    post_recv_request_kv_resharded,
+    send_request_kv_resharded,
+)
+from megatron.core.inference.disaggregation.mamba_reshard import MambaShardLayout
+from megatron.core.inference.disaggregation.transfer_backends.nccl import NcclTransportBackend
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
@@ -522,16 +530,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
     # --- disaggregated KV handoff (coordinator-driven) -------------------
     def _disagg_layouts(self, dicts):
-        from megatron.core.inference.disaggregation.kv_reshard import KVShardLayout
-
         # Strip the optional hybrid ``mamba`` sub-dict; it's a separate layout.
         return [KVShardLayout(**{k: v for k, v in d.items() if k != "mamba"}) for d in dicts]
 
     def _disagg_my_layout(self):
-        import torch.distributed as dist
-
-        from megatron.core.inference.disaggregation.kv_reshard import KVShardLayout
-
         rank = dist.get_rank()
         for d in self.disagg_instance_layouts:
             if d["global_rank"] == rank:
@@ -541,15 +543,9 @@ class DynamicInferenceEngine(AbstractEngine):
     def _disagg_mamba_layouts(self, dicts):
         """MambaShardLayout list for the hybrid dicts that carry a ``mamba``
         sub-dict (empty for non-hybrid models)."""
-        from megatron.core.inference.disaggregation.mamba_reshard import MambaShardLayout
-
         return [MambaShardLayout(**d["mamba"]) for d in dicts if d.get("mamba")]
 
     def _disagg_my_mamba_layout(self):
-        import torch.distributed as dist
-
-        from megatron.core.inference.disaggregation.mamba_reshard import MambaShardLayout
-
         rank = dist.get_rank()
         for d in self.disagg_instance_layouts:
             if d["global_rank"] == rank and d.get("mamba"):
@@ -557,10 +553,6 @@ class DynamicInferenceEngine(AbstractEngine):
         return None  # non-hybrid model
 
     def _disagg_get_backend(self):
-        from megatron.core.inference.disaggregation.transfer_backends.nccl import (
-            NcclTransportBackend,
-        )
-
         if self._disagg_backend is None:
             self._disagg_backend = NcclTransportBackend()
             self._disagg_backend.init()
@@ -579,8 +571,6 @@ class DynamicInferenceEngine(AbstractEngine):
         instance (resharded to its layout). Non-blocking: the send is reaped a
         step later in :meth:`_disagg_complete_pending` so the transfer overlaps
         the engine step."""
-        from megatron.core.inference.disaggregation.kv_transfer import send_request_kv_resharded
-
         # Backpressure: block on the oldest in-flight send once the window is
         # full, so prefill doesn't run arbitrarily far ahead of decode. The
         # pending set is identical across MP ranks (TP-broadcast messages), so
@@ -608,10 +598,6 @@ class DynamicInferenceEngine(AbstractEngine):
         receive is reaped a step later in :meth:`_disagg_complete_pending`, which
         imports the KV (registers the prefix-cache blocks) and admits the
         request -- add_request prefix-hits and continues generation."""
-        from megatron.core.inference.disaggregation.kv_transfer import (
-            post_recv_request_kv_resharded,
-        )
-
         # Backpressure: complete + admit the oldest in-flight receive once the
         # window is full (collective: identical pending set across MP ranks).
         while len(self._disagg_pending_recvs) >= self._disagg_max_inflight:

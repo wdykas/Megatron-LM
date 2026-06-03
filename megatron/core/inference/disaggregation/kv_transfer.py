@@ -10,11 +10,13 @@ from typing import Any, List, Optional
 
 import torch
 
+from megatron.core.inference.disaggregation import kv_reshard, mamba_reshard
 from megatron.core.inference.disaggregation.transfer_backends.base import (
     KVTransportBackend,
     TransferHandle,
     get_kv_transport_backend,
 )
+from megatron.core.inference.inference_request import compute_block_hashes_batched
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +33,6 @@ def derive_decode_schema(engine: Any, prompt_token_ids) -> Optional[dict]:
     Assumes a homogeneous, fresh prefill: ``block_count`` and the snapshot count
     follow directly from the prompt length and block size.
     """
-    from megatron.core.inference.inference_request import compute_block_hashes_batched
 
     ctx = engine.context
     if getattr(ctx, "cache_mla_latent", False):
@@ -143,18 +144,12 @@ def send_request_kv_resharded(
     from the live context -- used by the coordinator-native path, which
     exports + holds the KV at prefill completion and ships it later on SEND_KV.
     """
-    from megatron.core.inference.disaggregation.kv_reshard import (
-        plan_kv_reshard,
-        transfers_for_src,
-    )
 
     backend = backend or get_kv_transport_backend()
     if payload is None:
         payload = engine.context.export_request_kv(request_id)
     if payload is None:
-        raise ValueError(
-            f"send_request_kv_resharded: request {request_id} has no exportable KV"
-        )
+        raise ValueError(f"send_request_kv_resharded: request {request_id} has no exportable KV")
     if payload.get("mamba_payload") is not None and my_mamba_layout is None:
         raise NotImplementedError(
             "hybrid (Mamba) hetero handoff requires Mamba shard layouts; "
@@ -162,8 +157,8 @@ def send_request_kv_resharded(
         )
 
     attn = payload["staging_tensor"]  # [BC, 2, local_layers, BS, local_heads, HD]
-    plan = plan_kv_reshard(src_layouts, dst_layouts)
-    mine = transfers_for_src(plan, my_layout.global_rank)
+    plan = kv_reshard.plan_kv_reshard(src_layouts, dst_layouts)
+    mine = kv_reshard.transfers_for_src(plan, my_layout.global_rank)
     handles: List[TransferHandle] = []
     keep: List[torch.Tensor] = []
     for t in mine:
@@ -176,27 +171,29 @@ def send_request_kv_resharded(
 
     if payload.get("mamba_payload") is not None:
         _send_mamba_resharded(
-            payload["mamba_payload"], my_mamba_layout, src_mamba_layouts, dst_mamba_layouts,
-            backend, base_tag + _MAMBA_TAG_OFFSET, handles, keep,
+            payload["mamba_payload"],
+            my_mamba_layout,
+            src_mamba_layouts,
+            dst_mamba_layouts,
+            backend,
+            base_tag + _MAMBA_TAG_OFFSET,
+            handles,
+            keep,
         )
     return PrefillHandoff(handles=handles, keepalive=keep)
 
 
 def _send_mamba_resharded(mp, my_mamba, src_mamba, dst_mamba, backend, base_tag, handles, keep):
     """Reshard + send this rank's conv/ssm sub-blocks (one per Mamba transfer)."""
-    from megatron.core.inference.disaggregation.mamba_reshard import (
-        plan_mamba_reshard,
-        transfers_for_src,
-    )
 
     conv = mp["conv_states_tensor"]  # (local_layers, conv_dim_local, d_conv)
-    ssm = mp["ssm_states_tensor"]    # (local_layers, nheads_local, headdim, d_state)
-    plan = plan_mamba_reshard(src_mamba, dst_mamba)
-    for t in transfers_for_src(plan, my_mamba.global_rank):
+    ssm = mp["ssm_states_tensor"]  # (local_layers, nheads_local, headdim, d_state)
+    plan = mamba_reshard.plan_mamba_reshard(src_mamba, dst_mamba)
+    for t in mamba_reshard.transfers_for_src(plan, my_mamba.global_rank):
         if t.is_conv:
-            sub = conv[t.src_layer, t.src_lo:t.src_hi, :].contiguous()
+            sub = conv[t.src_layer, t.src_lo : t.src_hi, :].contiguous()
         else:
-            sub = ssm[t.src_layer, t.src_lo:t.src_hi, :, :].contiguous()
+            sub = ssm[t.src_layer, t.src_lo : t.src_hi, :, :].contiguous()
         keep.append(sub)
         handles.append(backend.send(sub, dst=t.dst_rank, tag=t.tag(base_tag)))
 
@@ -240,9 +237,9 @@ class DecodeRecv:
             for t, h in self.mamba_pending:
                 sub = h.wait()
                 if t.is_conv:
-                    self.mamba_conv[t.dst_layer, t.dst_lo:t.dst_hi, :] = sub
+                    self.mamba_conv[t.dst_layer, t.dst_lo : t.dst_hi, :] = sub
                 else:
-                    self.mamba_ssm[t.dst_layer, t.dst_lo:t.dst_hi, :, :] = sub
+                    self.mamba_ssm[t.dst_layer, t.dst_lo : t.dst_hi, :, :] = sub
             ml = self.my_mamba_layout
             payload["layout"] = "hybrid_v1"
             payload["mamba_payload"] = {
@@ -276,10 +273,6 @@ def post_recv_request_kv_resharded(
     :class:`DecodeRecv` to complete later. For hybrid models the conv/ssm
     sub-blocks are posted too (Mamba layouts supplied). Header-free (schema from
     config + prompt). Returns ``None`` if there is no KV to receive."""
-    from megatron.core.inference.disaggregation.kv_reshard import (
-        plan_kv_reshard,
-        transfers_for_dst,
-    )
 
     backend = backend or get_kv_transport_backend()
     meta = derive_decode_schema(engine, prompt_token_ids)
@@ -300,12 +293,18 @@ def post_recv_request_kv_resharded(
         device = mb.device if mb is not None else None
 
     staging = torch.empty(
-        bc, 2, my_layout.local_num_layers(), bs, my_layout.local_num_heads(), hd,
-        dtype=dtype, device=device,
+        bc,
+        2,
+        my_layout.local_num_layers(),
+        bs,
+        my_layout.local_num_heads(),
+        hd,
+        dtype=dtype,
+        device=device,
     )
 
-    plan = plan_kv_reshard(src_layouts, dst_layouts)
-    mine = transfers_for_dst(plan, my_layout.global_rank)
+    plan = kv_reshard.plan_kv_reshard(src_layouts, dst_layouts)
+    mine = kv_reshard.transfers_for_dst(plan, my_layout.global_rank)
     pending = []
     for t in mine:
         n_lay = t.g_layer1 - t.g_layer0
@@ -319,18 +318,22 @@ def post_recv_request_kv_resharded(
     recv = DecodeRecv(meta=meta, staging=staging, pending=pending, my_layout=my_layout)
     if meta["has_mamba"]:
         _post_recv_mamba_resharded(
-            recv, meta, my_mamba_layout, src_mamba_layouts, dst_mamba_layouts,
-            backend, base_tag + _MAMBA_TAG_OFFSET, device,
+            recv,
+            meta,
+            my_mamba_layout,
+            src_mamba_layouts,
+            dst_mamba_layouts,
+            backend,
+            base_tag + _MAMBA_TAG_OFFSET,
+            device,
         )
     return recv
 
 
-def _post_recv_mamba_resharded(recv, meta, my_mamba, src_mamba, dst_mamba, backend, base_tag, device):
+def _post_recv_mamba_resharded(
+    recv, meta, my_mamba, src_mamba, dst_mamba, backend, base_tag, device
+):
     """Allocate the decode conv/ssm buffers + post the Mamba sub-block receives."""
-    from megatron.core.inference.disaggregation.mamba_reshard import (
-        plan_mamba_reshard,
-        transfers_for_dst,
-    )
 
     ml = my_mamba
     conv_dtype = meta["mamba"]["conv_dtype"]
@@ -342,9 +345,9 @@ def _post_recv_mamba_resharded(recv, meta, my_mamba, src_mamba, dst_mamba, backe
     recv.mamba_ssm = torch.zeros(
         ml.num_layers, ml.nheads_local, ml.headdim, ml.d_state, dtype=ssm_dtype, device=device
     )
-    plan = plan_mamba_reshard(src_mamba, dst_mamba)
+    plan = mamba_reshard.plan_mamba_reshard(src_mamba, dst_mamba)
     recv.mamba_pending = []
-    for t in transfers_for_dst(plan, ml.global_rank):
+    for t in mamba_reshard.transfers_for_dst(plan, ml.global_rank):
         if t.is_conv:
             shape = (t.dst_hi - t.dst_lo, ml.d_conv)
             dt = conv_dtype
@@ -370,8 +373,14 @@ def recv_request_kv_resharded(
     """Blocking decode receive: :func:`post_recv_request_kv_resharded` then
     :meth:`DecodeRecv.finish` (post + wait + import) in one call."""
     recv = post_recv_request_kv_resharded(
-        engine, my_layout, src_layouts, dst_layouts, prompt_token_ids,
-        backend=backend, base_tag=base_tag, device=device,
+        engine,
+        my_layout,
+        src_layouts,
+        dst_layouts,
+        prompt_token_ids,
+        backend=backend,
+        base_tag=base_tag,
+        device=device,
     )
     if recv is None:
         return None
