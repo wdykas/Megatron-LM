@@ -4,13 +4,44 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+import abc
+from typing import Callable, Dict, List, Optional, Tuple
 
 PREFILL = "prefill"
 DECODE = "decode"
 
 
-class DisaggRouting:
+class DisaggRouter(abc.ABC):
+    """The routing contract the coordinator delegates to for 2-hop disagg.
+
+    Swap in a different policy (KV-/load-aware, or a Dynamo router) by
+    implementing these five methods and registering the class under a name
+    (:func:`register_disagg_router`); the coordinator resolves it by name so the
+    choice survives the spawn boundary. Implementations hold no sockets and do
+    no I/O -- the coordinator owns the transport."""
+
+    @abc.abstractmethod
+    def register(self, identity, role: str) -> None:
+        """Record an engine + its role (``"prefill"``/``"decode"``)."""
+
+    @abc.abstractmethod
+    def remove(self, identity) -> None:
+        """Drop a disconnected engine."""
+
+    @abc.abstractmethod
+    def route_submit(self, request_id: int):
+        """Hop 1: pick (and remember) the prefill engine for a new request."""
+
+    @abc.abstractmethod
+    def route_prefill_done(self, request_id: int) -> Tuple[object, object]:
+        """Hop 2: pick the decode engine; return ``(prefill_id, decode_id)``."""
+
+    @abc.abstractmethod
+    def forget(self, request_id: int) -> None:
+        """Drop per-request state once the reply has been routed home."""
+
+
+class DisaggRouting(DisaggRouter):
     """Sequences a request prefill-engine -> (KV handoff) -> decode-engine.
 
     Engines are identified by their opaque transport identity (bytes for ZMQ;
@@ -91,3 +122,25 @@ class DisaggRouting:
         dec = self.decode_engines[self._decode_rr % len(self.decode_engines)]
         self._decode_rr += 1
         return dec
+
+
+# --- router registry: resolve by name so the choice survives the coordinator
+# spawn (the coordinator process re-imports modules; a custom router registers
+# itself on import). External frameworks (e.g. Dynamo) register their own.
+_DISAGG_ROUTERS: Dict[str, Callable[[], DisaggRouter]] = {}
+
+
+def register_disagg_router(name: str, factory: Callable[[], DisaggRouter]) -> None:
+    """Register a :class:`DisaggRouter` factory under ``name`` (call at import)."""
+    _DISAGG_ROUTERS[name] = factory
+
+
+def make_disagg_router(name: str = "round_robin") -> DisaggRouter:
+    """Instantiate the router registered under ``name``."""
+    try:
+        return _DISAGG_ROUTERS[name]()
+    except KeyError:
+        raise KeyError(f"unknown disagg router {name!r}; registered: {sorted(_DISAGG_ROUTERS)}")
+
+
+register_disagg_router("round_robin", DisaggRouting)

@@ -120,7 +120,7 @@ class DisaggCoordinatorSetup:
 
 
 def configure_prebuilt_disagg_engine(
-    engine: Any, pg: Any, specs: List[InferenceShardSpec]
+    engine: Any, pg: Any, specs: List[InferenceShardSpec], disagg_router: str = "round_robin"
 ) -> DisaggCoordinatorSetup:
     """Configure an already-built engine for the shared coordinator.
 
@@ -181,6 +181,7 @@ def configure_prebuilt_disagg_engine(
         total_instances=total_instances,
         world_group=None,  # default world group for the cross-shard addr broadcast
         spawn_coordinator=(rank == 0),
+        disagg_router=disagg_router,
     )
     return DisaggCoordinatorSetup(
         role=role, replica_id=replica_id, engine=engine,

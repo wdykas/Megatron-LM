@@ -4,7 +4,48 @@
 
 import pytest
 
-from megatron.core.inference.disaggregation.coordinator_routing import DisaggRouting
+from megatron.core.inference.disaggregation.coordinator_routing import (
+    DisaggRouter,
+    DisaggRouting,
+    make_disagg_router,
+    register_disagg_router,
+)
+
+
+def test_router_registry_and_abc():
+    # Default resolves to the round-robin DisaggRouting (a DisaggRouter).
+    r = make_disagg_router("round_robin")
+    assert isinstance(r, DisaggRouting) and isinstance(r, DisaggRouter)
+    with pytest.raises(KeyError):
+        make_disagg_router("does-not-exist")
+
+    # A custom router registers by name and resolves (the Dynamo-router seam).
+    class _Custom(DisaggRouter):
+        def register(self, identity, role):
+            pass
+
+        def remove(self, identity):
+            pass
+
+        def route_submit(self, request_id):
+            return "p"
+
+        def route_prefill_done(self, request_id):
+            return ("p", "d")
+
+        def forget(self, request_id):
+            pass
+
+    register_disagg_router("custom_test", _Custom)
+    assert isinstance(make_disagg_router("custom_test"), _Custom)
+
+    # The ABC enforces the contract -- a partial implementation can't instantiate.
+    class _Incomplete(DisaggRouter):
+        def register(self, identity, role):
+            pass
+
+    with pytest.raises(TypeError):
+        _Incomplete()
 
 
 def _routing(n_prefill=1, n_decode=2):

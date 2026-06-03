@@ -462,6 +462,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.disagg_total_instances = None
         self.disagg_world_group = None
         self.disagg_spawn_coordinator = False
+        self.disagg_router_name = "round_robin"  # routing policy the coordinator resolves
         # Per-request KV staged on a prefill engine, held until SEND_KV. Keyed
         # by request_id; one staging payload per (this rank's) shard.
         self._disagg_staged_kv = {}
@@ -479,7 +480,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def set_disaggregation_config(
         self, *, role, instance_layouts, identity, total_instances,
-        world_group, spawn_coordinator,
+        world_group, spawn_coordinator, disagg_router="round_robin",
     ):
         """Mark this engine as a disaggregated prefill/decode shard.
 
@@ -495,8 +496,11 @@ class DynamicInferenceEngine(AbstractEngine):
             world_group: process group spanning all disagg ranks (used to
                 broadcast the coordinator address across shards).
             spawn_coordinator: whether THIS rank spawns the single coordinator.
+            disagg_router: name of the routing policy the coordinator resolves
+                (registered via ``register_disagg_router``; default round-robin).
         """
         assert role in ("prefill", "decode")
+        self.disagg_router_name = disagg_router
         # Defensive init (engines built without __init__ -- e.g. test doubles --
         # still get the disagg per-request state).
         if not hasattr(self, "_disagg_staged_kv"):
@@ -765,6 +769,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     "schedule_output_path": coordinator_schedule_output_path,
                     "hostname": hostname,
                     "disaggregated": disagg,
+                    "disagg_router": self.disagg_router_name,
                 },
             )
             self.inference_coordinator_process.start()

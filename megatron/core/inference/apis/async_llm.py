@@ -48,6 +48,7 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         coordinator_host: Optional[str] = None,
         coordinator_port: Optional[int] = None,
         inference_shards=None,
+        disagg_router: str = "round_robin",
     ) -> None:
         # MegatronAsyncLLM requires coordinator mode: direct mode invokes the
         # synchronous ``engine.generate()`` from inside the caller's asyncio
@@ -71,6 +72,7 @@ class MegatronAsyncLLM(_MegatronLLMBase):
             coordinator_host=coordinator_host,
             coordinator_port=coordinator_port,
             inference_shards=inference_shards,
+            disagg_router=disagg_router,
         )
         # Set in serve() when this rank starts the HTTP frontend; consulted by shutdown().
         self._serve_started: bool = False

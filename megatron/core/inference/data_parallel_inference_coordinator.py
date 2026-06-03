@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
-from megatron.core.inference.disaggregation.coordinator_routing import DisaggRouting
+from megatron.core.inference.disaggregation.coordinator_routing import make_disagg_router
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import compute_block_hashes_batched
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
@@ -101,6 +101,7 @@ class DataParallelInferenceCoordinator:
         schedule_output_path: str | None = None,
         hostname: str | None = None,
         disaggregated: bool = False,
+        disagg_router: str = "round_robin",
     ):
         """
         Initializes the inference coordinator.
@@ -181,7 +182,7 @@ class DataParallelInferenceCoordinator:
         # engine identity -> its instance's layout dicts; ``_req_meta`` stashes
         # prompt+sampling per request for the RECV_KV hop.
         self.disaggregated = disaggregated
-        self._disagg = DisaggRouting() if disaggregated else None
+        self._disagg = make_disagg_router(disagg_router) if disaggregated else None
         self._engine_layouts: dict = {}
         self._req_meta: dict = {}
         # time.sleep(5)  # Give data parallel ranks time to spawn and connect.
@@ -718,6 +719,7 @@ class DataParallelInferenceCoordinator:
         schedule_output_path: str | None = None,
         hostname: str | None = None,
         disaggregated: bool = False,
+        disagg_router: str = "round_robin",
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -753,6 +755,7 @@ class DataParallelInferenceCoordinator:
             schedule_output_path=schedule_output_path,
             hostname=hostname,
             disaggregated=disaggregated,
+            disagg_router=disagg_router,
         )
         ready_event.set()
         try:
