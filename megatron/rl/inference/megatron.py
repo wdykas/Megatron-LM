@@ -97,7 +97,16 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
                 "WARNING: Tokenizer has no BOS token so prompt will not have BOS token",
             )
 
+        from megatron.rl.inference.disagg import configure_disagg_engine, is_disagg_rollout
+
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(model=model)
+        if is_disagg_rollout(args):
+            # Disaggregated rollouts: ``model`` is this rank's prefill/decode shard
+            # model (built on its shard groups in setup_model_and_optimizer and
+            # kept fresh by disagg_refit). Tag its role + spawn the shared
+            # coordinator (2-hop prefill -> KV -> decode). Same --inference-shards
+            # flag as the serving entrypoint; the colocated path is unchanged.
+            configure_disagg_engine(inference_engine, model)
         dp_addr = await inference_engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=41521, launch_inference_coordinator=True,
         )
