@@ -7,6 +7,7 @@ from process groups, role-layout validation, global KV dims)."""
 
 from __future__ import annotations
 
+import functools
 from dataclasses import asdict, dataclass
 from typing import Any, List, Tuple
 
@@ -66,9 +67,14 @@ def _validate_disagg_specs(specs: List[InferenceShardSpec]) -> int:
     return sum(s.dp for s in decode)
 
 
+@functools.lru_cache(maxsize=None)
 def disagg_refit_pools(inference_shards, world_size: int, rank: int = None) -> Tuple[int, int]:
     """Map an ``--inference-shards`` spec to ``(num_dst_pools, dst_pool_index)``
     for :func:`~megatron.core.resharding.refit.swap_model_weights`.
+
+    Memoized: the result is a pure function of the (process-constant) spec,
+    world size, and this rank, so callers can invoke it once per rollout without
+    re-parsing the spec each time.
 
     Disaggregated serving refits the source (training) model into each shard's
     inference model -- disjoint rank windows, possibly at different parallelism
