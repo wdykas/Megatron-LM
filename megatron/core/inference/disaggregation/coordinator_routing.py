@@ -89,6 +89,10 @@ class DisaggRouting(DisaggRouter):
 
     def route_submit(self, request_id: int):
         """Hop 1: pick the prefill engine for a newly submitted request."""
+        # TODO: round-robin is not optimal -- it ignores per-engine load (queue
+        # depth / in-flight tokens) and prefix-cache locality. A better policy
+        # would pick the least-loaded prefill, or one that already holds a
+        # matching prompt prefix, instead of cycling blindly.
         if not self.prefill_engines:
             raise RuntimeError("no prefill engines registered")
         ident = self.prefill_engines[self._prefill_rr % len(self.prefill_engines)]
@@ -119,6 +123,11 @@ class DisaggRouting(DisaggRouter):
         self._req_decode.pop(request_id, None)
 
     def _pick_decode(self, request_id: int):
+        # TODO: round-robin is not optimal -- it ignores decode-side load (free
+        # KV blocks / running sequences) and the cost of the KV reshard from the
+        # request's prefill engine to the chosen decode. A better policy would
+        # prefer a decode with capacity and a layout that makes the handoff cheap
+        # (matching/co-located parallelism), rather than cycling blindly.
         dec = self.decode_engines[self._decode_rr % len(self.decode_engines)]
         self._decode_rr += 1
         return dec
