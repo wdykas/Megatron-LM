@@ -190,11 +190,13 @@ from megatron.core.inference.disaggregation.transfer_backends.base import (  # n
 
 
 class _Loopback(KVTransportBackend):
-    """Single-process P2P sim. ``cur`` is the rank currently acting, so
-    sends key by (src,dst,tag) and recvs by (src,cur,tag)."""
+    """Single-process P2P sim matching the production contract: recvs match
+    sends by POST-ORDER per (src, dst) pair, no tags -- exactly how the real
+    backends (NCCL/NVSHMEM ignore tags; gloo is same-tag FIFO) behave. ``cur``
+    is the rank currently acting."""
 
     def __init__(self):
-        self.store = {}
+        self.queues = {}  # (src, dst) -> FIFO of sent tensors
         self.cur = -1
 
     def is_initialized(self):
@@ -204,11 +206,11 @@ class _Loopback(KVTransportBackend):
         pass
 
     def send(self, t, dst, tag=0):
-        self.store[(self.cur, dst, tag)] = t.clone()
+        self.queues.setdefault((self.cur, dst), []).append(t.clone())
         return TransferHandle(wait_fn=None)
 
     def recv(self, shape, dtype, src, tag=0, *, device=None):
-        return TransferHandle(wait_fn=None, tensor=self.store.pop((src, self.cur, tag)))
+        return TransferHandle(wait_fn=None, tensor=self.queues[(src, self.cur)].pop(0))
 
 
 class _FakeCtxShard:

@@ -577,14 +577,6 @@ class DynamicInferenceEngine(AbstractEngine):
             self._disagg_backend.init()
         return self._disagg_backend
 
-    def _disagg_base_tag(self, request_id):
-        """Request-scoped transport tag base, so concurrent in-flight transfers
-        between the same rank pair don't alias on a tag-respecting backend
-        (gloo). NCCL ignores the P2P tag and matches by post-order; the modulus
-        keeps the value within the backend's tag range."""
-        my = self._disagg_my_layout
-        return (request_id % 4096) * (my.num_layers * my.num_heads)
-
     def _disagg_send_kv(self, request_id, dst_layout_dicts):
         """(prefill) post the staged KV for ``request_id`` to the decode
         instance (resharded to its layout). Non-blocking: the send is reaped a
@@ -614,7 +606,6 @@ class DynamicInferenceEngine(AbstractEngine):
             self._disagg_instance_kv_layouts,
             self._disagg_layouts(dst_layout_dicts),
             backend=self._disagg_get_backend(), payload=staged,
-            base_tag=self._disagg_base_tag(request_id),
             my_mamba_layout=self._disagg_my_mamba_layout,
             src_mamba_layouts=self._disagg_instance_mamba_layouts,
             dst_mamba_layouts=self._disagg_mamba_layouts(dst_layout_dicts),
@@ -640,7 +631,6 @@ class DynamicInferenceEngine(AbstractEngine):
             self._disagg_layouts(src_layout_dicts),
             self._disagg_instance_kv_layouts,
             prompt, backend=self._disagg_get_backend(),
-            base_tag=self._disagg_base_tag(request_id),
             my_mamba_layout=self._disagg_my_mamba_layout,
             src_mamba_layouts=self._disagg_mamba_layouts(src_layout_dicts),
             dst_mamba_layouts=self._disagg_instance_mamba_layouts,

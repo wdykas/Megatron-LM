@@ -100,12 +100,6 @@ class MambaTransfer:
     def is_conv(self) -> bool:
         return self.band in _CONV_BANDS
 
-    def tag(self, base: int = 0) -> int:
-        """Deterministic, collision-free tag within one (src,dst) pair: encodes
-        the band, the global layer, and the destination channel offset."""
-        band_id = {"x": 0, "B": 1, "C": 2, "ssm": 3}[self.band]
-        return base + ((self.global_layer * 4 + band_id) << 20) + self.dst_lo
-
 
 def _intersect(a: Tuple[int, int], b: Tuple[int, int]) -> Optional[Tuple[int, int]]:
     lo, hi = max(a[0], b[0]), min(a[1], b[1])

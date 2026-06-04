@@ -108,10 +108,16 @@ class PrefillHandoff:
         self.keepalive.clear()
 
 
-# Tag-space offset so Mamba transfers never collide with attention transfers
-# within a request (NCCL ignores the tag and matches by post-order; gloo/tests
-# respect it).
-_MAMBA_TAG_OFFSET = 1 << 28
+# Transfer matching is by POST-ORDER, not by tag. Every transport backend we
+# use matches a recv to a send by the order they are posted on a (src, dst)
+# pair: NCCL and NVSHMEM ignore the P2P tag entirely, and gloo matches same-tag
+# ops FIFO. So correctness rests on a single invariant: the send side and the
+# recv side enumerate the transfers for each (src, dst) pair in the SAME order.
+# They do -- both iterate the deterministic reshard plan (attention transfers,
+# then Mamba), and the coordinator emits each request's SEND_KV/RECV_KV in a
+# consistent request order, so concurrent in-flight requests stay ordered too.
+# No tags are needed; a new state-bearing layer type just extends the ordered
+# enumeration on both sides.
 
 
 def send_request_kv_resharded(
@@ -123,7 +129,6 @@ def send_request_kv_resharded(
     *,
     backend: Optional[KVTransportBackend] = None,
     group: Optional[object] = None,
-    base_tag: int = 0,
     payload: Optional[dict] = None,
     my_mamba_layout=None,
     src_mamba_layouts: Optional[list] = None,
@@ -166,8 +171,7 @@ def send_request_kv_resharded(
             :, :, t.src_layer_slice(my_layout), :, t.src_head_slice(my_layout), :
         ].contiguous()
         keep.append(sub)
-        tag = t.tag(my_layout.num_layers, my_layout.num_heads, base_tag)
-        handles.append(backend.send(sub, dst=t.dst_rank, tag=tag))
+        handles.append(backend.send(sub, dst=t.dst_rank))
 
     if payload.get("mamba_payload") is not None:
         _send_mamba_resharded(
@@ -176,15 +180,18 @@ def send_request_kv_resharded(
             src_mamba_layouts,
             dst_mamba_layouts,
             backend,
-            base_tag + _MAMBA_TAG_OFFSET,
             handles,
             keep,
         )
     return PrefillHandoff(handles=handles, keepalive=keep)
 
 
-def _send_mamba_resharded(mp, my_mamba, src_mamba, dst_mamba, backend, base_tag, handles, keep):
-    """Reshard + send this rank's conv/ssm sub-blocks (one per Mamba transfer)."""
+def _send_mamba_resharded(mp, my_mamba, src_mamba, dst_mamba, backend, handles, keep):
+    """Reshard + send this rank's conv/ssm sub-blocks (one per Mamba transfer).
+
+    Posted after the attention sends so the recv side, which posts its Mamba
+    receives after its attention receives, matches them in the same post-order.
+    """
 
     conv = mp["conv_states_tensor"]  # (local_layers, conv_dim_local, d_conv)
     ssm = mp["ssm_states_tensor"]  # (local_layers, nheads_local, headdim, d_state)
@@ -195,7 +202,7 @@ def _send_mamba_resharded(mp, my_mamba, src_mamba, dst_mamba, backend, base_tag,
         else:
             sub = ssm[t.src_layer, t.src_lo : t.src_hi, :, :].contiguous()
         keep.append(sub)
-        handles.append(backend.send(sub, dst=t.dst_rank, tag=t.tag(base_tag)))
+        handles.append(backend.send(sub, dst=t.dst_rank))
 
 
 @dataclass
@@ -267,7 +274,6 @@ def post_recv_request_kv_resharded(
     prompt_token_ids,
     *,
     backend: Optional[KVTransportBackend] = None,
-    base_tag: int = 0,
     device: Optional[torch.device] = None,
     my_mamba_layout=None,
     src_mamba_layouts: Optional[list] = None,
@@ -314,9 +320,8 @@ def post_recv_request_kv_resharded(
     for t in mine:
         n_lay = t.g_layer1 - t.g_layer0
         n_head = t.g_head1 - t.g_head0
-        tag = t.tag(my_layout.num_layers, my_layout.num_heads, base_tag)
         h = backend.recv(
-            (bc, 2, n_lay, bs, n_head, hd), dtype, src=t.src_rank, tag=tag, device=device
+            (bc, 2, n_lay, bs, n_head, hd), dtype, src=t.src_rank, device=device
         )
         pending.append((t, h))
 
@@ -329,14 +334,13 @@ def post_recv_request_kv_resharded(
             src_mamba_layouts,
             dst_mamba_layouts,
             backend,
-            base_tag + _MAMBA_TAG_OFFSET,
             device,
         )
     return recv
 
 
 def _post_recv_mamba_resharded(
-    recv, meta, my_mamba, src_mamba, dst_mamba, backend, base_tag, device
+    recv, meta, my_mamba, src_mamba, dst_mamba, backend, device
 ):
     """Allocate the decode conv/ssm buffers + post the Mamba sub-block receives."""
 
@@ -359,7 +363,7 @@ def _post_recv_mamba_resharded(
         else:
             shape = (t.dst_hi - t.dst_lo, ml.headdim, ml.d_state)
             dt = ssm_dtype
-        h = backend.recv(shape, dt, src=t.src_rank, tag=t.tag(base_tag), device=device)
+        h = backend.recv(shape, dt, src=t.src_rank, device=device)
         recv.mamba_pending.append((t, h))
 
 
@@ -372,7 +376,6 @@ def recv_request_kv_resharded(
     *,
     backend: Optional[KVTransportBackend] = None,
     group: Optional[object] = None,
-    base_tag: int = 0,
     device: Optional[torch.device] = None,
 ) -> Optional[dict]:
     """Blocking decode receive: :func:`post_recv_request_kv_resharded` then
@@ -384,7 +387,6 @@ def recv_request_kv_resharded(
         dst_layouts,
         prompt_token_ids,
         backend=backend,
-        base_tag=base_tag,
         device=device,
     )
     if recv is None:

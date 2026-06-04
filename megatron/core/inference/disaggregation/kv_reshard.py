@@ -101,14 +101,6 @@ class ReshardTransfer:
         off = dst.head_range()[0]
         return slice(self.g_head0 - off, self.g_head1 - off)
 
-    def tag(self, num_layers: int, num_heads: int, base: int = 0) -> int:
-        """Deterministic, collision-free tag for this sub-block.
-
-        There is one transfer per (src, dst) pair, so P2P matching by
-        (src, dst, tag) is already unique; the coordinate encoding makes
-        it robust if a pair ever carried more than one block."""
-        return base + (self.g_layer0 * num_heads + self.g_head0)
-
 
 def _intersect(a: Tuple[int, int], b: Tuple[int, int]) -> Optional[Tuple[int, int]]:
     lo, hi = max(a[0], b[0]), min(a[1], b[1])

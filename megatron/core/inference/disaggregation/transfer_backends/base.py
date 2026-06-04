@@ -33,9 +33,12 @@ class KVTransportBackend(abc.ABC):
     """Backend interface for moving KV-cache blobs between workers.
 
     PE identity is the backend's choice (NCCL uses the process group's
-    rank space; NVSHMEM uses global PE ids — equal in our setup). All
-    ops are point-to-point between a ``(src, dst)`` pair and tagged so
-    multiple per-layer / per-request transfers can be multiplexed.
+    rank space; NVSHMEM uses global PE ids — equal in our setup). All ops
+    are point-to-point between a ``(src, dst)`` pair; multiple transfers on
+    a pair are matched by POST-ORDER (the order they are posted), so the send
+    and recv sides must enumerate a pair's transfers in the same order. The
+    ``tag`` arg mirrors ``isend``/``irecv`` and may be ignored (NCCL/NVSHMEM
+    do; gloo is same-tag FIFO) -- callers must not rely on it for matching.
     """
 
     @abc.abstractmethod
