@@ -277,24 +277,21 @@ def create_unified_mempool() -> "MemPool":
             + details
         )
     else:
-        try:
-            pool = MemPool(allocator=_alloc)
-            # torch.cuda.MemPool can't coexist with the expandable-segments
-            # allocator (PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True, which
-            # train_grpo sets), but the failure only surfaces on the first
-            # allocation into the pool, not at construction. Probe with a tiny
-            # allocation now so the incompatibility is detected here and the
-            # caller falls back to non-UVM allocation instead of crashing
-            # mid-buffer-setup (hit with the 12B hybrid model).
-            with torch.cuda.use_mem_pool(pool):
-                _ = torch.empty(1, dtype=torch.uint8, device="cuda")
-            return pool
-        except RuntimeError as e:
+        # torch.cuda.MemPool can't coexist with the expandable-segments allocator
+        # (PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True, which train_grpo
+        # sets); the conflict only surfaces on the first allocation into the
+        # pool, not at construction, and would crash mid-buffer-setup (hit with
+        # the 12B hybrid model). Detect it up front from the allocator config and
+        # let the caller fall back to non-UVM allocation.
+        alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+        if "expandable_segments:true" in alloc_conf.lower():
             raise UnifiedMemoryUnsupportedError(
-                "UVM mempool unusable (likely PYTORCH_CUDA_ALLOC_CONF="
-                "expandable_segments:True, which torch.cuda.MemPool does not support): "
-                + str(e)
-            ) from e
+                "UVM mempool is incompatible with the expandable-segments allocator "
+                "(PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True, which "
+                "torch.cuda.MemPool does not support). Unset expandable_segments to "
+                "use UVM."
+            )
+        return MemPool(allocator=_alloc)
 
 
 def _get_ctypes_lib() -> "ctypes.CDLL":

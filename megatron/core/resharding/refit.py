@@ -49,6 +49,13 @@ class _PlanCacheKey:
     # global ranks.
     src_rank_offset: int = 0
     dst_rank_offset: int = 0
+    # Destination-pool index for multi-pool refit (disaggregated prefill/decode).
+    # A source-only rank has dst_config=None on every pool, so without this the
+    # passes share a key and a rank that was source-only on an earlier pass would
+    # cache-hit and SKIP the collective plan-build while target ranks MISS and
+    # run it -> desync/deadlock. Keying by pool keeps every pass's plan distinct
+    # and lets it be reused across refits (no rebuild) in lockstep.
+    pool_index: int = 0
 
 
 def _get_config_tuple(core) -> Optional[Tuple[int, int, int, int, int]]:
@@ -83,6 +90,7 @@ def _build_plan_cache_key(
     group=None,
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
+    pool_index: int = 0,
 ) -> _PlanCacheKey:
     """Build cache key for reshard plan."""
     # group.rank() supports cross-cluster ProcessGroups.
@@ -94,6 +102,7 @@ def _build_plan_cache_key(
         num_experts=num_experts,
         src_rank_offset=src_rank_offset,
         dst_rank_offset=dst_rank_offset,
+        pool_index=pool_index,
     )
 
 
@@ -191,7 +200,9 @@ def _unwrap_model_cores(src_model, target_model):
     return src_core, tgt_core, num_experts
 
 
-def _build_or_get_plan(src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset):
+def _build_or_get_plan(
+    src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset, pool_index=0
+):
     """Return the cached reshard plan, building it (collectively) if not yet cached.
 
     All participating ranks must call this simultaneously when the plan is not
@@ -205,6 +216,7 @@ def _build_or_get_plan(src_core, tgt_core, num_experts, group, src_rank_offset, 
         group=group,
         src_rank_offset=src_rank_offset,
         dst_rank_offset=dst_rank_offset,
+        pool_index=pool_index,
     )
     if cache_key not in _plan_cache:
         _plan_cache[cache_key] = build_centralized_reshard_plan(
@@ -366,23 +378,21 @@ def swap_model_weights(
     for pool in range(num_dst_pools):
         target = target_model if pool == dst_pool_index else None
 
-        # Multi-pool: the plan-build is collective (gather_object), but the cache
-        # key for a source-only rank (target=None -> dst_config=None) is constant
-        # across passes. Without clearing, a rank that was source-only in an
-        # earlier pass cache-hits and SKIPS the collective while target ranks
-        # MISS and call it -> ranks desync and deadlock (seen with multiple
-        # identical-layout pools). Clear so every rank rebuilds this pass's plan
-        # in lockstep. Cheap: multi-pool refit runs once per rollout.
-        if num_dst_pools > 1:
-            clear_plan_cache()
-
+        # The plan-build is collective (gather_object). A source-only rank
+        # (target=None -> dst_config=None) would otherwise key every pool's plan
+        # identically and, after being source-only on one pass, cache-hit and
+        # SKIP the collective on a later pass while target ranks MISS and run it
+        # -> desync/deadlock. Keying the cache by ``pool`` keeps each pass's plan
+        # distinct, so all ranks make the same hit/miss decision per pass: built
+        # once on the first refit, then reused across refits in lockstep (no
+        # per-pass rebuild).
         # Auto-resolve MXFP8 transform from the cached plan when no explicit
         # transform was provided (re-resolved per pool: the target differs).
         pass_transform = transform
         if pass_transform is None:
             src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target)
             plan = _build_or_get_plan(
-                src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset
+                src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset, pool
             )
             pass_transform = plan.transform
 
@@ -394,6 +404,7 @@ def swap_model_weights(
             src_rank_offset=src_rank_offset,
             dst_rank_offset=dst_rank_offset,
             transform=pass_transform,
+            pool_index=pool,
         )
 
 
@@ -455,6 +466,7 @@ def reshard_model_weights(
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
     transform: Optional[ReshardTransform] = None,
+    pool_index: int = 0,
 ):
     """Reshard and copy model weights from ``src_model`` to ``target_model`` using ``service``.
 
@@ -472,7 +484,7 @@ def reshard_model_weights(
     """
     src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target_model)
     plan = _build_or_get_plan(
-        src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset
+        src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset, pool_index
     )
     _harmonize_buffer_dtypes(plan, src_core, tgt_core, group=group)
     execute_reshard_plan(
