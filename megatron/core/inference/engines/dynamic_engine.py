@@ -533,6 +533,12 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.context is not None:
             self.context.disagg_stage_prefill_kv = role == "prefill"
             self.context.disagg_staged_kv = {}
+            # request_id -> prompt block count, recorded at SUBMIT. Caps the
+            # exported KV to the prompt-covering blocks so it matches the decode
+            # side's header-free block_count = ceil(prompt_len/block_size); the
+            # prefill otherwise allocates one extra block for its (discarded)
+            # generated token when prompt_len is block-aligned.
+            self.context.disagg_prompt_block_count = {}
 
     def _disagg_init_state(self):
         """Per-request KV hand-off state. Called from ``__init__`` and from
@@ -593,6 +599,16 @@ class DynamicInferenceEngine(AbstractEngine):
             self._disagg_pending_sends.pop(oldest).wait()
 
         staged = self.context.disagg_staged_kv.pop(request_id, None)
+        if staged is None:
+            # No staged KV for this request: the slot was already freed and
+            # re-exporting would fail. This can only happen on a stale/duplicate
+            # SEND_KV (the request was never staged or already shipped). Skip
+            # rather than crash the engine loop.
+            logging.warning(
+                "disagg prefill: SEND_KV for request %s has no staged KV; skipping",
+                request_id,
+            )
+            return
         handoff = send_request_kv_resharded(
             self, request_id, self._disagg_my_layout,
             self._disagg_instance_kv_layouts,
@@ -650,7 +666,16 @@ class DynamicInferenceEngine(AbstractEngine):
             self._disagg_pending_sends.pop(request_id).wait()
         for request_id in list(self._disagg_pending_recvs):
             recv, prompt, sampling_params = self._disagg_pending_recvs.pop(request_id)
-            recv.finish(self)
+            imported = recv.finish(self)
+            if imported is None:
+                # KV import failed (e.g. decode KV cache full): the request is
+                # still admitted but without the handed-off blocks, so it
+                # re-prefills from the prompt -- correct but slower. Surface it.
+                logging.warning(
+                    "disagg decode: KV import failed for request %s; "
+                    "re-prefilling from prompt instead of using handed-off KV",
+                    request_id,
+                )
             sp = SamplingParams.deserialize(sampling_params)
             self.add_request(request_id, prompt, sampling_params=sp)
 
@@ -2392,6 +2417,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     # generated tokens are discarded; decode regenerates from
                     # the prompt (prefix-cache hit on the imported KV).
                     sampling_params.num_tokens_to_generate = 1
+                    bs = int(self.context.block_size_tokens)
+                    self.context.disagg_prompt_block_count[request_id] = (
+                        len(prompt) + bs - 1
+                    ) // bs
                 nvtx_range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
                 nvtx_range_pop("add_request")

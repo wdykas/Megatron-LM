@@ -94,7 +94,6 @@ def _run_reshard(src_layouts, dst_layouts):
         ((4, 1), (2, 1)),   # TP merge (divisible)
         ((1, 2), (1, 3)),   # PP change (divisible both)
         ((2, 2), (4, 3)),   # both change
-        ((4, 1), (3, 1)),   # NON-divisible TP ratio (8 heads: 4->3? 8%3!=0 invalid)
         ((2, 3), (4, 2)),   # TP + PP mixed
     ],
 )

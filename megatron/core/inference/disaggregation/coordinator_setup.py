@@ -107,9 +107,19 @@ def _global_kv_dims(engine, pg) -> Tuple[int, int]:
     cfg = engine.controller.model_config
     num_heads = getattr(cfg, "num_query_groups", None) or cfg.num_attention_heads
     mb = getattr(getattr(engine, "context", None), "memory_buffer", None)
-    if mb is not None:
-        return int(mb.shape[1]) * get_pg_size(pg.pp), num_heads
-    return cfg.num_layers, num_heads
+    if mb is None:
+        return cfg.num_layers, num_heads
+    # memory_buffer layer dim is this PP stage's local attention-layer count.
+    # Hybrid models do not split attention layers evenly across PP stages, so
+    # gather the per-stage counts and sum (same approach as the Mamba layer
+    # offset) rather than assuming uniform distribution.
+    local_layers = int(mb.shape[1])
+    pp = get_pg_size(pg.pp)
+    if pp <= 1:
+        return local_layers, num_heads
+    counts = [0] * pp
+    dist.all_gather_object(counts, local_layers, group=pg.pp)
+    return sum(counts), num_heads
 
 
 def _mamba_layout_dict(engine, pg):
@@ -184,6 +194,13 @@ def configure_prebuilt_disagg_engine(
         assert getattr(ctx, "enable_prefix_caching", False), (
             "disaggregation requires prefix caching (enable_prefix_caching=True); "
             "the decode side admits handed-off KV via a prefix-cache hit."
+        )
+        # MLA's latent KV cache isn't derivable header-free, so the decode side
+        # can't reconstruct the schema. Reject it up front with a clear message
+        # rather than crash the engine loop at send/recv time.
+        assert not getattr(ctx, "cache_mla_latent", False), (
+            "disaggregation does not support the MLA latent KV cache "
+            "(cache_mla_latent=True)."
         )
     rank = dist.get_rank()
 

@@ -3884,6 +3884,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             return None
 
         block_count = int(self.request_kv_block_counts[internal_idx].item())
+        # Cap to the prompt-covering block count (recorded at SUBMIT for the
+        # disagg prefill path) so the export matches the decode side's
+        # header-free ceil(prompt_len/block_size); the prefill allocates one
+        # extra block for its discarded generated token when the prompt is
+        # block-aligned, which the decode never receives.
+        cap = getattr(self, "disagg_prompt_block_count", {}).pop(request_id, None)
+        if cap is not None:
+            block_count = min(block_count, cap)
         if block_count <= 0:
             return None
         block_ids = self.request_to_kv_block_ids[internal_idx, :block_count].tolist()

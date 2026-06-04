@@ -194,7 +194,10 @@ from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
-from megatron.core.inference.unified_memory import create_unified_mempool
+from megatron.core.inference.unified_memory import (
+    UnifiedMemoryUnsupportedError,
+    create_unified_mempool,
+)
 from megatron.core.optimizer import OptimizerConfig, ParamKey, get_megatron_optimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.parallel_state import (
@@ -1036,7 +1039,14 @@ def _rl_inference_model_alloc_ctx(args):
     Shared by the custom-parallelism and disaggregated build paths.
     """
     uvm_level = args.rl_inference_model_unified_memory_level
-    uvm_mempool = create_unified_mempool() if uvm_level and uvm_level > 0 else None
+    uvm_mempool = None
+    if uvm_level and uvm_level > 0:
+        try:
+            uvm_mempool = create_unified_mempool()
+        except UnifiedMemoryUnsupportedError as e:
+            # e.g. the expandable-segments allocator makes torch.cuda.MemPool
+            # unusable. Fall back to plain allocation rather than crash setup.
+            logging.warning("RL inference UVM mempool unavailable, using plain allocation: %s", e)
     use_torch_saver = (
         args.rl_offload_inference_model_weights_when_idle
         and uvm_level == 0

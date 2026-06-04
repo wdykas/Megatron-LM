@@ -300,6 +300,21 @@ class DataParallelInferenceCoordinator:
             prefill_id, Headers.SUBMIT_REQUEST, request_id, prompt, sampling_params
         )
 
+    def _drop_disagg_request(self, request_id, reason):
+        """Drop an unroutable disagg request and clear all per-request
+        coordinator state so nothing leaks (the 2-hop routing maps, the stashed
+        prompt, and the client maps). NOTE: the submitting client's future is
+        not resolved here -- the client protocol has no failure reply yet, so a
+        dropped request's caller will time out rather than get an error. Drops
+        are error/edge paths (missing decode engine, missing layouts, stale
+        PREFILL_DONE); the common cases are prevented upstream."""
+        logging.error("Coordinator: dropping disagg request %s: %s", request_id, reason)
+        self._disagg.forget(request_id)
+        self._req_meta.pop(request_id, None)
+        self.request_id_to_rank.pop(request_id, None)
+        self.request_id_to_client_id.pop(request_id, None)
+        self.request_id_to_client_request_id.pop(request_id, None)
+
     def _handle_prefill_done(self, request_id):
         """Hop 2: a prefill engine staged a request's KV. Pick a decode engine,
         tell prefill where to ship the KV (SEND_KV) and decode where to receive
@@ -314,20 +329,22 @@ class DataParallelInferenceCoordinator:
         """
         meta = self._req_meta.get(request_id)
         if meta is None:
-            logging.warning("Coordinator: PREFILL_DONE for unknown request %s; dropping", request_id)
+            # Stale/duplicate PREFILL_DONE (request already completed or dropped).
+            # No client is waiting; just log.
+            logging.warning("Coordinator: PREFILL_DONE for unknown request %s; ignoring", request_id)
             return
         try:
             prefill_id, decode_id = self._disagg.route_prefill_done(request_id)
         except RuntimeError as e:
-            logging.error("Coordinator: cannot route request %s to decode: %s", request_id, e)
+            self._drop_disagg_request(request_id, f"cannot route to decode: {e}")
             return
         prompt, sampling_params = meta
         src_layouts = self._engine_layouts.get(prefill_id)
         dst_layouts = self._engine_layouts.get(decode_id)
         if src_layouts is None or dst_layouts is None:
-            logging.error(
-                "Coordinator: missing KV layouts for request %s (prefill=%s, decode=%s); dropping",
-                request_id, prefill_id, decode_id,
+            self._drop_disagg_request(
+                request_id,
+                f"missing KV layouts (prefill={prefill_id}, decode={decode_id})",
             )
             return
         self._disagg_send(prefill_id, Headers.SEND_KV, request_id, dst_layouts)
