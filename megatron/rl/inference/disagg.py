@@ -23,7 +23,7 @@ from megatron.core.inference.shards_spec import (
     spec_declares_disaggregation,
 )
 from megatron.core.utils import get_attr_wrapped_model
-from megatron.rl.parallel_utils import build_inference_pg_collection
+from megatron.core.inference.shards import build_inference_pg_collection
 
 
 def is_disagg_rollout(args) -> bool:
