@@ -9,11 +9,10 @@ ack-credit path to recycle twice (send #2 blocks until decode acks #0),
 so a correct, in-order result validates the one-way put + decode-gated
 credit recycling on the actual interconnect.
 
-Skipped unless nvshmem4py is importable AND >=2 CUDA devices are present
-(i.e., real NVSHMEM hardware). This and the NVSHMEM config of
-``test_disagg_e2e`` are the only coverage of the credit-ring backend; both
-require hardware, so the protocol has no CPU/CI coverage yet (a single-process
-simulator of the 2-PE one-way-put + ack-credit path would close that gap).
+Requires nvshmem4py + >=2 CUDA devices, i.e. the real NVSHMEM transport on
+GPUs. That is the only environment this backend runs in, so it is the right
+(and only) place to test it -- no CPU stand-in. This and the NVSHMEM config of
+``test_disagg_e2e`` cover the credit-ring backend on hardware.
 """
 
 import os
