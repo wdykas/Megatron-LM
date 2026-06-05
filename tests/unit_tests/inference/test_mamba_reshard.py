@@ -111,22 +111,23 @@ def test_mamba_reshard_reconstructs_destination(src, dst):
 
 
 class _Store:
-    """Single-process transport stand-in: send stashes by (cur,dst,tag), recv
-    pops by (src,cur,tag). ``cur`` is the acting rank."""
+    """Single-process transport stand-in matching the production contract:
+    recvs match sends by POST-ORDER per (src, dst) pair (no tags). ``cur`` is
+    the acting rank."""
 
     def __init__(self):
         from megatron.core.inference.disaggregation.transfer_backends.base import TransferHandle
 
         self._TH = TransferHandle
-        self.store = {}
+        self.queues = {}  # (src, dst) -> FIFO of sent tensors
         self.cur = -1
 
     def send(self, t, dst, tag=0):
-        self.store[(self.cur, dst, tag)] = t.clone()
+        self.queues.setdefault((self.cur, dst), []).append(t.clone())
         return self._TH(wait_fn=None)
 
     def recv(self, shape, dtype, src, tag=0, *, device=None):
-        return self._TH(wait_fn=None, tensor=self.store.pop((src, self.cur, tag)))
+        return self._TH(wait_fn=None, tensor=self.queues[(src, self.cur)].pop(0))
 
 
 @pytest.mark.parametrize("src,dst", [((2, 1), (1, 1)), ((2, 2), (1, 1)), ((1, 1), (2, 2))])
@@ -152,14 +153,14 @@ def test_mamba_transport_wiring_roundtrip(src, dst):
         backend.cur = rk
         _send_mamba_resharded(
             {"conv_states_tensor": conv_l, "ssm_states_tensor": ssm_l},
-            lay, src_list, dst_list, backend, 0, [], [],
+            lay, src_list, dst_list, backend, [], [],
         )
 
     # Decode ranks receive + assemble, then must match a direct shard.
     for rk, lay in dst_lay.items():
         backend.cur = rk
         recv = DecodeRecv(meta=meta, staging=None, pending=[], my_layout=None)
-        _post_recv_mamba_resharded(recv, meta, lay, src_list, dst_list, backend, 0, None)
+        _post_recv_mamba_resharded(recv, meta, lay, src_list, dst_list, backend, None)
         for t, h in recv.mamba_pending:
             sub = h.wait()
             if t.is_conv:

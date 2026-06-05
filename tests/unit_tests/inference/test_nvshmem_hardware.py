@@ -10,8 +10,10 @@ so a correct, in-order result validates the one-way put + decode-gated
 credit recycling on the actual interconnect.
 
 Skipped unless nvshmem4py is importable AND >=2 CUDA devices are present
-(i.e., real NVSHMEM hardware). The protocol logic itself is covered by
-the simulator test ``test_nvshmem_ring.py`` in CPU CI.
+(i.e., real NVSHMEM hardware). This and the NVSHMEM config of
+``test_disagg_e2e`` are the only coverage of the credit-ring backend; both
+require hardware, so the protocol has no CPU/CI coverage yet (a single-process
+simulator of the 2-PE one-way-put + ack-credit path would close that gap).
 """
 
 import os

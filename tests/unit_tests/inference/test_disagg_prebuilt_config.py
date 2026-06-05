@@ -70,6 +70,11 @@ def _worker(rank, world, spec_str, port, q):
                 },
             )
         )
+        # Rendezvous before any rank tears down: rank 0 hosts the TCPStore, so
+        # if it exits while a slower rank is still in a collective the latter
+        # hits a "Broken pipe". The barrier keeps the group alive until all
+        # ranks have finished (only reached on the success path).
+        dist.barrier()
     except Exception:
         import traceback
 
