@@ -406,14 +406,11 @@ def build_centralized_reshard_plan(
                 src_meta_list = src_param_metadata.get(resolved_name)
                 if not src_meta_list and resolved_name.endswith("output_layer.weight"):
                     # Tied embeddings: the source shares the output projection with
-                    # the input embedding, so it exposes no separate
-                    # output_layer.weight. This shows up when the destination
-                    # splits embedding and output across pipeline stages (which
-                    # forces a distinct output_layer.weight) while the source does
-                    # not -- e.g. a pp=1 (tied) -> pp=2 reshard. Source it from the
-                    # embedding weight instead (identical shape + vocab/TP shard);
-                    # the same source tensor then feeds both the destination
-                    # embedding and output_layer.
+                    # the input embedding, so it has no separate output_layer.weight.
+                    # A pp>1 destination materializes one (embedding and output land
+                    # on different stages), e.g. pp=1 (tied) -> pp=2. Source it from
+                    # the embedding weight (same shape + vocab/TP shard); that tensor
+                    # then feeds both the destination embedding and output_layer.
                     for emb_name in (
                         "embedding.word_embeddings.weight",
                         "word_embeddings.weight",

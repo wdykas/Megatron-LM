@@ -49,12 +49,8 @@ class _PlanCacheKey:
     # global ranks.
     src_rank_offset: int = 0
     dst_rank_offset: int = 0
-    # Destination-pool index for multi-pool refit (disaggregated prefill/decode).
-    # A source-only rank has dst_config=None on every pool, so without this the
-    # passes share a key and a rank that was source-only on an earlier pass would
-    # cache-hit and SKIP the collective plan-build while target ranks MISS and
-    # run it -> desync/deadlock. Keying by pool keeps every pass's plan distinct
-    # and lets it be reused across refits (no rebuild) in lockstep.
+    # Multi-pool refit: keep each destination pool's plan distinct so source-only
+    # ranks (dst_config=None on every pool) don't alias them. See swap_model_weights.
     pool_index: int = 0
 
 
@@ -361,12 +357,10 @@ def swap_model_weights(
             is used automatically when the receiver needs MXFP8 conversion.
         num_dst_pools / dst_pool_index: refit into ``num_dst_pools`` disjoint
             destination pools (e.g. disaggregated prefill/decode instances on
-            separate rank windows). One collective pass per pool, in lockstep
-            across all ranks; this rank receives into ``target_model`` only on
-            its own pool's pass (``pool == dst_pool_index``) and is a pure
-            source (``None`` target) otherwise. Defaults ``(1, 0)`` reproduce
-            the single-destination behavior exactly. Use ``dst_pool_index < 0``
-            for a source-only rank that belongs to no pool.
+            separate rank windows), one collective pass per pool. This rank
+            receives into ``target_model`` only on its own pool's pass
+            (``pool == dst_pool_index``) and is a pure source otherwise.
+            Defaults ``(1, 0)`` reproduce the single-destination behavior.
     """
     if isinstance(refit_method, str):
         service = get_or_create_service(refit_method, group=group)
@@ -378,14 +372,10 @@ def swap_model_weights(
     for pool in range(num_dst_pools):
         target = target_model if pool == dst_pool_index else None
 
-        # The plan-build is collective (gather_object). A source-only rank
-        # (target=None -> dst_config=None) would otherwise key every pool's plan
-        # identically and, after being source-only on one pass, cache-hit and
-        # SKIP the collective on a later pass while target ranks MISS and run it
-        # -> desync/deadlock. Keying the cache by ``pool`` keeps each pass's plan
-        # distinct, so all ranks make the same hit/miss decision per pass: built
-        # once on the first refit, then reused across refits in lockstep (no
-        # per-pass rebuild).
+        # The plan-build is collective. Pass ``pool`` so a source-only rank
+        # (target=None, same cache key every pool) doesn't cache-hit and skip the
+        # collective on a later pass while target ranks run it -> deadlock. Each
+        # pool's plan is then built once and reused across refits in lockstep.
         # Auto-resolve MXFP8 transform from the cached plan when no explicit
         # transform was provided (re-resolved per pool: the target differs).
         pass_transform = transform
