@@ -277,10 +277,8 @@ def create_unified_mempool() -> "MemPool":
             + details
         )
     else:
-        # torch.cuda.MemPool can't coexist with the expandable-segments allocator
-        # (PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True, which train_grpo
-        # sets). Detect it up front and let the caller fall back to non-UVM
-        # allocation, rather than crash on the first allocation into the pool.
+        # torch.cuda.MemPool can't coexist with expandable_segments; bail so the
+        # caller falls back to non-UVM allocation.
         alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
         if "expandable_segments:true" in alloc_conf.lower():
             raise UnifiedMemoryUnsupportedError(
