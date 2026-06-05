@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Tuple
+
+from megatron.core.inference.disaggregation.reshard_ranges import intersect
 
 
 @dataclass(frozen=True)
@@ -102,11 +104,6 @@ class ReshardTransfer:
         return slice(self.g_head0 - off, self.g_head1 - off)
 
 
-def _intersect(a: Tuple[int, int], b: Tuple[int, int]) -> Optional[Tuple[int, int]]:
-    lo, hi = max(a[0], b[0]), min(a[1], b[1])
-    return (lo, hi) if lo < hi else None
-
-
 def plan_kv_reshard(
     srcs: List[KVShardLayout], dsts: List[KVShardLayout]
 ) -> List[ReshardTransfer]:
@@ -140,10 +137,10 @@ def plan_kv_reshard(
         for s in srcs:
             if s.global_rank not in source_ranks:
                 continue
-            li = _intersect(s.layer_range(), dl)
+            li = intersect(s.layer_range(), dl)
             if li is None:
                 continue
-            hi = _intersect(s.head_range(), dh)
+            hi = intersect(s.head_range(), dh)
             if hi is None:
                 continue
             transfers.append(

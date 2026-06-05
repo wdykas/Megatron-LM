@@ -6,7 +6,9 @@ decode shard layouts (the Mamba analog of the attention KV reshard)."""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Tuple
+
+from megatron.core.inference.disaggregation.reshard_ranges import intersect
 
 # Channel bands of a Mamba layer's state, in the order the conv state
 # concatenates them on its channel axis (x, B, C); ssm is the head axis.
@@ -101,11 +103,6 @@ class MambaTransfer:
         return self.band in _CONV_BANDS
 
 
-def _intersect(a: Tuple[int, int], b: Tuple[int, int]) -> Optional[Tuple[int, int]]:
-    lo, hi = max(a[0], b[0]), min(a[1], b[1])
-    return (lo, hi) if lo < hi else None
-
-
 def plan_mamba_reshard(
     src_layouts: List[MambaShardLayout], dst_layouts: List[MambaShardLayout]
 ) -> List[MambaTransfer]:
@@ -116,7 +113,7 @@ def plan_mamba_reshard(
     for s in src_layouts:
         s_lr = s.layer_range()
         for d in dst_layouts:
-            layer_ov = _intersect(s_lr, d.layer_range())
+            layer_ov = intersect(s_lr, d.layer_range())
             if layer_ov is None:
                 continue
             for band in (*_CONV_BANDS, "ssm"):
@@ -124,7 +121,7 @@ def plan_mamba_reshard(
                 _, d_size, d_off = d._band(band)
                 s_glo = (s.tp_rank * s_size, s.tp_rank * s_size + s_size)
                 d_glo = (d.tp_rank * d_size, d.tp_rank * d_size + d_size)
-                chan_ov = _intersect(s_glo, d_glo)
+                chan_ov = intersect(s_glo, d_glo)
                 if chan_ov is None:
                     continue
                 lo, hi = chan_ov
