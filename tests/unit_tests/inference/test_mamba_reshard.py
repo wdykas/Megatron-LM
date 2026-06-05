@@ -1,13 +1,16 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Hetero TP/PP reshard of Mamba conv/ssm state (pure, CPU).
+"""Hetero TP/PP reshard of Mamba conv/ssm state.
 
 Builds a known global Mamba state, shards it to a source (tp,pp) the exact way
 mamba_mixer does ([x|B|C] conv bands + head-sharded ssm, layers split by PP),
 runs plan_mamba_reshard to a different destination (tp,pp), and asserts every
 destination rank ends up byte-identical to a direct shard of the global state.
-This validates the band/layer index math against the real sharding model
-without a hybrid checkpoint (the residual gap is a real-model functional run).
+
+The plan/index-math sweep is device-agnostic and runs anywhere. A second test
+drives the full send/recv wiring over the real NCCL backend on GPUs (prefill
+TP2 -> decode TP1), so the transport helpers are exercised on hardware too.
+The residual gap is a real-model functional run with a hybrid checkpoint.
 """
 
 import pytest
@@ -40,14 +43,16 @@ def _global_state():
     return conv, ssm
 
 
-def _layouts(tp, pp):
-    """One MambaShardLayout per rank for a (tp, pp) instance; rank = p*tp + r.
-    PP splits the M layers evenly (contiguous per stage)."""
+def _layouts(tp, pp, base=0):
+    """One MambaShardLayout per rank for a (tp, pp) instance; rank = base+p*tp+r.
+    PP splits the M layers evenly (contiguous per stage). ``base`` offsets the
+    global ranks so a prefill instance and a decode instance occupy disjoint
+    rank windows (required for real point-to-point transport)."""
     per = M // pp
     out = {}
     for p in range(pp):
         for r in range(tp):
-            rank = p * tp + r
+            rank = base + p * tp + r
             out[rank] = MambaShardLayout(
                 global_rank=rank, tp_size=tp, tp_rank=r,
                 layer_start=p * per, num_layers=per,
@@ -110,63 +115,94 @@ def test_mamba_reshard_reconstructs_destination(src, dst):
         assert torch.equal(dst_t[rk][1], want_ssm), f"ssm mismatch at rank {rk} ({src}->{dst})"
 
 
-class _Store:
-    """Single-process transport stand-in matching the production contract:
-    recvs match sends by POST-ORDER per (src, dst) pair (no tags). ``cur`` is
-    the acting rank."""
+# --------------------------------------------------------------------------
+# Full Mamba transport wiring over the real NCCL backend on GPUs.
+# Prefill TP2 {0,1} -> decode TP1 {2}: each prefill rank exports its conv/ssm
+# shard and sends the resharded sub-blocks; the decode rank receives, assembles,
+# and must match a direct shard of the global state. Exercises the actual
+# _send_mamba_resharded / _post_recv_mamba_resharded path (post-order matched,
+# no tags) on real hardware. Larger hetero combos are covered device-agnostically
+# by test_mamba_reshard_reconstructs_destination above.
+# --------------------------------------------------------------------------
+def _nccl_mamba_worker(rank, world, port, q):
+    import os
 
-    def __init__(self):
-        from megatron.core.inference.disaggregation.transfer_backends.base import TransferHandle
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    import torch.distributed as dist
 
-        self._TH = TransferHandle
-        self.queues = {}  # (src, dst) -> FIFO of sent tensors
-        self.cur = -1
-
-    def send(self, t, dst, tag=0):
-        self.queues.setdefault((self.cur, dst), []).append(t.clone())
-        return self._TH(wait_fn=None)
-
-    def recv(self, shape, dtype, src, tag=0, *, device=None):
-        return self._TH(wait_fn=None, tensor=self.queues[(src, self.cur)].pop(0))
-
-
-@pytest.mark.parametrize("src,dst", [((2, 1), (1, 1)), ((2, 2), (1, 1)), ((1, 1), (2, 2))])
-def test_mamba_transport_wiring_roundtrip(src, dst):
-    """Drive the real send/recv wiring (_send_mamba_resharded /
-    _post_recv_mamba_resharded) over the store transport and assert each decode
-    rank's assembled conv/ssm matches a direct shard."""
-    from megatron.core.inference.disaggregation.kv_transfer import (
-        DecodeRecv,
-        _post_recv_mamba_resharded,
-        _send_mamba_resharded,
-    )
-
-    conv_g, ssm_g = _global_state()
-    src_lay, dst_lay = _layouts(*src), _layouts(*dst)
-    src_list, dst_list = list(src_lay.values()), list(dst_lay.values())
-    backend = _Store()
-    meta = {"has_mamba": True, "mamba": {"conv_dtype": torch.float32, "ssm_dtype": torch.float32}}
-
-    # Prefill ranks post their conv/ssm sub-blocks.
-    for rk, lay in src_lay.items():
-        conv_l, ssm_l = _shard(conv_g, ssm_g, lay)
-        backend.cur = rk
-        _send_mamba_resharded(
-            {"conv_states_tensor": conv_l, "ssm_states_tensor": ssm_l},
-            lay, src_list, dst_list, backend, [], [],
+    torch.cuda.set_device(rank)
+    dev = torch.device(f"cuda:{rank}")
+    dist.init_process_group("nccl", rank=rank, world_size=world)
+    try:
+        from megatron.core.inference.disaggregation.kv_transfer import (
+            DecodeRecv,
+            _post_recv_mamba_resharded,
+            _send_mamba_resharded,
+        )
+        from megatron.core.inference.disaggregation.transfer_backends.nccl import (
+            NcclTransportBackend,
         )
 
-    # Decode ranks receive + assemble, then must match a direct shard.
-    for rk, lay in dst_lay.items():
-        backend.cur = rk
-        recv = DecodeRecv(meta=meta, staging=None, pending=[], my_layout=None)
-        _post_recv_mamba_resharded(recv, meta, lay, src_list, dst_list, backend, None)
-        for t, h in recv.mamba_pending:
-            sub = h.wait()
-            if t.is_conv:
-                recv.mamba_conv[t.dst_layer, t.dst_lo:t.dst_hi, :] = sub
-            else:
-                recv.mamba_ssm[t.dst_layer, t.dst_lo:t.dst_hi, :, :] = sub
-        want_conv, want_ssm = _shard(conv_g, ssm_g, lay)
-        assert torch.equal(recv.mamba_conv, want_conv), f"conv wiring mismatch rank {rk}"
-        assert torch.equal(recv.mamba_ssm, want_ssm), f"ssm wiring mismatch rank {rk}"
+        conv_g, ssm_g = _global_state()
+        src_lay = _layouts(2, 1)            # prefill TP2 -> ranks {0,1}
+        dst_lay = _layouts(1, 1, base=2)    # decode  TP1 -> rank  {2}
+        src_list, dst_list = list(src_lay.values()), list(dst_lay.values())
+        backend = NcclTransportBackend()
+        backend.init()
+        meta = {"has_mamba": True,
+                "mamba": {"conv_dtype": torch.float32, "ssm_dtype": torch.float32}}
+
+        if rank in src_lay:  # prefill
+            lay = src_lay[rank]
+            conv_l, ssm_l = (t.to(dev) for t in _shard(conv_g, ssm_g, lay))
+            handles = []
+            _send_mamba_resharded(
+                {"conv_states_tensor": conv_l, "ssm_states_tensor": ssm_l},
+                lay, src_list, dst_list, backend, handles, [],
+            )
+            for h in handles:
+                h.wait()
+            q.put((rank, "prefill"))
+        else:                # decode
+            lay = dst_lay[rank]
+            recv = DecodeRecv(meta=meta, staging=None, pending=[], my_layout=None)
+            _post_recv_mamba_resharded(recv, meta, lay, src_list, dst_list, backend, dev)
+            for t, h in recv.mamba_pending:
+                sub = h.wait()
+                if t.is_conv:
+                    recv.mamba_conv[t.dst_layer, t.dst_lo:t.dst_hi, :] = sub
+                else:
+                    recv.mamba_ssm[t.dst_layer, t.dst_lo:t.dst_hi, :, :] = sub
+            want_conv, want_ssm = (t.to(dev) for t in _shard(conv_g, ssm_g, lay))
+            ok = torch.equal(recv.mamba_conv, want_conv) and torch.equal(recv.mamba_ssm, want_ssm)
+            q.put((rank, ("decode", bool(ok))))
+        dist.barrier()  # rendezvous before teardown (rank 0 hosts the store)
+    except Exception:
+        import traceback
+
+        q.put((rank, ("ERROR", traceback.format_exc())))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.device_count() >= 3),
+    reason="requires >=3 CUDA devices (prefill TP2 {0,1} + decode TP1 {2})",
+)
+def test_mamba_transport_wiring_roundtrip_nccl():
+    ctx = torch.multiprocessing.get_context("spawn")
+    q = ctx.Queue()
+    procs = [ctx.Process(target=_nccl_mamba_worker, args=(r, 3, 29611, q)) for r in range(3)]
+    for p in procs:
+        p.start()
+    out = {}
+    for _ in range(3):
+        rk, payload = q.get(timeout=180)
+        out[rk] = payload
+    for p in procs:
+        p.join(timeout=60)
+    errs = {r: v[1] for r, v in out.items() if isinstance(v, tuple) and v[0] == "ERROR"}
+    assert not errs, errs
+    assert out[2] == ("decode", True), out  # decode rank reconstructed the exact shard

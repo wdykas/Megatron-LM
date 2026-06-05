@@ -3,18 +3,16 @@
 """End-to-end functional test of the prefill->decode KV transfer.
 
 Drives the KV reshard + transport + import directly
-(send/recv_request_kv_resharded) and asserts the decode side reconstructs the
-exact global KV. Two configurations:
+(send/recv_request_kv_resharded) on real GPUs and asserts the decode side
+reconstructs the exact global KV. Two configurations:
 
-* **gloo / CI** (3 procs): prefill TP2 {0,1} -> decode TP1 {2}, which
-  exercises the hetero TP2->TP1 head merge over the NCCL backend. Runs
-  on CPU, no GPUs needed.
-* **NVSHMEM / hardware** (2 procs): prefill TP1 {0} -> decode TP1 {1}
-  over the real NVSHMEM credit-ring backend, validating the fast transport
-  end to end. Guarded (skips without nvshmem4py + >=2 GPUs). (A 3-PE NVSHMEM
-  run hits an NVSHMEM UID-bootstrap heap-allgather limitation across NUMA
-  sockets in this environment; the hetero merge is covered by the gloo config
-  + the reshard unit tests.)
+* **NCCL** (3 procs, >=3 GPUs): prefill TP2 {0,1} -> decode TP1 {2}, the
+  hetero TP2->TP1 head merge over the default GPU transport.
+* **NVSHMEM** (2 procs, >=2 GPUs): prefill TP1 {0} -> decode TP1 {1} over the
+  real NVSHMEM credit-ring backend. Guarded (skips without nvshmem4py). (A
+  3-PE NVSHMEM run hits an NVSHMEM UID-bootstrap heap-allgather limitation
+  across NUMA sockets in this environment; the hetero merge is covered by the
+  NCCL config + the reshard unit tests.)
 
 The LLM forward is stubbed (a fake context whose export returns this
 rank's head-shard of a known global KV and whose import records the
@@ -97,11 +95,10 @@ def _worker(rank, world, port, use_nvshmem, q):
     os.environ["MASTER_PORT"] = str(port)
     import torch.distributed as dist
 
-    device = "cpu"
-    if use_nvshmem:
-        torch.cuda.set_device(rank)
-        device = f"cuda:{rank}"
-    dist.init_process_group("gloo", rank=rank, world_size=world)
+    torch.cuda.set_device(rank)
+    device = f"cuda:{rank}"
+    # NVSHMEM bootstraps over a gloo group; the NCCL transport needs an NCCL one.
+    dist.init_process_group("gloo" if use_nvshmem else "nccl", rank=rank, world_size=world)
     try:
         from megatron.core.inference.disaggregation import kv_transfer as H
 
@@ -145,6 +142,9 @@ def _worker(rank, world, port, use_nvshmem, q):
             expected = _global_kv_staging().to(imported.device)
             ok = res is not None and torch.equal(imported, expected)
             q.put(("decode", (7, bool(ok))))
+        # Rendezvous before any rank tears down the group (rank 0 hosts the
+        # store); reached only on the success path.
+        dist.barrier()
     except Exception:
         import traceback
 
@@ -177,8 +177,11 @@ def _assert_ok(out):
     assert out["decode"] == (7, True), out  # request 7, exact global KV reconstructed
 
 
-@pytest.mark.skipif(not torch.distributed.is_available(), reason="torch.distributed unavailable")
-def test_disagg_e2e_tp2_to_tp1_gloo():
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.device_count() >= 3),
+    reason="requires >=3 CUDA devices (prefill TP2 {0,1} + decode TP1 {2})",
+)
+def test_disagg_e2e_tp2_to_tp1_nccl():
     _assert_ok(_run_e2e(29601, use_nvshmem=False))
 
 
