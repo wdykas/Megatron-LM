@@ -162,15 +162,3 @@ def transfers_for_dst(plan: List[ReshardTransfer], dst_rank: int) -> List[Reshar
 
 def transfers_for_src(plan: List[ReshardTransfer], src_rank: int) -> List[ReshardTransfer]:
     return [t for t in plan if t.src_rank == src_rank]
-
-
-def is_matched(src: KVShardLayout, dst: KVShardLayout) -> bool:
-    """Whether the two layouts are identical in the dims that affect KV
-    sharding (TP heads + PP layers). EP and ETP are KV-replica dimensions
-    and so are irrelevant here."""
-    return (
-        src.num_layers == dst.num_layers
-        and src.num_heads == dst.num_heads
-        and src.tp_size == dst.tp_size
-        and src.pp_size == dst.pp_size
-    )

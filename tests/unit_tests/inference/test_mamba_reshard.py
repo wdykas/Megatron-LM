@@ -18,10 +18,20 @@ import torch
 
 from megatron.core.inference.disaggregation.mamba_reshard import (
     MambaShardLayout,
-    apply_conv_transfer,
-    apply_ssm_transfer,
     plan_mamba_reshard,
 )
+
+
+def apply_conv_transfer(t, src_conv, dst_conv):
+    """Copy a conv sub-block in-memory (no transfer); conv is
+    ``(num_layers, conv_dim_local, d_conv)`` -- the band slices the channel axis."""
+    dst_conv[t.dst_layer, t.dst_lo:t.dst_hi, :] = src_conv[t.src_layer, t.src_lo:t.src_hi, :]
+
+
+def apply_ssm_transfer(t, src_ssm, dst_ssm):
+    """Copy an ssm sub-block in-memory; ssm is
+    ``(num_layers, nheads_local, headdim, d_state)`` -- the band slices heads."""
+    dst_ssm[t.dst_layer, t.dst_lo:t.dst_hi, :, :] = src_ssm[t.src_layer, t.src_lo:t.src_hi, :, :]
 
 # Global model dims (chosen divisible by the tp values under test).
 NHEADS, HEADDIM, DSTATE, NGROUPS, DCONV = 8, 4, 2, 2, 3

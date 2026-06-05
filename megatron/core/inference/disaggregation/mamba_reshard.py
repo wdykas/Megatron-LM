@@ -143,15 +143,3 @@ def transfers_for_src(plan: List[MambaTransfer], src_rank: int) -> List[MambaTra
 
 def transfers_for_dst(plan: List[MambaTransfer], dst_rank: int) -> List[MambaTransfer]:
     return [t for t in plan if t.dst_rank == dst_rank]
-
-
-def apply_conv_transfer(t: MambaTransfer, src_conv, dst_conv) -> None:
-    """Copy a conv sub-block (test/in-memory helper). conv tensors are
-    ``(num_layers, conv_dim_local, d_conv)``; the band slices the channel axis."""
-    dst_conv[t.dst_layer, t.dst_lo:t.dst_hi, :] = src_conv[t.src_layer, t.src_lo:t.src_hi, :]
-
-
-def apply_ssm_transfer(t: MambaTransfer, src_ssm, dst_ssm) -> None:
-    """Copy an ssm sub-block (test/in-memory helper). ssm tensors are
-    ``(num_layers, nheads_local, headdim, d_state)``; the band slices heads."""
-    dst_ssm[t.dst_layer, t.dst_lo:t.dst_hi, :, :] = src_ssm[t.src_layer, t.src_lo:t.src_hi, :, :]

@@ -365,30 +365,3 @@ def _post_recv_mamba_resharded(
             dt = ssm_dtype
         h = backend.recv(shape, dt, src=t.src_rank, device=device)
         recv.mamba_pending.append((t, h))
-
-
-def recv_request_kv_resharded(
-    engine: Any,
-    my_layout,
-    src_layouts: list,
-    dst_layouts: list,
-    prompt_token_ids,
-    *,
-    backend: Optional[KVTransportBackend] = None,
-    group: Optional[object] = None,
-    device: Optional[torch.device] = None,
-) -> Optional[dict]:
-    """Blocking decode receive: :func:`post_recv_request_kv_resharded` then
-    :meth:`DecodeRecv.finish` (post + wait + import) in one call."""
-    recv = post_recv_request_kv_resharded(
-        engine,
-        my_layout,
-        src_layouts,
-        dst_layouts,
-        prompt_token_ids,
-        backend=backend,
-        device=device,
-    )
-    if recv is None:
-        return None
-    return recv.finish(engine)

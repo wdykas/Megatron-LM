@@ -17,7 +17,6 @@ import torch
 
 from megatron.core.inference.disaggregation.kv_reshard import (
     KVShardLayout,
-    is_matched,
     plan_kv_reshard,
     transfers_for_dst,
 )
@@ -168,10 +167,3 @@ def test_one_prefill_to_multiple_decode_targets_of_different_parallelism():
                 f"decode target TP{tp_d}xPP{pp_d} rank {d.global_rank} mismatch"
             )
 
-
-def test_is_matched():
-    a = KVShardLayout(L, Hh, 2, 0, 1, 0, 0)
-    b = KVShardLayout(L, Hh, 2, 1, 1, 0, 1, ep_size=4, ep_rank=2)
-    c = KVShardLayout(L, Hh, 4, 0, 1, 0, 0)
-    assert is_matched(a, b)        # EP differs -> still matched for KV
-    assert not is_matched(a, c)    # TP differs -> reshard needed

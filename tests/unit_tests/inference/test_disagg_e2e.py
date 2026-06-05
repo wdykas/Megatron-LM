@@ -3,7 +3,7 @@
 """End-to-end functional test of the prefill->decode KV transfer.
 
 Drives the KV reshard + transport + import directly
-(send/recv_request_kv_resharded) on real GPUs and asserts the decode side
+(send_request_kv_resharded + post_recv/finish) on real GPUs and asserts the decode side
 reconstructs the exact global KV. Two configurations:
 
 * **NCCL** (3 procs, >=3 GPUs): prefill TP2 {0,1} -> decode TP1 {2}, the
@@ -135,9 +135,10 @@ def _worker(rank, world, port, use_nvshmem, q):
                 h.wait()
             q.put((f"prefill{rank}", "prefill"))
         else:
-            res = H.recv_request_kv_resharded(
+            recv = H.post_recv_request_kv_resharded(
                 eng, layout, src_layouts, dst_layouts, PROMPT, backend=backend,
             )
+            res = recv.finish(eng) if recv is not None else None
             imported = eng.context.imported
             expected = _global_kv_staging().to(imported.device)
             ok = res is not None and torch.equal(imported, expected)
