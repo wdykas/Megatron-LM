@@ -7,7 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple
 
-from megatron.core.inference.disaggregation.reshard_ranges import intersect
+from megatron.core.inference.disaggregation.utils import intersect
 
 
 @dataclass(frozen=True)

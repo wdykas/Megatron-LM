@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Shared range math for the KV / Mamba reshard planners."""
+"""Shared helpers for the disaggregation modules."""
 
 from __future__ import annotations
 

@@ -10,8 +10,6 @@ PP-changing, and EP-replicated -- exercises the range-intersection
 planner end to end without any distributed runtime.
 """
 
-import itertools
-
 import pytest
 import torch
 
