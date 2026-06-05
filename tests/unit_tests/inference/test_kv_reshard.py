@@ -165,3 +165,18 @@ def test_one_prefill_to_multiple_decode_targets_of_different_parallelism():
                 f"decode target TP{tp_d}xPP{pp_d} rank {d.global_rank} mismatch"
             )
 
+
+def test_uneven_pp_attention_window():
+    """Attention layers split UNEVENLY across PP (hybrid-style) via explicit
+    (layer_start, num_local_layers); reshard to pp=1 still reconstructs the
+    global KV. The even-split default would map the wrong global layers here."""
+    src = [
+        KVShardLayout(L, Hh, 1, 0, 2, 0, 0, layer_start=0, num_local_layers=5),
+        KVShardLayout(L, Hh, 1, 0, 2, 1, 1, layer_start=5, num_local_layers=7),
+    ]
+    dst = [KVShardLayout(L, Hh, 1, 0, 1, 0, 2)]   # pp=1: all L layers on one rank
+    assert src[0].layer_range() == (0, 5) and src[1].layer_range() == (5, 12)
+    g, out = _run_reshard(src, dst)
+    for d in dst:
+        assert torch.equal(out[d.global_rank], _shard_of(g, d))
+

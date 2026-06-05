@@ -125,6 +125,26 @@ def test_mamba_reshard_reconstructs_destination(src, dst):
         assert torch.equal(dst_t[rk][1], want_ssm), f"ssm mismatch at rank {rk} ({src}->{dst})"
 
 
+def test_mamba_rejects_indivisible_groups():
+    """ngroups < tp_size would truncate the B/C bands to zero width; reject it
+    up front instead of silently dropping state."""
+    with pytest.raises(ValueError):
+        MambaShardLayout(global_rank=0, tp_size=4, tp_rank=0, layer_start=0, num_layers=1,
+                         nheads=8, headdim=HEADDIM, d_state=DSTATE, ngroups=2, d_conv=DCONV)
+
+
+def test_mamba_dedupes_replica_sources():
+    """Two source ranks holding the same Mamba shard (same tp_rank+layer_start,
+    e.g. EP/DP replicas) are deduped: the shard is sourced from exactly one of
+    them (smallest global_rank), so no duplicate sends."""
+    def _lay(gr):
+        return MambaShardLayout(global_rank=gr, tp_size=1, tp_rank=0, layer_start=0,
+                                num_layers=M, nheads=NHEADS, headdim=HEADDIM,
+                                d_state=DSTATE, ngroups=NGROUPS, d_conv=DCONV)
+    plan = plan_mamba_reshard([_lay(0), _lay(1)], [_lay(2)])
+    assert {t.src_rank for t in plan} == {0}  # only the smallest-rank replica sources
+
+
 # --------------------------------------------------------------------------
 # Full Mamba transport wiring over the real NCCL backend on GPUs.
 # Prefill TP2 {0,1} -> decode TP1 {2}: each prefill rank exports its conv/ssm

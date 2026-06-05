@@ -35,6 +35,19 @@ class MambaShardLayout:
     ngroups: int       # global
     d_conv: int
 
+    def __post_init__(self) -> None:
+        # TP shards heads and groups; both must divide evenly or the local
+        # conv/ssm band sizes truncate to the wrong (or zero) width silently.
+        if self.nheads % self.tp_size != 0:
+            raise ValueError(f"nheads={self.nheads} not divisible by tp_size={self.tp_size}")
+        if self.ngroups % self.tp_size != 0:
+            raise ValueError(f"ngroups={self.ngroups} not divisible by tp_size={self.tp_size}")
+
+    def mamba_shard_key(self) -> Tuple[int, int]:
+        """The Mamba shard this rank holds: ``(tp_rank, layer_start)``. Ranks
+        sharing a key hold identical state (e.g. EP/DP replicas of it)."""
+        return (self.tp_rank, self.layer_start)
+
     @property
     def d_inner(self) -> int:
         return self.nheads * self.headdim
@@ -109,15 +122,27 @@ def plan_mamba_reshard(
     """Plan the conv/ssm sub-block moves from the prefill (src) layouts to the
     decode (dst) layouts. One transfer per (src rank, dst rank, global layer,
     band) where both the layer ranges and the channel ranges overlap."""
+    # Dedupe replica sources: ranks sharing (tp_rank, layer_start) hold identical
+    # Mamba state (e.g. EP/DP replicas), so source each shard from exactly one of
+    # them -- the smallest global_rank -- to avoid duplicate sends.
+    rep_rank: dict = {}
+    for s in src_layouts:
+        key = s.mamba_shard_key()
+        if key not in rep_rank or s.global_rank < rep_rank[key]:
+            rep_rank[key] = s.global_rank
+    source_ranks = set(rep_rank.values())
+
     out: List[MambaTransfer] = []
     for s in src_layouts:
+        if s.global_rank not in source_ranks:
+            continue
         s_lr = s.layer_range()
         for d in dst_layouts:
             layer_ov = intersect(s_lr, d.layer_range())
             if layer_ov is None:
                 continue
             for band in (*_CONV_BANDS, "ssm"):
-                g_total, s_size, s_off = s._band(band)
+                _, s_size, s_off = s._band(band)
                 _, d_size, d_off = d._band(band)
                 s_glo = (s.tp_rank * s_size, s.tp_rank * s_size + s_size)
                 d_glo = (d.tp_rank * d_size, d.tp_rank * d_size + d_size)

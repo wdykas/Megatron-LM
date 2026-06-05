@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from megatron.core.inference.disaggregation.utils import intersect
 
@@ -33,19 +33,27 @@ class KVShardLayout:
     ep_rank: int = 0
     etp_size: int = 1
     etp_rank: int = 0
+    # Optional explicit PP layer window for this stage. When None, an even split
+    # of num_layers across pp_size is assumed -- correct for pure-attention
+    # models. Models that do NOT split attention layers evenly across PP stages
+    # (e.g. hybrid Mamba+attention) must pass an explicit (layer_start,
+    # num_local_layers); the even-split default would otherwise map the wrong
+    # global layer indices.
+    layer_start: Optional[int] = None
+    num_local_layers: Optional[int] = None
 
     def __post_init__(self) -> None:
-        # Standard Megatron requirement: TP divides heads. PP usually
-        # divides layers. We support the divisible case (even splits);
-        # range intersection itself is general, but even splits keep the
-        # global<->local index map unambiguous.
+        # TP must divide heads (the head split is always even).
         if self.num_heads % self.tp_size != 0:
             raise ValueError(
                 f"num_heads={self.num_heads} not divisible by tp_size={self.tp_size}"
             )
-        if self.num_layers % self.pp_size != 0:
+        # Only the even-split path requires PP to divide layers; an explicit
+        # window may be uneven across stages.
+        if self.layer_start is None and self.num_layers % self.pp_size != 0:
             raise ValueError(
-                f"num_layers={self.num_layers} not divisible by pp_size={self.pp_size}"
+                f"num_layers={self.num_layers} not divisible by pp_size={self.pp_size}; "
+                "pass an explicit (layer_start, num_local_layers) for uneven PP splits"
             )
 
     def kv_shard_key(self) -> Tuple[int, int]:
@@ -54,6 +62,11 @@ class KVShardLayout:
         return (self.tp_rank, self.pp_rank)
 
     def layer_range(self) -> Tuple[int, int]:
+        if self.layer_start is not None:
+            n = self.num_local_layers
+            if n is None:
+                n = self.num_layers // self.pp_size
+            return (self.layer_start, self.layer_start + n)
         per = self.num_layers // self.pp_size
         return (self.pp_rank * per, (self.pp_rank + 1) * per)
 
