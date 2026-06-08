@@ -180,3 +180,12 @@ def test_uneven_pp_attention_window():
     for d in dst:
         assert torch.equal(out[d.global_rank], _shard_of(g, d))
 
+
+def test_explicit_layer_window_is_all_or_nothing():
+    # Setting only one of (layer_start, num_local_layers) would silently fall
+    # back to the even-split count -- reject it.
+    with pytest.raises(ValueError):
+        KVShardLayout(L, Hh, 1, 0, 2, 0, 0, layer_start=0)
+    with pytest.raises(ValueError):
+        KVShardLayout(L, Hh, 1, 0, 2, 0, 0, num_local_layers=5)
+

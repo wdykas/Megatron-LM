@@ -48,6 +48,13 @@ class KVShardLayout:
             raise ValueError(
                 f"num_heads={self.num_heads} not divisible by tp_size={self.tp_size}"
             )
+        # layer_start and num_local_layers are an all-or-nothing explicit window:
+        # setting only one would silently fall back to the even-split count and
+        # defeat the purpose (uneven stage with an even count).
+        if (self.layer_start is None) != (self.num_local_layers is None):
+            raise ValueError(
+                "layer_start and num_local_layers must be set together (or both omitted)"
+            )
         # Only the even-split path requires PP to divide layers; an explicit
         # window may be uneven across stages.
         if self.layer_start is None and self.num_layers % self.pp_size != 0:
@@ -62,11 +69,9 @@ class KVShardLayout:
         return (self.tp_rank, self.pp_rank)
 
     def layer_range(self) -> Tuple[int, int]:
+        # num_local_layers is guaranteed set whenever layer_start is (see __post_init__).
         if self.layer_start is not None:
-            n = self.num_local_layers
-            if n is None:
-                n = self.num_layers // self.pp_size
-            return (self.layer_start, self.layer_start + n)
+            return (self.layer_start, self.layer_start + self.num_local_layers)
         per = self.num_layers // self.pp_size
         return (self.pp_rank * per, (self.pp_rank + 1) * per)
 
