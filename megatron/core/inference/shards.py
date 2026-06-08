@@ -234,6 +234,8 @@ def build_inference_pg_collections_for_shards(
             world_size=shard_world,
             tp_size=tp,
             pp_size=pp,
+            # Inference shards don't context-parallelize: the spec has no cp key
+            # and the KV reshard models layer x head, not the sequence dim.
             cp_size=1,
             ep_size=ep,
             expt_tp_size=expt_tp,
