@@ -169,40 +169,27 @@ def build_inference_pg_collection(
 
 @dataclass
 class InferenceShard:
-    """One entry in a multi-shard inference layout.
+    """One shard in a multi-shard inference layout: its identity, its rank
+    window, and this rank's process groups for it.
 
     Attributes:
-        index: Position of this shard in the shards list.
         spec: This shard's :class:`~megatron.core.inference.shards_spec.InferenceShardSpec`
             (``tp``/``pp``/``ep``/``expt_tp``/``dp`` and optional
             ``role`` = ``prefill``/``decode``).
         rank_offset: First global rank belonging to this shard.
         world_size: Number of ranks in this shard (tp*pp*dp).
         pg_collection: The shard's ProcessGroupCollection if the current rank
-            is a member of this shard, else ``None``. Every rank still
-            participates in the collective process-group creation for every
-            shard (``dist.new_group`` is world-collective); only members get a
-            usable handle.
-        http_url: HTTP base URL of the shard's text-generation server;
-            populated by a serving-layer consumer.
+            is a member of this shard, else ``None`` -- the ``is not None`` check
+            is how a rank finds its own shard. Every rank still participates in
+            the collective process-group creation for every shard
+            (``dist.new_group`` is world-collective); only members get a usable
+            handle.
     """
 
-    index: int
     spec: InferenceShardSpec
     rank_offset: int
     world_size: int
     pg_collection: Optional[ProcessGroupCollection]
-    http_url: Optional[str] = None
-
-    def ranks(self) -> List[int]:
-        """Global ranks that are members of this shard."""
-        return list(range(self.rank_offset, self.rank_offset + self.world_size))
-
-    def owns_rank(self, rank: Optional[int] = None) -> bool:
-        """Whether ``rank`` (default: current rank) is in this shard."""
-        if rank is None:
-            rank = dist.get_rank()
-        return self.rank_offset <= rank < self.rank_offset + self.world_size
 
 
 def build_inference_pg_collections_for_shards(
@@ -256,7 +243,6 @@ def build_inference_pg_collections_for_shards(
         in_shard = offset <= rank < offset + shard_world
         results.append(
             InferenceShard(
-                index=i,
                 spec=spec,
                 rank_offset=offset,
                 world_size=shard_world,
