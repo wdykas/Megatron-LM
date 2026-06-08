@@ -318,8 +318,8 @@ def post_recv_request_kv_resharded(
     mine = kv_reshard.transfers_for_dst(plan, my_layout.global_rank)
     pending = []
     for t in mine:
-        n_lay = t.g_layer1 - t.g_layer0
-        n_head = t.g_head1 - t.g_head0
+        n_lay = t.global_layer_hi - t.global_layer_lo
+        n_head = t.global_head_hi - t.global_head_lo
         h = backend.recv(
             (bc, 2, n_lay, bs, n_head, hd), dtype, src=t.src_rank, device=device
         )

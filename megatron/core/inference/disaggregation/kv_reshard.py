@@ -100,26 +100,28 @@ class ReshardTransfer:
 
     src_rank: int
     dst_rank: int
-    g_layer0: int
-    g_layer1: int
-    g_head0: int
-    g_head1: int
+    # The transferred sub-block's GLOBAL bounds as half-open ranges:
+    # layers [global_layer_lo, global_layer_hi) x kv-heads [global_head_lo, global_head_hi).
+    global_layer_lo: int
+    global_layer_hi: int
+    global_head_lo: int
+    global_head_hi: int
 
     def src_layer_slice(self, src: KVShardLayout) -> slice:
         off = src.layer_range()[0]
-        return slice(self.g_layer0 - off, self.g_layer1 - off)
+        return slice(self.global_layer_lo - off, self.global_layer_hi - off)
 
     def src_head_slice(self, src: KVShardLayout) -> slice:
         off = src.head_range()[0]
-        return slice(self.g_head0 - off, self.g_head1 - off)
+        return slice(self.global_head_lo - off, self.global_head_hi - off)
 
     def dst_layer_slice(self, dst: KVShardLayout) -> slice:
         off = dst.layer_range()[0]
-        return slice(self.g_layer0 - off, self.g_layer1 - off)
+        return slice(self.global_layer_lo - off, self.global_layer_hi - off)
 
     def dst_head_slice(self, dst: KVShardLayout) -> slice:
         off = dst.head_range()[0]
-        return slice(self.g_head0 - off, self.g_head1 - off)
+        return slice(self.global_head_lo - off, self.global_head_hi - off)
 
 
 def plan_kv_reshard(
@@ -165,10 +167,10 @@ def plan_kv_reshard(
                 ReshardTransfer(
                     src_rank=s.global_rank,
                     dst_rank=d.global_rank,
-                    g_layer0=li[0],
-                    g_layer1=li[1],
-                    g_head0=hi[0],
-                    g_head1=hi[1],
+                    global_layer_lo=li[0],
+                    global_layer_hi=li[1],
+                    global_head_lo=hi[0],
+                    global_head_hi=hi[1],
                 )
             )
     return transfers
