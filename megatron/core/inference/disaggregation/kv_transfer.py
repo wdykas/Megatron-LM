@@ -214,12 +214,12 @@ class DecodeRecv:
 
     meta: dict
     staging: torch.Tensor
-    pending: List[tuple]  # [(ReshardTransfer, TransferHandle)]
+    pending: List[tuple]  # [(KVReshardTransfer, TransferHandle)]
     my_layout: Any
     # Mamba (hybrid only): the local conv/ssm buffers + their pending receives.
     mamba_conv: Optional[torch.Tensor] = None
     mamba_ssm: Optional[torch.Tensor] = None
-    mamba_pending: Optional[List[tuple]] = None  # [(MambaTransfer, TransferHandle)]
+    mamba_pending: Optional[List[tuple]] = None  # [(MambaReshardTransfer, TransferHandle)]
     my_mamba_layout: Any = None
 
     def finish(self, engine: Any) -> Optional[dict]:

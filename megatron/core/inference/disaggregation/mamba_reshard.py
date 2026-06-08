@@ -92,7 +92,7 @@ class MambaShardLayout:
 
 
 @dataclass(frozen=True)
-class MambaTransfer:
+class MambaReshardTransfer:
     """One sub-block move for the reshard.
 
     ``band`` is ``"x"``/``"B"``/``"C"`` (conv channel axis) or ``"ssm"`` (head
@@ -118,7 +118,7 @@ class MambaTransfer:
 
 def plan_mamba_reshard(
     src_layouts: List[MambaShardLayout], dst_layouts: List[MambaShardLayout]
-) -> List[MambaTransfer]:
+) -> List[MambaReshardTransfer]:
     """Plan the conv/ssm sub-block moves from the prefill (src) layouts to the
     decode (dst) layouts. One transfer per (src rank, dst rank, global layer,
     band) where both the layer ranges and the channel ranges overlap."""
@@ -132,7 +132,7 @@ def plan_mamba_reshard(
             rep_rank[key] = s.global_rank
     source_ranks = set(rep_rank.values())
 
-    out: List[MambaTransfer] = []
+    out: List[MambaReshardTransfer] = []
     for s in src_layouts:
         if s.global_rank not in source_ranks:
             continue
@@ -152,7 +152,7 @@ def plan_mamba_reshard(
                 lo, hi = chan_ov
                 for g in range(layer_ov[0], layer_ov[1]):
                     out.append(
-                        MambaTransfer(
+                        MambaReshardTransfer(
                             src_rank=s.global_rank, dst_rank=d.global_rank, band=band,
                             global_layer=g, src_layer=g - s.layer_start, dst_layer=g - d.layer_start,
                             src_lo=s_off + (lo - s_glo[0]), src_hi=s_off + (hi - s_glo[0]),
@@ -162,9 +162,9 @@ def plan_mamba_reshard(
     return out
 
 
-def transfers_for_src(plan: List[MambaTransfer], src_rank: int) -> List[MambaTransfer]:
+def transfers_for_src(plan: List[MambaReshardTransfer], src_rank: int) -> List[MambaReshardTransfer]:
     return [t for t in plan if t.src_rank == src_rank]
 
 
-def transfers_for_dst(plan: List[MambaTransfer], dst_rank: int) -> List[MambaTransfer]:
+def transfers_for_dst(plan: List[MambaReshardTransfer], dst_rank: int) -> List[MambaReshardTransfer]:
     return [t for t in plan if t.dst_rank == dst_rank]

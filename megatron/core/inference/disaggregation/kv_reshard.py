@@ -89,7 +89,7 @@ class KVShardLayout:
 
 
 @dataclass(frozen=True)
-class ReshardTransfer:
+class KVReshardTransfer:
     """One sub-block exchange between a (src, dst) rank pair.
 
     Global coords identify the intersection; the local-slice helpers
@@ -126,7 +126,7 @@ class ReshardTransfer:
 
 def plan_kv_reshard(
     srcs: List[KVShardLayout], dsts: List[KVShardLayout]
-) -> List[ReshardTransfer]:
+) -> List[KVReshardTransfer]:
     """Full reshard plan: every sub-block that must move src -> dst.
 
     Both sides compute the same plan from the same layouts and filter to
@@ -151,7 +151,7 @@ def plan_kv_reshard(
             rep_rank[key] = s.global_rank
     source_ranks = set(rep_rank.values())
 
-    transfers: List[ReshardTransfer] = []
+    transfers: List[KVReshardTransfer] = []
     for d in dsts:
         dl, dh = d.layer_range(), d.head_range()
         for s in srcs:
@@ -164,7 +164,7 @@ def plan_kv_reshard(
             if hi is None:
                 continue
             transfers.append(
-                ReshardTransfer(
+                KVReshardTransfer(
                     src_rank=s.global_rank,
                     dst_rank=d.global_rank,
                     global_layer_lo=li[0],
@@ -176,9 +176,9 @@ def plan_kv_reshard(
     return transfers
 
 
-def transfers_for_dst(plan: List[ReshardTransfer], dst_rank: int) -> List[ReshardTransfer]:
+def transfers_for_dst(plan: List[KVReshardTransfer], dst_rank: int) -> List[KVReshardTransfer]:
     return [t for t in plan if t.dst_rank == dst_rank]
 
 
-def transfers_for_src(plan: List[ReshardTransfer], src_rank: int) -> List[ReshardTransfer]:
+def transfers_for_src(plan: List[KVReshardTransfer], src_rank: int) -> List[KVReshardTransfer]:
     return [t for t in plan if t.src_rank == src_rank]
