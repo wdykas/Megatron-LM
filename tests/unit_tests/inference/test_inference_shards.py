@@ -58,6 +58,16 @@ def test_plus_and_semicolon_separators_equivalent():
     assert a == b
 
 
+def test_cp_accepted_only_when_one():
+    # cp is a recognized key (clear error, not "unknown key") but must be 1:
+    # inference shards don't context-parallelize.
+    assert parse_inference_shards_spec("tp=2,cp=1", world_size=2) == [InferenceShardSpec(tp=2, cp=1)]
+    with pytest.raises(ValueError):
+        InferenceShardSpec(tp=1, cp=2)
+    with pytest.raises(ValueError):
+        parse_inference_shards_spec("tp=1,cp=2", world_size=1)
+
+
 # --------------------------------------------------------------------------
 # role-layout validation + decode-instance count
 # --------------------------------------------------------------------------

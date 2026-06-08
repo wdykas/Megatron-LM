@@ -6,7 +6,7 @@
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Union
 
-VALID_INT_KEYS = ("tp", "pp", "ep", "expt_tp", "dp")
+VALID_INT_KEYS = ("tp", "pp", "ep", "expt_tp", "dp", "cp")
 VALID_ROLES = ("prefill", "decode")
 VALID_KEYS = (*VALID_INT_KEYS, "role")
 
@@ -27,12 +27,21 @@ class InferenceShardSpec:
     pp: int = 1
     ep: int = 1
     dp: int = 1
+    cp: int = 1
     expt_tp: Optional[int] = None
     role: Optional[str] = None
 
     def __post_init__(self):
         if self.role is not None and self.role not in VALID_ROLES:
             raise ValueError(f"role must be one of {VALID_ROLES} or None; got {self.role!r}")
+        # cp is accepted in the spec for forward-compatibility, but inference
+        # shards don't context-parallelize (the KV reshard models layer x head,
+        # not the sequence dim), so reject anything but cp=1 with a clear error.
+        if self.cp != 1:
+            raise ValueError(
+                f"context parallelism is not supported for inference shards; cp must be 1, "
+                f"got cp={self.cp}"
+            )
         # Resolve expt_tp's default (tp) on this frozen instance.
         if self.expt_tp is None:
             object.__setattr__(self, "expt_tp", self.tp)
