@@ -13,11 +13,8 @@ planner end to end without any distributed runtime.
 import pytest
 import torch
 
-from megatron.core.inference.disaggregation.kv_reshard import (
-    KVShardLayout,
-    plan_kv_reshard,
-    transfers_for_dst,
-)
+from megatron.core.inference.disaggregation.kv_reshard import KVShardLayout, plan_kv_reshard
+from megatron.core.inference.disaggregation.utils import transfers_for_dst
 
 # global model
 L, Hh, BC, BS, HD = 12, 8, 2, 4, 5  # layers, kv-heads, block_count, block_size, head_dim

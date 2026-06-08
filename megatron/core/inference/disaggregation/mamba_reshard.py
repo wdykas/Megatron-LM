@@ -160,11 +160,3 @@ def plan_mamba_reshard(
                         )
                     )
     return out
-
-
-def transfers_for_src(plan: List[MambaReshardTransfer], src_rank: int) -> List[MambaReshardTransfer]:
-    return [t for t in plan if t.src_rank == src_rank]
-
-
-def transfers_for_dst(plan: List[MambaReshardTransfer], dst_rank: int) -> List[MambaReshardTransfer]:
-    return [t for t in plan if t.dst_rank == dst_rank]

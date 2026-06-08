@@ -10,7 +10,7 @@ from typing import Any, List, Optional
 
 import torch
 
-from megatron.core.inference.disaggregation import kv_reshard, mamba_reshard
+from megatron.core.inference.disaggregation import kv_reshard, mamba_reshard, utils
 from megatron.core.inference.disaggregation.transfer_backends.base import (
     KVTransportBackend,
     TransferHandle,
@@ -163,7 +163,7 @@ def send_request_kv_resharded(
 
     attn = payload["staging_tensor"]  # [BC, 2, local_layers, BS, local_heads, HD]
     plan = kv_reshard.plan_kv_reshard(src_layouts, dst_layouts)
-    mine = kv_reshard.transfers_for_src(plan, my_layout.global_rank)
+    mine = utils.transfers_for_src(plan, my_layout.global_rank)
     handles: List[TransferHandle] = []
     keep: List[torch.Tensor] = []
     for t in mine:
@@ -196,7 +196,7 @@ def _send_mamba_resharded(mp, my_mamba, src_mamba, dst_mamba, backend, handles, 
     conv = mp["conv_states_tensor"]  # (local_layers, conv_dim_local, d_conv)
     ssm = mp["ssm_states_tensor"]  # (local_layers, nheads_local, headdim, d_state)
     plan = mamba_reshard.plan_mamba_reshard(src_mamba, dst_mamba)
-    for t in mamba_reshard.transfers_for_src(plan, my_mamba.global_rank):
+    for t in utils.transfers_for_src(plan, my_mamba.global_rank):
         if t.is_conv:
             sub = conv[t.src_layer, t.src_lo : t.src_hi, :].contiguous()
         else:
@@ -315,7 +315,7 @@ def post_recv_request_kv_resharded(
     )
 
     plan = kv_reshard.plan_kv_reshard(src_layouts, dst_layouts)
-    mine = kv_reshard.transfers_for_dst(plan, my_layout.global_rank)
+    mine = utils.transfers_for_dst(plan, my_layout.global_rank)
     pending = []
     for t in mine:
         n_lay = t.global_layer_hi - t.global_layer_lo
@@ -356,7 +356,7 @@ def _post_recv_mamba_resharded(
     )
     plan = mamba_reshard.plan_mamba_reshard(src_mamba, dst_mamba)
     recv.mamba_pending = []
-    for t in mamba_reshard.transfers_for_dst(plan, ml.global_rank):
+    for t in utils.transfers_for_dst(plan, ml.global_rank):
         if t.is_conv:
             shape = (t.dst_hi - t.dst_lo, ml.d_conv)
             dt = conv_dtype
