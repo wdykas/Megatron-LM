@@ -17,31 +17,69 @@ _CONV_BANDS = ("x", "B", "C")
 
 
 @dataclass(frozen=True)
-class MambaShardLayout:
-    """One rank's Mamba-state ownership: which global layers + TP rank.
+class MambaStateDims:
+    """The model's (global, unsharded) Mamba structural dims.
 
-    Global structural dims (``nheads``, ``headdim``, ``d_state``, ``ngroups``,
-    ``d_conv``) are unsharded; per-rank locals follow by dividing by ``tp_size``.
+    These belong to the MambaMixer / model config -- carried as one unit (rather
+    than loose constants spread across the layout) so there's a single source
+    and they can't drift apart. The producer should read them straight from the
+    model config (e.g. ``ngroups = config.mamba_num_groups``) rather than
+    reverse-deriving from tensor shapes. TP shards ``nheads``/``ngroups``; the
+    rest are unsharded.
     """
+
+    nheads: int
+    headdim: int
+    d_state: int
+    ngroups: int
+    d_conv: int
+
+
+@dataclass(frozen=True)
+class MambaShardLayout:
+    """One rank's Mamba-state ownership: which global layers + TP rank, plus the
+    model's structural dims (:class:`MambaStateDims`). Per-rank locals follow by
+    dividing by ``tp_size``."""
 
     global_rank: int
     tp_size: int
     tp_rank: int
     layer_start: int   # global Mamba-layer index of this rank's first layer
     num_layers: int    # Mamba layers held locally (this PP stage)
-    nheads: int        # global
-    headdim: int
-    d_state: int
-    ngroups: int       # global
-    d_conv: int
+    dims: MambaStateDims
 
     def __post_init__(self) -> None:
+        # Wire reconstruction (MambaShardLayout(**dict)) hands ``dims`` as a
+        # plain dict; coerce it back to MambaStateDims.
+        if isinstance(self.dims, dict):
+            object.__setattr__(self, "dims", MambaStateDims(**self.dims))
         # TP shards heads and groups; both must divide evenly or the local
         # conv/ssm band sizes truncate to the wrong (or zero) width silently.
-        if self.nheads % self.tp_size != 0:
-            raise ValueError(f"nheads={self.nheads} not divisible by tp_size={self.tp_size}")
-        if self.ngroups % self.tp_size != 0:
-            raise ValueError(f"ngroups={self.ngroups} not divisible by tp_size={self.tp_size}")
+        if self.dims.nheads % self.tp_size != 0:
+            raise ValueError(f"nheads={self.dims.nheads} not divisible by tp_size={self.tp_size}")
+        if self.dims.ngroups % self.tp_size != 0:
+            raise ValueError(f"ngroups={self.dims.ngroups} not divisible by tp_size={self.tp_size}")
+
+    # Convenience proxies onto the dims so callers read ``layout.headdim`` etc.
+    @property
+    def nheads(self) -> int:
+        return self.dims.nheads
+
+    @property
+    def headdim(self) -> int:
+        return self.dims.headdim
+
+    @property
+    def d_state(self) -> int:
+        return self.dims.d_state
+
+    @property
+    def ngroups(self) -> int:
+        return self.dims.ngroups
+
+    @property
+    def d_conv(self) -> int:
+        return self.dims.d_conv
 
     def mamba_shard_key(self) -> Tuple[int, int]:
         """The Mamba shard this rank holds: ``(tp_rank, layer_start)``. Ranks
@@ -50,11 +88,11 @@ class MambaShardLayout:
 
     @property
     def d_inner(self) -> int:
-        return self.nheads * self.headdim
+        return self.dims.nheads * self.dims.headdim
 
     @property
     def nheads_local(self) -> int:
-        return self.nheads // self.tp_size
+        return self.dims.nheads // self.tp_size
 
     @property
     def d_inner_local(self) -> int:
@@ -62,11 +100,11 @@ class MambaShardLayout:
 
     @property
     def ngroups_local(self) -> int:
-        return self.ngroups // self.tp_size
+        return self.dims.ngroups // self.tp_size
 
     @property
     def conv_dim_local(self) -> int:
-        return self.d_inner_local + 2 * self.ngroups_local * self.d_state
+        return self.d_inner_local + 2 * self.ngroups_local * self.dims.d_state
 
     def layer_range(self) -> Tuple[int, int]:
         return (self.layer_start, self.layer_start + self.num_layers)
@@ -81,13 +119,13 @@ class MambaShardLayout:
             g = self.d_inner
             return g, self.d_inner_local, 0
         if name == "B":
-            g = self.ngroups * self.d_state
-            return g, self.ngroups_local * self.d_state, self.d_inner_local
+            g = self.dims.ngroups * self.dims.d_state
+            return g, self.ngroups_local * self.dims.d_state, self.d_inner_local
         if name == "C":
-            g = self.ngroups * self.d_state
-            return g, self.ngroups_local * self.d_state, self.d_inner_local + self.ngroups_local * self.d_state
+            g = self.dims.ngroups * self.dims.d_state
+            return g, self.ngroups_local * self.dims.d_state, self.d_inner_local + self.ngroups_local * self.dims.d_state
         if name == "ssm":
-            return self.nheads, self.nheads_local, 0
+            return self.dims.nheads, self.nheads_local, 0
         raise KeyError(name)
 
 

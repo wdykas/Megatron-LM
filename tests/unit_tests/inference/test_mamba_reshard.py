@@ -18,6 +18,7 @@ import torch
 
 from megatron.core.inference.disaggregation.mamba_reshard import (
     MambaShardLayout,
+    MambaStateDims,
     plan_mamba_reshard,
 )
 
@@ -66,7 +67,8 @@ def _layouts(tp, pp, base=0):
             out[rank] = MambaShardLayout(
                 global_rank=rank, tp_size=tp, tp_rank=r,
                 layer_start=p * per, num_layers=per,
-                nheads=NHEADS, headdim=HEADDIM, d_state=DSTATE, ngroups=NGROUPS, d_conv=DCONV,
+                dims=MambaStateDims(nheads=NHEADS, headdim=HEADDIM, d_state=DSTATE,
+                                    ngroups=NGROUPS, d_conv=DCONV),
             )
     return out
 
@@ -130,7 +132,8 @@ def test_mamba_rejects_indivisible_groups():
     up front instead of silently dropping state."""
     with pytest.raises(ValueError):
         MambaShardLayout(global_rank=0, tp_size=4, tp_rank=0, layer_start=0, num_layers=1,
-                         nheads=8, headdim=HEADDIM, d_state=DSTATE, ngroups=2, d_conv=DCONV)
+                         dims=MambaStateDims(nheads=8, headdim=HEADDIM, d_state=DSTATE,
+                                             ngroups=2, d_conv=DCONV))
 
 
 def test_mamba_dedupes_replica_sources():
@@ -139,10 +142,27 @@ def test_mamba_dedupes_replica_sources():
     them (smallest global_rank), so no duplicate sends."""
     def _lay(gr):
         return MambaShardLayout(global_rank=gr, tp_size=1, tp_rank=0, layer_start=0,
-                                num_layers=M, nheads=NHEADS, headdim=HEADDIM,
-                                d_state=DSTATE, ngroups=NGROUPS, d_conv=DCONV)
+                                num_layers=M, dims=MambaStateDims(
+                                    nheads=NHEADS, headdim=HEADDIM, d_state=DSTATE,
+                                    ngroups=NGROUPS, d_conv=DCONV))
     plan = plan_mamba_reshard([_lay(0), _lay(1)], [_lay(2)])
     assert {t.src_rank for t in plan} == {0}  # only the smallest-rank replica sources
+
+
+def test_layout_wire_roundtrip():
+    """Layouts cross the coordinator as plain dicts (asdict) and are rebuilt via
+    MambaShardLayout(**dict); the nested dims dict must coerce back to
+    MambaStateDims so proxies (.headdim/.d_conv/...) keep working."""
+    import dataclasses
+
+    lay = MambaShardLayout(
+        global_rank=1, tp_size=2, tp_rank=1, layer_start=0, num_layers=M,
+        dims=MambaStateDims(nheads=NHEADS, headdim=HEADDIM, d_state=DSTATE,
+                            ngroups=NGROUPS, d_conv=DCONV),
+    )
+    rebuilt = MambaShardLayout(**dataclasses.asdict(lay))
+    assert rebuilt == lay
+    assert rebuilt.headdim == HEADDIM and rebuilt.d_conv == DCONV
 
 
 # --------------------------------------------------------------------------
