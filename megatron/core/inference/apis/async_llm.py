@@ -27,6 +27,15 @@ class MegatronAsyncLLM(_MegatronLLMBase):
       ``resume`` / ``shutdown`` / ``wait_for_shutdown``.
     - :meth:`serve` for OpenAI-compatible HTTP serving on the primary rank.
     - ``async with`` context-manager protocol; exit calls :meth:`shutdown`.
+
+    Disaggregated prefill->decode serving is just this class with
+    ``inference_shards`` set (a role-tagged shard layout, e.g.
+    ``"tp=2,role=prefill+tp=1,role=decode"``) and ``inference_config.pg_collection``
+    pointing at this rank's shard groups. The engine is then marked as a
+    prefill/decode shard and the shared coordinator 2-hop routes requests
+    (prefill -> KV handoff -> decode); ``generate`` / :meth:`serve` are
+    otherwise unchanged. Build each rank's model against its shard's groups via
+    :func:`~megatron.core.inference.shards.build_inference_pg_collections_for_shards`.
     """
 
     def __init__(
@@ -38,6 +47,8 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         use_coordinator: bool = False,
         coordinator_host: Optional[str] = None,
         coordinator_port: Optional[int] = None,
+        inference_shards=None,
+        disagg_router: str = "round_robin",
     ) -> None:
         # MegatronAsyncLLM requires coordinator mode: direct mode invokes the
         # synchronous ``engine.generate()`` from inside the caller's asyncio
@@ -60,6 +71,8 @@ class MegatronAsyncLLM(_MegatronLLMBase):
             use_coordinator=use_coordinator,
             coordinator_host=coordinator_host,
             coordinator_port=coordinator_port,
+            inference_shards=inference_shards,
+            disagg_router=disagg_router,
         )
         # Set in serve() when this rank starts the HTTP frontend; consulted by shutdown().
         self._serve_started: bool = False

@@ -15,12 +15,18 @@ import sys
 from argparse import ArgumentParser
 
 import torch
+import torch.distributed as dist
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
 
 from megatron.core.inference.apis import MegatronAsyncLLM, ServeConfig
+from megatron.core.inference.shards import build_inference_pg_collections_for_shards
+from megatron.core.inference.shards_spec import (
+    parse_inference_shards_spec,
+    spec_declares_disaggregation,
+)
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import configure_nvtx_profiling
 from megatron.inference.utils import (
@@ -52,7 +58,33 @@ def add_serve_args(parser: ArgumentParser) -> ArgumentParser:
     return parser
 
 
-async def _serve(args, model, tokenizer, inference_config):
+def _build_model_and_inference_config(args):
+    """Build this rank's model + inference config.
+
+    Regular (colocated) serving builds one model on the global parallel state.
+    Disaggregated serving (``--inference-shards`` with ``role=`` tags) instead
+    partitions the world into prefill/decode shards, builds this rank's model
+    against its shard's process groups, and points the inference config at them
+    -- the only difference from colocated serving. Returns
+    ``(model, inference_config, inference_shards)`` where ``inference_shards`` is
+    the parsed spec list for disagg, else ``None``.
+    """
+    if args.inference_shards and spec_declares_disaggregation(args.inference_shards):
+        world = dist.get_world_size()
+        specs = parse_inference_shards_spec(args.inference_shards, world)
+        shards = build_inference_pg_collections_for_shards(world, specs)
+        my = next(s for s in shards if s.pg_collection is not None)
+        model = get_model_for_inference(pg_collection=my.pg_collection)
+        inference_config = get_inference_config_from_model_and_args(model, args)
+        inference_config.pg_collection = my.pg_collection
+        return model, inference_config, specs
+
+    model = get_model_for_inference()
+    inference_config = get_inference_config_from_model_and_args(model, args)
+    return model, inference_config, None
+
+
+async def _serve(args, model, tokenizer, inference_config, inference_shards):
     async with MegatronAsyncLLM(
         model=model,
         tokenizer=tokenizer,
@@ -60,6 +92,7 @@ async def _serve(args, model, tokenizer, inference_config):
         use_coordinator=True,
         coordinator_host=args.coordinator_host,
         coordinator_port=args.coordinator_port,
+        inference_shards=inference_shards,
     ) as llm:
         serve_config = ServeConfig(
             host=args.host,
@@ -85,11 +118,10 @@ def main():
         configure_nvtx_profiling(True)
 
     tokenizer = build_tokenizer(args)
-    model = get_model_for_inference()
-    inference_config = get_inference_config_from_model_and_args(model, args)
+    model, inference_config, inference_shards = _build_model_and_inference_config(args)
 
     try:
-        asyncio.run(_serve(args, model, tokenizer, inference_config))
+        asyncio.run(_serve(args, model, tokenizer, inference_config, inference_shards))
     except KeyboardInterrupt:
         print("Server process interrupted by user.")
     finally:

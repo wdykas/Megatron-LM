@@ -15,6 +15,7 @@ import numpy as np
 import torch
 
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
+from megatron.core.inference.disaggregation.coordinator_routing import make_disagg_router
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import compute_block_hashes_batched
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
@@ -99,6 +100,8 @@ class DataParallelInferenceCoordinator:
         prefix_caching_routing_alpha: float = 0.5,
         schedule_output_path: str | None = None,
         hostname: str | None = None,
+        disaggregated: bool = False,
+        disagg_router: str = "round_robin",
     ):
         """
         Initializes the inference coordinator.
@@ -170,9 +173,21 @@ class DataParallelInferenceCoordinator:
         logging.info("Inference Coordinator: waiting for connections from data parallel ranks...")
         # First wait for all data parallel ranks to establish connections.
         self.identities_of_data_parallel_ranks = deque([])
+        # Disaggregation: engines register dynamically in the start() loop via
+        # REGISTER_ROLE (their role + their instance's full KV layout across all
+        # tp/pp ranks), so the coordinator can 2-hop route and plan reshards --
+        # robust to engines/client connecting in any order (the disagg
+        # coordinator spawns with data_parallel_size=0, not the blocking count
+        # below). ``_disagg`` is the routing policy; ``_engine_layouts`` maps
+        # engine identity -> its instance's layout dicts; ``_req_meta`` stashes
+        # prompt+sampling per request for the RECV_KV hop.
+        self.disaggregated = disaggregated
+        self._disagg = make_disagg_router(disagg_router) if disaggregated else None
+        self._engine_layouts: dict = {}
+        self._req_meta: dict = {}
         # time.sleep(5)  # Give data parallel ranks time to spawn and connect.
         for _ in range(data_parallel_size):
-            identity, _ = self.router_socket.recv_multipart()
+            identity, payload = self.router_socket.recv_multipart()
             assert identity not in self.identities_of_data_parallel_ranks
             self.identities_of_data_parallel_ranks.append(identity)
         logging.info("Inference Coordinator: Connected with data parallel ranks...")
@@ -258,10 +273,83 @@ class DataParallelInferenceCoordinator:
     def _remove_engine(self, identity):
         """Remove a disconnected engine from the routing pool."""
         self.identities_of_data_parallel_ranks.remove(identity)
+        # Disaggregated: also drop it from the prefill/decode pools so it isn't
+        # handed further requests.
+        if self.disaggregated:
+            self._disagg.remove(identity)
+            self._engine_layouts.pop(identity, None)
         logging.warning(
             "Coordinator: removed engine %s (now %d engines)",
             identity,
             len(self.identities_of_data_parallel_ranks),
+        )
+
+    # --- disaggregated 2-hop routing -------------------------------------
+    def _disagg_send(self, identity, header, *parts):
+        """msgpack ``[header, *parts]`` to one engine."""
+        return self._send_to_engine(
+            identity, msgpack.packb([header.value, *parts], use_bin_type=True)
+        )
+
+    def _route_submit_disagg(self, request_id, prompt, sampling_params):
+        """Hop 1: forward a new request to a prefill engine; stash its prompt +
+        sampling so they can be forwarded to the chosen decode engine later."""
+        self._req_meta[request_id] = (prompt, sampling_params)
+        prefill_id = self._disagg.route_submit(request_id)
+        self._disagg_send(
+            prefill_id, Headers.SUBMIT_REQUEST, request_id, prompt, sampling_params
+        )
+
+    def _drop_disagg_request(self, request_id, reason):
+        """Drop an unroutable disagg request and clear all per-request
+        coordinator state so nothing leaks (the 2-hop routing maps, the stashed
+        prompt, and the client maps). NOTE: the submitting client's future is
+        not resolved here -- the client protocol has no failure reply yet, so a
+        dropped request's caller will time out rather than get an error. Drops
+        are error/edge paths (missing decode engine, missing layouts, stale
+        PREFILL_DONE); the common cases are prevented upstream."""
+        logging.error("Coordinator: dropping disagg request %s: %s", request_id, reason)
+        self._disagg.forget(request_id)
+        self._req_meta.pop(request_id, None)
+        self.request_id_to_rank.pop(request_id, None)
+        self.request_id_to_client_id.pop(request_id, None)
+        self.request_id_to_client_request_id.pop(request_id, None)
+
+    def _handle_prefill_done(self, request_id):
+        """Hop 2: a prefill engine staged a request's KV. Pick a decode engine,
+        tell prefill where to ship the KV (SEND_KV) and decode where to receive
+        it + the prompt to admit (RECV_KV). The KV bytes move engine->engine via
+        the transport backend; only control flows through the coordinator.
+
+        Drops the request (with a logged warning) rather than crashing the
+        coordinator loop if its state is missing -- e.g. a duplicate/late
+        PREFILL_DONE, or the chosen decode engine disconnected before it could
+        be routed. The coordinator is shared by the whole job, so an unhandled
+        exception here would take every engine down with it.
+        """
+        meta = self._req_meta.get(request_id)
+        if meta is None:
+            # Stale/duplicate PREFILL_DONE (request already completed or dropped).
+            # No client is waiting; just log.
+            logging.warning("Coordinator: PREFILL_DONE for unknown request %s; ignoring", request_id)
+            return
+        try:
+            prefill_id, decode_id = self._disagg.route_prefill_done(request_id)
+        except RuntimeError as e:
+            self._drop_disagg_request(request_id, f"cannot route to decode: {e}")
+            return
+        prompt, sampling_params = meta
+        src_layouts = self._engine_layouts.get(prefill_id)
+        dst_layouts = self._engine_layouts.get(decode_id)
+        if src_layouts is None or dst_layouts is None:
+            self._drop_disagg_request(
+                request_id,
+                f"missing KV layouts (prefill={prefill_id}, decode={decode_id})",
+            )
+            return
+        self._disagg_send(prefill_id, Headers.SEND_KV, request_id, dst_layouts)
+        self._disagg_send(
+            decode_id, Headers.RECV_KV, request_id, src_layouts, prompt, sampling_params
         )
 
     def _send_to_engine(self, identity, payload):
@@ -398,6 +486,17 @@ class DataParallelInferenceCoordinator:
             deserialized_payload = msgpack.unpackb(serialized_payload, raw=False)
             header = Headers(deserialized_payload[0])
 
+            if header == Headers.REGISTER_ROLE:
+                # Disaggregated engine registration (dynamic, order-independent):
+                # role + this instance's KV layouts.
+                _, role, layouts = deserialized_payload
+                if sender_identity not in self.identities_of_data_parallel_ranks:
+                    self.identities_of_data_parallel_ranks.append(sender_identity)
+                    self._register_rank_identity(sender_identity)
+                self._disagg.register(sender_identity, role)
+                self._engine_layouts[sender_identity] = layouts
+                continue
+
             if header == Headers.CONNECT:
                 if sender_identity in known_clients:
                     logging.info(
@@ -440,6 +539,13 @@ class DataParallelInferenceCoordinator:
                 else:
                     raise Exception("specialize for <%s> prompt." % type(prompt).__name__)
 
+                # Disaggregated: hop 1 is prefill. Send the request to a prefill
+                # engine and stash its prompt/sampling for the RECV_KV forward;
+                # decode selection + KV handoff happen on PREFILL_DONE.
+                if self.disaggregated:
+                    self._route_submit_disagg(request_id, prompt, sampling_params)
+                    continue
+
                 payload = msgpack.packb(
                     [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params],
                     use_bin_type=True,
@@ -476,6 +582,13 @@ class DataParallelInferenceCoordinator:
                             "num_hashes": len(request_hashes),
                         }
                     )
+
+            elif header == Headers.PREFILL_DONE:
+                # Disaggregated hop 2: a prefill engine finished a request's
+                # prefill (KV staged). Pick a decode engine and wire the handoff.
+                assert self.disaggregated, "PREFILL_DONE on a non-disaggregated coordinator"
+                request_id = deserialized_payload[1]
+                self._handle_prefill_done(request_id)
 
             elif header in (
                 Headers.PAUSE,
@@ -545,6 +658,11 @@ class DataParallelInferenceCoordinator:
                     client_request_identity = self.request_id_to_client_request_id[fid]
                     del self.request_id_to_client_id[fid]
                     del self.request_id_to_client_request_id[fid]
+                    if self.disaggregated:
+                        # Disagg routing didn't use the prefix/load counters;
+                        # just drop the per-request 2-hop state.
+                        self._disagg.forget(fid)
+                        self._req_meta.pop(fid, None)
                     assigned_rank = self.request_id_to_rank.pop(fid, None)
                     if assigned_rank is not None:
                         idx = self.identity_to_rank_index.get(assigned_rank)
@@ -617,6 +735,8 @@ class DataParallelInferenceCoordinator:
         prefix_caching_routing_alpha: float = 0.5,
         schedule_output_path: str | None = None,
         hostname: str | None = None,
+        disaggregated: bool = False,
+        disagg_router: str = "round_robin",
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -651,6 +771,8 @@ class DataParallelInferenceCoordinator:
             prefix_caching_routing_alpha=prefix_caching_routing_alpha,
             schedule_output_path=schedule_output_path,
             hostname=hostname,
+            disaggregated=disaggregated,
+            disagg_router=disagg_router,
         )
         ready_event.set()
         try:

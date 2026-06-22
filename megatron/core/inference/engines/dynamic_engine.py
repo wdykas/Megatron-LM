@@ -17,6 +17,7 @@ from itertools import repeat
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
+import torch.distributed as dist
 from torch import Tensor
 
 from megatron.core.inference.batch_dimensions_utils import (
@@ -33,6 +34,13 @@ from megatron.core.inference.contexts.dynamic_context import (
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
+from megatron.core.inference.disaggregation.kv_reshard import KVShardLayout
+from megatron.core.inference.disaggregation.kv_transfer import (
+    post_recv_request_kv_resharded,
+    send_request_kv_resharded,
+)
+from megatron.core.inference.disaggregation.mamba_reshard import MambaShardLayout
+from megatron.core.inference.disaggregation.transfer_backends.nccl import NcclTransportBackend
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
@@ -299,6 +307,26 @@ class DynamicInferenceEngine(AbstractEngine):
         # Mark the inference engine as active. Cleared in `suspend()` and re-set in `resume()`.
         InferenceMode.set_active()
 
+        # Disaggregation config (None role => normal aggregated engine). Set via
+        # set_disaggregation_config() before start_listening_to_data_parallel_coordinator.
+        # Lives here (not create_cuda_graphs, which early-returns when cuda graphs
+        # are disabled -- e.g. hybrid models -- and re-runs on recapture) so every
+        # engine always has it.
+        self.disagg_role = None
+        self.disagg_instance_layouts = None
+        self.disagg_identity = None
+        self.disagg_total_instances = None
+        self.disagg_world_group = None
+        self.disagg_spawn_coordinator = False
+        self.disagg_router_name = "round_robin"  # routing policy the coordinator resolves
+        # Immutable per-rank/instance layouts, precomputed in
+        # set_disaggregation_config (None/empty until then).
+        self._disagg_my_layout = None
+        self._disagg_my_mamba_layout = None
+        self._disagg_instance_kv_layouts = []
+        self._disagg_instance_mamba_layouts = []
+        self._disagg_init_state()
+
         # Create cuda graphs.
         self.create_cuda_graphs()
 
@@ -520,6 +548,193 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.capture_stats = capture_stats
 
+    def set_disaggregation_config(
+        self, *, role, instance_layouts, identity, total_instances,
+        world_group, spawn_coordinator, disagg_router="round_robin",
+    ):
+        """Mark this engine as a disaggregated prefill/decode shard.
+
+        Call before :meth:`start_listening_to_data_parallel_coordinator`.
+
+        Args:
+            role: ``"prefill"`` or ``"decode"``.
+            instance_layouts: KV-shard layout dicts for every rank of this
+                instance (so the coordinator can build reshard plans).
+            identity: unique ZMQ identity for this instance's MP-coordinator
+                (must differ across shards/instances).
+            total_instances: total prefill+decode instances (coordinator sizing).
+            world_group: process group spanning all disagg ranks (used to
+                broadcast the coordinator address across shards).
+            spawn_coordinator: whether THIS rank spawns the single coordinator.
+            disagg_router: name of the routing policy the coordinator resolves
+                (registered via ``register_disagg_router``; default round-robin).
+        """
+        assert role in ("prefill", "decode")
+        self._disagg_init_state()  # also covers engine doubles that skip __init__
+        self.disagg_role = role
+        self.disagg_instance_layouts = instance_layouts
+        self.disagg_identity = identity
+        self.disagg_total_instances = total_instances
+        self.disagg_world_group = world_group
+        self.disagg_spawn_coordinator = spawn_coordinator
+        self.disagg_router_name = disagg_router
+        # Precompute the immutable per-rank/instance layouts once: they're fixed
+        # for the engine's life, so building them here (instead of rescanning +
+        # rebuilding on every hand-off) keeps the send/recv path cheap.
+        rank = dist.get_rank()
+        self._disagg_instance_kv_layouts = self._disagg_layouts(instance_layouts)
+        self._disagg_instance_mamba_layouts = self._disagg_mamba_layouts(instance_layouts)
+        self._disagg_my_layout = next(
+            (l for l in self._disagg_instance_kv_layouts if l.global_rank == rank), None
+        )
+        assert (
+            self._disagg_my_layout is not None
+        ), f"rank {rank} not found in its disagg instance layouts"
+        self._disagg_my_mamba_layout = next(
+            (m for m in self._disagg_instance_mamba_layouts if m.global_rank == rank), None
+        )
+        # The prefill controller stages each finished request's KV into the
+        # context (while the slot is still valid) -- the engine's finish loop
+        # runs after the context has freed the slot. _disagg_send_kv drains it.
+        if self.context is not None:
+            self.context.disagg_stage_prefill_kv = role == "prefill"
+            self.context.disagg_staged_kv = {}
+            # request_id -> prompt block count, recorded at SUBMIT. Caps the
+            # exported KV to the prompt-covering blocks so it matches the decode
+            # side's header-free block_count = ceil(prompt_len/block_size); the
+            # prefill otherwise allocates one extra block for its (discarded)
+            # generated token when prompt_len is block-aligned.
+            self.context.disagg_prompt_block_count = {}
+
+    def _disagg_init_state(self):
+        """Per-request KV hand-off state. Called from ``__init__`` and from
+        :meth:`set_disaggregation_config` (so engine doubles that skip
+        ``__init__`` still get it).
+
+        Prefill KV staging lives on the context (``context.disagg_staged_kv``,
+        populated by the controller before the slot is freed); _disagg_send_kv
+        drains it. This holds only the in-flight transfer state:
+
+        - ``_disagg_pending_{sends,recvs}``: in-flight transfers, completed one
+          step later in :meth:`_disagg_complete_pending` (collective across MP
+          ranks since coordinator messages are TP-broadcast), so the transfer
+          overlaps the engine step.
+        - ``_disagg_max_inflight``: depth window bounding concurrent hand-offs
+          (and staged-KV memory) so prefill can't outrun decode.
+        """
+        self._disagg_backend = None  # lazily-created KV transport backend
+        self._disagg_pending_sends = {}  # request_id -> PrefillHandoff
+        self._disagg_pending_recvs = {}  # request_id -> (DecodeRecv, prompt, sampling_params)
+        self._disagg_max_inflight = 8
+
+    # --- disaggregated KV handoff (coordinator-driven) -------------------
+    def _disagg_layouts(self, dicts):
+        # Strip the optional hybrid ``mamba`` sub-dict; it's a separate layout.
+        return [KVShardLayout(**{k: v for k, v in d.items() if k != "mamba"}) for d in dicts]
+
+    def _disagg_mamba_layouts(self, dicts):
+        """MambaShardLayout list for the hybrid dicts that carry a ``mamba``
+        sub-dict (empty for non-hybrid models)."""
+        return [MambaShardLayout(**d["mamba"]) for d in dicts if d.get("mamba")]
+
+    def _disagg_get_backend(self):
+        if self._disagg_backend is None:
+            self._disagg_backend = NcclTransportBackend()
+            self._disagg_backend.init()
+        return self._disagg_backend
+
+    def _disagg_send_kv(self, request_id, dst_layout_dicts):
+        """(prefill) post the staged KV for ``request_id`` to the decode
+        instance (resharded to its layout). Non-blocking: the send is reaped a
+        step later in :meth:`_disagg_complete_pending` so the transfer overlaps
+        the engine step."""
+        # Backpressure: block on the oldest in-flight send once the window is
+        # full, so prefill doesn't run arbitrarily far ahead of decode. The
+        # pending set is identical across MP ranks (TP-broadcast messages), so
+        # the drain decision is collective.
+        while len(self._disagg_pending_sends) >= self._disagg_max_inflight:
+            oldest = next(iter(self._disagg_pending_sends))
+            self._disagg_pending_sends.pop(oldest).wait()
+
+        staged = self.context.disagg_staged_kv.pop(request_id, None)
+        if staged is None:
+            # No staged KV for this request: the slot was already freed and
+            # re-exporting would fail. This can only happen on a stale/duplicate
+            # SEND_KV (the request was never staged or already shipped). Skip
+            # rather than crash the engine loop.
+            logging.warning(
+                "disagg prefill: SEND_KV for request %s has no staged KV; skipping",
+                request_id,
+            )
+            return
+        handoff = send_request_kv_resharded(
+            self, request_id, self._disagg_my_layout,
+            self._disagg_instance_kv_layouts,
+            self._disagg_layouts(dst_layout_dicts),
+            backend=self._disagg_get_backend(), payload=staged,
+            my_mamba_layout=self._disagg_my_mamba_layout,
+            src_mamba_layouts=self._disagg_instance_mamba_layouts,
+            dst_mamba_layouts=self._disagg_mamba_layouts(dst_layout_dicts),
+        )
+        if handoff is not None:
+            self._disagg_pending_sends[request_id] = handoff
+
+    def _disagg_recv_kv(self, request_id, src_layout_dicts, prompt, sampling_params):
+        """(decode) post the receive of ``request_id``'s KV. Non-blocking: the
+        receive is reaped a step later in :meth:`_disagg_complete_pending`, which
+        imports the KV (registers the prefix-cache blocks) and admits the
+        request -- add_request prefix-hits and continues generation."""
+        # Backpressure: complete + admit the oldest in-flight receive once the
+        # window is full (collective: identical pending set across MP ranks).
+        while len(self._disagg_pending_recvs) >= self._disagg_max_inflight:
+            oldest = next(iter(self._disagg_pending_recvs))
+            rv, p, sp = self._disagg_pending_recvs.pop(oldest)
+            rv.finish(self)
+            self.add_request(oldest, p, sampling_params=SamplingParams.deserialize(sp))
+
+        recv = post_recv_request_kv_resharded(
+            self, self._disagg_my_layout,
+            self._disagg_layouts(src_layout_dicts),
+            self._disagg_instance_kv_layouts,
+            prompt, backend=self._disagg_get_backend(),
+            my_mamba_layout=self._disagg_my_mamba_layout,
+            src_mamba_layouts=self._disagg_mamba_layouts(src_layout_dicts),
+            dst_mamba_layouts=self._disagg_instance_mamba_layouts,
+        )
+        if recv is None:
+            # No KV to receive (shouldn't happen header-free): admit directly.
+            sp = SamplingParams.deserialize(sampling_params)
+            self.add_request(request_id, prompt, sampling_params=sp)
+            return
+        self._disagg_pending_recvs[request_id] = (recv, prompt, sampling_params)
+
+    def _disagg_complete_pending(self):
+        """Reap KV transfers posted on the previous step.
+
+        Collective across the MP group: the pending sets were populated from
+        TP-broadcast coordinator messages, so every rank completes the same
+        requests in the same (insertion) order. Prefill: wait each send and
+        release its staged KV. Decode: wait each receive, import the KV
+        (registers the prefix-cache blocks) and admit the request."""
+        if getattr(self, "disagg_role", None) is None:
+            return
+        for request_id in list(self._disagg_pending_sends):
+            self._disagg_pending_sends.pop(request_id).wait()
+        for request_id in list(self._disagg_pending_recvs):
+            recv, prompt, sampling_params = self._disagg_pending_recvs.pop(request_id)
+            imported = recv.finish(self)
+            if imported is None:
+                # KV import failed (e.g. decode KV cache full): the request is
+                # still admitted but without the handed-off blocks, so it
+                # re-prefills from the prompt -- correct but slower. Surface it.
+                logging.warning(
+                    "disagg decode: KV import failed for request %s; "
+                    "re-prefilling from prompt instead of using handed-off KV",
+                    request_id,
+                )
+            sp = SamplingParams.deserialize(sampling_params)
+            self.add_request(request_id, prompt, sampling_params=sp)
+
     @internal_api
     async def start_listening_to_data_parallel_coordinator(
         self,
@@ -601,8 +816,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
         local_ip = hostname or socket.gethostname()
 
-        # Spawn a DP coordinator process and get the connection info.
-        if launch_inference_coordinator and self.is_dp_coordinator:
+        disagg = self.disagg_role is not None
+        # Disaggregated: ONE coordinator for the whole job, sized to the total
+        # prefill+decode instance count, spawned by the designated rank (the
+        # prefill instance's coordinator). Otherwise: one coordinator per DP
+        # group, spawned by each DP coordinator rank.
+        should_spawn = self.disagg_spawn_coordinator if disagg else self.is_dp_coordinator
+        if launch_inference_coordinator and should_spawn:
             spawn_context = multiprocessing.get_context('spawn')
             deterministic_mode = torch.are_deterministic_algorithms_enabled()
             dp_pipe, dp_process_pipe = spawn_context.Pipe()
@@ -612,7 +832,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 kwargs={
                     "pipe_connection": dp_process_pipe,
                     "ready_event": coordinator_ready_event,
-                    "data_parallel_size": get_pg_size(self.pg_collection.dp),
+                    # Disagg engines register dynamically (REGISTER_ROLE in the
+                    # coordinator loop, order-independent), so spawn with size 0
+                    # -- no blocking registration count in the coordinator init.
+                    "data_parallel_size": (
+                        0 if disagg else get_pg_size(self.pg_collection.dp)
+                    ),
                     "tokenizer": self.controller.tokenizer,
                     "max_requests": self.context.max_requests,
                     "inference_coordinator_port": inference_coordinator_port,
@@ -623,6 +848,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     "prefix_caching_routing_alpha": self.context.prefix_caching_routing_alpha,
                     "schedule_output_path": coordinator_schedule_output_path,
                     "hostname": hostname,
+                    "disaggregated": disagg,
+                    "disagg_router": self.disagg_router_name,
                 },
             )
             self.inference_coordinator_process.start()
@@ -652,15 +879,22 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             mp_req_addr = None
 
-        # Broadcast addresses to respective ranks.
+        # Broadcast the coordinator address. Disaggregated: the single
+        # coordinator is shared across shards, so broadcast over the whole
+        # disagg group from the spawner (global rank 0). Otherwise: within the
+        # DP group from its source rank.
         bcast = [dp_addr]
-        torch.distributed.broadcast_object_list(bcast, src=dp_src, group=dp_group)
+        if disagg:
+            torch.distributed.broadcast_object_list(bcast, src=0, group=self.disagg_world_group)
+        else:
+            torch.distributed.broadcast_object_list(bcast, src=dp_src, group=dp_group)
         [dp_addr] = bcast
+        # MP (intra-instance) publisher address is always group-local.
         bcast = [mp_req_addr]
         torch.distributed.broadcast_object_list(bcast, src=mp_src, group=mp_group)
         [mp_req_addr] = bcast
 
-        identity = f'mp-coord-{dp_rank}'
+        identity = self.disagg_identity if disagg else f'mp-coord-{dp_rank}'
         if self.is_mp_coordinator:
             # 1. Create dealer sockets where tp_rank = 0 and pp_rank = 0
             #    These will receive requests from an InferenceCoordinator.
@@ -669,8 +903,18 @@ class DynamicInferenceEngine(AbstractEngine):
             self.socket_for_receiving_requests.setsockopt(zmq.IDENTITY, identity.encode('utf-8'))
             self.socket_for_receiving_requests.connect(dp_addr)
 
-            # send empty string. this is used to register with the coordinator.
-            self.socket_for_receiving_requests.send(b"")
+            # Register with the coordinator. Disaggregated: announce role + this
+            # instance's KV layouts so the coordinator can 2-hop route + plan
+            # reshards. Otherwise: an empty string is the registration ping.
+            if disagg:
+                self.socket_for_receiving_requests.send(
+                    msgpack.packb(
+                        [Headers.REGISTER_ROLE.value, self.disagg_role, self.disagg_instance_layouts],
+                        use_bin_type=True,
+                    )
+                )
+            else:
+                self.socket_for_receiving_requests.send(b"")
 
             # 2. Create a publisher socket. This is used to publish or broadcast
             #    requests within the model parallel group
@@ -709,7 +953,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.zmq_context, process_group=None, hostname=hostname
             )
 
-        if launch_inference_coordinator and self.is_dp_coordinator:
+        if launch_inference_coordinator and should_spawn:
             await await_process_call(
                 coordinator_ready_event.wait, self.inference_coordinator_process
             )
@@ -1338,6 +1582,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
                     request.add_event_finish()
+                    # Prefill-only disagg: the request's KV was staged by the
+                    # controller before the context freed its slot (see
+                    # disagg_stage_prefill_kv); _disagg_send_kv drains it on
+                    # SEND_KV. Nothing to capture here.
                     finished_entry = self.requests.pop(request_id)
                     finished_request = finished_entry.record[-1]
                     finished_request.generated_length = len(finished_request.generated_tokens)
@@ -2004,7 +2252,20 @@ class DynamicInferenceEngine(AbstractEngine):
             records_to_send = [
                 r for r in finished_request_records if r.requests[-1].status != Status.FAILED
             ]
-            if records_to_send:
+            if records_to_send and self.disagg_role == "prefill":
+                # Prefill-only: don't reply to the client. Tell the coordinator
+                # each request finished prefill (KV staged); it will name the
+                # decode target via SEND_KV/RECV_KV.
+                nvtx_range_push("coordinator_communication")
+                for r in records_to_send:
+                    self.socket_for_receiving_requests.send(
+                        msgpack.packb(
+                            [Headers.PREFILL_DONE.value, r.requests[-1].request_id],
+                            use_bin_type=True,
+                        )
+                    )
+                nvtx_range_pop("coordinator_communication")
+            elif records_to_send:
                 nvtx_range_push("coordinator_communication")
                 payload = msgpack.packb(
                     [Headers.ENGINE_REPLY.value, [r.merge().serialize() for r in records_to_send]],
@@ -2270,6 +2531,10 @@ class DynamicInferenceEngine(AbstractEngine):
             int: The number of messages that were received and processed in this batch.
         """
 
+        # Reap KV transfers posted on the previous step before admitting this
+        # step's batch (no-op unless disaggregated; collective across MP ranks).
+        self._disagg_complete_pending()
+
         nvtx_range_push("drain_zmq_socket")
         all_messages = []
         if self.is_mp_coordinator:
@@ -2298,9 +2563,28 @@ class DynamicInferenceEngine(AbstractEngine):
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
                 sampling_params = SamplingParams.deserialize(sampling_params)
+                if self.disagg_role == "prefill":
+                    # Prefill-only: run prefill (which populates the prompt KV)
+                    # and stop right after, so the request leaves this engine
+                    # with its prompt-block KV intact for the handoff. The few
+                    # generated tokens are discarded; decode regenerates from
+                    # the prompt (prefix-cache hit on the imported KV).
+                    sampling_params.num_tokens_to_generate = 1
+                    bs = int(self.context.block_size_tokens)
+                    self.context.disagg_prompt_block_count[request_id] = (
+                        len(prompt) + bs - 1
+                    ) // bs
                 nvtx_range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
                 nvtx_range_pop("add_request")
+            elif header == Headers.SEND_KV:
+                # (prefill) ship a staged request's KV to the chosen decode
+                # instance, resharded to its layout.
+                self._disagg_send_kv(data[1], data[2])
+            elif header == Headers.RECV_KV:
+                # (decode) receive a request's KV, import it (registers the
+                # prefix-cache blocks), then admit it for generation.
+                self._disagg_recv_kv(data[1], data[2], data[3], data[4])
             elif header == Headers.SET_GENERATION_EPOCH:
                 new_generation_epoch = data[1]
             else:
