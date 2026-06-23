@@ -50,9 +50,17 @@ def _make_layouts(tp, pp, ep=1, etp=1):
                 for et in range(etp):
                     outs.append(
                         KVShardLayout(
-                            num_layers=L, num_heads=Hh, tp_size=tp, tp_rank=t,
-                            pp_size=pp, pp_rank=p, global_rank=rank,
-                            ep_size=ep, ep_rank=e, etp_size=etp, etp_rank=et,
+                            num_layers=L,
+                            num_heads=Hh,
+                            tp_size=tp,
+                            tp_rank=t,
+                            pp_size=pp,
+                            pp_rank=p,
+                            global_rank=rank,
+                            ep_size=ep,
+                            ep_rank=e,
+                            etp_size=etp,
+                            etp_rank=et,
                         )
                     )
                     rank += 1
@@ -67,14 +75,10 @@ def _run_reshard(src_layouts, dst_layouts):
     by_rank = {s.global_rank: s for s in src_layouts}
     out = {}
     for d in dst_layouts:
-        dst = torch.full(
-            (BC, 2, d.local_num_layers(), BS, d.local_num_heads(), HD), -999.0
-        )
+        dst = torch.full((BC, 2, d.local_num_layers(), BS, d.local_num_heads(), HD), -999.0)
         for t in transfers_for_dst(plan, d.global_rank):
             s = by_rank[t.src_rank]
-            block = src_buf[t.src_rank][
-                :, :, t.src_layer_slice(s), :, t.src_head_slice(s), :
-            ]
+            block = src_buf[t.src_rank][:, :, t.src_layer_slice(s), :, t.src_head_slice(s), :]
             dst[:, :, t.dst_layer_slice(d), :, t.dst_head_slice(d), :] = block
         out[d.global_rank] = dst
     return g, out
@@ -83,12 +87,12 @@ def _run_reshard(src_layouts, dst_layouts):
 @pytest.mark.parametrize(
     "src,dst",
     [
-        ((1, 1), (1, 1)),   # homogeneous
-        ((2, 1), (4, 1)),   # TP fan-out (divisible)
-        ((4, 1), (2, 1)),   # TP merge (divisible)
-        ((1, 2), (1, 3)),   # PP change (divisible both)
-        ((2, 2), (4, 3)),   # both change
-        ((2, 3), (4, 2)),   # TP + PP mixed
+        ((1, 1), (1, 1)),  # homogeneous
+        ((2, 1), (4, 1)),  # TP fan-out (divisible)
+        ((4, 1), (2, 1)),  # TP merge (divisible)
+        ((1, 2), (1, 3)),  # PP change (divisible both)
+        ((2, 2), (4, 3)),  # both change
+        ((2, 3), (4, 2)),  # TP + PP mixed
     ],
 )
 def test_reshard_matches_direct_split(src, dst):
@@ -136,7 +140,7 @@ def test_expert_replication_picks_single_source(ep, etp):
 def test_hetero_tp_with_expert_replication():
     """Hetero attention TP merge (4->2) while sources are also ETP-replicated:
     the reshard still merges heads correctly and dedupes the ETP replicas."""
-    src_layouts = _make_layouts(tp=4, pp=1, etp=2)   # 8 ranks, 4 attn shards x2
+    src_layouts = _make_layouts(tp=4, pp=1, etp=2)  # 8 ranks, 4 attn shards x2
     dst_layouts = _make_layouts(tp=2, pp=1)
     plan = plan_kv_reshard(src_layouts, dst_layouts)
     _assert_one_source_per_shard(plan, src_layouts)
@@ -151,16 +155,16 @@ def test_one_prefill_to_multiple_decode_targets_of_different_parallelism():
     decode pool. Each target is an independent reshard (one plan call per
     target replica); the planner imposes no shared parallelism across
     targets."""
-    src_layouts = _make_layouts(tp=2, pp=2)          # prefill: TP2 x PP2
-    targets = [(4, 1), (2, 1), (1, 3), (4, 3)]        # decode replicas, all different
+    src_layouts = _make_layouts(tp=2, pp=2)  # prefill: TP2 x PP2
+    targets = [(4, 1), (2, 1), (1, 3), (4, 3)]  # decode replicas, all different
     g = _global_kv()
     for tp_d, pp_d in targets:
         dst_layouts = _make_layouts(tp_d, pp_d)
         _, out = _run_reshard(src_layouts, dst_layouts)
         for d in dst_layouts:
-            assert torch.equal(out[d.global_rank], _shard_of(g, d)), (
-                f"decode target TP{tp_d}xPP{pp_d} rank {d.global_rank} mismatch"
-            )
+            assert torch.equal(
+                out[d.global_rank], _shard_of(g, d)
+            ), f"decode target TP{tp_d}xPP{pp_d} rank {d.global_rank} mismatch"
 
 
 def test_uneven_pp_attention_window():
@@ -171,7 +175,7 @@ def test_uneven_pp_attention_window():
         KVShardLayout(L, Hh, 1, 0, 2, 0, 0, layer_start=0, num_local_layers=5),
         KVShardLayout(L, Hh, 1, 0, 2, 1, 1, layer_start=5, num_local_layers=7),
     ]
-    dst = [KVShardLayout(L, Hh, 1, 0, 1, 0, 2)]   # pp=1: all L layers on one rank
+    dst = [KVShardLayout(L, Hh, 1, 0, 1, 0, 2)]  # pp=1: all L layers on one rank
     assert src[0].layer_range() == (0, 5) and src[1].layer_range() == (5, 12)
     g, out = _run_reshard(src, dst)
     for d in dst:
@@ -185,4 +189,3 @@ def test_explicit_layer_window_is_all_or_nothing():
         KVShardLayout(L, Hh, 1, 0, 2, 0, 0, layer_start=0)
     with pytest.raises(ValueError):
         KVShardLayout(L, Hh, 1, 0, 2, 0, 0, num_local_layers=5)
-

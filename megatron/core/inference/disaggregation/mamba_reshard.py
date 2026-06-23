@@ -44,8 +44,8 @@ class MambaShardLayout:
     global_rank: int
     tp_size: int
     tp_rank: int
-    layer_start: int   # global Mamba-layer index of this rank's first layer
-    num_layers: int    # Mamba layers held locally (this PP stage)
+    layer_start: int  # global Mamba-layer index of this rank's first layer
+    num_layers: int  # Mamba layers held locally (this PP stage)
     dims: MambaStateDims
 
     def __post_init__(self) -> None:
@@ -63,22 +63,27 @@ class MambaShardLayout:
     # Convenience proxies onto the dims so callers read ``layout.headdim`` etc.
     @property
     def nheads(self) -> int:
+        """Global (unsharded) number of Mamba heads."""
         return self.dims.nheads
 
     @property
     def headdim(self) -> int:
+        """Dimension of each Mamba head."""
         return self.dims.headdim
 
     @property
     def d_state(self) -> int:
+        """SSM state size per head."""
         return self.dims.d_state
 
     @property
     def ngroups(self) -> int:
+        """Global (unsharded) number of B/C groups."""
         return self.dims.ngroups
 
     @property
     def d_conv(self) -> int:
+        """Convolution kernel width."""
         return self.dims.d_conv
 
     def mamba_shard_key(self) -> Tuple[int, int]:
@@ -88,25 +93,31 @@ class MambaShardLayout:
 
     @property
     def d_inner(self) -> int:
+        """Global inner dimension (nheads * headdim)."""
         return self.dims.nheads * self.dims.headdim
 
     @property
     def nheads_local(self) -> int:
+        """Number of Mamba heads held by this TP rank."""
         return self.dims.nheads // self.tp_size
 
     @property
     def d_inner_local(self) -> int:
+        """Local inner dimension for this TP rank."""
         return self.d_inner // self.tp_size
 
     @property
     def ngroups_local(self) -> int:
+        """Number of B/C groups held by this TP rank."""
         return self.dims.ngroups // self.tp_size
 
     @property
     def conv_dim_local(self) -> int:
+        """Total local conv channel width (x + B + C bands)."""
         return self.d_inner_local + 2 * self.ngroups_local * self.dims.d_state
 
     def layer_range(self) -> Tuple[int, int]:
+        """Global Mamba-layer range ``[lo, hi)`` owned by this rank."""
         return (self.layer_start, self.layer_start + self.num_layers)
 
     def _band(self, name: str) -> Tuple[int, int, int]:
@@ -123,7 +134,11 @@ class MambaShardLayout:
             return g, self.ngroups_local * self.dims.d_state, self.d_inner_local
         if name == "C":
             g = self.dims.ngroups * self.dims.d_state
-            return g, self.ngroups_local * self.dims.d_state, self.d_inner_local + self.ngroups_local * self.dims.d_state
+            return (
+                g,
+                self.ngroups_local * self.dims.d_state,
+                self.d_inner_local + self.ngroups_local * self.dims.d_state,
+            )
         if name == "ssm":
             return self.dims.nheads, self.nheads_local, 0
         raise KeyError(name)
@@ -151,6 +166,7 @@ class MambaReshardTransfer:
 
     @property
     def is_conv(self) -> bool:
+        """True if this transfer targets the conv state; False for ssm."""
         return self.band in _CONV_BANDS
 
 
@@ -191,10 +207,16 @@ def plan_mamba_reshard(
                 for g in range(layer_ov[0], layer_ov[1]):
                     out.append(
                         MambaReshardTransfer(
-                            src_rank=s.global_rank, dst_rank=d.global_rank, band=band,
-                            global_layer=g, src_layer=g - s.layer_start, dst_layer=g - d.layer_start,
-                            src_lo=s_off + (lo - s_glo[0]), src_hi=s_off + (hi - s_glo[0]),
-                            dst_lo=d_off + (lo - d_glo[0]), dst_hi=d_off + (hi - d_glo[0]),
+                            src_rank=s.global_rank,
+                            dst_rank=d.global_rank,
+                            band=band,
+                            global_layer=g,
+                            src_layer=g - s.layer_start,
+                            dst_layer=g - d.layer_start,
+                            src_lo=s_off + (lo - s_glo[0]),
+                            src_hi=s_off + (hi - s_glo[0]),
+                            dst_lo=d_off + (lo - d_glo[0]),
+                            dst_hi=d_off + (hi - d_glo[0]),
                         )
                     )
     return out

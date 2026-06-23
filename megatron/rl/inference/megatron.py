@@ -99,6 +99,10 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
         from megatron.rl.inference.disagg import configure_disagg_engine, is_disagg_rollout
 
+        # RL needs log probs, but not prompt log probs.
+        args.return_log_probs = True
+        args.skip_prompt_log_probs = True
+
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(model=model)
         if is_disagg_rollout(args):
             # Disaggregated rollouts: ``model`` is this rank's prefill/decode shard
@@ -112,7 +116,9 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         )
 
         if dist.get_rank() == 0:
-            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import start_text_gen_server
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
+                start_text_gen_server,
+            )
 
             client = InferenceClient(inference_coordinator_address=dp_addr)
             client.start()
@@ -172,7 +178,9 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             self._client.stop()
 
         if dist.get_rank() == 0:
-            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import stop_text_gen_server
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
+                stop_text_gen_server,
+            )
             stop_text_gen_server()
 
     def set_generation_epoch(self, generation_epoch: int):

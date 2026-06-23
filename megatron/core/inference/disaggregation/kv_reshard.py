@@ -45,9 +45,7 @@ class KVShardLayout:
     def __post_init__(self) -> None:
         # TP must divide heads (the head split is always even).
         if self.num_heads % self.tp_size != 0:
-            raise ValueError(
-                f"num_heads={self.num_heads} not divisible by tp_size={self.tp_size}"
-            )
+            raise ValueError(f"num_heads={self.num_heads} not divisible by tp_size={self.tp_size}")
         # layer_start and num_local_layers are an all-or-nothing explicit window:
         # setting only one would silently fall back to the even-split count and
         # defeat the purpose (uneven stage with an even count).
@@ -69,6 +67,7 @@ class KVShardLayout:
         return (self.tp_rank, self.pp_rank)
 
     def layer_range(self) -> Tuple[int, int]:
+        """Global attention-layer range ``[lo, hi)`` owned by this rank."""
         # num_local_layers is guaranteed set whenever layer_start is (see __post_init__).
         if self.layer_start is not None:
             return (self.layer_start, self.layer_start + self.num_local_layers)
@@ -76,14 +75,17 @@ class KVShardLayout:
         return (self.pp_rank * per, (self.pp_rank + 1) * per)
 
     def head_range(self) -> Tuple[int, int]:
+        """Global KV-head range ``[lo, hi)`` owned by this rank."""
         per = self.num_heads // self.tp_size
         return (self.tp_rank * per, (self.tp_rank + 1) * per)
 
     def local_num_layers(self) -> int:
+        """Number of attention layers held locally by this rank."""
         lo, hi = self.layer_range()
         return hi - lo
 
     def local_num_heads(self) -> int:
+        """Number of KV heads held locally by this rank."""
         lo, hi = self.head_range()
         return hi - lo
 
@@ -108,18 +110,22 @@ class KVReshardTransfer:
     global_head_hi: int
 
     def src_layer_slice(self, src: KVShardLayout) -> slice:
+        """Local layer slice on the source side for this transfer."""
         off = src.layer_range()[0]
         return slice(self.global_layer_lo - off, self.global_layer_hi - off)
 
     def src_head_slice(self, src: KVShardLayout) -> slice:
+        """Local KV-head slice on the source side for this transfer."""
         off = src.head_range()[0]
         return slice(self.global_head_lo - off, self.global_head_hi - off)
 
     def dst_layer_slice(self, dst: KVShardLayout) -> slice:
+        """Local layer slice on the destination side for this transfer."""
         off = dst.layer_range()[0]
         return slice(self.global_layer_lo - off, self.global_layer_hi - off)
 
     def dst_head_slice(self, dst: KVShardLayout) -> slice:
+        """Local KV-head slice on the destination side for this transfer."""
         off = dst.head_range()[0]
         return slice(self.global_head_lo - off, self.global_head_hi - off)
 
