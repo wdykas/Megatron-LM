@@ -300,6 +300,25 @@ class RLRuntimeState:
         self.last_collection_iteration = 0
         self.sequences_this_iteration_on_rank = 0
         self.latest_batch_num_sequences = 0
+        # Online compactor training state — managed by compaction.learned.online
+        # (maybe_init_compactor_online / build_compactor_trajectories / maybe_train_compactor).
+        self.compactor = None
+        self.compactor_optimizer = None   # _CompactorOptimizer once attached
+        self.compactor_cfg = None
+        self.compactor_trajectories: list = []
+        # Training model reference for differentiable student forward (teacher-KL mode)
+        # and for KV capture via forward pass (all STILL online modes).
+        self.compactor_student_model = None
+        # Raw rollout sequences for KV capture: list of (seq_ids: list[int], reward: float).
+        # Populated during rollout collection on rank 0; consumed by online.build_compactor_trajectories.
+        self.compactor_raw_sequences: list = []
+        # Cumulative step offset for checkpoint naming: set to loaded step so that
+        # filenames advance monotonically across job restarts.
+        self.compactor_step_offset: int = 0
+        # Deferred optimizer attachment: set by online.init_compactor_from_kv, consumed by
+        # online.attach_compactor_optimizer on the first maybe_train_compactor call.
+        self._compactor_lr: float = 3e-4
+        self._compactor_ckpt_path: str | None = None
 
     def reset_iteration_counters(self, iteration):
         """Reset per-iteration counters."""
@@ -438,6 +457,50 @@ def get_agent(args, parallel_generation_tasks: int | None = None):
 _INFERENCE_INTERFACE = None
 
 
+def _maybe_save_trajectory(trajectory, trajectory_dir: str, iteration: int, prompt_idx: int) -> None:
+    """Save a KV Trajectory to disk if trajectory_dir is set.
+
+    Tensors are moved to CPU before pickling so the file can be loaded on any
+    machine regardless of GPU availability.
+    """
+    import pickle
+    from megatron.rl.compaction.learned.training.data import Trajectory
+
+    def _cpu_trajectory(traj: Trajectory) -> Trajectory:
+        cpu_chunks = [
+            (
+                [k.cpu() for k in chunk_keys],
+                [v.cpu() for v in chunk_vals],
+            )
+            for chunk_keys, chunk_vals in traj.chunks
+        ]
+        # Move probe tensors to CPU via dataclasses.replace on the tensor fields.
+        import dataclasses
+        cpu_probes: dict = {}
+        for chunk_idx, probes in traj.probes_by_chunk.items():
+            cpu_p = []
+            for p in probes:
+                updates = {
+                    f.name: getattr(p, f.name).cpu()
+                    for f in dataclasses.fields(p)
+                    if isinstance(getattr(p, f.name), torch.Tensor)
+                }
+                cpu_p.append(dataclasses.replace(p, **updates))
+            cpu_probes[chunk_idx] = cpu_p
+        return Trajectory(
+            chunks=cpu_chunks,
+            probes_by_chunk=cpu_probes,
+            rollout_return=traj.rollout_return,
+            teacher_logprob_return=traj.teacher_logprob_return,
+        )
+
+    out_dir = Path(trajectory_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"iter{iteration:07d}_prompt{prompt_idx:05d}.pt"
+    with open(path, "wb") as f:
+        pickle.dump(_cpu_trajectory(trajectory), f, protocol=pickle.HIGHEST_PROTOCOL)
+
+
 def get_inference_interface(args, loop, model):
     global _INFERENCE_INTERFACE
     if _INFERENCE_INTERFACE is None:
@@ -544,6 +607,26 @@ def get_environment_rollouts(
 
             # NOTE(jbarker): we need to double check this when using PP>1
             rank = torch.distributed.get_rank()
+
+            # Set up trajectory collector if KV compaction is enabled.
+            traj_collector = None
+            if getattr(args, "rl_compaction_enabled", False) and rank == 0:
+                kv_hook = getattr(inference_interface, "_kv_hook", None)
+                _want_trajs = (
+                    getattr(args, "rl_compaction_trajectory_dir", None) or
+                    getattr(args, "rl_compaction_compactor_train", False)
+                )
+                if kv_hook is not None and _want_trajs:
+                    from megatron.rl.compaction.learned import PipelineConfig
+                    from megatron.rl.compaction.learned.capture.hook_collector import HookTrajectoryCollector
+                    _traj_cfg = PipelineConfig(
+                        chunk_size=getattr(args, "rl_compaction_chunk_size", 256),
+                    )
+                    traj_collector = HookTrajectoryCollector(kv_hook, _traj_cfg)
+                    _compactor_online.maybe_init_compactor_online(get_rl_runtime_state(), args, kv_hook)
+                    # Store training model for KV capture and differentiable student forward.
+                    get_rl_runtime_state().compactor_student_model = model
+
             with nvtx_range("collect-rollouts"):
                 if rank == 0:
                     log_single_rank(
@@ -551,9 +634,77 @@ def get_environment_rollouts(
                         logging.INFO,
                         f"Collecting rollouts, Iteration {args.curr_iteration}...",
                     )
-                    rollouts = [
-                        loop.run_until_complete(anext(rollout_generator)) for _ in range(n_prompts)
-                    ]
+                    rollouts = []
+                    for _prompt_idx in range(n_prompts):
+                        if traj_collector is not None:
+                            traj_collector.begin_rollout()
+                        group = loop.run_until_complete(anext(rollout_generator))
+                        if traj_collector is not None:
+                            # Use first rollout's response tokens as probe query/answer.
+                            # teacher_logits=None → only task loss and kv_recon are active;
+                            # teacher_kl requires online training via maybe_train_compactor.
+                            _resp = None
+                            if group and hasattr(group[0], "response_tokens") and group[0].response_tokens:
+                                _resp_ids = group[0].response_tokens
+                                _resp = torch.tensor(
+                                    _resp_ids, dtype=torch.long, device="cpu"
+                                ).unsqueeze(0)  # (1, S_resp)
+
+                            _n_toks = len(group[0].response_tokens) if (
+                                group and hasattr(group[0], "response_tokens") and group[0].response_tokens
+                            ) else 1
+                            traj_collector.on_step(
+                                n_new_tokens=max(_n_toks, 1),
+                                query_tokens=_resp,
+                                answer_tokens=_resp,
+                            )
+                            _traj = traj_collector.end_rollout()
+
+                            if _traj.chunks:
+                                # Attach rollout return so value-directed training can
+                                # weight kv_recon by task performance.
+                                _group_reward = sum(
+                                    float(r.reward) for r in group
+                                    if hasattr(r, "reward") and r.reward is not None
+                                )
+                                if _group_reward != 0.0:
+                                    _traj.rollout_return = _group_reward
+                                # Attach teacher logprob return for STILL training.
+                                # teacher_logprob_return = mean log P(token | full KV) across
+                                # response tokens.  Negative value; less-negative = more confident.
+                                # We negate it so a higher value = better teacher confidence,
+                                # matching the "higher advantage = more gradient" convention.
+                                _lps = getattr(group[0], "logprobs", None)
+                                if _lps and _lps[0]:
+                                    _mean_lp = float(sum(_lps[0]) / max(len(_lps[0]), 1))
+                                    _traj.teacher_logprob_return = -_mean_lp  # positive; higher = more confident
+                                # Save to disk for offline training.
+                                if getattr(args, "rl_compaction_trajectory_dir", None):
+                                    _maybe_save_trajectory(
+                                        _traj,
+                                        args.rl_compaction_trajectory_dir,
+                                        iteration=args.curr_iteration,
+                                        prompt_idx=_prompt_idx,
+                                    )
+                                # Accumulate for online STILL training this iteration.
+                                if getattr(args, "rl_compaction_compactor_train", False):
+                                    get_rl_runtime_state().compactor_trajectories.append(_traj)
+                        # Save raw sequence for forward-pass KV capture.
+                        # This is the fallback when kv_hook.get_kv_matrices() returns None
+                        # (paged cache is empty after inference completes).
+                        if getattr(args, "rl_compaction_compactor_train", False):
+                            _prompt_ids = list(getattr(group[0], "prompt_tokens", []) or []) if group else []
+                            _resp_ids2 = list(getattr(group[0], "response_tokens", []) or []) if group else []
+                            if _prompt_ids or _resp_ids2:
+                                _full_seq = _prompt_ids + _resp_ids2
+                                _reward2 = sum(
+                                    float(r.reward) for r in group
+                                    if hasattr(r, "reward") and r.reward is not None
+                                )
+                                get_rl_runtime_state().compactor_raw_sequences.append(
+                                    (_full_seq, _reward2)
+                                )
+                        rollouts.append(group)
                     # In deterministic mode, sort rollouts by problem_id for consistent ordering
                     # regardless of completion order due to system timing jitter.
                     if torch.are_deterministic_algorithms_enabled():
@@ -1604,6 +1755,10 @@ def get_grpo_data_iterator(
         runtime_state.group_stats = group_stats
         runtime_state.example_groups = example_groups
         runtime_state.reset_iteration_counters(iteration)
+        # Build compactor trajectories via model forward when paged-cache capture failed.
+        _rs = get_rl_runtime_state()
+        _compactor_online.build_compactor_trajectories(_rs, model, get_args())
+        _compactor_online.maybe_train_compactor(_rs, get_args(), optimizer=optimizer)
 
     maybe_log_training_metrics(
         group_stats=runtime_state.group_stats,
@@ -2008,3 +2163,7 @@ def _pad_nonnull_with_zeros(data: list[Optional[torch.Tensor]], max_len: int) ->
             padded_data.append(torch.zeros(max_len))
     return torch.stack(padded_data)
 
+
+
+# Online compactor RL-loop glue is defined in the compaction package.
+from megatron.rl.compaction.learned import online as _compactor_online  # noqa: E402

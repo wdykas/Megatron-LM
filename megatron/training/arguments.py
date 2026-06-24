@@ -2318,6 +2318,80 @@ def _add_rl_args(parser):
     group.add_argument('--rl-inference-parsers', nargs='*', default=[],
                        help='List of response parsers to enable for RL inference '
                             '(e.g. --rl-inference-parsers deepseek-r1-reasoning qwen3-coder-tool).')
+
+    # KV compaction
+    group.add_argument('--rl-compaction-enabled', action='store_true', default=False,
+                       help='Enable KV compaction during RL rollouts.')
+    group.add_argument(
+        '--rl-compaction-strategy',
+        type=str,
+        default='topk',
+        choices=['topk', 'h2o', 'streaming_llm', 'omp', 'still', 'belief_still'],
+        help='KV compaction strategy: topk/h2o/streaming_llm/omp use selection; '
+             'still/belief_still use Perceiver-based synthesis.',
+    )
+    group.add_argument(
+        '--rl-compaction-mode',
+        type=str,
+        default='record_only',
+        choices=['record_only', 'shadow', 'live'],
+        help='record_only: collect KV traces without modifying inference; '
+             'shadow: compute compaction but do not apply; '
+             'live: apply compaction in-place to the KV cache.',
+    )
+    group.add_argument('--rl-compaction-kv-budget-ratio', type=float, default=0.5,
+                       help='Fraction of KV positions to retain per step (0-1).')
+    group.add_argument('--rl-compaction-n-compress', type=int, default=64,
+                       help='Number of synthetic memory slots C for Still/Belief-Still.')
+    group.add_argument('--rl-compaction-chunk-size', type=int, default=256,
+                       help='Token chunk size for HookTrajectoryCollector.')
+    group.add_argument('--rl-compaction-trajectory-dir', type=str, default=None,
+                       help='Directory to save collected KV trajectories for offline training.')
+    group.add_argument('--rl-compaction-compactor-checkpoint', type=str, default=None,
+                       help='Path to trained Still/Belief-Still checkpoint for live compaction.')
+    # Online STILL training during the RL loop
+    group.add_argument('--rl-compaction-compactor-train', action='store_true', default=False,
+                       help='Train a GatedRecurrentUpdater online during RL rollouts using '
+                            'collected KV trajectories weighted by rollout advantages.')
+    group.add_argument('--rl-compaction-compactor-lr', type=float, default=3e-4,
+                       help='Learning rate for online STILL compactor training.')
+    group.add_argument('--rl-compaction-compactor-checkpoint-dir', type=str, default=None,
+                       help='Directory to save online STILL compactor checkpoints.')
+    group.add_argument('--rl-compaction-compactor-checkpoint-every', type=int, default=100,
+                       help='Save online STILL checkpoint every N RL iterations.')
+    group.add_argument('--rl-compaction-compactor-advantage-clip', type=float, default=5.0,
+                       help='Clip advantages to [-clip, clip] before computing probe weights.')
+    group.add_argument('--rl-compaction-compactor-advantage-min-weight', type=float, default=0.1,
+                       help='Minimum advantage weight for value-directed training.')
+    group.add_argument('--rl-compaction-compactor-use-teacher-logprob', action='store_true', default=False,
+                       help='STILL mode: weight kv_recon by teacher log-prob confidence instead of task reward.')
+    group.add_argument('--rl-compaction-compactor-teacher-kl', action='store_true', default=False,
+                       help='True STILL paper objective: run differentiable student forward through the frozen '
+                            'model with compact KV injected via attention hook, then minimize CE(student_logits, '
+                            'response_tokens).  Requires the training model to be accessible (set automatically).  '
+                            'Replaces kv_recon as the compactor training signal.')
+    # NextLat latent-dynamics regularizers (arXiv 2511.05963) for the online compactor.
+    group.add_argument('--rl-compaction-compactor-dynamics', type=float, default=0.0,
+                       help='Weight for the NextLat dynamics-prediction loss: a dedicated head predicts '
+                            'M_{t+1} from M_t, trained via SmoothL1 against stop-grad targets. '
+                            'Requires --rl-compaction-compactor-use-dynamics-head.')
+    group.add_argument('--rl-compaction-compactor-use-dynamics-head', action='store_true', default=False,
+                       help='Add a dynamics head to the GatedRecurrentUpdater (needed for the dynamics loss).')
+    group.add_argument('--rl-compaction-compactor-future-kv-reconstruction', type=float, default=0.0,
+                       help='Weight for the NextLat future-KV-reconstruction loss: old memory M_{t-1} must '
+                            'answer queries drawn from the future chunk t (belief-state sufficiency test).')
+    group.add_argument('--rl-compaction-compactor-use-future-accuracy-weight', action='store_true', default=False,
+                       help='Up-weight kv_reconstruction on chunks where future reconstruction is harder '
+                            '(future/current ratio, clamped to [0.5, 4.0]).')
+    group.add_argument('--rl-compaction-compactor-future-horizon-kl', type=float, default=0.0,
+                       help='Weight for the future-horizon KL loss: position-weighted teacher KL that '
+                            'upweights later positions in the probe window.')
+    group.add_argument('--rl-compaction-compactor-future-horizon-gamma', type=float, default=1.0,
+                       help='Discount for future-horizon KL position weights (<1.0 upweights later positions; '
+                            '1.0 is uniform, equivalent to plain teacher KL).')
+    group.add_argument('--rl-compaction-compactor-merged-chunk-prob', type=float, default=0.0,
+                       help='Probability per chunk of adding a merged-chunk consistency loss: the sequential '
+                            'belief must agree with compressing the merged (prev+current) chunk in one pass.')
     return parser
 
 def _add_training_args(parser):
