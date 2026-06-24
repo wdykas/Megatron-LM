@@ -21,7 +21,6 @@ def train_compactor_trajectory(
     trajectory,         # Trajectory
     student_fn,         # StudentFn
     cfg,                # CompactorTrainerConfig
-    feature_extractor=None,  # optional ChunkFeatureExtractor (z_t features for the gate)
 ) -> dict:
     """THE single STILL training path — shared by online RL and offline training.
 
@@ -36,8 +35,7 @@ def train_compactor_trajectory(
       * online true-STILL (teacher-KL): still_ce via student_fn.
       * offline (BeliefCompactorTrainer): all of the above PLUS the probe-distillation
         terms (teacher_kl / future_kl / weighted_kl / retrieval / future_horizon_kl)
-        when probes carry teacher_logits, plus an optional feature_extractor (z_t) —
-        passed by BeliefCompactorTrainer.train_trajectory, which delegates here.
+        when probes carry teacher_logits.
 
     Advantage weighting is applied when cfg.vd_cfg is set and probe.advantage (or
     the trajectory return) is available.
@@ -47,7 +45,6 @@ def train_compactor_trajectory(
     Without this, the compactor forward builds no autograd graph, chunk_loss never
     requires grad, and optimizer.step() is a silent no-op (weights never change).
     """
-    import inspect
     # All loss/weight helpers used in the per-chunk loop, hoisted here so they are
     # imported once per trajectory (not per chunk/probe) and visible in one place.
     from megatron.rl.compaction.learned.training.losses import (
@@ -58,12 +55,6 @@ def train_compactor_trajectory(
     from megatron.rl.compaction.learned.training.value_directed import _probe_weight
     from megatron.rl.compaction.learned.training.data import TrainingProbe
 
-    # Detect whether the updater accepts a `features` kwarg (gate conditioning).
-    def _accepts_features(fn):
-        try:
-            return "features" in inspect.signature(fn).parameters
-        except (ValueError, TypeError):
-            return False
     # ``model`` may be an mcore DistributedDataParallel wrapping the compactor (online,
     # distributed) or the bare module (offline / unit tests). ``updater`` is always the
     # bare module used for the forward pass; the optional DDP hooks (zero_grad_buffer /
@@ -82,9 +73,6 @@ def train_compactor_trajectory(
         if _ddp_sync is not None:
             _ddp_sync()           # all-reduce grads across the (world) DP group
         optimizer.step()
-
-    _init_has_features = feature_extractor is not None and _accepts_features(updater.initial_compress)
-    _fwd_has_features = feature_extractor is not None and _accepts_features(getattr(updater, "update", updater.forward))
 
     _zero_grad()
     memory = None
@@ -126,26 +114,16 @@ def train_compactor_trajectory(
         chunk_keys = [k.to(_dev, dtype=_dtype) for k in chunk_keys]
         chunk_values = [v.to(_dev, dtype=_dtype) for v in chunk_values]
 
-        # Optional chunk features z_t for gate conditioning (offline path).
-        z_t = None
-        if feature_extractor is not None:
-            current_slots = 0 if memory is None else feature_extractor.memory_budget
-            feat_vec = feature_extractor.batch_extract(chunk_keys, chunk_idx, current_slots)
-            _B = chunk_keys[0].shape[0]
-            z_t = feat_vec.unsqueeze(0).expand(_B, -1).to(chunk_keys[0].device)
-
         memory_before_update = None
         preds = None
         if memory is None:
             # chunk 0: bootstrap from zero prior; get predictions to train the
             # prediction head toward the data mean even on the first step.
             if _use_update:
-                _kw = {"features": z_t} if (_init_has_features and z_t is not None) else {}
                 memory, preds = updater.initial_compress(
-                    chunk_keys, chunk_values, return_preds=True, **_kw)
+                    chunk_keys, chunk_values, return_preds=True)
             else:
-                _kw = {"features": z_t} if (_init_has_features and z_t is not None) else {}
-                memory = updater.initial_compress(chunk_keys, chunk_values, **_kw)
+                memory = updater.initial_compress(chunk_keys, chunk_values)
 
             if preds is not None and cfg.loss_weights.predictive > 0.0:
                 pred_l = predictive_coding_loss(preds, chunk_keys)
@@ -157,12 +135,10 @@ def train_compactor_trajectory(
             memory_prev = memory.detach() if cfg.loss_weights.consistency > 0.0 else None
 
             if _use_update:
-                _kw = {"features": z_t} if (_fwd_has_features and z_t is not None) else {}
-                memory, gates, preds = updater.update(memory, chunk_keys, chunk_values, **_kw)
+                memory, gates, preds = updater.update(memory, chunk_keys, chunk_values)
             else:
                 gates = None
-                _kw = {"features": z_t} if (_fwd_has_features and z_t is not None) else {}
-                memory = updater(memory, chunk_keys, chunk_values, **_kw)
+                memory = updater(memory, chunk_keys, chunk_values)
 
             # Predictive loss: each slot predicts R_t from M_{t-1}
             if preds is not None and cfg.loss_weights.predictive > 0.0:
@@ -444,11 +420,10 @@ class BeliefCompactorTrainer:
         log = trainer.train_trajectory(trajectory, student_fn)
     """
 
-    def __init__(self, updater, optimizer, config, feature_extractor=None) -> None:
+    def __init__(self, updater, optimizer, config) -> None:
         self.updater = updater
         self.optimizer = optimizer
         self.config = config
-        self.feature_extractor = feature_extractor
 
     @torch.enable_grad()
     def train_trajectory(self, trajectory, student_fn) -> dict:
@@ -464,7 +439,6 @@ class BeliefCompactorTrainer:
             trajectory=trajectory,
             student_fn=student_fn,
             cfg=self.config,
-            feature_extractor=self.feature_extractor,
         )
 
 

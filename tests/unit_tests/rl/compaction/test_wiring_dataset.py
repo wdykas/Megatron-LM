@@ -4,7 +4,6 @@
 
 Covers:
   - still/types.py — CompactKV, StudentFn canonical aliases
-  - BeliefCompactorTrainer + ChunkFeatureExtractor (z_t injection)
   - TrajectoryDataset + trajectory_collate_fn
 """
 
@@ -17,7 +16,6 @@ from megatron.rl.compaction.learned.models.belief import BeliefMemory, BeliefUpd
 from megatron.rl.compaction.learned.models.compactor import PerceiverCompactor, PerceiverConfig
 from megatron.rl.compaction.learned.training.data import Trajectory, TrainingProbe
 from megatron.rl.compaction.learned.training.data import TrajectoryDataset, trajectory_collate_fn
-from megatron.rl.compaction.learned.models.value import ChunkFeatureExtractor, FEATURE_DIM
 from megatron.rl.compaction.learned.training.data import PipelineConfig
 from megatron.rl.compaction.learned.training.training import BeliefCompactorTrainer
 from megatron.rl.compaction.learned.training.data import CompactorTrainerConfig
@@ -42,10 +40,8 @@ def _perceiver_cfg():
     return PerceiverConfig(d_kv=D, n_heads=2, n_compress=C, n_attn_layers=L)
 
 
-def _gated_updater(feature_dim=0):
-    cfg = GatedUpdaterConfig(d_kv=D, n_heads=2, n_compress=C, n_attn_layers=L,
-                             feature_dim=feature_dim)
-    return GatedRecurrentUpdater(cfg)
+def _gated_updater():
+    return GatedRecurrentUpdater(GatedUpdaterConfig(d_kv=D, n_heads=2, n_compress=C, n_attn_layers=L))
 
 
 def _belief_updater():
@@ -104,55 +100,6 @@ class TestTypes:
         from megatron.rl.compaction import learned
         assert hasattr(learned, "CompactKV")
         assert hasattr(learned, "StudentFn")
-
-
-# ---------------------------------------------------------------------------
-# BeliefCompactorTrainer + ChunkFeatureExtractor
-# ---------------------------------------------------------------------------
-
-class TestBeliefStillTrainerFeatures:
-    def test_train_without_extractor_still_works(self):
-        updater = _gated_updater(feature_dim=0)
-        opt = torch.optim.SGD(updater.parameters(), lr=1e-3)
-        trainer = BeliefCompactorTrainer(updater, opt, CompactorTrainerConfig())
-        traj = _make_trajectory()
-        log = trainer.train_trajectory(traj, _student_fn)
-        assert "total" in log
-
-    def test_train_with_extractor_gated_updater(self):
-        updater = _gated_updater(feature_dim=FEATURE_DIM)
-        opt = torch.optim.SGD(updater.parameters(), lr=1e-3)
-        extractor = ChunkFeatureExtractor(memory_budget=C, max_chunks=64)
-        trainer = BeliefCompactorTrainer(updater, opt, CompactorTrainerConfig(),
-                                     feature_extractor=extractor)
-        traj = _make_trajectory()
-        log = trainer.train_trajectory(traj, _student_fn)
-        assert "total" in log
-        assert torch.isfinite(torch.tensor(log["total"]))
-
-    def test_extractor_ignored_for_plain_belief_updater(self):
-        # BeliefUpdater doesn't accept features; trainer should not crash
-        updater = _belief_updater()
-        opt = torch.optim.SGD(updater.parameters(), lr=1e-3)
-        extractor = ChunkFeatureExtractor(memory_budget=C, max_chunks=64)
-        trainer = BeliefCompactorTrainer(updater, opt, CompactorTrainerConfig(),
-                                     feature_extractor=extractor)
-        traj = _make_trajectory()
-        log = trainer.train_trajectory(traj, _student_fn)
-        assert "total" in log
-
-    def test_features_detection_flag(self):
-        # The unified training path auto-detects whether the updater accepts a
-        # `features` kwarg: a gated updater consumes z_t, a plain BeliefUpdater
-        # ignores it.  Both must train without error when a feature_extractor is
-        # supplied (gated uses features; plain silently skips them).
-        ext = ChunkFeatureExtractor(memory_budget=C, max_chunks=64)
-        for updater in (_belief_updater(), _gated_updater(feature_dim=FEATURE_DIM)):
-            opt = torch.optim.SGD(updater.parameters(), lr=1e-3)
-            trainer = BeliefCompactorTrainer(updater, opt, CompactorTrainerConfig(),
-                                         feature_extractor=ext)
-            log = trainer.train_trajectory(_make_trajectory(), _student_fn)
-            assert isinstance(log, dict) and "total" in log
 
 
 # ---------------------------------------------------------------------------

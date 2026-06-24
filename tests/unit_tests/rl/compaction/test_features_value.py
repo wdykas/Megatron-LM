@@ -1,108 +1,14 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Tests for ChunkFeatureExtractor and path_consistency_loss."""
+"""Tests for path_consistency_loss."""
 
 import pytest
 import torch
 import torch.nn as nn
 
-from megatron.rl.compaction.learned.models.value import (
-    ChunkFeatureExtractor,
-    ChunkFeatures,
-    FEATURE_DIM,
-)
-from megatron.rl.compaction.learned.models.belief import BeliefMemory
 from megatron.rl.compaction.learned.training.losses import path_consistency_loss
 from megatron.rl.compaction.learned.models.belief import BeliefUpdater
 from megatron.rl.compaction.learned.models.compactor import PerceiverConfig, PerceiverCompactor
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _chunk_keys(n_layers=2, B=1, T=8, d=16):
-    return [torch.randn(B, T, d) for _ in range(n_layers)]
-
-
-def _belief(n_layers=2, B=1, C=4, d=16):
-    return BeliefMemory(
-        keys=torch.randn(n_layers, B, C, d),
-        values=torch.randn(n_layers, B, C, d),
-    )
-
-
-# ---------------------------------------------------------------------------
-# ChunkFeatureExtractor
-# ---------------------------------------------------------------------------
-
-class TestChunkFeatureExtractor:
-    def test_vector_shape(self):
-        extractor = ChunkFeatureExtractor(memory_budget=64)
-        keys = _chunk_keys()
-        feat = extractor.extract(keys, chunk_index=0)
-        assert feat.vector.shape == (FEATURE_DIM,)
-
-    def test_feature_dim_constant(self):
-        assert FEATURE_DIM == 4
-
-    def test_chunk_index_norm_in_range(self):
-        extractor = ChunkFeatureExtractor(memory_budget=64, max_chunks=100)
-        keys = _chunk_keys()
-        feat = extractor.extract(keys, chunk_index=50)
-        assert 0.0 <= feat.chunk_index_norm <= 1.0
-
-    def test_memory_pressure_zero_when_empty(self):
-        extractor = ChunkFeatureExtractor(memory_budget=64)
-        keys = _chunk_keys()
-        feat = extractor.extract(keys, chunk_index=0, current_memory_slots=0)
-        assert feat.memory_pressure == 0.0
-
-    def test_memory_pressure_one_when_full(self):
-        extractor = ChunkFeatureExtractor(memory_budget=64)
-        keys = _chunk_keys()
-        feat = extractor.extract(keys, chunk_index=0, current_memory_slots=64)
-        assert feat.memory_pressure == 1.0
-
-    def test_memory_pressure_capped(self):
-        extractor = ChunkFeatureExtractor(memory_budget=8)
-        keys = _chunk_keys()
-        feat = extractor.extract(keys, chunk_index=0, current_memory_slots=100)
-        assert feat.memory_pressure == 1.0
-
-    def test_key_norm_positive(self):
-        extractor = ChunkFeatureExtractor(memory_budget=64)
-        keys = _chunk_keys()
-        feat = extractor.extract(keys, chunk_index=2)
-        assert feat.key_norm_mean >= 0.0
-        assert feat.key_norm_std >= 0.0
-
-    def test_batch_extract_returns_tensor(self):
-        extractor = ChunkFeatureExtractor(memory_budget=32)
-        keys = _chunk_keys()
-        vec = extractor.batch_extract(keys, chunk_index=1)
-        assert isinstance(vec, torch.Tensor)
-        assert vec.shape == (FEATURE_DIM,)
-
-    def test_last_chunk_saturates_norm(self):
-        extractor = ChunkFeatureExtractor(memory_budget=64, max_chunks=10)
-        keys = _chunk_keys()
-        feat = extractor.extract(keys, chunk_index=9)
-        assert feat.chunk_index_norm == pytest.approx(0.9)
-
-    def test_returns_chunk_features_dataclass(self):
-        extractor = ChunkFeatureExtractor(memory_budget=16)
-        keys = _chunk_keys()
-        feat = extractor.extract(keys, chunk_index=3)
-        assert isinstance(feat, ChunkFeatures)
-        assert feat.chunk_index == 3
-
-    def test_different_chunks_different_vectors(self):
-        extractor = ChunkFeatureExtractor(memory_budget=64, max_chunks=100)
-        keys = _chunk_keys()
-        v0 = extractor.batch_extract(keys, chunk_index=0)
-        v5 = extractor.batch_extract(keys, chunk_index=50)
-        assert not torch.allclose(v0, v5)
 
 
 # ---------------------------------------------------------------------------

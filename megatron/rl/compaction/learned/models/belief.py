@@ -238,8 +238,6 @@ class GatedUpdaterConfig:
                          Set automatically by ``from_transformer_config``.
     d_ff:                Feed-forward hidden dim. Default: 4 × d_kv.
     dropout:             Dropout rate.
-    feature_dim:         Dimension of optional z_t feature vector fed to the
-                         gate.  0 disables this path.
     share_across_layers: If True, one set of updater weights for all layers.
     """
 
@@ -249,7 +247,6 @@ class GatedUpdaterConfig:
     n_attn_layers:       int
     d_ff:                int | None = None
     dropout:             float = 0.0
-    feature_dim:         int = 0
     share_across_layers: bool = False
 
     def __post_init__(self) -> None:
@@ -311,9 +308,8 @@ class _GatedLayerUpdater(nn.Module):
 
         # Prediction head: each slot predicts the mean content of the next chunk
         self.predict_head = TEColumnParallelLinear(d, d, **lin)
-        # Gate input now includes pred_err: d*2 + 1 + feature_dim
-        gate_in_dim = d * 2 + 1 + cfg.feature_dim
-        self.gate_proj = TEColumnParallelLinear(gate_in_dim, d, **{**lin, "bias": True})
+        # Gate input: [positioned query q, candidate h, pred_err] -> d*2 + 1
+        self.gate_proj = TEColumnParallelLinear(d * 2 + 1, d, **{**lin, "bias": True})
 
         # Project gated slot representation → synthetic K and V
         self.key_proj = TEColumnParallelLinear(d, d, **lin)
@@ -325,7 +321,6 @@ class _GatedLayerUpdater(nn.Module):
         mem_values:  torch.Tensor,   # (B, C, d)
         chunk_keys:  torch.Tensor,   # (B, T, d)
         chunk_values: torch.Tensor,  # (B, T, d)
-        features:    torch.Tensor | None = None,  # (B, feature_dim)
         slot_pos:    torch.Tensor | None = None,  # (1, C, d) persistent slot identity
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Returns (new_keys, new_values, gates, pred_Rt), each (B, C, d)."""
@@ -353,9 +348,6 @@ class _GatedLayerUpdater(nn.Module):
 
         # Gate: use positioned query (q) so gate is identity-aware
         gate_input = torch.cat([q, h, pred_err], dim=-1)          # (B, C, 2d+1)
-        if features is not None:
-            feat = features.unsqueeze(1).expand(-1, h.shape[1], -1)
-            gate_input = torch.cat([gate_input, feat], dim=-1)
         gate_logits, _ = self.gate_proj(gate_input)
         g = torch.sigmoid(gate_logits)                            # (B, C, d)
 
@@ -425,7 +417,6 @@ class GatedRecurrentUpdater(MegatronModule):
         memory:      BeliefMemory,
         chunk_keys:  list[torch.Tensor],    # n_layers × (B, T, d)
         chunk_values: list[torch.Tensor],
-        features:    torch.Tensor | None = None,
     ) -> tuple[BeliefMemory, torch.Tensor, torch.Tensor]:
         """Update belief, returning new memory, gate activations, and slot predictions.
 
@@ -441,7 +432,7 @@ class GatedRecurrentUpdater(MegatronModule):
         for l in range(memory.n_layers):
             mem_k, mem_v = memory.layer(l)
             new_k, new_v, g, pred = self._module(l)(
-                mem_k, mem_v, chunk_keys[l], chunk_values[l], features,
+                mem_k, mem_v, chunk_keys[l], chunk_values[l],
                 slot_pos=self.slot_pos,
             )
             new_keys.append(new_k)
@@ -464,17 +455,15 @@ class GatedRecurrentUpdater(MegatronModule):
         memory:      BeliefMemory,
         chunk_keys:  list[torch.Tensor],
         chunk_values: list[torch.Tensor],
-        features:    torch.Tensor | None = None,
     ) -> BeliefMemory:
         """BeliefUpdater-compatible interface — returns only the new memory."""
-        new_memory, _, _ = self.update(memory, chunk_keys, chunk_values, features)
+        new_memory, _, _ = self.update(memory, chunk_keys, chunk_values)
         return new_memory
 
     def initial_compress(
         self,
         keys_per_layer:   list[torch.Tensor],   # n_layers × (B, T, d)
         values_per_layer: list[torch.Tensor],
-        features:         torch.Tensor | None = None,
         return_preds:     bool = False,
     ) -> "BeliefMemory | tuple[BeliefMemory, torch.Tensor]":
         """Bootstrap the belief state from the first chunk (step 0).
@@ -506,7 +495,7 @@ class GatedRecurrentUpdater(MegatronModule):
             values=init_vals_stacked,
             step=0,
         )
-        new_memory, _, preds = self.update(prior_mem, keys_per_layer, values_per_layer, features)
+        new_memory, _, preds = self.update(prior_mem, keys_per_layer, values_per_layer)
         memory = BeliefMemory(new_memory.keys, new_memory.values, step=0)
         if return_preds:
             return memory, preds

@@ -287,13 +287,6 @@ class TestGatedRecurrentUpdater:
         m0 = updater.initial_compress(*_random_kv())
         assert m0.keys.shape == (L, B, C, D)
 
-    def test_feature_dim_accepted(self):
-        updater = self._make(feature_dim=3)
-        features = torch.randn(B, 3)
-        m0 = updater.initial_compress(*_random_kv(), features=features)
-        m1 = updater(m0, *_random_kv(), features=features)
-        assert m1.keys.shape == (L, B, C, D)
-
     def test_variable_chunk_size(self):
         updater = self._make()
         m0 = updater.initial_compress(*_random_kv(T_len=8))
