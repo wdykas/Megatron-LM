@@ -80,7 +80,6 @@ class DisaggDummyEngine(DummyEngine):
     def __init__(self):
         super().__init__()
         self.context = _FakeKVContext()
-        self._disagg_staged_kv = {}
         self._disagg_backend = None
 
     async def async_step(self, *, verbose=False):
@@ -105,8 +104,11 @@ class DisaggDummyEngine(DummyEngine):
             self.context.active_cnt -= 1
             to_remove.append(rid)
             if self.disagg_role == "prefill":
-                # prefill-stop: stage KV + tell the coordinator (no client reply)
-                self._disagg_staged_kv[rid] = self.context.export_request_kv(rid)
+                # prefill-stop: stage KV + tell the coordinator (no client reply).
+                # The real SEND_KV handler drains context.disagg_staged_kv (the
+                # controller stages there while the slot is still valid), so the
+                # dummy must stage in the same place.
+                self.context.disagg_staged_kv[rid] = self.context.export_request_kv(rid)
                 if self.is_mp_coordinator:
                     self.socket_for_receiving_requests.send(
                         msgpack.packb([Headers.PREFILL_DONE.value, rid], use_bin_type=True)

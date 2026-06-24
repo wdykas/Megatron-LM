@@ -2418,6 +2418,20 @@ class DynamicInferenceContext(BaseInferenceContext):
         tensors immediately before the H2D (GPU reads them at `[:n_active]`
         while CPU bookkeeping keeps them at `[paused_count:total_count)`).
         """
+        # The bookkeeping buffer is a single reused pinned tensor copied H2D
+        # with non_blocking=True. If the CPU overwrites it for the next step
+        # before the previous step's async copy has executed, the in-flight H2D
+        # tears -- it reads a mix of old/new bytes -- corrupting GPU bookkeeping.
+        # For hybrid models this surfaced as an out-of-range Mamba
+        # ``batch_indices`` entry and an illegal memory access in the conv
+        # update kernel, but only under fast churn (disagg prefill with
+        # num_tokens_to_generate=1, where the active batch -- and therefore the
+        # copied indices -- changes every step). Gate CPU reuse of the pinned
+        # buffer on the prior step's H2D having completed.
+        _bk_event = getattr(self, "_bookkeeping_h2d_event", None)
+        if _bk_event is not None:
+            _bk_event.synchronize()
+
         n_active = self.total_request_count - self.paused_request_count
         active_slice = slice(self.paused_request_count, self.total_request_count)
         padded_active = max(n_active, self.padded_active_request_count)
@@ -2464,6 +2478,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         if hasattr(self, '_pending_mamba_transfer') and self._pending_mamba_transfer is not None:
             self.mamba_metadata.load_from_cpu(self._pending_mamba_transfer)
             self._pending_mamba_transfer = None
+
+        # Mark when the (async) H2D copies for this step have been enqueued, so
+        # the next step waits for them before overwriting the shared pinned
+        # buffer (see the synchronize at the top of this method).
+        if getattr(self, "_bookkeeping_h2d_event", None) is None:
+            self._bookkeeping_h2d_event = torch.cuda.Event()
+        self._bookkeeping_h2d_event.record()
 
     def reset_tensors(self) -> None:
         """Fill all bookkeeping tensors with sentinel values."""
@@ -4032,7 +4053,16 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         memory_buffer = self.memory_buffer
         # memory_buffer shape: (2, L, total_blocks, block_size, heads, hidden)
-        _, num_layers, _, block_size, heads, hidden = memory_buffer.shape
+        _, num_layers, total_blocks, block_size, heads, hidden = memory_buffer.shape
+        # DISAGG-DEBUG: a stale/out-of-range block id here is a classic async
+        # CUDA illegal-memory-access; surface it as a clean Python error with
+        # the request's block bookkeeping so we can see the mismatch.
+        raw_count = int(self.request_kv_block_counts[internal_idx].item())
+        bad = [b for b in block_ids if b < 0 or b >= total_blocks]
+        assert not bad, (
+            f"DISAGG_EXPORT req={request_id}: block_ids out of range {bad} "
+            f"(total_blocks={total_blocks}, block_count={block_count}, raw_count={raw_count})"
+        )
         staging = torch.empty(
             (block_count, 2, num_layers, block_size, heads, hidden),
             dtype=memory_buffer.dtype,
@@ -4247,6 +4277,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             return None
         local_block_ids = local_block_ids_tensor.tolist()
 
+        # DISAGG-DEBUG: validate the decode allocator's block ids and the
+        # staging size before the in-place writes (bad bid / size skew -> async IMA).
+        total_blocks = memory_buffer.shape[2]
+        bad = [b for b in local_block_ids if b < 0 or b >= total_blocks]
+        assert not bad and len(local_block_ids) == block_count == staging.shape[0], (
+            f"DISAGG_IMPORT bad write: bad_ids={bad} n_ids={len(local_block_ids)} "
+            f"block_count={block_count} staging_blocks={staging.shape[0]} total_blocks={total_blocks}"
+        )
         for i, bid in enumerate(local_block_ids):
             memory_buffer[:, :, bid, :, :, :] = staging[i]
 
