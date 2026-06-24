@@ -32,11 +32,11 @@ import torch
 import torch.nn as nn
 
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
 from megatron.rl.compaction.learned.models.compactor import (
     PerceiverCompactor,
     CrossAttention,
     FeedForward,
-    column_linear,
     compactor_transformer_config,
     _count_attention_layers,
 )
@@ -297,6 +297,9 @@ class _GatedLayerUpdater(nn.Module):
     def __init__(self, cfg: GatedUpdaterConfig, config, pg_collection=None) -> None:
         super().__init__()
         d = cfg.d_kv
+        tp_group = pg_collection.tp if pg_collection is not None else None
+        lin = dict(config=config, init_method=config.init_method, gather_output=False,
+                   bias=False, skip_bias_add=False, is_expert=False, tp_group=tp_group)
 
         # Cross-attention: Q = memory keys, KV = [memory; chunk]
         self.cross_attn = CrossAttention(config, pg_collection)
@@ -308,14 +311,14 @@ class _GatedLayerUpdater(nn.Module):
         self.ffn = FeedForward(config, pg_collection)
 
         # Prediction head: each slot predicts the mean content of the next chunk
-        self.predict_head = column_linear(d, d, config, pg_collection)
+        self.predict_head = TEColumnParallelLinear(d, d, **lin)
         # Gate input now includes pred_err: d*2 + 1 + feature_dim
         gate_in_dim = d * 2 + 1 + cfg.feature_dim
-        self.gate_proj = column_linear(gate_in_dim, d, config, pg_collection, bias=True)
+        self.gate_proj = TEColumnParallelLinear(gate_in_dim, d, **{**lin, "bias": True})
 
         # Project gated slot representation → synthetic K and V
-        self.key_proj = column_linear(d, d, config, pg_collection)
-        self.val_proj = column_linear(d, d, config, pg_collection)
+        self.key_proj = TEColumnParallelLinear(d, d, **lin)
+        self.val_proj = TEColumnParallelLinear(d, d, **lin)
 
     def forward(
         self,
@@ -416,11 +419,14 @@ class GatedRecurrentUpdater(MegatronModule):
         )
         n_head_sets = 1 if cfg.share_across_layers else cfg.n_attn_layers
         if cfg.use_dynamics_head:
+            tp_group = pg_collection.tp if pg_collection is not None else None
+            lin = dict(config=config, init_method=config.init_method, gather_output=False,
+                       bias=False, skip_bias_add=False, is_expert=False, tp_group=tp_group)
             self.dynamics_key_heads = nn.ModuleList([
-                column_linear(cfg.d_kv, cfg.d_kv, config, pg_collection) for _ in range(n_head_sets)
+                TEColumnParallelLinear(cfg.d_kv, cfg.d_kv, **lin) for _ in range(n_head_sets)
             ])
             self.dynamics_val_heads = nn.ModuleList([
-                column_linear(cfg.d_kv, cfg.d_kv, config, pg_collection) for _ in range(n_head_sets)
+                TEColumnParallelLinear(cfg.d_kv, cfg.d_kv, **lin) for _ in range(n_head_sets)
             ])
         else:
             self.dynamics_key_heads = None

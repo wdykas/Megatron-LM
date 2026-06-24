@@ -144,14 +144,14 @@ class TestGetKvMatrices:
 
 
 # ---------------------------------------------------------------------------
-# get_attention_scores
+# approx_attention_scores
 # ---------------------------------------------------------------------------
 
 class TestGetAttentionScores:
     def test_returns_list_of_floats(self):
         ctx = _make_context(seq_len=8)
         hook = MegatronInferenceHook(ctx)
-        scores = hook.get_attention_scores()
+        scores = hook.approx_attention_scores()
         assert isinstance(scores, list)
         assert len(scores) == 8
         assert all(isinstance(s, float) for s in scores)
@@ -160,18 +160,18 @@ class TestGetAttentionScores:
         ctx = _make_context()
         ctx.memory_buffer = None
         hook = MegatronInferenceHook(ctx)
-        assert hook.get_attention_scores() == []
+        assert hook.approx_attention_scores() == []
 
     def test_returns_empty_when_no_active(self):
         ctx = _make_context()
         ctx.total_request_count = 0
         hook = MegatronInferenceHook(ctx)
-        assert hook.get_attention_scores() == []
+        assert hook.approx_attention_scores() == []
 
     def test_scores_are_positive(self):
         ctx = _make_context(seq_len=10)
         hook = MegatronInferenceHook(ctx)
-        scores = hook.get_attention_scores()
+        scores = hook.approx_attention_scores()
         assert all(s >= 0.0 for s in scores)
 
     def test_scores_reflect_kv_magnitudes(self):
@@ -181,7 +181,7 @@ class TestGetAttentionScores:
         ctx.memory_buffer[:, :, :, :, :, :] = 0.001
         ctx.memory_buffer[0, 0, 0, 3] = 10.0   # position 3, keys layer 0
         hook = MegatronInferenceHook(ctx)
-        scores = hook.get_attention_scores()
+        scores = hook.approx_attention_scores()
         assert scores[3] > scores[0]
 
 

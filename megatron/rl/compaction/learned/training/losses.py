@@ -36,31 +36,12 @@ not for KV reconstruction fidelity.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
 
 import torch
 import torch.nn.functional as F
 
 from megatron.rl.compaction.learned.models.belief import BeliefMemory
 from megatron.rl.compaction.learned.training.data import CompactKV, StudentFn
-
-
-@runtime_checkable
-class _UpdaterProtocol(Protocol):
-    """Minimal interface required by path_consistency_loss."""
-
-    def initial_compress(
-        self,
-        keys_per_layer: list[torch.Tensor],
-        values_per_layer: list[torch.Tensor],
-    ) -> BeliefMemory: ...
-
-    def __call__(
-        self,
-        memory: BeliefMemory,
-        new_keys: list[torch.Tensor],
-        new_values: list[torch.Tensor],
-    ) -> BeliefMemory: ...
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +285,7 @@ def consistency_loss(
 
 
 def path_consistency_loss(
-    updater: _UpdaterProtocol,
+    updater,   # GatedRecurrentUpdater / BeliefUpdater
     chunk_a_keys:   list[torch.Tensor],   # n_layers × (B, T_a, d)
     chunk_a_values: list[torch.Tensor],
     chunk_b_keys:   list[torch.Tensor],   # n_layers × (B, T_b, d)

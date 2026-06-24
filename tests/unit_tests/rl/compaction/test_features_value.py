@@ -140,21 +140,6 @@ class TestValueHead:
         out.sum().backward()
         assert mem.keys.grad is not None
 
-    def test_slot_ablation_shape(self):
-        vh = ValueHead(n_layers=2, d_model=16, hidden_dim=32)
-        mem = _belief(n_layers=2, B=1, C=4, d=16)
-        importance = vh.slot_ablation(mem)
-        assert importance.shape == (1, 4)
-
-    def test_slot_ablation_zeroing_changes_value(self):
-        """Ablating a random slot should usually change the value."""
-        torch.manual_seed(42)
-        vh = ValueHead(n_layers=2, d_model=16, hidden_dim=32)
-        mem = _belief(n_layers=2, B=1, C=4, d=16)
-        imp = vh.slot_ablation(mem)
-        # At least one slot should have non-zero importance
-        assert imp.abs().sum().item() > 0.0
-
     def test_no_feature_dim_no_error(self):
         vh = ValueHead(n_layers=3, d_model=32, hidden_dim=64, feature_dim=0)
         mem = _belief(n_layers=3, B=2, C=8, d=32)

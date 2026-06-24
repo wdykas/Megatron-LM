@@ -25,7 +25,7 @@ class FakeHook:
         self._cumul_len = 0
         self._enabled = True
 
-    def get_attention_scores(self):
+    def approx_attention_scores(self):
         return []
 
     def apply_mask(self, mask):

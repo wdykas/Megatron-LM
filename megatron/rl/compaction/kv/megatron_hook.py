@@ -29,7 +29,7 @@ If you need the full multi-head KV across TP ranks, call
 ``get_kv_matrices(all_gather=True)`` (requires torch.distributed to be
 initialised with a TP process group).
 
-get_attention_scores
+approx_attention_scores
 --------------------
 Returns a per-position importance proxy: mean L2 norm of K vectors averaged
 over layers.  This correlates with attention importance and is sufficient for
@@ -52,7 +52,7 @@ from .types import KVMask
 class NullHook:
     """No-op hook for tests and when compaction is disabled."""
 
-    def get_attention_scores(self) -> list[float]:
+    def approx_attention_scores(self) -> list[float]:
         return []
 
     def apply_mask(self, mask: KVMask) -> None:
@@ -103,13 +103,14 @@ class MegatronInferenceHook:
     # InferenceEngineHook protocol
     # ------------------------------------------------------------------
 
-    def get_attention_scores(self) -> list[float]:
-        """Return per-position importance scores as mean ||K||₂ across layers.
+    def approx_attention_scores(self) -> list[float]:
+        """APPROXIMATE per-position importance: mean ||K||₂ across layers.
 
-        Uses the L2 norm of key vectors as a proxy for attention importance.
-        Positions with large key norms tend to receive more attention mass,
-        making this a reliable heuristic for TopK / H2O / StreamingLLM without
-        the overhead of registering per-step forward hooks.
+        This is NOT real attention mass — it is a key-norm *proxy*. Positions with
+        large key norms tend to receive more attention, so it is a cheap heuristic
+        for TopK / H2O / StreamingLLM selection without registering per-step forward
+        hooks. For exact attention weights, hook Megatron's CoreAttention during
+        decode and accumulate the softmax outputs.
 
         Returns a flat list of floats (one per KV position) for the FIRST
         active request.  Returns [] when no active request or KV unavailable.

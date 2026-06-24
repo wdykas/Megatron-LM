@@ -31,11 +31,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
 from megatron.rl.compaction.learned.models.belief import BeliefMemory
-from megatron.rl.compaction.learned.models.compactor import (
-    column_linear,
-    compactor_transformer_config,
-)
+from megatron.rl.compaction.learned.models.compactor import compactor_transformer_config
 
 
 # ---------------------------------------------------------------------------
@@ -175,9 +173,12 @@ class ValueHead(nn.Module):
         in_dim = n_layers * d_model + feature_dim
         config = compactor_transformer_config(hidden_dim, n_heads=1, ffn_hidden_size=hidden_dim,
                                               params_dtype=params_dtype)
-        self.fc1 = column_linear(in_dim, hidden_dim, config, pg_collection, bias=True)
-        self.fc2 = column_linear(hidden_dim, hidden_dim, config, pg_collection, bias=True)
-        self.fc3 = column_linear(hidden_dim, 1, config, pg_collection, bias=True)
+        tp_group = pg_collection.tp if pg_collection is not None else None
+        lin = dict(config=config, init_method=config.init_method, gather_output=False,
+                   bias=True, skip_bias_add=False, is_expert=False, tp_group=tp_group)
+        self.fc1 = TEColumnParallelLinear(in_dim, hidden_dim, **lin)
+        self.fc2 = TEColumnParallelLinear(hidden_dim, hidden_dim, **lin)
+        self.fc3 = TEColumnParallelLinear(hidden_dim, 1, **lin)
 
     def forward(
         self,
@@ -211,34 +212,3 @@ class ValueHead(nn.Module):
         h = F.gelu(h)
         out, _ = self.fc3(h)
         return out.squeeze(-1)                          # (B,)
-
-    def slot_ablation(
-        self,
-        memory: BeliefMemory,
-        features: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Estimate value drop when each memory slot is removed.
-
-        Returns a (B, C) tensor where entry [b, i] is the estimated value
-        decrease when slot i is zeroed out.  Use to identify high-importance
-        slots for interpretability or informed eviction.
-
-        This is a first-order approximation: it re-runs the value head C+1
-        times (once with full memory, C times with each slot zeroed).  For
-        inference-time use, prefer the gradient-based shortcut:
-            importance_i ≈ |∂V/∂M_t[:, :, i, :]|
-        """
-        baseline = self.forward(memory, features)  # (B,)
-
-        C = memory.budget
-        importances = []
-        for i in range(C):
-            ablated_keys = memory.keys.clone()
-            ablated_vals = memory.values.clone()
-            ablated_keys[:, :, i, :] = 0.0
-            ablated_vals[:, :, i, :] = 0.0
-            ablated_mem = BeliefMemory(ablated_keys, ablated_vals, memory.step)
-            v_ablated = self.forward(ablated_mem, features)  # (B,)
-            importances.append((baseline - v_ablated).unsqueeze(-1))  # (B, 1)
-
-        return torch.cat(importances, dim=-1)  # (B, C)

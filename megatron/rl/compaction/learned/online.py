@@ -113,30 +113,16 @@ def init_compactor_from_kv(runtime_state: Any, args, n_attn_layers: int, d_kv: i
         use_future_accuracy_weight=getattr(args, "rl_compaction_compactor_use_future_accuracy_weight", False),
         merged_chunk_prob=getattr(args, "rl_compaction_compactor_merged_chunk_prob", 0.0),
     )
-    # Guard against silent no-op misconfigurations: a positive loss weight whose
-    # enabling flag/condition is off means the term is computed-and-logged but
-    # contributes nothing (or is skipped entirely).
-    if trainer_cfg.loss_weights.dynamics > 0.0 and not getattr(args, "rl_compaction_compactor_use_dynamics_head", False):
+    # Warn on loss weights that are silently inert online (term enabled but its
+    # precondition is off, so it contributes no gradient).
+    _w = trainer_cfg.loss_weights
+    if _w.dynamics > 0.0 and not getattr(args, "rl_compaction_compactor_use_dynamics_head", False):
         log_single_rank(logger, logging.WARNING,
-                        "[STILL online] --rl-compaction-compactor-dynamics > 0 but "
-                        "--rl-compaction-compactor-use-dynamics-head is NOT set; the dynamics "
-                        "loss will be silently skipped (no dynamics head to predict M_{t+1}).")
-    if trainer_cfg.loss_weights.future_horizon_kl > 0.0 and trainer_cfg.future_horizon_gamma >= 1.0:
+                        "[STILL online] dynamics loss > 0 but --use-dynamics-head is off; it is skipped.")
+    if _w.future_horizon_kl > 0.0 and (trainer_cfg.future_horizon_gamma >= 1.0 or _use_teacher_kl):
         log_single_rank(logger, logging.WARNING,
-                        "[STILL online] --rl-compaction-compactor-future-horizon-kl > 0 but "
-                        "--rl-compaction-compactor-future-horizon-gamma >= 1.0; the future-horizon-KL "
-                        "term is gated off (gamma must be < 1.0 to upweight later positions).")
-    # The probe-distillation losses (teacher_kl / future_kl / future_horizon_kl) are
-    # computed only in the use_teacher_kl=False student-forward branch and require
-    # per-probe teacher_logits. Online rollouts do NOT capture teacher_logits, and
-    # teacher-KL mode uses the CE branch instead — so these terms are OFFLINE-only
-    # today and silently inert online. Warn rather than mislead.
-    if trainer_cfg.loss_weights.future_horizon_kl > 0.0 and _use_teacher_kl:
-        log_single_rank(logger, logging.WARNING,
-                        "[STILL online] --rl-compaction-compactor-future-horizon-kl > 0 with "
-                        "--rl-compaction-compactor-teacher-kl: teacher-KL mode uses the CE branch, so "
-                        "future-horizon-KL is NOT computed online (it needs per-probe teacher "
-                        "logits, captured only in the offline pipeline). This term is inert here.")
+                        "[STILL online] future-horizon-KL > 0 is inert online (needs gamma < 1.0 and "
+                        "per-probe teacher_logits, which only the offline pipeline captures).")
 
     runtime_state.compactor = compactor
     runtime_state.compactor_optimizer = None  # set by attach_compactor_optimizer

@@ -81,41 +81,6 @@ def compactor_transformer_config(
     )
 
 
-def _tp_group(pg_collection):
-    """Tensor-parallel group for the compactor's linears (None -> parallel_state)."""
-    return pg_collection.tp if pg_collection is not None else None
-
-
-def column_linear(input_size, output_size, config, pg_collection=None, bias=False):
-    """A (replicated, tp=1) TE column-parallel linear. Returns ``(output, bias)``."""
-    return TEColumnParallelLinear(
-        input_size,
-        output_size,
-        config=config,
-        init_method=config.init_method,
-        gather_output=False,
-        bias=bias,
-        skip_bias_add=False,
-        is_expert=False,
-        tp_group=_tp_group(pg_collection),
-    )
-
-
-def row_linear(input_size, output_size, config, pg_collection=None, bias=False):
-    """A (replicated, tp=1) TE row-parallel linear. Returns ``(output, bias)``."""
-    return TERowParallelLinear(
-        input_size,
-        output_size,
-        config=config,
-        init_method=config.init_method,
-        bias=bias,
-        input_is_parallel=True,
-        skip_bias_add=False,
-        is_expert=False,
-        tp_group=_tp_group(pg_collection),
-    )
-
-
 # ---------------------------------------------------------------------------
 # Helper: count attention layers from a TransformerConfig
 # ---------------------------------------------------------------------------
@@ -152,12 +117,15 @@ class CrossAttention(nn.Module):
         self.n_heads = config.num_attention_heads
         self.d_head = config.kv_channels
         proj = self.d_head * self.n_heads
+        tp_group = pg_collection.tp if pg_collection is not None else None
+        lin = dict(config=config, init_method=config.init_method, gather_output=False,
+                   bias=False, skip_bias_add=False, is_expert=False, tp_group=tp_group)
 
         self.norm_q = TENorm(config, d)
         self.norm_kv = TENorm(config, d)
-        self.linear_q = column_linear(d, proj, config, pg_collection)
-        self.linear_k = column_linear(d, proj, config, pg_collection)
-        self.linear_v = column_linear(d, proj, config, pg_collection)
+        self.linear_q = TEColumnParallelLinear(d, proj, **lin)
+        self.linear_k = TEColumnParallelLinear(d, proj, **lin)
+        self.linear_v = TEColumnParallelLinear(d, proj, **lin)
         self.core_attention = TEDotProductAttention(
             config=config,
             layer_number=layer_number,
@@ -165,7 +133,10 @@ class CrossAttention(nn.Module):
             attention_type="cross",
             pg_collection=pg_collection,
         )
-        self.linear_proj = row_linear(proj, d, config, pg_collection)
+        self.linear_proj = TERowParallelLinear(
+            proj, d, config=config, init_method=config.init_method, bias=False,
+            input_is_parallel=True, skip_bias_add=False, is_expert=False, tp_group=tp_group,
+        )
 
     def forward(
         self,
@@ -200,7 +171,7 @@ class FeedForward(nn.Module):
         self.mlp = MLP(
             config,
             MLPSubmodules(linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear),
-            tp_group=_tp_group(pg_collection),
+            tp_group=(pg_collection.tp if pg_collection is not None else None),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -261,10 +232,13 @@ class _LayerCompactor(nn.Module):
 
     def __init__(self, cfg: PerceiverConfig, config: TransformerConfig, pg_collection=None) -> None:
         super().__init__()
+        tp_group = pg_collection.tp if pg_collection is not None else None
+        lin = dict(config=config, init_method=config.init_method, gather_output=False,
+                   bias=False, skip_bias_add=False, is_expert=False, tp_group=tp_group)
         self.cross_attn = CrossAttention(config, pg_collection)
         self.ffn = FeedForward(config, pg_collection)
-        self.key_proj = column_linear(cfg.d_kv, cfg.d_kv, config, pg_collection)
-        self.val_proj = column_linear(cfg.d_kv, cfg.d_kv, config, pg_collection)
+        self.key_proj = TEColumnParallelLinear(cfg.d_kv, cfg.d_kv, **lin)
+        self.val_proj = TEColumnParallelLinear(cfg.d_kv, cfg.d_kv, **lin)
 
     def forward(
         self,
