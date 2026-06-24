@@ -2418,6 +2418,20 @@ class DynamicInferenceContext(BaseInferenceContext):
         tensors immediately before the H2D (GPU reads them at `[:n_active]`
         while CPU bookkeeping keeps them at `[paused_count:total_count)`).
         """
+        # The bookkeeping buffer is a single reused pinned tensor copied H2D
+        # with non_blocking=True. If the CPU overwrites it for the next step
+        # before the previous step's async copy has executed, the in-flight H2D
+        # tears -- it reads a mix of old/new bytes -- corrupting GPU bookkeeping.
+        # For hybrid models this surfaced as an out-of-range Mamba
+        # ``batch_indices`` entry and an illegal memory access in the conv
+        # update kernel, but only under fast churn (disagg prefill with
+        # num_tokens_to_generate=1, where the active batch -- and therefore the
+        # copied indices -- changes every step). Gate CPU reuse of the pinned
+        # buffer on the prior step's H2D having completed.
+        _bk_event = getattr(self, "_bookkeeping_h2d_event", None)
+        if _bk_event is not None:
+            _bk_event.synchronize()
+
         n_active = self.total_request_count - self.paused_request_count
         active_slice = slice(self.paused_request_count, self.total_request_count)
         padded_active = max(n_active, self.padded_active_request_count)
@@ -2464,6 +2478,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         if hasattr(self, '_pending_mamba_transfer') and self._pending_mamba_transfer is not None:
             self.mamba_metadata.load_from_cpu(self._pending_mamba_transfer)
             self._pending_mamba_transfer = None
+
+        # Mark when the (async) H2D copies for this step have been enqueued, so
+        # the next step waits for them before overwriting the shared pinned
+        # buffer (see the synchronize at the top of this method).
+        if getattr(self, "_bookkeeping_h2d_event", None) is None:
+            self._bookkeeping_h2d_event = torch.cuda.Event()
+        self._bookkeeping_h2d_event.record()
 
     def reset_tensors(self) -> None:
         """Fill all bookkeeping tensors with sentinel values."""
