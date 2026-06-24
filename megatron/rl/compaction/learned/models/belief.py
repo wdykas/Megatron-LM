@@ -34,11 +34,11 @@ import torch.nn as nn
 from megatron.core.transformer.module import MegatronModule
 from megatron.rl.compaction.learned.models.compactor import (
     PerceiverCompactor,
-    _CrossAttentionBlock,
-    _FFNBlock,
+    CrossAttention,
+    FeedForward,
+    column_linear,
+    compactor_transformer_config,
     _count_attention_layers,
-    duplicated_linear,
-    _minimal_transformer_config,
 )
 
 
@@ -294,28 +294,28 @@ class GatedUpdaterConfig:
 class _GatedLayerUpdater(nn.Module):
     """Single-layer gated recurrent belief update."""
 
-    def __init__(self, cfg: GatedUpdaterConfig, config) -> None:
+    def __init__(self, cfg: GatedUpdaterConfig, config, pg_collection=None) -> None:
         super().__init__()
         d = cfg.d_kv
 
         # Cross-attention: Q = memory keys, KV = [memory; chunk]
-        self.cross_attn = _CrossAttentionBlock(d, cfg.n_heads, cfg.dropout, config)
+        self.cross_attn = CrossAttention(config, pg_collection)
 
         # Self-attention among the C updated slots (pre-norm is internal to the block)
-        self.self_attn = _CrossAttentionBlock(d, cfg.n_heads, cfg.dropout, config)
+        self.self_attn = CrossAttention(config, pg_collection)
 
         # FFN
-        self.ffn = _FFNBlock(d, cfg.ff_dim, cfg.dropout, config)
+        self.ffn = FeedForward(config, pg_collection)
 
         # Prediction head: each slot predicts the mean content of the next chunk
-        self.predict_head = duplicated_linear(d, d, config)
+        self.predict_head = column_linear(d, d, config, pg_collection)
         # Gate input now includes pred_err: d*2 + 1 + feature_dim
         gate_in_dim = d * 2 + 1 + cfg.feature_dim
-        self.gate_proj = duplicated_linear(gate_in_dim, d, config, bias=True)
+        self.gate_proj = column_linear(gate_in_dim, d, config, pg_collection, bias=True)
 
         # Project gated slot representation → synthetic K and V
-        self.key_proj = duplicated_linear(d, d, config)
-        self.val_proj = duplicated_linear(d, d, config)
+        self.key_proj = column_linear(d, d, config, pg_collection)
+        self.val_proj = column_linear(d, d, config, pg_collection)
 
     def forward(
         self,
@@ -387,13 +387,14 @@ class GatedRecurrentUpdater(MegatronModule):
         gate_loss = gates.abs().mean()  # sparsity penalty
     """
 
-    def __init__(self, cfg: GatedUpdaterConfig, transformer_config=None) -> None:
-        config = transformer_config or _minimal_transformer_config(cfg.d_kv, cfg.n_heads)
+    def __init__(self, cfg: GatedUpdaterConfig, params_dtype: torch.dtype = torch.float32,
+                 pg_collection=None) -> None:
+        config = compactor_transformer_config(cfg.d_kv, cfg.n_heads, cfg.ff_dim, params_dtype)
         super().__init__(config)
         self.cfg = cfg
         n_sets = 1 if cfg.share_across_layers else cfg.n_attn_layers
         self._layer_modules = nn.ModuleList([
-            _GatedLayerUpdater(cfg, config) for _ in range(n_sets)
+            _GatedLayerUpdater(cfg, config, pg_collection) for _ in range(n_sets)
         ])
         # Persistent slot identity embeddings.
         # Serves two roles:
@@ -416,10 +417,10 @@ class GatedRecurrentUpdater(MegatronModule):
         n_head_sets = 1 if cfg.share_across_layers else cfg.n_attn_layers
         if cfg.use_dynamics_head:
             self.dynamics_key_heads = nn.ModuleList([
-                duplicated_linear(cfg.d_kv, cfg.d_kv, config) for _ in range(n_head_sets)
+                column_linear(cfg.d_kv, cfg.d_kv, config, pg_collection) for _ in range(n_head_sets)
             ])
             self.dynamics_val_heads = nn.ModuleList([
-                duplicated_linear(cfg.d_kv, cfg.d_kv, config) for _ in range(n_head_sets)
+                column_linear(cfg.d_kv, cfg.d_kv, config, pg_collection) for _ in range(n_head_sets)
             ])
         else:
             self.dynamics_key_heads = None

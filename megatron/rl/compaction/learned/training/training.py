@@ -3,11 +3,12 @@
 """Compactor training core — the single learned-compactor training path.
 
 `train_compactor_trajectory` (used by both the online RL loop and the offline
-trainer), the trainer classes, the Megatron mixed-precision optimizer adapter
-`_CompactorOptimizer`, and the probe-term helpers.  Extracted from rl_utils.py so
-the `learned/` package is self-contained; rl_utils keeps only the RL-loop
-integration glue (maybe_train_compactor / _build_compactor_trajectories /
-_init_* / _attach_*) which depends on the GRPO runtime state.
+trainer), the trainer classes, and the probe-term helpers. The training step is
+plain Megatron: ``model`` may be a bare module (offline / tests) or an mcore
+``DistributedDataParallel`` wrapping it (online), driven by a standard
+``get_megatron_optimizer`` (see ``training/parallel.py``) — there is no bespoke
+optimizer class. rl_utils keeps only the RL-loop integration glue
+(``compaction/learned/online.py``), which depends on the GRPO runtime state.
 """
 from __future__ import annotations
 
@@ -15,8 +16,8 @@ import torch
 
 @torch.enable_grad()
 def train_compactor_trajectory(
-    updater,            # BeliefUpdater or GatedRecurrentUpdater
-    optimizer,          # torch.optim.Optimizer
+    model,              # BeliefUpdater / GatedRecurrentUpdater, or an mcore DDP wrapping one
+    optimizer,          # torch.optim.Optimizer, or a Megatron optimizer (online)
     trajectory,         # Trajectory
     student_fn,         # StudentFn
     cfg,                # CompactorTrainerConfig
@@ -65,10 +66,29 @@ def train_compactor_trajectory(
             return "features" in inspect.signature(fn).parameters
         except (ValueError, TypeError):
             return False
+    # ``model`` may be an mcore DistributedDataParallel wrapping the compactor (online,
+    # distributed) or the bare module (offline / unit tests). ``updater`` is always the
+    # bare module used for the forward pass; the optional DDP hooks (zero_grad_buffer /
+    # finish_grad_sync) are the standard Megatron grad-buffer + all-reduce machinery and
+    # are simply absent for a bare module.
+    updater = getattr(model, "module", model)
+    _ddp_zero = getattr(model, "zero_grad_buffer", None)
+    _ddp_sync = getattr(model, "finish_grad_sync", None)
+
+    def _zero_grad():
+        if _ddp_zero is not None:
+            _ddp_zero()
+        optimizer.zero_grad()
+
+    def _step():
+        if _ddp_sync is not None:
+            _ddp_sync()           # all-reduce grads across the (world) DP group
+        optimizer.step()
+
     _init_has_features = feature_extractor is not None and _accepts_features(updater.initial_compress)
     _fwd_has_features = feature_extractor is not None and _accepts_features(getattr(updater, "update", updater.forward))
 
-    optimizer.zero_grad()
+    _zero_grad()
     memory = None
     all_probe_terms = []
 
@@ -301,8 +321,8 @@ def train_compactor_trajectory(
                 chunk_loss.backward()
                 if cfg.clip_grad_norm is not None:
                     torch.nn.utils.clip_grad_norm_(list(updater.parameters()), cfg.clip_grad_norm)
-                optimizer.step()
-                optimizer.zero_grad()
+                _step()
+                _zero_grad()
             chunk_loss = torch.zeros([], device=_dev)
             memory = memory.detach()
             n_since_detach = 0
@@ -314,8 +334,8 @@ def train_compactor_trajectory(
         chunk_loss.backward()
         if cfg.clip_grad_norm is not None:
             torch.nn.utils.clip_grad_norm_(list(updater.parameters()), cfg.clip_grad_norm)
-        optimizer.step()
-        optimizer.zero_grad()
+        _step()
+        _zero_grad()
 
     if not all_probe_terms and not any(_per_chunk_accumulators.values()):
         return {}
@@ -337,110 +357,6 @@ def train_compactor_trajectory(
 
 
 
-class _CompactorOptimizer:
-    """Thin adapter around Megatron's Float16OptimizerWithFloat16Params.
-
-    The compactor trains in BF16 with FP32 master weights exactly like the main
-    Megatron model (and like the trainable projector in a frozen-LLM VLM such as
-    LLaVA): the inner Adam steps the FP32 masters, gradients are copied BF16→FP32
-    before the step and the masters copied FP32→BF16 after.  We reuse Megatron's
-    own optimizer rather than re-deriving the mixed-precision bookkeeping.
-
-    Why construct Float16OptimizerWithFloat16Params directly instead of via the
-    get_megatron_optimizer() factory (the VLM flow)?  The factory requires
-    DDP-wrapped model chunks — it reads model_chunks[0].ddp_config and builds grad
-    buffers + a DP-sharded distributed optimizer (optimizer/__init__.py:713).  The
-    VLM works because its whole model is DistributedDataParallel-wrapped.  The
-    compactor is a standalone nn.Module, replicated across TP (not DP-sharded), and
-    trained with truncated BPTT (multiple backward() per trajectory) — DDP grad
-    buckets would be wrong/heavy here.  For the bf16 case the factory ultimately
-    instantiates THIS SAME class, so constructing it directly is the correct
-    Megatron-native optimizer for a non-DDP replicated module.  Used by both the
-    online RL loop and the offline trainer (scripts/train_still.py).
-
-    Standalone — NOT a param group inside the LLM optimizer.  In joint training
-    the LLM master params still hold their previous-iteration gradient when the
-    compactor steps (the LLM zero_grad runs later, in train_step), so sharing the
-    optimizer would re-step and corrupt the LLM.  A dedicated optimizer keeps the
-    two independent.  (A VLM achieves the analogous separation by freezing the LLM
-    via requires_grad=False so the shared optimizer skips it; our LLM runs
-    inference-only with no optimizer at all, so the compactor gets its own.)
-
-    The compactor is replicated across TP ranks (not sharded), so Megatron's
-    grad-norm / zero-count collectives are disabled (clip_grad=0,
-    log_num_zeros_in_grad=False) to avoid cross-rank all-reduces; gradient
-    clipping is applied to the BF16 grads in the training loop before step().
-    No loss scaling (bf16 has fp32 exponent range).
-
-    Checkpointing uses Megatron's state_dict()/load_state_dict(), which serialise
-    the FP32 masters (`fp32_from_fp16_params`, the authoritative weights) plus the
-    inner Adam moments — so resume is full precision, not reconstructed from BF16.
-    """
-
-    def __init__(self, compactor, lr):
-        from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
-        from megatron.core.optimizer.optimizer_config import OptimizerConfig
-
-        # Param group carries the identifier keys Megatron's optimizer uses to
-        # match groups across save/load (wd_mult, lr_mult, is_decoupled_lr,
-        # is_expert_parallel); a bare AdamW group omits them and load_state_dict's
-        # _filter_and_reorder_param_groups raises KeyError 'pre_wd_mult'.
-        base = torch.optim.AdamW(
-            [{
-                'params': list(compactor.parameters()),
-                'wd_mult': 1.0,
-                'lr_mult': 1.0,
-                'is_decoupled_lr': False,
-                'is_expert_parallel': False,
-            }],
-            lr=lr, betas=(0.9, 0.999), eps=1e-8)
-        cfg = OptimizerConfig(
-            bf16=True,
-            fp16=False,
-            clip_grad=0.0,                # clipped manually in the loop; avoids TP all-reduce
-            log_num_zeros_in_grad=False,  # avoids the count-zeros all-reduce
-            params_dtype=torch.float32,
-            barrier_with_L1_time=False,
-            timers=None,
-        )
-
-        def _init_state_fn(opt, config=None):
-            # Pre-create Adam moments so optimizer state exists before a load.
-            for group in opt.param_groups:
-                for p in group['params']:
-                    if len(opt.state.get(p, {})) == 0:
-                        opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
-                        opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
-
-        # grad_scaler=None: bf16 with no loss scale (Megatron's documented case).
-        self._mopt = Float16OptimizerWithFloat16Params(
-            optimizer=base, config=cfg, grad_scaler=None, init_state_fn=_init_state_fn)
-        self._compactor = compactor
-
-    # --- duck-type interface used by train_compactor_trajectory / maybe_train_compactor ---
-
-    @property
-    def state(self):
-        return self._mopt.optimizer.state  # inner Adam state, keyed by FP32 masters
-
-    def zero_grad(self):
-        self._mopt.zero_grad()
-
-    def step(self):
-        # Float16 optimizer: copy BF16 grads → FP32 master grads, step inner Adam,
-        # copy FP32 masters → BF16 params.  Returns (success, grad_norm, n_zeros);
-        # the caller does not need it.
-        self._mopt.step()
-
-    # --- checkpoint support (plain torch.save; FP32 masters included) ---
-
-    def state_dict(self):
-        return self._mopt.state_dict()
-
-    def load_state_dict(self, sd):
-        self._mopt.load_state_dict(sd)
-        # Masters are authoritative; push the restored FP32 values into BF16 params.
-        self._mopt._copy_main_params_to_model_params()
 
 
 
@@ -566,7 +482,7 @@ class BeliefCompactorTrainer:
         import dataclasses as _dc
 
         result = train_compactor_trajectory(
-            updater=self.updater,
+            model=self.updater,
             optimizer=self.optimizer,
             trajectory=trajectory,
             student_fn=student_fn,

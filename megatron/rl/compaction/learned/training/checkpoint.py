@@ -57,11 +57,13 @@ def _model_type_and_config(model: nn.Module) -> tuple[str, dict]:
     )
 
 
-def _build_model(model_type: str, config_dict: dict) -> nn.Module:
+def _build_model(model_type: str, config_dict: dict, params_dtype=torch.float32, pg_collection=None) -> nn.Module:
     if model_type == "perceiver":
-        return PerceiverCompactor(PerceiverConfig(**config_dict))
+        return PerceiverCompactor(PerceiverConfig(**config_dict), params_dtype=params_dtype,
+                                  pg_collection=pg_collection)
     if model_type == "gated_recurrent":
-        return GatedRecurrentUpdater(GatedUpdaterConfig(**config_dict))
+        return GatedRecurrentUpdater(GatedUpdaterConfig(**config_dict), params_dtype=params_dtype,
+                                     pg_collection=pg_collection)
     raise ValueError(f"Unknown model_type '{model_type}' in checkpoint.")
 
 
@@ -100,7 +102,7 @@ def save_checkpoint(
             # sharded params — the idiomatic, consistency-checked representation.
             sharded_sd["optimizer"] = optimizer.sharded_state_dict(sharded_sd["model"])
         else:
-            # Offline (_CompactorOptimizer, single-process): no sharded path; the
+            # Offline (plain torch optimizer, single-process): no sharded path; the
             # replicated tensors go in the common store.
             sharded_sd["optimizer"] = optimizer.state_dict()
     if scheduler is not None and hasattr(scheduler, "state_dict"):
@@ -117,18 +119,20 @@ def save_checkpoint(
 def load_checkpoint(
     path: str | Path,
     map_location: str | torch.device = "cuda",
+    params_dtype: torch.dtype = torch.float32,
+    pg_collection=None,
 ) -> tuple[nn.Module, CheckpointMeta]:
     """Load a compactor from a dist-checkpoint directory.
 
-    Reads common state first to recover the model config, rebuilds the model,
-    then loads the sharded weights into it.
+    Reads common state first to recover the model config, rebuilds the model
+    (replicated via ``pg_collection``), then loads the sharded weights into it.
     """
     path = str(path)
     common = dist_checkpointing.load_common_state_dict(path)
     model_type = common["model_type"]
     config_dict = common["config"]
 
-    model = _build_model(model_type, config_dict).to(map_location)
+    model = _build_model(model_type, config_dict, params_dtype, pg_collection).to(map_location)
     loaded = dist_checkpointing.load({"model": model.sharded_state_dict()}, path)
     model.load_state_dict(loaded["model"])
 
@@ -154,7 +158,7 @@ def load_optimizer_state(
     via the sharded path. ``model_sharded_state_dict`` is the same model sharded
     dict used at save time (the optimizer keys its state to those params).
 
-    Offline (_CompactorOptimizer): the state is in the common store.
+    Offline (plain torch optimizer): the state is in the common store.
     """
     if hasattr(optimizer, "sharded_state_dict") and model_sharded_state_dict is not None:
         opt_template = optimizer.sharded_state_dict(model_sharded_state_dict, is_loading=True)

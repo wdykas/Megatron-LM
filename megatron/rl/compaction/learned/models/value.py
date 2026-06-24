@@ -33,8 +33,8 @@ import torch.nn.functional as F
 
 from megatron.rl.compaction.learned.models.belief import BeliefMemory
 from megatron.rl.compaction.learned.models.compactor import (
-    duplicated_linear,
-    _minimal_transformer_config,
+    column_linear,
+    compactor_transformer_config,
 )
 
 
@@ -164,6 +164,8 @@ class ValueHead(nn.Module):
         d_model: int,
         hidden_dim: int = 256,
         feature_dim: int = 0,
+        params_dtype: torch.dtype = torch.float32,
+        pg_collection=None,
     ) -> None:
         super().__init__()
         self.n_layers = n_layers
@@ -171,10 +173,11 @@ class ValueHead(nn.Module):
         self.feature_dim = feature_dim
 
         in_dim = n_layers * d_model + feature_dim
-        config = _minimal_transformer_config(hidden_dim, n_heads=1)
-        self.fc1 = duplicated_linear(in_dim, hidden_dim, config, bias=True)
-        self.fc2 = duplicated_linear(hidden_dim, hidden_dim, config, bias=True)
-        self.fc3 = duplicated_linear(hidden_dim, 1, config, bias=True)
+        config = compactor_transformer_config(hidden_dim, n_heads=1, ffn_hidden_size=hidden_dim,
+                                              params_dtype=params_dtype)
+        self.fc1 = column_linear(in_dim, hidden_dim, config, pg_collection, bias=True)
+        self.fc2 = column_linear(hidden_dim, hidden_dim, config, pg_collection, bias=True)
+        self.fc3 = column_linear(hidden_dim, 1, config, pg_collection, bias=True)
 
     def forward(
         self,

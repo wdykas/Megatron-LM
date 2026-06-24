@@ -303,12 +303,12 @@ class TestCurriculumScheduler:
 # Checkpoint I/O
 # ===========================================================================
 
-@pytest.mark.skipif(
-    not torch.distributed.is_initialized(),
-    reason="checkpoint.py uses collective Megatron dist_checkpointing (needs "
-    "torch.distributed + model-parallel state + the spawn-Manager __main__ guard). "
-    "The save/load/resume round-trip is validated end-to-end under torchrun by "
-    "scripts/_optc_online_smoke.py; it cannot run in single-process pytest.",
+@pytest.mark.skip(
+    reason="checkpoint.py uses collective Megatron dist_checkpointing whose async "
+    "writer spawns a multiprocessing Manager that re-imports the entry module — it "
+    "needs a real multi-rank torchrun launch with an __main__ guard, which plain "
+    "single-process pytest does not provide. The save/load/resume round-trip is "
+    "validated end-to-end by scripts/_optc_online_smoke.py under torchrun.",
 )
 class TestCheckpointIO:
     def _perceiver(self):

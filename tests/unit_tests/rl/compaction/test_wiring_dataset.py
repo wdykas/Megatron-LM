@@ -380,4 +380,3 @@ class TestTypeConsolidation:
         assert hasattr(training_mod, "SinglePassCompactorTrainer")
         assert hasattr(training_mod, "BeliefCompactorTrainer")
         assert hasattr(training_mod, "train_compactor_trajectory")
-        assert hasattr(training_mod, "_CompactorOptimizer")

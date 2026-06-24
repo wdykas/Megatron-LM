@@ -59,10 +59,19 @@ class EveryNStepsTrigger:
 
 
 class TokenBudgetTrigger:
-    """Compact when the belief context string exceeds a token/character budget.
+    """Compact when the belief's context exceeds a token budget.
 
-    If a tokenizer is supplied its ``tokenize`` method is used for an exact
-    token count. Otherwise a rough 4-chars-per-token estimate is applied.
+    The authoritative size is ``belief.token_estimate`` — the real, tokenizer-
+    measured token count of the actor context, which the recorder computes once
+    per step when it builds and tokenizes that context (see
+    ``PomdpRolloutRecorder.build_context_for_step``). Reading it here is O(1) and
+    reflects exactly what the model consumed, so this is the normal path.
+
+    The fallbacks below only apply when no upstream count is available (e.g. the
+    context has not been built yet, or the recorder has no tokenizer): if a
+    tokenizer was supplied to this trigger, tokenize the belief's context string;
+    otherwise apply a coarse 4-chars-per-token estimate. Both are last resorts —
+    they re-derive a worse proxy and should not be relied on in steady state.
     """
 
     def __init__(self, budget: int, tokenizer: Any = None) -> None:
@@ -70,11 +79,16 @@ class TokenBudgetTrigger:
         self._tokenizer = tokenizer
 
     def should_compact(self, step_id: int, belief: Any, action: Any, observation: Any) -> bool:
+        # Primary path: the real token count maintained on the belief upstream.
+        token_estimate = getattr(belief, "token_estimate", None)
+        if token_estimate is not None:
+            return token_estimate >= self._budget
+
+        # Fallback: no upstream count available — re-derive from the context string.
         text = belief.to_context_str() if hasattr(belief, "to_context_str") else str(belief)
         if self._tokenizer is not None:
             try:
-                tokens = self._tokenizer.tokenize(text)
-                return len(tokens) >= self._budget
+                return len(self._tokenizer.tokenize(text)) >= self._budget
             except Exception:
                 pass
         return len(text) >= self._budget * 4

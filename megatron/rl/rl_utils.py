@@ -302,8 +302,9 @@ class RLRuntimeState:
         self.latest_batch_num_sequences = 0
         # Online compactor training state — managed by compaction.learned.online
         # (build_compactor_trajectories / maybe_train_compactor).
-        self.compactor = None
-        self.compactor_optimizer = None   # CompactorParallelOptimizer once attached
+        self.compactor = None             # the raw GatedRecurrentUpdater (MegatronModule)
+        self.compactor_ddp = None         # mcore DistributedDataParallel wrapping it (once attached)
+        self.compactor_optimizer = None   # get_megatron_optimizer result (once attached)
         self.compactor_cfg = None
         self.compactor_trajectories: list = []
         # Training model reference for differentiable student forward (teacher-KL mode)

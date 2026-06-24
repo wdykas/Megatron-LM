@@ -23,7 +23,10 @@ import torch
 
 from megatron.core.utils import log_single_rank
 from megatron.rl.compaction.learned.training.training import train_compactor_trajectory
-from megatron.rl.compaction.learned.training.parallel import CompactorParallelOptimizer
+from megatron.rl.compaction.learned.training.parallel import (
+    build_compactor_pg_collection,
+    wrap_compactor_for_training,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,21 +57,18 @@ def init_compactor_from_kv(runtime_state: Any, args, n_attn_layers: int, d_kv: i
     _dtype = (torch.bfloat16 if getattr(args, 'bf16', False)
               else torch.float16 if getattr(args, 'fp16', False)
               else torch.float32)
-    # Build a TransformerConfig carrying the mixed-precision flags so the compactor's
-    # TE layers and the Option C DDP grad buffers use the right dtype (see
-    # CompactorParallelOptimizer). hidden_size = d_kv (the compactor operates on the
-    # local KV slice), num_attention_heads = the compactor's internal head count.
-    import dataclasses as _dc
-    from megatron.rl.compaction.learned.models.compactor import _minimal_transformer_config
-    _tcfg = _dc.replace(
-        _minimal_transformer_config(d_kv, n_heads),
-        bf16=(_dtype == torch.bfloat16),
-        fp16=(_dtype == torch.float16),
-        params_dtype=_dtype,
-    )
-    compactor = GatedRecurrentUpdater(updater_cfg, transformer_config=_tcfg).cuda().to(_dtype)
 
-    # Load compactor weights from checkpoint if provided (replicated across TP ranks).
+    # The compactor is replicated on every rank, data-parallel across the world.
+    # build_compactor_pg_collection() gives it a singleton tensor-parallel group
+    # (so the Megatron sub-modules build replicated, not sharded across the real TP
+    # group) and a world data-parallel group (used by DDP at optimizer-attach time).
+    pg_collection = build_compactor_pg_collection()
+    runtime_state._compactor_pg_collection = pg_collection
+    compactor = GatedRecurrentUpdater(
+        updater_cfg, params_dtype=_dtype, pg_collection=pg_collection,
+    ).cuda().to(_dtype)
+
+    # Load compactor weights from checkpoint if provided (replicated across all ranks).
     _ckpt_path = getattr(args, "rl_compaction_compactor_checkpoint", None)
     _loaded_step = None
     _loaded_ckpt_payload = None
@@ -77,14 +77,10 @@ def init_compactor_from_kv(runtime_state: Any, args, n_attn_layers: int, d_kv: i
         try:
             # dist_checkpointing builds TE layers (CUDA-only) and load() is collective —
             # all ranks reach here together via build_compactor_trajectories.
-            compactor, _meta = _load_ckpt(_ckpt_path, map_location="cuda")
+            compactor, _meta = _load_ckpt(
+                _ckpt_path, map_location="cuda", params_dtype=_dtype, pg_collection=pg_collection,
+            )
             compactor = compactor.to(_dtype).train()
-            # Ensure the rebuilt module's config carries the mixed-precision flags so
-            # the Option C DDP grad buffers use the right dtype (the saved config_dict
-            # came from the minimal fp32 TransformerConfig).
-            compactor.config.bf16 = (_dtype == torch.bfloat16)
-            compactor.config.fp16 = (_dtype == torch.float16)
-            compactor.config.params_dtype = _dtype
             _loaded_step = getattr(_meta, "step", None)
             _loaded_ckpt_payload = _ckpt_path  # stash path for optimizer state restore
             log_single_rank(logger, logging.INFO,
@@ -153,20 +149,18 @@ def init_compactor_from_kv(runtime_state: Any, args, n_attn_layers: int, d_kv: i
 
 
 def attach_compactor_optimizer(runtime_state: Any, megatron_opt=None) -> None:
-    """Build the compactor's Option C world-DP optimizer (DDP + Megatron optimizer).
+    """DDP-wrap the compactor and build its Megatron optimizer.
 
-    ``CompactorParallelOptimizer`` wraps the replicated compactor in Megatron DDP
-    over the whole-world data-parallel group and a real ``get_megatron_optimizer``;
-    gradients are all-reduced across all ranks on every step so replicas stay
-    bit-identical. This is the compactor's own optimizer, separate from the LLM's —
-    in joint training the LLM master params still hold the previous iteration's
-    gradient when the compactor steps, so sharing would re-step and corrupt the LLM.
+    Uses the standard Megatron machinery (``wrap_compactor_for_training`` ->
+    ``DistributedDataParallel`` + ``get_megatron_optimizer``) over the world
+    data-parallel group, so gradients are all-reduced across all ranks and the
+    replicas stay bit-identical. The compactor has its OWN optimizer, separate from
+    the LLM's — in joint training the LLM master params still hold the previous
+    iteration's gradient when the compactor steps, so sharing would corrupt the LLM.
 
     ``megatron_opt`` (the LLM optimizer) is accepted for call-site stability but
-    intentionally unused: the compactor is always self-contained.
-
-    Called once, collectively on ALL ranks, on the first maybe_train_compactor
-    invocation. No-op if the optimizer is already set or the compactor is not built.
+    intentionally unused. Called once, collectively on ALL ranks, on the first
+    maybe_train_compactor invocation.
     """
     del megatron_opt  # intentionally unused — see docstring
     if runtime_state.compactor_optimizer is not None:
@@ -174,14 +168,18 @@ def attach_compactor_optimizer(runtime_state: Any, megatron_opt=None) -> None:
     if runtime_state.compactor is None:
         return
 
-    compactor_opt = CompactorParallelOptimizer(runtime_state.compactor, runtime_state._compactor_lr)
+    ddp_model, optimizer = wrap_compactor_for_training(
+        runtime_state.compactor,
+        runtime_state._compactor_lr,
+        pg_collection=getattr(runtime_state, "_compactor_pg_collection", None),
+    )
 
     # Restore FP32 masters + Adam moments from checkpoint if available.
     if runtime_state._compactor_ckpt_path is not None:
         from megatron.rl.compaction.learned.training.checkpoint import load_optimizer_state
         try:
             load_optimizer_state(
-                runtime_state._compactor_ckpt_path, compactor_opt,
+                runtime_state._compactor_ckpt_path, optimizer,
                 model_sharded_state_dict=runtime_state.compactor.sharded_state_dict(),
             )
             log_single_rank(logger, logging.INFO,
@@ -193,10 +191,11 @@ def attach_compactor_optimizer(runtime_state: Any, megatron_opt=None) -> None:
                             "[STILL online] checkpoint has no optimizer state; "
                             "FP32 masters + Adam moments start fresh from the loaded weights.")
 
-    runtime_state.compactor_optimizer = compactor_opt
+    runtime_state.compactor_ddp = ddp_model
+    runtime_state.compactor_optimizer = optimizer
     log_single_rank(logger, logging.INFO,
                     "[STILL online] Compactor optimizer attached "
-                    "(Option C: world-DP DDP + Megatron optimizer).")
+                    "(DDP over the world DP group + Megatron optimizer).")
 
 
 def build_compactor_trajectories(runtime_state: Any, model, args) -> None:
@@ -208,8 +207,8 @@ def build_compactor_trajectories(runtime_state: Any, model, args) -> None:
     LOCAL tensor-parallel KV partition (a different subset of KV heads per rank —
     with GQA+TP, e.g. d_kv = 1*kv_channels for tp=4/num_query_groups=2; no
     all-gather). Each rank builds its own Trajectory from its local slice and trains
-    on it; CompactorParallelOptimizer all-reduces gradients across the world so the
-    replicas stay bit-identical. The compactor is sized from the actual captured
+    on it; the DDP wrapping the compactor all-reduces gradients across the world so
+    the replicas stay bit-identical. The compactor is sized from the actual captured
     local d_kv (consistent across ranks by symmetric GQA+TP replication), so it
     always matches the data exactly.
 
@@ -377,7 +376,7 @@ def maybe_train_compactor(runtime_state: Any, args=None, optimizer=None) -> None
     for trajectory in trajectories:
         try:
             log = train_compactor_trajectory(
-                updater=runtime_state.compactor,
+                model=runtime_state.compactor_ddp,
                 optimizer=runtime_state.compactor_optimizer,
                 trajectory=trajectory,
                 student_fn=_student_fn,

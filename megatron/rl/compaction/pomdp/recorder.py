@@ -138,20 +138,26 @@ class PomdpRolloutRecorder:
         context_tokens_ref: ArtifactRef | None = None
         belief_id = getattr(belief, "belief_id", None)
 
+        # Tokenize the actor context once (when a tokenizer is available) and record
+        # the real count on the belief as ``token_estimate``. This is the authoritative
+        # size TokenBudgetTrigger reads, so the budget decision uses the exact number of
+        # tokens the actor consumed — no re-tokenization of a string representation.
+        tokens = self._context_builder.encode(compact_context)
+        if tokens is not None and hasattr(belief, "token_estimate"):
+            belief.token_estimate = len(tokens)
+
         if self._config.enabled:
             context_ref = self._store.put_artifact(
                 kind="raw_actor_context",
                 payload=compact_context,
                 metadata={"run_id": run_id, "belief_id": belief_id},
             )
-            if self._config.store_actor_input_tokens:
-                tokens = self._context_builder.encode(compact_context)
-                if tokens is not None:
-                    context_tokens_ref = self._store.put_artifact(
-                        kind="tokenized_actor_context",
-                        payload={"tokens": tokens},
-                        metadata={"run_id": run_id, "belief_id": belief_id},
-                    )
+            if self._config.store_actor_input_tokens and tokens is not None:
+                context_tokens_ref = self._store.put_artifact(
+                    kind="tokenized_actor_context",
+                    payload={"tokens": tokens},
+                    metadata={"run_id": run_id, "belief_id": belief_id},
+                )
 
         if self._config.mode == "shadow" and full_context_text is not None:
             self._record_shadow_step(run_id, belief, compact_context, full_context_text)

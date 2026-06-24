@@ -104,6 +104,35 @@ class TestTokenBudgetTrigger:
         assert t.should_compact(0, _Short(), _act(), _obs()) is False
         assert t.should_compact(0, _Long(), _act(), _obs()) is True
 
+    def test_prefers_belief_token_estimate(self):
+        """The authoritative token_estimate is used directly — no re-tokenization."""
+        t = TokenBudgetTrigger(budget=100)
+
+        class _Belief:
+            token_estimate = 150  # >= budget
+            def to_context_str(self):
+                raise AssertionError("must not re-tokenize when token_estimate is set")
+
+        assert t.should_compact(0, _Belief(), _act(), _obs()) is True
+
+        class _Small:
+            token_estimate = 50  # < budget
+            def to_context_str(self):
+                raise AssertionError("must not re-tokenize when token_estimate is set")
+
+        assert t.should_compact(0, _Small(), _act(), _obs()) is False
+
+    def test_falls_back_when_token_estimate_is_none(self):
+        """When token_estimate is absent/None, fall back to the context string."""
+        t = TokenBudgetTrigger(budget=10)
+
+        class _Belief:
+            token_estimate = None
+            def to_context_str(self):
+                return "x" * 500  # >> 10 * 4
+
+        assert t.should_compact(0, _Belief(), _act(), _obs()) is True
+
     def test_no_to_context_str_falls_back_to_str(self):
         t = TokenBudgetTrigger(budget=1)
         assert t.should_compact(0, "a" * 100, _act(), _obs()) is True

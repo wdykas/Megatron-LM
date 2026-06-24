@@ -190,7 +190,7 @@ def test_still_train_trajectory_with_vd_cfg_runs():
         vd_cfg=vd_cfg,
     )
     log = train_compactor_trajectory(
-        updater=updater,
+        model=updater,
         optimizer=optimizer,
         trajectory=traj,
         student_fn=_dummy_student_fn,
