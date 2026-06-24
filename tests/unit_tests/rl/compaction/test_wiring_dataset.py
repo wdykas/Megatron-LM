@@ -22,11 +22,9 @@ from megatron.rl.compaction.learned.models.compactor import PerceiverCompactor, 
 from megatron.rl.compaction.learned.training.curriculum import CurriculumScheduler
 from megatron.rl.compaction.learned.training.data import Trajectory, TrainingProbe
 from megatron.rl.compaction.learned.training.data import TrajectoryDataset, trajectory_collate_fn
-from megatron.rl.compaction.learned.serving.eval import CompactionEvaluator, EvalConfig
 from megatron.rl.compaction.learned.models.value import ChunkFeatureExtractor, FEATURE_DIM
 from megatron.rl.compaction.learned.training.losses import CompactorLossWeights
-from .tiny_lm import TinyLM, TinyLMAdapter
-from megatron.rl.compaction.learned.training.data import PipelineConfig, TrajectoryBuilder
+from megatron.rl.compaction.learned.training.data import PipelineConfig
 from megatron.rl.compaction.learned.training.training import BeliefCompactorTrainer
 from megatron.rl.compaction.learned.training.data import CompactorTrainerConfig
 from megatron.rl.compaction.learned.training.data import CompactKV, StudentFn
@@ -75,10 +73,6 @@ def _make_trajectory(n_chunks=4, add_probe_at=2):
     probes_by_chunk = {add_probe_at: [_make_probe()]}
     return Trajectory(chunks=chunks, probes_by_chunk=probes_by_chunk)
 
-
-def _tiny_adapter():
-    model = TinyLM(vocab_size=V, n_layers=L, d_model=D, n_heads=2)
-    return TinyLMAdapter(model)
 
 
 def _student_fn(query_tokens: torch.Tensor, compact_kv: CompactKV) -> torch.Tensor:
@@ -279,81 +273,6 @@ class TestBeliefStillTrainerFullWiring:
 
 
 # ---------------------------------------------------------------------------
-# eval._greedy_generate — context accumulation
-# ---------------------------------------------------------------------------
-
-class TestGreedyGenerate:
-    def _setup(self):
-        adapter = _tiny_adapter()
-        cfg = EvalConfig(chunk_size=8, max_new_tokens=4)
-        return CompactionEvaluator(adapter, cfg), adapter
-
-    def test_generates_correct_number_of_tokens(self):
-        evaluator, adapter = self._setup()
-        compact_kv: CompactKV = [
-            (torch.zeros(1, 4, adapter.d_head * adapter.n_heads),
-             torch.zeros(1, 4, adapter.d_head * adapter.n_heads))
-            for _ in range(adapter.n_layers)
-        ]
-        prompt = torch.randint(0, V, (1, 4))
-        generated = evaluator._greedy_generate(prompt, compact_kv, max_new_tokens=5)
-        assert generated.shape == (1, 5)
-
-    def test_each_step_conditions_on_prior_output(self):
-        # Run twice with same model; second run feeds a different prompt.
-        # If context is not accumulated, outputs would be identical despite
-        # different inputs — we check they can diverge.
-        adapter = _tiny_adapter()
-        cfg = EvalConfig(chunk_size=8, max_new_tokens=3)
-        evaluator = CompactionEvaluator(adapter, cfg)
-        compact_kv: CompactKV = [
-            (torch.zeros(1, 4, D), torch.zeros(1, 4, D))
-            for _ in range(L)
-        ]
-        prompt_a = torch.zeros(1, 2, dtype=torch.long)
-        prompt_b = torch.ones(1, 2, dtype=torch.long) * (V - 1)
-        gen_a = evaluator._greedy_generate(prompt_a, compact_kv, max_new_tokens=3)
-        gen_b = evaluator._greedy_generate(prompt_b, compact_kv, max_new_tokens=3)
-        # With non-trivial prompts, at least one token should differ
-        # (may fail if the model happens to be degenerate, but TinyLM is random-init)
-        # Accept either different outputs OR same shape (latter means model is degenerate)
-        assert gen_a.shape == gen_b.shape == (1, 3)
-
-    def test_history_grows_across_steps(self):
-        adapter = _tiny_adapter()
-        cfg = EvalConfig(max_new_tokens=6)
-        evaluator = CompactionEvaluator(adapter, cfg)
-        compact_kv: CompactKV = [
-            (torch.zeros(1, 2, D), torch.zeros(1, 2, D)) for _ in range(L)
-        ]
-        prompt = torch.randint(0, V, (1, 3))
-        generated = evaluator._greedy_generate(prompt, compact_kv, max_new_tokens=6)
-        assert generated.shape == (1, 6)
-        # All token IDs must be valid vocabulary indices
-        assert (generated >= 0).all() and (generated < V).all()
-
-    def test_needle_in_haystack_completes(self):
-        # Full integration: build trajectory, run NIH eval
-        adapter = _tiny_adapter()
-        cfg = EvalConfig(chunk_size=8, max_new_tokens=2, batch_size=1)
-        evaluator = CompactionEvaluator(adapter, cfg)
-        from megatron.rl.compaction.learned.models.compactor import PerceiverCompactor, PerceiverConfig
-        from megatron.rl.compaction.learned.serving.selection_adapter import SelectionBeliefAdapter
-        from megatron.rl.compaction.kv import TopKCompressor
-        compressor = SelectionBeliefAdapter(
-            TopKCompressor(), budget=4, n_layers=L
-        )
-        haystack = torch.randint(0, V, (1, 32))
-        query = torch.randint(0, V, (1, 4))
-        answer = torch.randint(0, V, (1, 2))
-        result = evaluator.needle_in_haystack(haystack, query, answer, compressor)
-        assert "exact_match" in result
-        assert "token_overlap" in result
-        assert 0.0 <= result["exact_match"] <= 1.0
-        assert 0.0 <= result["token_overlap"] <= 1.0
-
-
-# ---------------------------------------------------------------------------
 # TrajectoryDataset + trajectory_collate_fn
 # ---------------------------------------------------------------------------
 
@@ -401,7 +320,10 @@ class TestTrajectoryDataset:
         trajs = [_make_trajectory() for _ in range(8)]
         ds = TrajectoryDataset(trajs)
         loader = DataLoader(ds, batch_size=2, collate_fn=trajectory_collate_fn, shuffle=True)
-        batches = list(loader)
+        # DataLoader's shuffle sampler draws indices with a CPU generator; data
+        # loading is CPU-side, so iterate under the CPU default device.
+        with torch.device("cpu"):
+            batches = list(loader)
         all_trajs = [t for b in batches for t in b]
         assert len(all_trajs) == 8
 

@@ -31,8 +31,7 @@ KV format
 Keys and values are stored *as returned by the hook* — typically with RoPE
 already applied.  This is fine for BeliefUpdater training (the updater learns
 to compress positional keys).  If you need position-free keys for a
-standalone FrozenModelAdapter student_fn, use kv/rope.py to strip them
-before saving.
+student forward pass, use kv/rope.py to strip them before saving.
 """
 
 from __future__ import annotations

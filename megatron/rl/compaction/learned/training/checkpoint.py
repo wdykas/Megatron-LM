@@ -1,27 +1,29 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Checkpoint save/load for trained compactors.
+"""Distributed checkpointing for trained compactors.
 
-Stores both the model config (so the architecture can be reconstructed without
-out-of-band files) and the optimizer/scheduler state for full training resume.
+The compactor is a Megatron ``MegatronModule`` built from TransformerEngine
+layers, so it is checkpointed the same way the main model is: via
+``megatron.core.dist_checkpointing``. The model weights are stored as a
+*sharded* state dict (which correctly handles TE ``_extra_state``), while the
+model config, optimizer state, scheduler state, and step are stored as *common*
+(replicated) state. A checkpoint is therefore a **directory**, not a ``.pt``.
+
+This requires ``torch.distributed`` + Megatron model-parallel state to be
+initialized (always true inside the RL training loop). The async file writer
+also needs a working multiprocessing context — present under ``torchrun``.
 
 Usage — save:
-    from megatron.rl.compaction.learned.training.checkpoint import save_checkpoint
-    save_checkpoint(compactor, "run/ckpt_step1000.pt", step=1000,
-                    optimizer=opt, scheduler=curriculum,
-                    metadata={"val_ppl": 14.2})
+    save_checkpoint(compactor, "run/step_0001000", step=1000,
+                    optimizer=opt, scheduler=curriculum)
 
 Usage — load:
-    from megatron.rl.compaction.learned.training.checkpoint import load_checkpoint
-    model, meta = load_checkpoint("run/ckpt_step1000.pt")
-    # model is a PerceiverCompactor or GatedRecurrentUpdater, weights loaded
-    # meta.step, meta.metadata carry the saved state
+    model, meta = load_checkpoint("run/step_0001000", map_location="cuda")
 """
 
 from __future__ import annotations
 
 import dataclasses
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,30 +31,38 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from megatron.core import dist_checkpointing
 from megatron.rl.compaction.learned.models.compactor import PerceiverCompactor, PerceiverConfig
 from megatron.rl.compaction.learned.models.belief import GatedRecurrentUpdater, GatedUpdaterConfig
 
 
-# ---------------------------------------------------------------------------
-# Metadata type
-# ---------------------------------------------------------------------------
-
 @dataclass
 class CheckpointMeta:
-    """Metadata stored alongside the model in a checkpoint file.
-
-    Attributes
-    ----------
-    model_type: "perceiver" or "gated_recurrent".
-    config:     Serialised model config dict (reconstructable).
-    step:       Gradient step at save time.
-    metadata:   Arbitrary dict for experiment tracking (loss values, etc.).
-    """
+    """Metadata stored (as common state) alongside the model in a checkpoint."""
 
     model_type: str
     config: dict
     step: int
     metadata: dict
+
+
+def _model_type_and_config(model: nn.Module) -> tuple[str, dict]:
+    if isinstance(model, PerceiverCompactor):
+        return "perceiver", dataclasses.asdict(model.cfg)
+    if isinstance(model, GatedRecurrentUpdater):
+        return "gated_recurrent", dataclasses.asdict(model.cfg)
+    raise TypeError(
+        f"save_checkpoint only supports PerceiverCompactor and GatedRecurrentUpdater, "
+        f"got {type(model).__name__}."
+    )
+
+
+def _build_model(model_type: str, config_dict: dict) -> nn.Module:
+    if model_type == "perceiver":
+        return PerceiverCompactor(PerceiverConfig(**config_dict))
+    if model_type == "gated_recurrent":
+        return GatedRecurrentUpdater(GatedUpdaterConfig(**config_dict))
+    raise ValueError(f"Unknown model_type '{model_type}' in checkpoint.")
 
 
 # ---------------------------------------------------------------------------
@@ -63,54 +73,41 @@ def save_checkpoint(
     model: nn.Module,
     path: str | Path,
     step: int = 0,
-    optimizer: torch.optim.Optimizer | None = None,
+    optimizer: Any | None = None,
     scheduler: Any | None = None,
     metadata: dict | None = None,
 ) -> None:
-    """Save a compactor checkpoint with config, weights, and optional opt state.
+    """Save a compactor checkpoint (a directory) via dist_checkpointing.
 
-    Parameters
-    ----------
-    model:     A PerceiverCompactor or GatedRecurrentUpdater (or any nn.Module
-               with a .cfg dataclass attribute of one of the two config types).
-    path:      File path.  Parent directories are created if needed.
-    step:      Current gradient step (for resume).
-    optimizer: If provided, its state_dict is saved too.
-    scheduler: If provided and has a state_dict() method, saves scheduler state.
-               Pass a CurriculumScheduler to enable curriculum resume.
-    metadata:  Arbitrary dict (val loss, PPL, timestamp, etc.).
+    The model is saved as a sharded state dict; config/optimizer/scheduler/step
+    are saved as common (replicated) state.
     """
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    model_type, config_dict = _model_type_and_config(model)
 
-    if isinstance(model, PerceiverCompactor):
-        model_type = "perceiver"
-        config_dict = dataclasses.asdict(model.cfg)
-    elif isinstance(model, GatedRecurrentUpdater):
-        model_type = "gated_recurrent"
-        config_dict = dataclasses.asdict(model.cfg)
-    else:
-        raise TypeError(
-            f"save_checkpoint only supports PerceiverCompactor and "
-            f"GatedRecurrentUpdater, got {type(model).__name__}. "
-            f"For other nn.Module types use torch.save directly."
-        )
-
-    payload: dict[str, Any] = {
+    sharded_sd: dict[str, Any] = {
+        "model": model.sharded_state_dict(),
+        # Common (replicated) state — plain objects, saved via the common store.
         "model_type": model_type,
         "config": config_dict,
         "step": step,
         "metadata": metadata or {},
-        "model_state_dict": model.state_dict(),
     }
-
     if optimizer is not None:
-        payload["optimizer_state_dict"] = optimizer.state_dict()
-
+        if hasattr(optimizer, "sharded_state_dict"):
+            # Online (Option C): the Megatron optimizer's state (FP32 masters + Adam
+            # moments) is stored as replicated ShardedTensors keyed to the model's
+            # sharded params — the idiomatic, consistency-checked representation.
+            sharded_sd["optimizer"] = optimizer.sharded_state_dict(sharded_sd["model"])
+        else:
+            # Offline (_CompactorOptimizer, single-process): no sharded path; the
+            # replicated tensors go in the common store.
+            sharded_sd["optimizer"] = optimizer.state_dict()
     if scheduler is not None and hasattr(scheduler, "state_dict"):
-        payload["scheduler_state_dict"] = scheduler.state_dict()
+        sharded_sd["scheduler"] = scheduler.state_dict()
 
-    torch.save(payload, path)
+    path.mkdir(parents=True, exist_ok=True)
+    dist_checkpointing.save(sharded_sd, str(path))
 
 
 # ---------------------------------------------------------------------------
@@ -119,73 +116,64 @@ def save_checkpoint(
 
 def load_checkpoint(
     path: str | Path,
-    map_location: str | torch.device = "cpu",
+    map_location: str | torch.device = "cuda",
 ) -> tuple[nn.Module, CheckpointMeta]:
-    """Load a compactor from a checkpoint file.
+    """Load a compactor from a dist-checkpoint directory.
 
-    Reconstructs the model from the saved config (no need to know the
-    architecture in advance), loads weights, and returns metadata.
-
-    Parameters
-    ----------
-    path:         Checkpoint file path.
-    map_location: Passed to torch.load.  Use "cuda" to load directly onto GPU.
-
-    Returns
-    -------
-    (model, meta) where model has weights loaded (no mode set — caller must call
-    .eval() or .train() as appropriate).
-    meta.step and meta.metadata carry the saved training state.
+    Reads common state first to recover the model config, rebuilds the model,
+    then loads the sharded weights into it.
     """
-    payload = torch.load(path, map_location=map_location, weights_only=False)
+    path = str(path)
+    common = dist_checkpointing.load_common_state_dict(path)
+    model_type = common["model_type"]
+    config_dict = common["config"]
 
-    model_type: str = payload["model_type"]
-    config_dict: dict = payload["config"]
-    step: int = payload.get("step", 0)
-    meta_dict: dict = payload.get("metadata", {})
-
-    if model_type == "perceiver":
-        cfg = PerceiverConfig(**config_dict)
-        model: nn.Module = PerceiverCompactor(cfg)
-    elif model_type == "gated_recurrent":
-        cfg = GatedUpdaterConfig(**config_dict)
-        model = GatedRecurrentUpdater(cfg)
-    else:
-        raise ValueError(
-            f"Unknown model_type '{model_type}' in checkpoint. "
-            f"Expected 'perceiver' or 'gated_recurrent'."
-        )
-
-    model.load_state_dict(payload["model_state_dict"])
+    model = _build_model(model_type, config_dict).to(map_location)
+    loaded = dist_checkpointing.load({"model": model.sharded_state_dict()}, path)
+    model.load_state_dict(loaded["model"])
 
     meta = CheckpointMeta(
         model_type=model_type,
         config=config_dict,
-        step=step,
-        metadata=meta_dict,
+        step=common.get("step", 0),
+        metadata=common.get("metadata", {}),
     )
     return model, meta
 
 
 def load_optimizer_state(
     path: str | Path,
-    optimizer: torch.optim.Optimizer,
-    map_location: str | torch.device = "cpu",
+    optimizer: Any,
+    model_sharded_state_dict: dict | None = None,
+    map_location: str | torch.device = "cuda",
 ) -> None:
-    """Restore optimizer state from a checkpoint (in-place)."""
-    payload = torch.load(path, map_location=map_location, weights_only=False)
-    if "optimizer_state_dict" not in payload:
+    """Restore optimizer state from a dist-checkpoint directory.
+
+    Online (Option C): the optimizer exposes ``sharded_state_dict`` and the state
+    was saved as replicated ShardedTensors; build the loading template and read it
+    via the sharded path. ``model_sharded_state_dict`` is the same model sharded
+    dict used at save time (the optimizer keys its state to those params).
+
+    Offline (_CompactorOptimizer): the state is in the common store.
+    """
+    if hasattr(optimizer, "sharded_state_dict") and model_sharded_state_dict is not None:
+        opt_template = optimizer.sharded_state_dict(model_sharded_state_dict, is_loading=True)
+        loaded = dist_checkpointing.load({"optimizer": opt_template}, str(path))
+        optimizer.load_state_dict(loaded["optimizer"])
+        return
+    common = dist_checkpointing.load_common_state_dict(str(path))
+    if "optimizer" not in common:
         raise KeyError(f"Checkpoint at {path} has no optimizer state.")
-    optimizer.load_state_dict(payload["optimizer_state_dict"])
+    optimizer.load_state_dict(common["optimizer"])
 
 
 def load_scheduler_state(
     path: str | Path,
     scheduler: Any,
-    map_location: str | torch.device = "cpu",
+    map_location: str | torch.device = "cuda",
 ) -> None:
-    """Restore scheduler (e.g. CurriculumScheduler) state from a checkpoint."""
-    payload = torch.load(path, map_location=map_location, weights_only=False)
-    if "scheduler_state_dict" not in payload:
+    """Restore scheduler state (common) from a dist-checkpoint directory."""
+    common = dist_checkpointing.load_common_state_dict(str(path))
+    if "scheduler" not in common:
         raise KeyError(f"Checkpoint at {path} has no scheduler state.")
-    scheduler.load_state_dict(payload["scheduler_state_dict"])
+    scheduler.load_state_dict(common["scheduler"])

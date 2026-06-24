@@ -202,7 +202,7 @@ class TestPathConsistencyLoss:
         vb = [torch.randn(B, T, d) for _ in range(n_layers)]
         q  = torch.randint(0, 100, (B, 4))
         loss = path_consistency_loss(updater, ka, va, kb, vb, q, self._student_fn)
-        assert loss.item() >= 0.0
+        assert loss.item() >= -1e-5   # ~0 by construction; allow GPU fp rounding
 
     def test_grad_flows_through_sequential_path(self):
         """path_consistency_loss should back-prop into the updater's compactor."""

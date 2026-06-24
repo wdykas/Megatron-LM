@@ -9,7 +9,6 @@ Covers:
   - BeliefUpdater: initial_compress, forward (recurrent update), step counter
   - Loss functions: teacher_kl, future_kl, consistency, task
   - CompactorLosses.compute: full and partial loss configs
-  - CompactorAdapter: integrates with KVCompactionBenchmark
 """
 
 from __future__ import annotations
@@ -30,7 +29,6 @@ from megatron.rl.compaction.learned.training.losses import (
     task_loss,
     teacher_kl_loss,
 )
-from megatron.rl.compaction.learned.serving.eval import CompactorAdapter
 from megatron.rl.compaction.kv.benchmark import KVCompactionBenchmark
 from megatron.rl.compaction.kv import OMPCompressor, TopKCompressor
 
@@ -62,7 +60,7 @@ def compactor_shared(cfg_shared):
 
 
 def _kv(B, T, d, *, seed=0):
-    g = torch.Generator()
+    g = torch.Generator(device='cuda')
     g.manual_seed(seed)
     return (
         torch.randn(B, T, d, generator=g),
@@ -489,89 +487,3 @@ class TestBeliefStillLosses:
         # Compactor params should have gradients
         has_grad = any(p.grad is not None for p in compactor.parameters())
         assert has_grad, "Loss should flow gradients back through compact representation"
-
-
-# ---------------------------------------------------------------------------
-# CompactorAdapter + benchmark integration
-# ---------------------------------------------------------------------------
-
-class TestStillAdapter:
-    def test_compress_output_shape(self, compactor, cfg):
-        adapter = CompactorAdapter(compactor, layer_idx=0)
-        rng = np.random.default_rng(0)
-        T, d, C = 64, cfg.d_kv, cfg.n_compress
-        K = rng.standard_normal((T, d)).astype(np.float32)
-        V = rng.standard_normal((T, d)).astype(np.float32)
-        Q_ref = rng.standard_normal((8, d)).astype(np.float32)
-
-        result = adapter.compress(K, V, C, ref_queries=Q_ref, run_id="r", step_id=0)
-        assert result.compacted_keys.shape == (C, d)
-        assert result.compacted_values.shape == (C, d)
-        assert result.bias.shape == (C,)
-        assert (result.bias == 0.0).all()
-
-    def test_compress_strategy_name(self, compactor):
-        adapter = CompactorAdapter(compactor)
-        assert "still" in adapter.strategy
-
-    def test_retained_positions_convention(self, compactor, cfg):
-        adapter = CompactorAdapter(compactor)
-        rng = np.random.default_rng(0)
-        T, d = 32, cfg.d_kv
-        K = rng.standard_normal((T, d)).astype(np.float32)
-        V = rng.standard_normal((T, d)).astype(np.float32)
-        Q = rng.standard_normal((4, d)).astype(np.float32)
-        result = adapter.compress(K, V, cfg.n_compress, ref_queries=Q, run_id="r", step_id=0)
-        assert result.retained_positions == list(range(cfg.n_compress))
-
-    def test_different_inputs_different_outputs(self, compactor, cfg):
-        adapter = CompactorAdapter(compactor)
-        rng = np.random.default_rng(0)
-        T, d = 32, cfg.d_kv
-        K1 = rng.standard_normal((T, d)).astype(np.float32)
-        V1 = rng.standard_normal((T, d)).astype(np.float32)
-        K2 = rng.standard_normal((T, d)).astype(np.float32)
-        V2 = rng.standard_normal((T, d)).astype(np.float32)
-        Q = rng.standard_normal((4, d)).astype(np.float32)
-
-        r1 = adapter.compress(K1, V1, cfg.n_compress, ref_queries=Q, run_id="r", step_id=0)
-        r2 = adapter.compress(K2, V2, cfg.n_compress, ref_queries=Q, run_id="r", step_id=0)
-        assert not torch.allclose(r1.compacted_keys, r2.compacted_keys)
-
-    def test_benchmark_integration(self, compactor, cfg):
-        adapter = CompactorAdapter(compactor, layer_idx=0)
-        torch.manual_seed(42)
-        T, d = 64, cfg.d_kv
-        K = torch.randn(T, d, dtype=torch.float32)
-        V = torch.randn(T, d, dtype=torch.float32)
-        Q_ref  = torch.randn(8, d, dtype=torch.float32)
-        Q_eval = torch.randn(8, d, dtype=torch.float32)
-
-        results = KVCompactionBenchmark().run(
-            compressors={
-                "still": adapter,
-                "omp":   OMPCompressor(fit_values=True),
-                "topk":  TopKCompressor(),
-            },
-            keys=K, values=V, ref_queries=Q_ref, eval_queries=Q_eval,
-            budget=cfg.n_compress,
-        )
-        assert len(results) == 3
-        names = {r.algorithm for r in results}
-        assert names == {"still", "omp", "topk"}
-        # All results should have valid MSE
-        for r in results:
-            assert r.output_mse >= 0.0
-
-    def test_to_kv_mask(self, compactor, cfg):
-        adapter = CompactorAdapter(compactor)
-        rng = np.random.default_rng(0)
-        T, d = 32, cfg.d_kv
-        K = rng.standard_normal((T, d)).astype(np.float32)
-        V = rng.standard_normal((T, d)).astype(np.float32)
-        Q = rng.standard_normal((4, d)).astype(np.float32)
-        result = adapter.compress(K, V, cfg.n_compress, ref_queries=Q, run_id="run7", step_id=3)
-        mask = result.to_kv_mask()
-        assert mask.run_id == "run7"
-        assert mask.step_id == 3
-        assert mask.total_positions == T

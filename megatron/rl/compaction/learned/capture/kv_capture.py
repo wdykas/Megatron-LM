@@ -52,9 +52,13 @@ def capture_kv_from_forward(
     """Run a forward pass and capture K/V from all attention layers.
 
     All TP ranks must call this simultaneously (it issues collective
-    communications inside the model forward).  Only the calling rank's
-    local K/V partition is captured — when GQA KV heads are replicated
-    across TP ranks, rank 0 has the full K/V and no all-gather is needed.
+    communications inside the model forward).  Each rank captures only its
+    LOCAL tensor-parallel partition of the K/V — the KV heads that serve that
+    rank's local query-head shard, shape (1, S, H_kv_local * d_head). This is
+    NOT the full KV: with GQA + TP where num_query_groups < tp_size the KV heads
+    are replicated in groups across ranks (e.g. tp=4, num_query_groups=2 → each
+    rank holds one KV head, so d_kv = 1 * kv_channels). No all-gather is done;
+    the caller decides what to keep (today: rank 0's local partition only).
 
     Parameters
     ----------

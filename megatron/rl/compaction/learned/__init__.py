@@ -27,14 +27,10 @@ from megatron.rl.compaction.learned.training.data import (
     TrajectoryDataset,
     trajectory_collate_fn,
     CompactorTrainerConfig,
-    FrozenModelAdapter,
     PipelineConfig,
-    TrajectoryBuilder,
 )
 from megatron.rl.compaction.learned.models.value import ValueHead, ChunkFeatures, ChunkFeatureExtractor, FEATURE_DIM
 from megatron.rl.compaction.learned.capture.hook_collector import HookTrajectoryCollector
-from megatron.rl.compaction.learned.serving.eval import EvalConfig, CompactionEvaluator, CompactorAdapter
-from megatron.rl.compaction.learned.serving.selection_adapter import SelectionBeliefAdapter
 from megatron.rl.compaction.learned.training.curriculum import CurriculumStage, CurriculumScheduler
 from megatron.rl.compaction.learned.serving.belief_compactor import BeliefSession, BeliefSessionStore, BeliefServerCompactor
 from megatron.rl.compaction.learned.training.checkpoint import (
@@ -62,13 +58,10 @@ __all__ = [
     "CompactKV", "StudentFn",
     "TrainingProbe", "Trajectory", "TrajectoryDataset", "trajectory_collate_fn",
     "CompactorTrainerConfig",
-    "FrozenModelAdapter", "PipelineConfig", "TrajectoryBuilder",
-    "CompactorAdapter",
+    "PipelineConfig",
     "ChunkFeatures", "ChunkFeatureExtractor", "FEATURE_DIM",
     "ValueHead",
     "HookTrajectoryCollector",
-    "EvalConfig", "CompactionEvaluator",
-    "SelectionBeliefAdapter",
     "CurriculumStage", "CurriculumScheduler",
     "BeliefSession", "BeliefSessionStore", "BeliefServerCompactor",
     "CheckpointMeta", "save_checkpoint", "load_checkpoint",

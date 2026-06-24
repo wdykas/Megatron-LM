@@ -340,7 +340,7 @@ class TestDataTypes:
 
     def test_trajectory_device(self):
         traj = _trajectory()
-        assert traj.device == torch.device("cpu")
+        assert traj.device.type == "cuda"
 
 
 # ---------------------------------------------------------------------------

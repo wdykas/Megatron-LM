@@ -31,7 +31,15 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn as nn
 
-from megatron.rl.compaction.learned.models.compactor import PerceiverCompactor, _CrossAttentionBlock, _FFNBlock, _count_attention_layers
+from megatron.core.transformer.module import MegatronModule
+from megatron.rl.compaction.learned.models.compactor import (
+    PerceiverCompactor,
+    _CrossAttentionBlock,
+    _FFNBlock,
+    _count_attention_layers,
+    duplicated_linear,
+    _minimal_transformer_config,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -286,31 +294,28 @@ class GatedUpdaterConfig:
 class _GatedLayerUpdater(nn.Module):
     """Single-layer gated recurrent belief update."""
 
-    def __init__(self, cfg: GatedUpdaterConfig, transformer_config=None) -> None:
+    def __init__(self, cfg: GatedUpdaterConfig, config) -> None:
         super().__init__()
         d = cfg.d_kv
 
         # Cross-attention: Q = memory keys, KV = [memory; chunk]
-        self.cross_attn = _CrossAttentionBlock(d, cfg.n_heads, cfg.dropout, transformer_config)
+        self.cross_attn = _CrossAttentionBlock(d, cfg.n_heads, cfg.dropout, config)
 
-        # Self-attention among the C updated slots
-        self.self_attn_norm = nn.LayerNorm(d)
-        self.self_attn = nn.MultiheadAttention(
-            d, cfg.n_heads, dropout=cfg.dropout, batch_first=True
-        )
+        # Self-attention among the C updated slots (pre-norm is internal to the block)
+        self.self_attn = _CrossAttentionBlock(d, cfg.n_heads, cfg.dropout, config)
 
         # FFN
-        self.ffn = _FFNBlock(d, cfg.ff_dim, cfg.dropout, transformer_config)
+        self.ffn = _FFNBlock(d, cfg.ff_dim, cfg.dropout, config)
 
         # Prediction head: each slot predicts the mean content of the next chunk
-        self.predict_head = nn.Linear(d, d, bias=False)
+        self.predict_head = duplicated_linear(d, d, config)
         # Gate input now includes pred_err: d*2 + 1 + feature_dim
         gate_in_dim = d * 2 + 1 + cfg.feature_dim
-        self.gate_proj = nn.Linear(gate_in_dim, d)
+        self.gate_proj = duplicated_linear(gate_in_dim, d, config, bias=True)
 
         # Project gated slot representation → synthetic K and V
-        self.key_proj = nn.Linear(d, d, bias=False)
-        self.val_proj = nn.Linear(d, d, bias=False)
+        self.key_proj = duplicated_linear(d, d, config)
+        self.val_proj = duplicated_linear(d, d, config)
 
     def forward(
         self,
@@ -328,7 +333,7 @@ class _GatedLayerUpdater(nn.Module):
         q = mem_keys if slot_pos is None else mem_keys + slot_pos
 
         # POMDP predictive gate: predict R_t from M_{t-1}
-        pred_Rt = self.predict_head(q)                             # (B, C, d) — slot predictions
+        pred_Rt, _ = self.predict_head(q)                          # (B, C, d) — slot predictions
         chunk_mean = chunk_keys.mean(dim=1, keepdim=True)          # (B, 1, d)
         pred_err = (pred_Rt - chunk_mean).pow(2).mean(dim=-1, keepdim=True)  # (B, C, 1)
 
@@ -338,10 +343,8 @@ class _GatedLayerUpdater(nn.Module):
         # Cross-attend: positioned query → distinct attention pattern per slot
         h = q + self.cross_attn(q, combined_k, combined_v)
 
-        # Refine slot interactions via self-attention
-        h_n = self.self_attn_norm(h)
-        h_sa, _ = self.self_attn(h_n, h_n, h_n)
-        h = h + h_sa
+        # Refine slot interactions via self-attention (block applies its own norm)
+        h = h + self.self_attn(h, h, h)
 
         # FFN
         h = h + self.ffn(h)
@@ -351,21 +354,24 @@ class _GatedLayerUpdater(nn.Module):
         if features is not None:
             feat = features.unsqueeze(1).expand(-1, h.shape[1], -1)
             gate_input = torch.cat([gate_input, feat], dim=-1)
-        g = torch.sigmoid(self.gate_proj(gate_input))              # (B, C, d)
+        gate_logits, _ = self.gate_proj(gate_input)
+        g = torch.sigmoid(gate_logits)                            # (B, C, d)
 
         # Blend old memory with candidate update (separate blend per modality so
         # mem_values is preserved when g≈0, not overwritten by a projection of mem_keys).
         slot_repr_k = (1.0 - g) * mem_keys + g * h
         slot_repr_v = (1.0 - g) * mem_values + g * h
 
-        return self.key_proj(slot_repr_k), self.val_proj(slot_repr_v), g, pred_Rt
+        new_k, _ = self.key_proj(slot_repr_k)
+        new_v, _ = self.val_proj(slot_repr_v)
+        return new_k, new_v, g, pred_Rt
 
 
 # ---------------------------------------------------------------------------
 # GatedRecurrentUpdater  (M_{t+1} = U_θ(M_t, R_t))
 # ---------------------------------------------------------------------------
 
-class GatedRecurrentUpdater(nn.Module):
+class GatedRecurrentUpdater(MegatronModule):
     """Full Belief-Still gated recurrent updater.
 
     Drop-in replacement for BeliefUpdater with richer per-slot dynamics:
@@ -382,11 +388,12 @@ class GatedRecurrentUpdater(nn.Module):
     """
 
     def __init__(self, cfg: GatedUpdaterConfig, transformer_config=None) -> None:
-        super().__init__()
+        config = transformer_config or _minimal_transformer_config(cfg.d_kv, cfg.n_heads)
+        super().__init__(config)
         self.cfg = cfg
         n_sets = 1 if cfg.share_across_layers else cfg.n_attn_layers
         self._layer_modules = nn.ModuleList([
-            _GatedLayerUpdater(cfg, transformer_config) for _ in range(n_sets)
+            _GatedLayerUpdater(cfg, config) for _ in range(n_sets)
         ])
         # Persistent slot identity embeddings.
         # Serves two roles:
@@ -409,10 +416,10 @@ class GatedRecurrentUpdater(nn.Module):
         n_head_sets = 1 if cfg.share_across_layers else cfg.n_attn_layers
         if cfg.use_dynamics_head:
             self.dynamics_key_heads = nn.ModuleList([
-                nn.Linear(cfg.d_kv, cfg.d_kv, bias=False) for _ in range(n_head_sets)
+                duplicated_linear(cfg.d_kv, cfg.d_kv, config) for _ in range(n_head_sets)
             ])
             self.dynamics_val_heads = nn.ModuleList([
-                nn.Linear(cfg.d_kv, cfg.d_kv, bias=False) for _ in range(n_head_sets)
+                duplicated_linear(cfg.d_kv, cfg.d_kv, config) for _ in range(n_head_sets)
             ])
         else:
             self.dynamics_key_heads = None
@@ -479,8 +486,10 @@ class GatedRecurrentUpdater(nn.Module):
         for l in range(memory.n_layers):
             head_idx = 0 if self.cfg.share_across_layers else l
             mk, mv = memory.layer(l)
-            pred_keys.append(self.dynamics_key_heads[head_idx](mk))
-            pred_values.append(self.dynamics_val_heads[head_idx](mv))
+            pk, _ = self.dynamics_key_heads[head_idx](mk)
+            pv, _ = self.dynamics_val_heads[head_idx](mv)
+            pred_keys.append(pk)
+            pred_values.append(pv)
         return pred_keys, pred_values
 
     def initial_compress(

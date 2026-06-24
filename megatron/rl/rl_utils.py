@@ -301,16 +301,18 @@ class RLRuntimeState:
         self.sequences_this_iteration_on_rank = 0
         self.latest_batch_num_sequences = 0
         # Online compactor training state — managed by compaction.learned.online
-        # (maybe_init_compactor_online / build_compactor_trajectories / maybe_train_compactor).
+        # (build_compactor_trajectories / maybe_train_compactor).
         self.compactor = None
-        self.compactor_optimizer = None   # _CompactorOptimizer once attached
+        self.compactor_optimizer = None   # CompactorParallelOptimizer once attached
         self.compactor_cfg = None
         self.compactor_trajectories: list = []
         # Training model reference for differentiable student forward (teacher-KL mode)
         # and for KV capture via forward pass (all STILL online modes).
         self.compactor_student_model = None
         # Raw rollout sequences for KV capture: list of (seq_ids: list[int], reward: float).
-        # Populated during rollout collection on rank 0; consumed by online.build_compactor_trajectories.
+        # Populated on ALL ranks from the broadcast `rollouts` (Option C); consumed by
+        # online.build_compactor_trajectories, which replays a collective forward so each
+        # rank captures its own TP-local KV slice.
         self.compactor_raw_sequences: list = []
         # Cumulative step offset for checkpoint naming: set to loaded step so that
         # filenames advance monotonically across job restarts.
@@ -623,9 +625,9 @@ def get_environment_rollouts(
                         chunk_size=getattr(args, "rl_compaction_chunk_size", 256),
                     )
                     traj_collector = HookTrajectoryCollector(kv_hook, _traj_cfg)
-                    _compactor_online.maybe_init_compactor_online(get_rl_runtime_state(), args, kv_hook)
-                    # Store training model for KV capture and differentiable student forward.
-                    get_rl_runtime_state().compactor_student_model = model
+                    # The compactor itself is created/initialized on ALL ranks in
+                    # build_compactor_trajectories (Option C), not here — this rank-0
+                    # block only drives the offline trajectory_dir disk-save collector.
 
             with nvtx_range("collect-rollouts"):
                 if rank == 0:
@@ -686,24 +688,14 @@ def get_environment_rollouts(
                                         iteration=args.curr_iteration,
                                         prompt_idx=_prompt_idx,
                                     )
-                                # Accumulate for online STILL training this iteration.
-                                if getattr(args, "rl_compaction_compactor_train", False):
-                                    get_rl_runtime_state().compactor_trajectories.append(_traj)
-                        # Save raw sequence for forward-pass KV capture.
-                        # This is the fallback when kv_hook.get_kv_matrices() returns None
-                        # (paged cache is empty after inference completes).
-                        if getattr(args, "rl_compaction_compactor_train", False):
-                            _prompt_ids = list(getattr(group[0], "prompt_tokens", []) or []) if group else []
-                            _resp_ids2 = list(getattr(group[0], "response_tokens", []) or []) if group else []
-                            if _prompt_ids or _resp_ids2:
-                                _full_seq = _prompt_ids + _resp_ids2
-                                _reward2 = sum(
-                                    float(r.reward) for r in group
-                                    if hasattr(r, "reward") and r.reward is not None
-                                )
-                                get_rl_runtime_state().compactor_raw_sequences.append(
-                                    (_full_seq, _reward2)
-                                )
+                        # NOTE: the compactor's online training data is NOT collected
+                        # here. The rank-0 paged-cache hook can only see rank 0's local
+                        # KV, which is incompatible with Option C (every rank trains on
+                        # its own TP-local KV slice). Instead, compactor_raw_sequences is
+                        # populated on ALL ranks below from the broadcast `rollouts`, and
+                        # build_compactor_trajectories replays a collective forward so each
+                        # rank captures its own slice. The trajectory_dir disk-save above
+                        # (offline pipeline) still uses the rank-0 collector.
                         rollouts.append(group)
                     # In deterministic mode, sort rollouts by problem_id for consistent ordering
                     # regardless of completion order due to system timing jitter.
@@ -725,6 +717,25 @@ def get_environment_rollouts(
             # TODO(jbarker): double check why this isn't causing rank 0 memory allocations
             torch.distributed.broadcast_object_list(rollouts, src=0)
         logger.debug(f"Got rollouts on rank {rank}")
+
+        # Option C: every rank populates the compactor's raw-sequence buffer from the
+        # now-broadcast `rollouts` (identical on all ranks). build_compactor_trajectories
+        # then replays a collective forward so each rank captures its own TP-local KV
+        # slice and trains on it (world-DP grad all-reduce keeps replicas in sync).
+        if getattr(args, "rl_compaction_compactor_train", False):
+            _rs = get_rl_runtime_state()
+            for group in rollouts:
+                if not group or group[0] is None:
+                    continue
+                _prompt_ids = list(getattr(group[0], "prompt_tokens", []) or [])
+                _resp_ids = list(getattr(group[0], "response_tokens", []) or [])
+                if not (_prompt_ids or _resp_ids):
+                    continue
+                _reward = sum(
+                    float(r.reward) for r in group
+                    if r is not None and getattr(r, "reward", None) is not None
+                )
+                _rs.compactor_raw_sequences.append((_prompt_ids + _resp_ids, _reward))
 
     if args.rl_offload_optimizer_during_inference:
         with nvtx_range("restore-optimizer-state-and-grad-buffers-after-inference"):

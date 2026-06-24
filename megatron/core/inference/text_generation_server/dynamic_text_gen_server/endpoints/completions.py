@@ -60,6 +60,21 @@ try:
         except Exception as e:
             return f"Error tokenizing prompt: {e}", 500
 
+        # --- 1b. Parse Belief Compaction Params ---
+        session_id: str | None = req.get("session_id", None)
+        do_compact: bool = bool(req.get("compact", False))
+
+        belief_compactor = current_app.config.get("belief_compactor", None)
+        if do_compact and belief_compactor is None:
+            return "compact=True requires a belief_compactor configured on the server", 400
+        if (do_compact or session_id is not None) and belief_compactor is not None:
+            # Register intent for each prompt in the batch before add_request
+            for _ in prompts_as_tokens:
+                belief_compactor.register(
+                    session_id=session_id or "",
+                    do_compact=do_compact,
+                )
+
         # --- 2. Parse Sampling Params ---
         try:
             temperature = float(req.get("temperature", 1.0))

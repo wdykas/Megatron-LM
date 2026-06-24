@@ -49,102 +49,57 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import transformer_engine.pytorch as te
 
-# ---------------------------------------------------------------------------
-# Optional Megatron base class (falls back to nn.Module when unavailable)
-# ---------------------------------------------------------------------------
-
-try:
-    from megatron.core.transformer.module import MegatronModule as _MegatronBase
-    _MEGATRON_AVAILABLE = True
-except ImportError:
-    _MegatronBase = nn.Module
-    _MEGATRON_AVAILABLE = False
+from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.extensions.transformer_engine import TELinear, TENorm
 
 
 # ---------------------------------------------------------------------------
-# Tensor-parallel linear factory
+# Layer factory — replicated TransformerEngine layers (Megatron wrappers)
 # ---------------------------------------------------------------------------
+#
+# The compactor is a small module REPLICATED across every tensor-parallel rank
+# (not sharded). We use Megatron's TransformerEngine wrappers with
+# parallel_mode='duplicated' (the same replicated mode MoE uses): fused /
+# FP8-capable TE kernels, weights replicated across the TP group, and grads kept
+# in sync by Megatron's machinery. TE is CUDA-only — the compactor is GPU-only.
 
-class _Linear(nn.Module):
-    """Uniform call interface over nn.Linear and Megatron parallel linears.
+def _minimal_transformer_config(d_model: int, n_heads: int) -> TransformerConfig:
+    """Build a minimal TransformerConfig for the compactor.
 
-    ColumnParallelLinear / RowParallelLinear always return ``(output, bias)``;
-    nn.Linear returns just ``output``.  This wrapper normalises to a single
-    tensor return so callers don't need to branch.
+    Used when no model TransformerConfig is supplied. Drives the TE wrapper
+    layers (dims, init, dtype) and registers the module as a MegatronModule with
+    sharded_state_dict / distributed-checkpointing support.
     """
-
-    def __init__(self, inner: nn.Module) -> None:
-        super().__init__()
-        self._inner = inner
-        self._is_parallel = not isinstance(inner, nn.Linear)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self._inner(x)
-        return out[0] if self._is_parallel else out
+    return TransformerConfig(
+        num_layers=1,
+        hidden_size=d_model,
+        num_attention_heads=n_heads,
+    )
 
 
-def _make_linear(
-    in_features: int,
-    out_features: int,
-    transformer_config=None,
-    *,
-    column: bool,
-    gather_output: bool = True,
-) -> _Linear:
-    """Create a linear layer, using Megatron parallel variants when TP > 1.
+def duplicated_linear(in_features: int, out_features: int, config, bias: bool = False) -> TELinear:
+    """A replicated TELinear (``parallel_mode='duplicated'``), as MoE / MLA use.
 
-    Parameters
-    ----------
-    in_features:        Input dimension.
-    out_features:       Output dimension.
-    transformer_config: Megatron ModelParallelConfig (or TransformerConfig).
-                        When provided AND tensor parallelism > 1, creates
-                        ColumnParallelLinear or RowParallelLinear.
-                        When None, always uses nn.Linear.
-    column:             True → ColumnParallelLinear; False → RowParallelLinear.
-    gather_output:      Passed to ColumnParallelLinear.  Set False when the
-                        output feeds another parallel layer (e.g. q_proj feeding
-                        the attention kernel before out_proj).
+    The weight is replicated across the TP group (not sharded) and Megatron's
+    grad machinery keeps the replicas in sync. Returns a ``TELinear`` directly so
+    it is stored as the attribute (clean ``<name>.weight`` keys); like every
+    Megatron linear it returns an ``(output, bias)`` tuple — unwrap at the call
+    site (``out, _ = layer(x)``).
     """
-    if transformer_config is not None:
-        try:
-            from megatron.core.parallel_state import get_tensor_model_parallel_world_size
-            from megatron.core import tensor_parallel
-            from megatron.core.utils import init_method_normal
-            tp = get_tensor_model_parallel_world_size()
-        except Exception:
-            tp = 1
-
-        if tp > 1:
-            # init_method: use config's method when available, else Xavier.
-            init_fn = getattr(transformer_config, 'init_method', None)
-            if init_fn is None:
-                init_fn = init_method_normal(0.02)
-
-            if column:
-                inner = tensor_parallel.ColumnParallelLinear(
-                    in_features,
-                    out_features,
-                    config=transformer_config,
-                    init_method=init_fn,
-                    bias=False,
-                    gather_output=gather_output,
-                    skip_bias_add=False,
-                )
-            else:
-                inner = tensor_parallel.RowParallelLinear(
-                    in_features,
-                    out_features,
-                    config=transformer_config,
-                    init_method=init_fn,
-                    bias=False,
-                    input_is_parallel=True,
-                    skip_bias_add=False,
-                )
-            return _Linear(inner)
-
-    return _Linear(nn.Linear(in_features, out_features, bias=False))
+    return TELinear(
+        in_features,
+        out_features,
+        parallel_mode='duplicated',
+        config=config,
+        init_method=config.init_method,
+        bias=bias,
+        skip_bias_add=False,
+        skip_weight_param_allocation=False,
+        is_expert=False,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -246,56 +201,37 @@ class PerceiverConfig:
 class _CrossAttentionBlock(nn.Module):
     """Perceiver-style cross-attention: queries attend to keys and values.
 
-    Queries come from the learnable compression state (C vectors).
-    Keys and values come from the full (or combined) KV cache (T vectors).
+    Queries come from the learnable compression state (C vectors); keys and
+    values come from the full (or combined) KV cache (T vectors).
 
-    Uses ``F.scaled_dot_product_attention`` which dispatches to flash attention
-    on CUDA when available, falling back to the math kernel otherwise.
-
-    When ``transformer_config`` is provided and TP > 1, Q/K/V projections use
-    Megatron's ColumnParallelLinear and the output projection uses
-    RowParallelLinear so the attention computation is distributed across ranks.
+    Projections are replicated linears (Megatron ``TELinear`` duplicated). The
+    attention is **raw** ``te.DotProductAttention`` (parameter-free), not the
+    Megatron ``TEDotProductAttention`` wrapper: the wrapper shards heads across
+    the TP group, but the compactor is REPLICATED (full heads on every rank), so
+    we run the un-sharded attention. Being parameter-free, it needs no grad-sync
+    or checkpointing. qkv_format='bshd', no causal mask.
     """
 
-    def __init__(
-        self,
-        d_model: int,
-        n_heads: int,
-        dropout: float = 0.0,
-        transformer_config=None,
-    ) -> None:
+    def __init__(self, d_model: int, n_heads: int, dropout: float, config) -> None:
         super().__init__()
-        d_head = d_model // n_heads
         self.n_heads = n_heads
-        self.d_head = d_head
-        self.dropout_p = dropout
+        self.d_head = d_model // n_heads
 
-        self.norm_q  = nn.LayerNorm(d_model)
-        self.norm_kv = nn.LayerNorm(d_model)
+        self.norm_q  = TENorm(config, d_model)
+        self.norm_kv = TENorm(config, d_model)
 
-        # Determine if projections will be tensor-parallel (column-parallel output split).
-        # Store at init time so forward() knows which head count to use for .view().
-        _tp_at_init = 1
-        if transformer_config is not None:
-            try:
-                from megatron.core.parallel_state import get_tensor_model_parallel_world_size
-                _tp_at_init = get_tensor_model_parallel_world_size()
-            except Exception:
-                pass
-        self._is_parallel = (_tp_at_init > 1)
+        self.q_proj   = duplicated_linear(d_model, d_model, config)
+        self.k_proj   = duplicated_linear(d_model, d_model, config)
+        self.v_proj   = duplicated_linear(d_model, d_model, config)
+        self.out_proj = duplicated_linear(d_model, d_model, config)
 
-        # Column-parallel projections split the output dimension across TP ranks;
-        # gather_output=False because the result feeds the attention kernel
-        # (another parallel op) before the row-parallel out_proj.
-        self.q_proj   = _make_linear(d_model, d_model, transformer_config,
-                                     column=True,  gather_output=False)
-        self.k_proj   = _make_linear(d_model, d_model, transformer_config,
-                                     column=True,  gather_output=False)
-        self.v_proj   = _make_linear(d_model, d_model, transformer_config,
-                                     column=True,  gather_output=False)
-        # Row-parallel: reduces partial sums from all TP ranks into a full output.
-        self.out_proj = _make_linear(d_model, d_model, transformer_config,
-                                     column=False)
+        self.attn = te.DotProductAttention(
+            num_attention_heads=n_heads,
+            kv_channels=self.d_head,
+            attention_dropout=dropout,
+            qkv_format='bshd',
+            attn_mask_type='no_mask',
+        )
 
     def forward(
         self,
@@ -303,76 +239,49 @@ class _CrossAttentionBlock(nn.Module):
         keys:    torch.Tensor,   # (B, T, d)
         values:  torch.Tensor,   # (B, T, d)
     ) -> torch.Tensor:           # (B, C, d)
-        B, C, d = queries.shape
+        B, C, _ = queries.shape
         T = keys.shape[1]
+        h, dh = self.n_heads, self.d_head
 
-        # Only split heads if projections are actually ColumnParallelLinear
-        # (i.e. transformer_config was provided at init AND TP > 1).
-        if self._is_parallel:
-            try:
-                from megatron.core.parallel_state import get_tensor_model_parallel_world_size as _tp
-                local_heads = self.n_heads // _tp()
-            except Exception:
-                local_heads = self.n_heads
-        else:
-            local_heads = self.n_heads
-        dh = self.d_head
+        q, _ = self.q_proj(self.norm_q(queries))
+        k, _ = self.k_proj(self.norm_kv(keys))
+        v, _ = self.v_proj(self.norm_kv(values))
+        Q = q.view(B, C, h, dh)
+        K = k.view(B, T, h, dh)
+        V = v.view(B, T, h, dh)
 
-        Q = self.q_proj(self.norm_q(queries)).view(B, C, local_heads, dh).transpose(1, 2)
-        K = self.k_proj(self.norm_kv(keys)).view(B, T, local_heads, dh).transpose(1, 2)
-        V = self.v_proj(self.norm_kv(values)).view(B, T, local_heads, dh).transpose(1, 2)
-
-        # Flash-attention aware: dispatches to efficient kernel when on CUDA.
-        dp = self.dropout_p if self.training else 0.0
-        out = F.scaled_dot_product_attention(Q, K, V, dropout_p=dp)  # (B, h, C, dh)
-
-        out = out.transpose(1, 2).contiguous().view(B, C, local_heads * dh)
-        return self.out_proj(out)
+        out = self.attn(Q, K, V)            # (B, C, h*dh) with qkv_format='bshd'
+        out, _ = self.out_proj(out)
+        return out
 
 
 class _FFNBlock(nn.Module):
-    """Pre-norm feed-forward block.
+    """Pre-norm feed-forward block (Megatron TE wrappers, replicated)."""
 
-    When ``transformer_config`` is provided and TP > 1, uses
-    ColumnParallelLinear (fc1) + RowParallelLinear (fc2) for tensor parallelism.
-    """
-
-    def __init__(
-        self,
-        d_model: int,
-        d_ff: int,
-        dropout: float = 0.0,
-        transformer_config=None,
-    ) -> None:
+    def __init__(self, d_model: int, d_ff: int, dropout: float, config) -> None:
         super().__init__()
-        self.norm = nn.LayerNorm(d_model)
-        # fc1 splits d_ff across TP ranks; fc2 expects the sharded input.
-        self.fc1  = _make_linear(d_model, d_ff,    transformer_config,
-                                 column=True,  gather_output=False)
-        self.fc2  = _make_linear(d_ff,    d_model, transformer_config,
-                                 column=False)
+        self.norm = TENorm(config, d_model)
+        self.fc1  = duplicated_linear(d_model, d_ff, config)
+        self.fc2  = duplicated_linear(d_ff, d_model, config)
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.norm(x)
-        h = self.drop(F.gelu(self.fc1(h)))
-        return self.fc2(h)
+        h1, _ = self.fc1(h)
+        h = self.drop(F.gelu(h1))
+        h2, _ = self.fc2(h)
+        return h2
 
 
 class _LayerCompactor(nn.Module):
     """Single-layer compactor: cross-attend + FFN + project to K, V spaces."""
 
-    def __init__(self, cfg: PerceiverConfig, transformer_config=None) -> None:
+    def __init__(self, cfg: PerceiverConfig, config) -> None:
         super().__init__()
-        self.cross_attn = _CrossAttentionBlock(
-            cfg.d_kv, cfg.n_heads, cfg.dropout, transformer_config)
-        self.ffn        = _FFNBlock(
-            cfg.d_kv, cfg.ff_dim, cfg.dropout, transformer_config)
-        # Output heads: gather_output=True so each rank has the full compact KV.
-        self.key_proj   = _make_linear(cfg.d_kv, cfg.d_kv, transformer_config,
-                                       column=True, gather_output=True)
-        self.val_proj   = _make_linear(cfg.d_kv, cfg.d_kv, transformer_config,
-                                       column=True, gather_output=True)
+        self.cross_attn = _CrossAttentionBlock(cfg.d_kv, cfg.n_heads, cfg.dropout, config)
+        self.ffn        = _FFNBlock(cfg.d_kv, cfg.ff_dim, cfg.dropout, config)
+        self.key_proj   = duplicated_linear(cfg.d_kv, cfg.d_kv, config)
+        self.val_proj   = duplicated_linear(cfg.d_kv, cfg.d_kv, config)
 
     def forward(
         self,
@@ -382,14 +291,16 @@ class _LayerCompactor(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         h = compress_q + self.cross_attn(compress_q, keys, values)
         h = h + self.ffn(h)
-        return self.key_proj(h), self.val_proj(h)
+        ck, _ = self.key_proj(h)
+        cv, _ = self.val_proj(h)
+        return ck, cv
 
 
 # ---------------------------------------------------------------------------
 # PerceiverCompactor  (the Still model)
 # ---------------------------------------------------------------------------
 
-class PerceiverCompactor(_MegatronBase):
+class PerceiverCompactor(MegatronModule):
     """Per-layer Perceiver KV compactor (Still architecture).
 
     For each transformer layer, takes the full KV cache of length T and
@@ -422,13 +333,10 @@ class PerceiverCompactor(_MegatronBase):
         cfg: PerceiverConfig,
         transformer_config=None,
     ) -> None:
-        if _MEGATRON_AVAILABLE and transformer_config is not None:
-            super().__init__(config=transformer_config)
-        else:
-            nn.Module.__init__(self)
+        config = transformer_config or _minimal_transformer_config(cfg.d_kv, cfg.n_heads)
+        super().__init__(config)
 
         self.cfg = cfg
-        self._transformer_config = transformer_config
 
         # Learnable compression queries: one set per layer (or one shared set).
         n_sets = 1 if cfg.share_across_layers else cfg.n_attn_layers
@@ -436,15 +344,10 @@ class PerceiverCompactor(_MegatronBase):
             torch.randn(n_sets, cfg.n_compress, cfg.d_kv) * 0.02
         )
 
-        if cfg.share_across_layers:
-            self._layer_modules = nn.ModuleList([
-                _LayerCompactor(cfg, transformer_config)
-            ])
-        else:
-            self._layer_modules = nn.ModuleList([
-                _LayerCompactor(cfg, transformer_config)
-                for _ in range(cfg.n_attn_layers)
-            ])
+        n_modules = 1 if cfg.share_across_layers else cfg.n_attn_layers
+        self._layer_modules = nn.ModuleList([
+            _LayerCompactor(cfg, config) for _ in range(n_modules)
+        ])
 
     # --- helpers --------------------------------------------------------
 

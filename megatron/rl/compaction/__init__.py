@@ -30,7 +30,6 @@ from .learned import (
     BeliefMemory, BeliefUpdater,
     CompactorLossWeights, CompactorLossTerms, CompactorLosses,
     teacher_kl_loss, future_kl_loss, consistency_loss, task_loss,
-    CompactorAdapter,
 )
 
 __all__ = [
@@ -57,5 +56,4 @@ __all__ = [
     "BeliefMemory", "BeliefUpdater",
     "CompactorLossWeights", "CompactorLossTerms", "CompactorLosses",
     "teacher_kl_loss", "future_kl_loss", "consistency_loss", "task_loss",
-    "CompactorAdapter",
 ]

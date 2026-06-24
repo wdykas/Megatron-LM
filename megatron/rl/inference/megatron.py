@@ -43,6 +43,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
     _rl_kv_cache_management_mode: KVCacheManagementMode = PrivateAttr(None)
     _openai_client: AsyncOpenAI = PrivateAttr(None)
+    _kv_hook: object = PrivateAttr(None)   # MegatronInferenceHook (optional)
 
     async def base_generate(self, request: InferenceRequest) -> InferenceResponse:
         tokenizer = get_tokenizer()
@@ -125,6 +126,11 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         launched_server._rl_kv_cache_management_mode = KVCacheManagementMode(
             args.rl_kv_cache_management_mode
         )
+
+        # Wire the KV compaction hook when compaction is enabled.
+        if getattr(args, "rl_compaction_enabled", False):
+            from megatron.rl.compaction.kv import MegatronInferenceHook
+            launched_server._kv_hook = MegatronInferenceHook.from_engine(inference_engine)
 
         concurrency_limit = args.grpo_prompts_per_step * args.grpo_group_size * args.rl_parallel_generation_tasks
         custom_limits = httpx.Limits(

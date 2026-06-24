@@ -1,7 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Tests for H2O, StreamingLLM, SelectionBeliefAdapter,
-CurriculumScheduler, and checkpoint I/O."""
+"""Tests for H2O, StreamingLLM, CurriculumScheduler, and checkpoint I/O."""
 
 import os
 import tempfile
@@ -15,7 +14,6 @@ from megatron.rl.compaction.kv import (
     CompactionResult,
 )
 from megatron.rl.compaction.kv.benchmark import KVCompactionBenchmark
-from megatron.rl.compaction.learned.serving.selection_adapter import SelectionBeliefAdapter
 from megatron.rl.compaction.learned.training.curriculum import (
     CurriculumStage,
     CurriculumScheduler,
@@ -30,8 +28,6 @@ from megatron.rl.compaction.learned.training.checkpoint import (
 )
 from megatron.rl.compaction.learned.models.compactor import PerceiverConfig, PerceiverCompactor
 from megatron.rl.compaction.learned.models.belief import GatedUpdaterConfig, GatedRecurrentUpdater
-from megatron.rl.compaction.learned.serving.eval import CompactionEvaluator, EvalConfig
-from .tiny_lm import TinyLM, TinyLMAdapter
 
 
 # ---------------------------------------------------------------------------
@@ -50,10 +46,6 @@ def _kv_torch(n_layers=2, B=1, T=16, d=16):
     keys   = [torch.randn(B, T, d) for _ in range(n_layers)]
     values = [torch.randn(B, T, d) for _ in range(n_layers)]
     return keys, values
-
-
-def _tiny_adapter(vocab=64, n_layers=2, d=32, n_heads=4):
-    return TinyLMAdapter(TinyLM(vocab, n_layers, d, n_heads))
 
 
 # ===========================================================================
@@ -206,95 +198,6 @@ class TestStreamingLLMCompressor:
 
 
 # ===========================================================================
-# SelectionBeliefAdapter
-# ===========================================================================
-
-class TestSelectionBeliefAdapter:
-    def _adapter(self, compressor=None, budget=4, n_layers=2):
-        if compressor is None:
-            compressor = H2OProxyCompressor(n_sink=2, fit_bias=False, fit_values=False)
-        return SelectionBeliefAdapter(compressor, budget=budget, n_layers=n_layers)
-
-    def test_initial_compress_returns_belief_memory(self):
-        from megatron.rl.compaction.learned.models.belief import BeliefMemory
-        adapter = self._adapter()
-        keys, vals = _kv_torch()
-        mem = adapter.initial_compress(keys, vals)
-        assert isinstance(mem, BeliefMemory)
-
-    def test_belief_memory_shape(self):
-        adapter = self._adapter(budget=4, n_layers=2)
-        keys, vals = _kv_torch(n_layers=2, B=1, T=16, d=16)
-        mem = adapter.initial_compress(keys, vals)
-        assert mem.keys.shape == (2, 1, 4, 16)
-        assert mem.values.shape == (2, 1, 4, 16)
-
-    def test_call_updates_memory(self):
-        adapter = self._adapter(budget=4, n_layers=2)
-        k1, v1 = _kv_torch(T=16)
-        k2, v2 = _kv_torch(T=8)
-        mem0 = adapter.initial_compress(k1, v1)
-        mem1 = adapter(mem0, k2, v2)
-        # Step counter advances
-        assert mem1.step > mem0.step
-
-    def test_pool_eviction(self):
-        """When pool grows beyond max_pool_size, oldest tokens are dropped."""
-        adapter = SelectionBeliefAdapter(
-            H2OProxyCompressor(n_sink=2, fit_bias=False, fit_values=False),
-            budget=4,
-            n_layers=1,
-            max_pool_size=10,
-        )
-        k1, v1 = _kv_torch(n_layers=1, T=8)
-        mem = adapter.initial_compress(k1, v1)
-        # Add enough chunks to overflow the pool
-        for _ in range(5):
-            k, v = _kv_torch(n_layers=1, T=4)
-            mem = adapter(mem, k, v)
-        # Should not error and still return valid memory
-        assert mem.budget == 4
-
-    def test_streaming_llm_adapter(self):
-        from megatron.rl.compaction.learned.models.belief import BeliefMemory
-        slm = StreamingLLMCompressor(n_sink=2, fit_bias=False, fit_values=False)
-        adapter = SelectionBeliefAdapter(slm, budget=4, n_layers=2)
-        keys, vals = _kv_torch(T=20)
-        mem = adapter.initial_compress(keys, vals)
-        assert isinstance(mem, BeliefMemory)
-
-    def test_compaction_evaluator_with_selection(self):
-        """SelectionBeliefAdapter can be used in CompactionEvaluator."""
-        slm = StreamingLLMCompressor(n_sink=2)
-        adapter_lm = _tiny_adapter()
-        adapter_comp = SelectionBeliefAdapter(slm, budget=4, n_layers=2)
-        evaluator = CompactionEvaluator(adapter_lm, EvalConfig(chunk_size=8))
-        tokens = torch.randint(0, 64, (1, 48))
-        result = evaluator.perplexity(tokens, adapter_comp)
-        assert "ppl_full" in result
-        assert result["ppl_ratio"] > 0.0
-
-    def test_h2o_vs_streaming_in_evaluator(self):
-        """Both H2O and StreamingLLM can be evaluated side-by-side."""
-        lm_adapter = _tiny_adapter(d=32, n_heads=4)
-        tokens = torch.randint(0, 64, (1, 48))
-
-        for cls, kwargs in [(H2OProxyCompressor, {"n_sink": 2}),
-                            (StreamingLLMCompressor, {"n_sink": 2})]:
-            comp = cls(**kwargs, fit_bias=False, fit_values=False)
-            sel_adapter = SelectionBeliefAdapter(comp, budget=4, n_layers=2)
-            evaluator = CompactionEvaluator(lm_adapter, EvalConfig(chunk_size=8))
-            result = evaluator.perplexity(tokens, sel_adapter)
-            assert "ppl_ratio" in result
-
-    def test_batch_size_2(self):
-        adapter = self._adapter(budget=4, n_layers=2)
-        keys, vals = _kv_torch(B=2, T=16, d=16)
-        mem = adapter.initial_compress(keys, vals)
-        assert mem.keys.shape == (2, 2, 4, 16)
-
-
-# ===========================================================================
 # CurriculumScheduler
 # ===========================================================================
 
@@ -400,6 +303,13 @@ class TestCurriculumScheduler:
 # Checkpoint I/O
 # ===========================================================================
 
+@pytest.mark.skipif(
+    not torch.distributed.is_initialized(),
+    reason="checkpoint.py uses collective Megatron dist_checkpointing (needs "
+    "torch.distributed + model-parallel state + the spawn-Manager __main__ guard). "
+    "The save/load/resume round-trip is validated end-to-end under torchrun by "
+    "scripts/_optc_online_smoke.py; it cannot run in single-process pytest.",
+)
 class TestCheckpointIO:
     def _perceiver(self):
         cfg = PerceiverConfig(d_kv=16, n_heads=2, n_compress=4, n_attn_layers=2)

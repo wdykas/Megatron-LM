@@ -29,8 +29,13 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from megatron.rl.compaction.learned.models.belief import BeliefMemory
+from megatron.rl.compaction.learned.models.compactor import (
+    duplicated_linear,
+    _minimal_transformer_config,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +120,7 @@ class ChunkFeatureExtractor:
         pressure = float(min(current_memory_slots, self.memory_budget)) / self.memory_budget
 
         # --- 4. assemble tensor ---------------------------------------------
-        device = chunk_keys[0].device if chunk_keys else torch.device("cpu")
+        device = chunk_keys[0].device
         vec = torch.tensor(
             [chunk_idx_norm, key_norm_mean_n, key_norm_std_n, pressure],
             dtype=torch.float32,
@@ -166,13 +171,10 @@ class ValueHead(nn.Module):
         self.feature_dim = feature_dim
 
         in_dim = n_layers * d_model + feature_dim
-        self.mlp = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1),
-        )
+        config = _minimal_transformer_config(hidden_dim, n_heads=1)
+        self.fc1 = duplicated_linear(in_dim, hidden_dim, config, bias=True)
+        self.fc2 = duplicated_linear(hidden_dim, hidden_dim, config, bias=True)
+        self.fc3 = duplicated_linear(hidden_dim, 1, config, bias=True)
 
     def forward(
         self,
@@ -200,7 +202,12 @@ class ValueHead(nn.Module):
                 features = features.unsqueeze(0).expand(B, -1)
             flat = torch.cat([flat, features], dim=-1)  # (B, n_layers*d + feature_dim)
 
-        return self.mlp(flat).squeeze(-1)               # (B,)
+        h, _ = self.fc1(flat)
+        h = F.gelu(h)
+        h, _ = self.fc2(h)
+        h = F.gelu(h)
+        out, _ = self.fc3(h)
+        return out.squeeze(-1)                          # (B,)
 
     def slot_ablation(
         self,

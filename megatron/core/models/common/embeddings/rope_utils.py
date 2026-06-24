@@ -349,3 +349,43 @@ def apply_rotary_pos_emb_with_cos_sin(
         y = y.permute(1, 0, 2, 3)
 
     return y
+
+
+def remove_rotary_pos_emb(
+    t: Tensor,
+    freqs: Tensor,
+    rotary_interleaved: bool = False,
+) -> Tensor:
+    """Strip RoPE from tensor t, returning position-free keys/queries.
+
+    Inverse of ``_apply_rotary_pos_emb_bshd``.  Since RoPE is an orthogonal
+    rotation R(pos), its inverse is R(-pos).  For the half-rotation convention
+    this amounts to negating the sin component:
+
+        t_free = t_rope * cos(freqs) - rotate_half(t_rope) * sin(freqs)
+
+    ``freqs`` must be in the same format as the raw frequency tensor produced by
+    ``RotaryEmbedding`` (shape (..., S, d), values are angles θ, NOT cos/sin
+    values).  Pass the same ``freqs`` that was used when applying RoPE.
+
+    This is the unfused CPU/GPU path that works for any tensor shape — unlike
+    ``apply_rotary_pos_emb_with_cos_sin`` it does not route through Flash
+    Attention and does not require a 4-D BSHD layout.  Required by the
+    KV-compaction pipeline (Still / Belief-Still) to produce position-free keys
+    before PerceiverCompactor and to re-apply RoPE at synthetic positions after
+    compaction.
+
+    Args:
+        t:                  Tensor with RoPE applied.  Shape (..., S, d).
+        freqs:              Raw angle tensor.  Shape (..., S, d).
+        rotary_interleaved: Must match the convention used during apply.
+
+    Returns:
+        Position-free tensor of the same shape as ``t``.
+    """
+    rot_dim = freqs.shape[-1]
+    t, t_pass = t[..., :rot_dim], t[..., rot_dim:]
+    cos_ = torch.cos(freqs).to(t.dtype)
+    sin_ = torch.sin(freqs).to(t.dtype)
+    t_free = t * cos_ - _rotate_half(t, rotary_interleaved) * sin_
+    return torch.cat((t_free, t_pass), dim=-1)

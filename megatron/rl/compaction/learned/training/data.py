@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Protocol, runtime_checkable
+from typing import Callable
 
 import torch
 from torch.utils.data import Dataset
@@ -92,7 +92,7 @@ class TrajectoryDataset(Dataset):
     """Dataset of Trajectory objects for BeliefCompactorTrainer.
 
     Each element is a complete offline Trajectory (KV chunks + probes)
-    collected from a frozen model by TrajectoryBuilder.
+    loaded from disk (saved during rollout collection).
     """
 
     def __init__(self, trajectories: list[Trajectory]) -> None:
@@ -167,148 +167,14 @@ class CompactorTrainerConfig:
 
 
 # ---------------------------------------------------------------------------
-# FrozenModelAdapter protocol
-# ---------------------------------------------------------------------------
-
-@runtime_checkable
-class FrozenModelAdapter(Protocol):
-    """Interface to a frozen LLM for data collection and student evaluation.
-
-    Implementers handle:
-        • KV cache extraction from the forward pass
-        • RoPE stripping (prefill returns position-FREE keys)
-        • KV cache injection for the student forward pass
-
-    All tensors use batch-first layout: (B, S, ...).
-    """
-
-    @property
-    def n_layers(self) -> int: ...
-    @property
-    def d_head(self) -> int: ...
-    @property
-    def n_heads(self) -> int: ...
-    @property
-    def vocab_size(self) -> int: ...
-
-    def prefill(
-        self,
-        token_ids: torch.Tensor,           # (B, S)
-        kv_prefix: "CompactKV | None",     # position-free KV to prepend
-        logical_start: int,                # logical position of token_ids[0]
-    ) -> "tuple[CompactKV, torch.Tensor]":  # (position-free kv, logits (B, S, vocab))
-        """Run the frozen LLM on token_ids, optionally with a KV prefix."""
-        ...
-
-    def student_logits(
-        self,
-        query_tokens: torch.Tensor,   # (B, S_q)
-        compact_kv: "CompactKV",      # position-free compact memory
-        logical_kv_start: int,        # logical position of first compact KV slot
-        logical_query_start: int,     # logical position of first query token
-    ) -> torch.Tensor:               # (B, S_q, vocab)
-        """Evaluate the LLM on query_tokens conditioned on compact KV memory."""
-        ...
-
-
-# ---------------------------------------------------------------------------
 # Pipeline configuration
 # ---------------------------------------------------------------------------
 
 @dataclass
 class PipelineConfig:
-    """Configuration for TrajectoryBuilder."""
+    """Chunking/probing config for the online HookTrajectoryCollector."""
 
     chunk_size:     int = 256
-    # Variable-size chunking: if chunk_size_max > chunk_size, each chunk's
-    # length is sampled uniformly from [chunk_size, chunk_size_max].
-    # This trains the updater to handle compaction at arbitrary boundaries.
-    chunk_size_max: int = 0        # 0 = fixed (use chunk_size for all chunks)
     probe_stride:   int = 1
     probe_query_len: int = 32
     max_probes:     int | None = None
-
-
-# ---------------------------------------------------------------------------
-# TrajectoryBuilder
-# ---------------------------------------------------------------------------
-
-class TrajectoryBuilder:
-    """Collect KV chunks and teacher logits from a frozen model.
-
-    Usage:
-        config  = PipelineConfig(chunk_size=512, probe_stride=2)
-        builder = TrajectoryBuilder(config)
-        traj    = builder.build(token_ids, adapter)
-    """
-
-    def __init__(self, config: PipelineConfig = PipelineConfig()) -> None:
-        self.cfg = config
-
-    def build(
-        self,
-        token_ids: torch.Tensor,          # (B, total_len)
-        adapter: FrozenModelAdapter,
-    ) -> Trajectory:
-        """Segment token_ids into chunks and collect KV + teacher logits.
-
-        Chunk sizes are fixed (cfg.chunk_size) unless cfg.chunk_size_max > 0,
-        in which case each chunk length is sampled uniformly from
-        [cfg.chunk_size, cfg.chunk_size_max].  Variable sizes train the updater
-        to compact at arbitrary boundaries, matching on-demand inference.
-        """
-        import random
-        B, total_len = token_ids.shape
-        cfg = self.cfg
-        variable = cfg.chunk_size_max > cfg.chunk_size
-
-        # Build chunk boundary list
-        chunk_starts: list[int] = []
-        pos = 0
-        while pos < total_len:
-            chunk_starts.append(pos)
-            if variable:
-                pos += random.randint(cfg.chunk_size, cfg.chunk_size_max)
-            else:
-                pos += cfg.chunk_size
-
-        chunks: list[tuple[list[torch.Tensor], list[torch.Tensor]]] = []
-        probes_by_chunk: dict[int, list[TrainingProbe]] = {}
-        n_probes = 0
-
-        for chunk_idx, start in enumerate(chunk_starts):
-            end = min(
-                chunk_starts[chunk_idx + 1] if chunk_idx + 1 < len(chunk_starts) else total_len,
-                total_len,
-            )
-            chunk_kv, _ = adapter.prefill(
-                token_ids[:, start:end], kv_prefix=None, logical_start=start,
-            )
-            chunks.append(([k for k, _ in chunk_kv], [v for _, v in chunk_kv]))
-
-            if chunk_idx % cfg.probe_stride == 0:
-                if cfg.max_probes is None or n_probes < cfg.max_probes:
-                    probe = self._make_probe(chunk_idx, chunk_starts, token_ids, adapter, cfg, end)
-                    if probe is not None:
-                        probes_by_chunk[chunk_idx] = [probe]
-                        n_probes += 1
-
-        return Trajectory(chunks=chunks, probes_by_chunk=probes_by_chunk)
-
-    def _make_probe(self, chunk_idx, chunk_starts, token_ids, adapter, cfg, chunk_end=None):
-        B, total_len = token_ids.shape
-        if chunk_end is None:
-            chunk_end = min(chunk_starts[chunk_idx] + cfg.chunk_size, total_len)
-        q_start = chunk_end
-        q_end   = min(q_start + cfg.probe_query_len, total_len)
-        if q_start >= total_len:
-            return None
-        query_tokens = token_ids[:, q_start:q_end]
-        _, context_logits = adapter.prefill(
-            token_ids[:, :q_end], kv_prefix=None, logical_start=0,
-        )
-        S_q = q_end - q_start
-        return TrainingProbe(
-            query_tokens=query_tokens,
-            teacher_logits=context_logits[:, -S_q:, :].detach(),
-        )

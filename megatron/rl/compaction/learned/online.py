@@ -22,10 +22,8 @@ from typing import Any
 import torch
 
 from megatron.core.utils import log_single_rank
-from megatron.rl.compaction.learned.training.training import (
-    train_compactor_trajectory,
-    _CompactorOptimizer,
-)
+from megatron.rl.compaction.learned.training.training import train_compactor_trajectory
+from megatron.rl.compaction.learned.training.parallel import CompactorParallelOptimizer
 
 logger = logging.getLogger(__name__)
 
@@ -45,18 +43,30 @@ def init_compactor_from_kv(runtime_state: Any, args, n_attn_layers: int, d_kv: i
     from megatron.rl.compaction.learned.training.losses import CompactorLossWeights
 
     n_compress = getattr(args, "rl_compaction_n_compress", 64)
+    n_heads = 8
     updater_cfg = GatedUpdaterConfig(
         n_compress=n_compress,
-        n_heads=8,
+        n_heads=n_heads,
         d_kv=d_kv,
         n_attn_layers=n_attn_layers,
         use_dynamics_head=getattr(args, "rl_compaction_compactor_use_dynamics_head", False),
     )
-    compactor = GatedRecurrentUpdater(updater_cfg).cuda()
     _dtype = (torch.bfloat16 if getattr(args, 'bf16', False)
               else torch.float16 if getattr(args, 'fp16', False)
               else torch.float32)
-    compactor = compactor.to(_dtype)
+    # Build a TransformerConfig carrying the mixed-precision flags so the compactor's
+    # TE layers and the Option C DDP grad buffers use the right dtype (see
+    # CompactorParallelOptimizer). hidden_size = d_kv (the compactor operates on the
+    # local KV slice), num_attention_heads = the compactor's internal head count.
+    import dataclasses as _dc
+    from megatron.rl.compaction.learned.models.compactor import _minimal_transformer_config
+    _tcfg = _dc.replace(
+        _minimal_transformer_config(d_kv, n_heads),
+        bf16=(_dtype == torch.bfloat16),
+        fp16=(_dtype == torch.float16),
+        params_dtype=_dtype,
+    )
+    compactor = GatedRecurrentUpdater(updater_cfg, transformer_config=_tcfg).cuda().to(_dtype)
 
     # Load compactor weights from checkpoint if provided (replicated across TP ranks).
     _ckpt_path = getattr(args, "rl_compaction_compactor_checkpoint", None)
@@ -65,8 +75,16 @@ def init_compactor_from_kv(runtime_state: Any, args, n_attn_layers: int, d_kv: i
     if _ckpt_path:
         from megatron.rl.compaction.learned import load_checkpoint as _load_ckpt
         try:
-            compactor, _meta = _load_ckpt(_ckpt_path, map_location="cpu")
-            compactor = compactor.cuda().to(_dtype).train()
+            # dist_checkpointing builds TE layers (CUDA-only) and load() is collective —
+            # all ranks reach here together via build_compactor_trajectories.
+            compactor, _meta = _load_ckpt(_ckpt_path, map_location="cuda")
+            compactor = compactor.to(_dtype).train()
+            # Ensure the rebuilt module's config carries the mixed-precision flags so
+            # the Option C DDP grad buffers use the right dtype (the saved config_dict
+            # came from the minimal fp32 TransformerConfig).
+            compactor.config.bf16 = (_dtype == torch.bfloat16)
+            compactor.config.fp16 = (_dtype == torch.float16)
+            compactor.config.params_dtype = _dtype
             _loaded_step = getattr(_meta, "step", None)
             _loaded_ckpt_payload = _ckpt_path  # stash path for optimizer state restore
             log_single_rank(logger, logging.INFO,
@@ -135,19 +153,20 @@ def init_compactor_from_kv(runtime_state: Any, args, n_attn_layers: int, d_kv: i
 
 
 def attach_compactor_optimizer(runtime_state: Any, megatron_opt=None) -> None:
-    """Build the compactor's standalone Megatron mixed-precision optimizer.
+    """Build the compactor's Option C world-DP optimizer (DDP + Megatron optimizer).
 
-    Always gives the compactor its own Float16OptimizerWithFloat16Params (BF16
-    params + FP32 masters) rather than a param group inside the LLM optimizer —
-    see _CompactorOptimizer for why sharing corrupts the LLM in joint training.
+    ``CompactorParallelOptimizer`` wraps the replicated compactor in Megatron DDP
+    over the whole-world data-parallel group and a real ``get_megatron_optimizer``;
+    gradients are all-reduced across all ranks on every step so replicas stay
+    bit-identical. This is the compactor's own optimizer, separate from the LLM's —
+    in joint training the LLM master params still hold the previous iteration's
+    gradient when the compactor steps, so sharing would re-step and corrupt the LLM.
 
-    ``megatron_opt`` is accepted for call-site stability but intentionally unused:
-    frozen-LLM pipelines pass None (Megatron skips the optimizer under
-    --skip-train --no-load-optim) and joint pipelines pass the real optimizer,
-    which we deliberately do not touch.
+    ``megatron_opt`` (the LLM optimizer) is accepted for call-site stability but
+    intentionally unused: the compactor is always self-contained.
 
-    Called once on the first maybe_train_compactor invocation. No-op if
-    compactor_optimizer is already set or the compactor is not yet built.
+    Called once, collectively on ALL ranks, on the first maybe_train_compactor
+    invocation. No-op if the optimizer is already set or the compactor is not built.
     """
     del megatron_opt  # intentionally unused — see docstring
     if runtime_state.compactor_optimizer is not None:
@@ -155,7 +174,7 @@ def attach_compactor_optimizer(runtime_state: Any, megatron_opt=None) -> None:
     if runtime_state.compactor is None:
         return
 
-    compactor_opt = _CompactorOptimizer(runtime_state.compactor, runtime_state._compactor_lr)
+    compactor_opt = CompactorParallelOptimizer(runtime_state.compactor, runtime_state._compactor_lr)
 
     # Restore FP32 masters + Adam moments from checkpoint if available.
     if runtime_state._compactor_ckpt_path is not None:
@@ -163,7 +182,7 @@ def attach_compactor_optimizer(runtime_state: Any, megatron_opt=None) -> None:
         try:
             load_optimizer_state(
                 runtime_state._compactor_ckpt_path, compactor_opt,
-                map_location=next(runtime_state.compactor.parameters()).device,
+                model_sharded_state_dict=runtime_state.compactor.sharded_state_dict(),
             )
             log_single_rank(logger, logging.INFO,
                             "[STILL online] Restored optimizer state "
@@ -177,263 +196,129 @@ def attach_compactor_optimizer(runtime_state: Any, megatron_opt=None) -> None:
     runtime_state.compactor_optimizer = compactor_opt
     log_single_rank(logger, logging.INFO,
                     "[STILL online] Compactor optimizer attached "
-                    "(Megatron Float16OptimizerWithFloat16Params, standalone).")
+                    "(Option C: world-DP DDP + Megatron optimizer).")
 
 
 def build_compactor_trajectories(runtime_state: Any, model, args) -> None:
-    """Build trajectories via model forward-pass KV capture.
+    """Build compactor training trajectories via a collective forward-pass KV capture.
 
-    Called on ALL TP ranks simultaneously (the forward pass is collective). Raw
-    sequences saved during rollout collection are consumed; K/V is captured on
-    rank 0 (GQA KV heads are replicated across TP ranks when tp_size >
-    num_kv_groups, so rank 0 has the full K/V). Trajectories are appended to
-    runtime_state.compactor_trajectories (rank 0 only).
+    Option C — called on ALL ranks. ``compactor_raw_sequences`` is identical on
+    every rank (populated from the broadcast ``rollouts``), so all ranks replay the
+    same sequences through one collective forward and EACH rank captures its own
+    LOCAL tensor-parallel KV partition (a different subset of KV heads per rank —
+    with GQA+TP, e.g. d_kv = 1*kv_channels for tp=4/num_query_groups=2; no
+    all-gather). Each rank builds its own Trajectory from its local slice and trains
+    on it; CompactorParallelOptimizer all-reduces gradients across the world so the
+    replicas stay bit-identical. The compactor is sized from the actual captured
+    local d_kv (consistent across ranks by symmetric GQA+TP replication), so it
+    always matches the data exactly.
 
-    No-op when online training is disabled, sequences list is empty, or the
-    HookTrajectoryCollector already produced non-empty trajectories.
+    No-op when online training is disabled. Collective: every rank loops the same
+    number of sequences and runs the forward together.
     """
     from megatron.training import get_args
     args_obj = args if args is not None else get_args()
     if not getattr(args_obj, "rl_compaction_compactor_train", False):
         return
 
-    # If paged-cache capture already populated trajectories, skip replay.
-    # Broadcast rank-0's status so ALL TP ranks take the same branch.
-    _has_trajs_t = torch.tensor(
-        [1 if runtime_state.compactor_trajectories else 0],
-        dtype=torch.long, device="cuda",
-    )
-    torch.distributed.broadcast(_has_trajs_t, src=0)
-    if _has_trajs_t.item():
-        runtime_state.compactor_raw_sequences = []
-        # Ensure the compactor is initialized so maybe_train_compactor can train on
-        # these paged-cache trajectories. Init from the first trajectory's KV shape.
-        if torch.distributed.get_rank() == 0 and runtime_state.compactor is None and runtime_state.compactor_trajectories:
-            try:
-                _t0 = runtime_state.compactor_trajectories[0]
-                if _t0.chunks:
-                    _ck, _ = _t0.chunks[0]
-                    _n_layers = len(_ck)
-                    _d_kv = _ck[0].shape[-1]
-                    if _n_layers > 0 and _d_kv > 0:
-                        init_compactor_from_kv(runtime_state, args_obj, _n_layers, _d_kv)
-            except Exception as _e:
-                log_single_rank(logger, logging.WARNING,
-                                f"[STILL online] compactor init from paged-cache traj failed: {_e}")
-        return
+    # Training model for the teacher-KL student forward (set on all ranks).
+    runtime_state.compactor_student_model = model
 
     raw_seqs = runtime_state.compactor_raw_sequences
     runtime_state.compactor_raw_sequences = []
 
-    rank = torch.distributed.get_rank()
-    log_single_rank(logger, logging.INFO,
-                    f"[STILL online] build_compactor_trajectories entered: "
-                    f"n_raw_seqs={len(raw_seqs)} rank={rank}")
+    from megatron.rl.compaction.learned.capture.kv_capture import capture_kv_from_forward
+    from megatron.rl.compaction.learned.training.data import Trajectory, TrainingProbe
 
-    n_seqs = len(raw_seqs) if rank == 0 else 0
-    n_seqs_t = torch.tensor([n_seqs], dtype=torch.long, device="cuda")
-    torch.distributed.broadcast(n_seqs_t, src=0)
+    # Lockstep count across ranks (raw_seqs is identical by construction, but guard
+    # against any drift so the collective forwards below stay matched).
+    n_seqs_t = torch.tensor([len(raw_seqs)], dtype=torch.long, device="cuda")
+    torch.distributed.all_reduce(n_seqs_t, op=torch.distributed.ReduceOp.MIN)
     n_seqs = int(n_seqs_t.item())
 
     log_single_rank(logger, logging.INFO,
-                    f"[STILL online] n_seqs after broadcast: {n_seqs}")
-
+                    f"[STILL online] build_compactor_trajectories: n_seqs={n_seqs}")
     if n_seqs == 0:
         return
 
-    from megatron.rl.compaction.learned.capture.kv_capture import capture_kv_from_forward, _unwrap_model
-    from megatron.rl.compaction.learned.training.data import Trajectory, TrainingProbe
-
-    # Initialize compactor from model structure NOW (before any forward) so it is
-    # always available for maybe_train_compactor even if KV capture later fails/hangs.
-    if rank == 0 and runtime_state.compactor is None:
-        try:
-            _gpt_tmp = _unwrap_model(model)
-            # Use the SAME predicate as kv_capture._attn_core_modules (which defines
-            # the captured KV layer count) — in a Mamba+attention hybrid, counting
-            # bare `self_attention` can disagree with the layers that actually expose
-            # core_attention, producing a compactor sized for the wrong layer count.
-            _n_attn = sum(
-                1 for _l in _gpt_tmp.decoder.layers
-                if hasattr(_l, "self_attention") and hasattr(_l.self_attention, "core_attention")
-            )
-            _d_kv = (
-                getattr(args_obj, "num_query_groups", 1)
-                * getattr(args_obj, "kv_channels", 128)
-            )
-            if _n_attn > 0 and _d_kv > 0:
-                init_compactor_from_kv(runtime_state, args_obj, _n_attn, _d_kv)
-        except Exception as _e:
-            log_single_rank(logger, logging.WARNING,
-                            f"[STILL online] early compactor init failed: {_e}")
-
     chunk_size = getattr(args_obj, "rl_compaction_chunk_size", 256)
-
     # Sequence parallel requires S divisible by TP size.
     tp_size = max(1, getattr(args_obj, "tensor_model_parallel_size", 1))
 
     for i in range(n_seqs):
-        # Broadcast sequence length so all ranks can allocate the buffer.
-        if rank == 0:
-            seq_ids, reward = raw_seqs[i]
-        else:
-            seq_ids, reward = [], 0.0
-
-        seq_len = len(seq_ids) if rank == 0 else 0
-        seq_len_t = torch.tensor([seq_len], dtype=torch.long, device="cuda")
-        torch.distributed.broadcast(seq_len_t, src=0)
-        seq_len = int(seq_len_t.item())
+        seq_ids, reward = raw_seqs[i]
+        seq_len = len(seq_ids)
         if seq_len == 0:
             continue
 
         # Pad to the model's full seq_length so CUDA graphs (captured at that length)
-        # replay correctly. Padding to only TP-boundary would give a different input
-        # shape than what the graph was captured with, causing rank 0 to fail before
-        # the first NCCL collective and deadlocking the other TP ranks.
+        # replay correctly, and to a TP boundary for sequence-parallel scatter/gather.
         model_seq_len = getattr(args_obj, "seq_length", 8192)
-        # Also ensure divisibility by TP for sequence-parallel scatter/gather.
         full_len = max(model_seq_len, seq_len)
         pad_len = (tp_size - full_len % tp_size) % tp_size
         padded_len = full_len + pad_len
 
         token_t = torch.zeros(padded_len, dtype=torch.long, device="cuda")
-        if rank == 0:
-            token_t[:seq_len].copy_(torch.tensor(seq_ids, dtype=torch.long))
-        torch.distributed.broadcast(token_t, src=0)
-        tokens = token_t.unsqueeze(0)  # (1, padded_len=model_seq_len)
+        token_t[:seq_len].copy_(torch.tensor(seq_ids, dtype=torch.long))
+        tokens = token_t.unsqueeze(0)
         pos_ids = torch.arange(padded_len, dtype=torch.long, device="cuda").unsqueeze(0)
-
-        log_single_rank(logger, logging.INFO,
-                        f"[STILL online] forward pass KV capture: seq {i+1}/{n_seqs}, "
-                        f"seq_len={seq_len} padded_to={padded_len}")
 
         # Free any cached GPU memory so the forward pass has headroom.
         torch.cuda.empty_cache()
 
-        # All ranks run forward collectively; rank 0 captures K/V via hooks.
-        # Build PackedSeqParams matching get_logprobs() to avoid CUDA-graph mismatch.
-        try:
-            from megatron.core.packed_seq_params import PackedSeqParams as _PSP
-            _S = tokens.shape[1]
-            _cu = torch.tensor([0, _S], dtype=torch.int32, device="cuda")
-            _packed_seq_params = _PSP(
-                qkv_format='thd',
-                cu_seqlens_q=_cu,
-                cu_seqlens_kv=_cu,
-                max_seqlen_q=_S,
-                max_seqlen_kv=_S,
-                total_tokens=_S,
-            )
-        except Exception:
-            _packed_seq_params = None
-
+        # All ranks run the SAME collective forward and each captures its own local KV.
         kv_result = None
         _fwd_ok = 1
         try:
-            if rank == 0:
-                kv_result = capture_kv_from_forward(model, tokens, pos_ids)
-            else:
-                # Non-rank-0: use identical forward path as rank 0 to ensure all
-                # TP ranks hit the same NCCL collectives.
-                gpt = _unwrap_model(model)
-                _flash_decode = getattr(gpt.config, 'flash_decode', False)
-                gpt.config.flash_decode = False
-                _was_training = gpt.training
-                gpt.eval()
-                try:
-                    with torch.no_grad():
-                        gpt(
-                            input_ids=tokens,
-                            position_ids=pos_ids,
-                            attention_mask=None,
-                            packed_seq_params=_packed_seq_params,
-                            runtime_gather_output=True,
-                        )
-                finally:
-                    gpt.config.flash_decode = _flash_decode
-                    if _was_training:
-                        gpt.train()
+            kv_result = capture_kv_from_forward(model, tokens, pos_ids)
             torch.cuda.synchronize()
-            log_single_rank(logger, logging.INFO,
-                            f"[STILL online] forward pass completed for seq {i+1}/{n_seqs}, "
-                            f"kv_captured={'yes' if kv_result is not None else 'no'}")
         except Exception as exc:
             log_single_rank(logger, logging.WARNING,
                             f"[STILL online] forward pass failed for seq {i}: {exc}")
             _fwd_ok = 0
 
         # Collective agreement: if the forward failed on ANY rank, ALL ranks skip
-        # this sequence together. Without this, a rank that hit `continue` would
-        # race ahead to the next sequence's broadcast while the others are still
-        # synced here → mismatched collectives → NCCL deadlock. (This all_reduce is
-        # reached by every rank whether the forward succeeded or raised.)
+        # this sequence together to keep collectives matched (avoids NCCL deadlock).
         _ok_t = torch.tensor([_fwd_ok], dtype=torch.long, device="cuda")
         torch.distributed.all_reduce(_ok_t, op=torch.distributed.ReduceOp.MIN)
-        if _ok_t.item() == 0:
+        if _ok_t.item() == 0 or kv_result is None:
             continue
 
-        if rank == 0 and kv_result is not None:
-            keys, vals = kv_result
-            n_attn_layers = len(keys)
-            d_kv = keys[0].shape[-1]  # (1, S_pad, d_kv)
+        keys, vals = kv_result
+        n_attn_layers = len(keys)
+        d_kv = keys[0].shape[-1]  # local partition size, identical across ranks
 
-            # Initialize compactor on first successful capture.
-            init_compactor_from_kv(runtime_state, args_obj, n_attn_layers, d_kv)
+        # Initialize compactor from the actual captured local d_kv (collective: the
+        # checkpoint load inside is collective and all ranks reach it together).
+        init_compactor_from_kv(runtime_state, args_obj, n_attn_layers, d_kv)
 
-            # Trim padding back to original sequence length before chunking.
-            keys = [k[:, :seq_len, :] for k in keys]
-            vals = [v[:, :seq_len, :] for v in vals]
+        # Trim padding back to the original sequence length before chunking.
+        keys = [k[:, :seq_len, :] for k in keys]
+        vals = [v[:, :seq_len, :] for v in vals]
 
-            # Slice K/V into chunks and build a Trajectory.
-            S = seq_len
-            chunks = []
-            for chunk_start in range(0, S, chunk_size):
-                chunk_end = min(chunk_start + chunk_size, S)
-                chunk_keys = [k[:, chunk_start:chunk_end, :] for k in keys]
-                chunk_vals = [v[:, chunk_start:chunk_end, :] for v in vals]
-                chunks.append((chunk_keys, chunk_vals))
+        chunks = []
+        for chunk_start in range(0, seq_len, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, seq_len)
+            chunks.append((
+                [k[:, chunk_start:chunk_end, :] for k in keys],
+                [v[:, chunk_start:chunk_end, :] for v in vals],
+            ))
+        if not chunks:
+            continue
 
-            if not chunks:
-                continue
-
-            # Add a probe at the last chunk so kv_recon has a query target.
-            last_idx = len(chunks) - 1
-            resp_t = token_t[:seq_len].unsqueeze(0).cpu()  # (1, seq_len)
-            probe = TrainingProbe(
-                query_tokens=resp_t,
-                teacher_logits=None,
-                answer_tokens=None,
-                advantage=reward if reward != 0.0 else None,
-            )
-            traj = Trajectory(
-                chunks=chunks,
-                probes_by_chunk={last_idx: [probe]},
-                rollout_return=reward,
-            )
-            runtime_state.compactor_trajectories.append(traj)
-            log_single_rank(logger, logging.DEBUG,
-                            f"[STILL online] Built trajectory from forward pass: "
-                            f"n_chunks={len(chunks)} d_kv={d_kv}")
-
-
-def maybe_init_compactor_online(runtime_state: Any, args, kv_hook) -> None:
-    """Lazily create the online compactor from a live KV hook if dims are available.
-
-    Falls back to forward-pass KV capture (build_compactor_trajectories) when the
-    hook returns None (paged cache cleared after inference). No-op if online
-    training is disabled or the compactor is already initialized.
-    """
-    if not getattr(args, "rl_compaction_compactor_train", False):
-        return
-    if runtime_state.compactor is not None:
-        return
-
-    kv = kv_hook.get_kv_matrices()
-    if kv is None:
-        return  # dims not yet available; build_compactor_trajectories will init on first forward
-
-    keys_per_layer, _ = kv
-    init_compactor_from_kv(runtime_state, args, len(keys_per_layer), keys_per_layer[0].shape[-1])
+        # Probe at the last chunk so kv_recon has a query target.
+        last_idx = len(chunks) - 1
+        probe = TrainingProbe(
+            query_tokens=token_t[:seq_len].unsqueeze(0).cpu(),
+            teacher_logits=None,
+            answer_tokens=None,
+            advantage=reward if reward != 0.0 else None,
+        )
+        runtime_state.compactor_trajectories.append(Trajectory(
+            chunks=chunks,
+            probes_by_chunk={last_idx: [probe]},
+            rollout_return=reward,
+        ))
 
 
 def maybe_train_compactor(runtime_state: Any, args=None, optimizer=None) -> None:
@@ -453,10 +338,10 @@ def maybe_train_compactor(runtime_state: Any, args=None, optimizer=None) -> None
     if runtime_state.compactor is None:
         return
 
-    # Attach the compactor optimizer on first call (deferred because the Megatron
-    # optimizer is not available during init_compactor_from_kv). optimizer may
-    # legitimately be None in frozen-LLM pipelines (--skip-train --no-load-optim);
-    # the attach builds a standalone optimizer in that case.
+    # Attach the compactor optimizer on first call (deferred because the compactor
+    # dims are only known after the first KV capture). This is COLLECTIVE — it wraps
+    # the compactor in world-DP DDP — so it must run on all ranks; it does, because
+    # the compactor is created collectively in build_compactor_trajectories.
     if runtime_state.compactor_optimizer is None:
         attach_compactor_optimizer(runtime_state, optimizer)
 
@@ -465,6 +350,13 @@ def maybe_train_compactor(runtime_state: Any, args=None, optimizer=None) -> None
 
     if not trajectories:
         return
+
+    # Option C: every rank trains on its OWN local KV slice. The optimizer's step()
+    # runs finalize_model_grads, which all-reduces gradients across the whole world
+    # (DP+TP collapsed), so replicas stay bit-identical without any bespoke sync.
+    # All ranks have the same number of trajectories (built in lockstep) and each
+    # trajectory drives the same number of optimizer steps (same chunk count / BPTT
+    # schedule), so the per-step finalize collectives stay matched across ranks.
 
     # Build student_fn for true STILL (teacher-KL) mode.
     # student_fn: (query_tokens, compact_kv) → logits (B, S, vocab)
@@ -505,12 +397,14 @@ def maybe_train_compactor(runtime_state: Any, args=None, optimizer=None) -> None
     # Advance the persistent global training-step counter. This is monotonic across
     # job restarts (restored from the loaded checkpoint's step and only increments),
     # unlike args.curr_iteration which is the LLM loop counter and resets to 0 every
-    # process — using that could re-emit and overwrite an existing step_N.pt with
+    # process — using that could re-emit and overwrite an existing checkpoint with
     # different weights after a restart.
     runtime_state.compactor_step_offset += 1
     global_step = runtime_state.compactor_step_offset
 
-    # Periodic checkpoint
+    # Periodic checkpoint via dist_checkpointing — COLLECTIVE (all ranks call it).
+    # global_step is identical across ranks, so the gate fires on all ranks together.
+    # Each checkpoint is a DIRECTORY (sharded model + common optimizer/step state).
     if args is not None:
         ckpt_dir = getattr(args, "rl_compaction_compactor_checkpoint_dir", None)
         ckpt_every = getattr(args, "rl_compaction_compactor_checkpoint_every", 100)
@@ -518,7 +412,7 @@ def maybe_train_compactor(runtime_state: Any, args=None, optimizer=None) -> None
             import os
             from megatron.rl.compaction.learned import save_checkpoint
             os.makedirs(ckpt_dir, exist_ok=True)
-            ckpt_path = os.path.join(ckpt_dir, f"step_{global_step:07d}.pt")
+            ckpt_path = os.path.join(ckpt_dir, f"step_{global_step:07d}")
             scheduler = getattr(runtime_state, "compactor_scheduler", None)
             save_checkpoint(
                 runtime_state.compactor,
