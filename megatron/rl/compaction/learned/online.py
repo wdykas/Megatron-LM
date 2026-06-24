@@ -9,9 +9,10 @@ them at the loop sites, passing its ``runtime_state`` (an ``RLRuntimeState``).
 
 ``runtime_state`` is duck-typed — these functions read/write the compactor_*
 fields on it:
-    compactor, compactor_optimizer, compactor_cfg, compactor_trajectories,
-    compactor_raw_sequences, compactor_step_offset, compactor_student_model,
-    compactor_scheduler, _compactor_lr, _compactor_ckpt_path
+    compactor, compactor_ddp, compactor_optimizer, compactor_cfg,
+    compactor_trajectories, compactor_raw_sequences, compactor_step_offset,
+    compactor_student_model, _compactor_lr, _compactor_ckpt_path,
+    _compactor_pg_collection
 """
 
 from __future__ import annotations
@@ -398,12 +399,10 @@ def maybe_train_compactor(runtime_state: Any, args=None, optimizer=None) -> None
             from megatron.rl.compaction.learned import save_checkpoint
             os.makedirs(ckpt_dir, exist_ok=True)
             ckpt_path = os.path.join(ckpt_dir, f"step_{global_step:07d}")
-            scheduler = getattr(runtime_state, "compactor_scheduler", None)
             save_checkpoint(
                 runtime_state.compactor,
                 ckpt_path,
                 step=global_step,
                 optimizer=runtime_state.compactor_optimizer,
-                scheduler=scheduler,
             )
             log_single_rank(logger, logging.INFO, f"[STILL online] checkpoint saved: {ckpt_path}")

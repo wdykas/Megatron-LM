@@ -22,7 +22,6 @@ def train_compactor_trajectory(
     student_fn,         # StudentFn
     cfg,                # CompactorTrainerConfig
     feature_extractor=None,  # optional ChunkFeatureExtractor (z_t features for the gate)
-    value_head=None,         # optional ValueHead (belief-state value prediction logging)
 ) -> dict:
     """THE single STILL training path — shared by online RL and offline training.
 
@@ -37,9 +36,8 @@ def train_compactor_trajectory(
       * online true-STILL (teacher-KL): still_ce via student_fn.
       * offline (BeliefCompactorTrainer): all of the above PLUS the probe-distillation
         terms (teacher_kl / future_kl / weighted_kl / retrieval / future_horizon_kl)
-        when probes carry teacher_logits, plus optional feature_extractor (z_t) and
-        value_head — passed by BeliefCompactorTrainer.train_trajectory, which delegates
-        here.
+        when probes carry teacher_logits, plus an optional feature_extractor (z_t) —
+        passed by BeliefCompactorTrainer.train_trajectory, which delegates here.
 
     Advantage weighting is applied when cfg.vd_cfg is set and probe.advantage (or
     the trajectory return) is available.
@@ -97,7 +95,6 @@ def train_compactor_trajectory(
     # result assembly — keyed by the result-dict name it maps to.
     pred_loss_vals: list[float] = []
     consist_loss_vals: list[float] = []
-    value_preds: list[float] = []
     kv_recon_vals: list[float] = []
     adv_weight_vals: list[float] = []
     still_ce_vals: list[float] = []
@@ -115,7 +112,6 @@ def train_compactor_trajectory(
         "dynamics": dynamics_vals,
         "future_horizon_kl": future_horizon_kl_vals,
         "merged_consistency": merged_consist_vals,
-        "value_mean": value_preds,
     }
 
     _dev = next(updater.parameters()).device
@@ -179,12 +175,6 @@ def train_compactor_trajectory(
                 consist_l = consistency_loss(memory_prev, memory, gates=gates)
                 chunk_loss = chunk_loss + cfg.loss_weights.consistency * consist_l
                 consist_loss_vals.append(consist_l.item())
-
-        # Optional belief-state value prediction (logging only; offline path).
-        if value_head is not None:
-            with torch.no_grad():
-                v_pred = value_head(memory, z_t)
-            value_preds.append(float(v_pred.mean().item()))
 
         compact_keys_list = [memory.keys[l] for l in range(memory.n_layers)]
         compact_vals_list = [memory.values[l] for l in range(memory.n_layers)]
@@ -444,59 +434,32 @@ class BeliefCompactorTrainer:
     config.truncated_bptt_steps chunks.
 
     Usage:
-        trainer = BeliefCompactorTrainer(updater, optimizer, CompactorTrainerConfig(),
-                                     scheduler=CurriculumScheduler.default_4stage())
+        trainer = BeliefCompactorTrainer(updater, optimizer, CompactorTrainerConfig())
         log = trainer.train_trajectory(trajectory, student_fn)
     """
 
-    def __init__(
-        self,
-        updater,
-        optimizer,
-        config,
-        feature_extractor=None,
-        value_head=None,
-        scheduler=None,
-    ) -> None:
+    def __init__(self, updater, optimizer, config, feature_extractor=None) -> None:
         self.updater = updater
         self.optimizer = optimizer
         self.config = config
         self.feature_extractor = feature_extractor
-        self.value_head = value_head
-        self.scheduler = scheduler
 
     @torch.enable_grad()
     def train_trajectory(self, trajectory, student_fn) -> dict:
         """Train on one full trajectory — delegates to the unified
-        ``train_compactor_trajectory`` (the single STILL training path), passing this
-        trainer's feature_extractor and value_head.  Offline-only objectives
-        (probe distillation: teacher_kl / future_kl / weighted_kl / retrieval /
-        future_horizon_kl) activate automatically because offline probes carry
-        teacher_logits and student_fn is provided; the online-introduced NextLat
-        objectives (dynamics / future_kv_reconstruction / merged_chunk / future
-        accuracy weighting) are likewise available here for free.
-
-        After the trajectory, advances the optional curriculum scheduler (which the
-        online path does not use).
+        ``train_compactor_trajectory`` (the single STILL training path). Offline-only
+        objectives (probe distillation: teacher_kl / future_kl / weighted_kl /
+        retrieval / future_horizon_kl) activate automatically when offline probes
+        carry teacher_logits and student_fn is provided.
         """
-        import dataclasses as _dc
-
-        result = train_compactor_trajectory(
+        return train_compactor_trajectory(
             model=self.updater,
             optimizer=self.optimizer,
             trajectory=trajectory,
             student_fn=student_fn,
             cfg=self.config,
             feature_extractor=self.feature_extractor,
-            value_head=self.value_head,
         )
-
-        # Curriculum: advance once per trajectory and swap in the new loss weights.
-        if self.scheduler is not None:
-            new_weights = self.scheduler.step()
-            self.config = _dc.replace(self.config, loss_weights=new_weights)
-
-        return result
 
 
 def _compute_probe_terms(cfg, probe, student_logits):

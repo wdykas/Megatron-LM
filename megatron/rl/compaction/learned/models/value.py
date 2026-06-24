@@ -1,26 +1,9 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Value head V_ψ(M_t, z_t) for value-directed belief compression.
+"""Chunk feature extractor: a fixed-dim feature vector z_t for gate conditioning.
 
-The value head estimates the cumulative future reward achievable from the
-current belief state M_t.  It serves two purposes:
-
-    1. Curriculum stage 4 (value-directed training):
-       Minimise |V_ψ(M_t, z_t) - G_t|^2  where G_t is a return estimate
-       from the task reward signal.  This back-propagates through the value
-       head into the compactor, shaping which information is worth remembering.
-
-    2. Slot ablation estimation:
-       Remove one slot at a time and measure the predicted value drop to
-       identify which slots matter most.  Used for interpretability and for
-       informed eviction in memory-constrained deployment.
-
-Architecture:
-
-    pool    = mean_pool(M_t.keys, dim=slots)   → (B, n_layers, d_model)
-    flat    = reshape(pool, (B, n_layers * d_model))
-    z_cat   = cat([flat, z_t], dim=-1)  if z_t is not None  else flat
-    value   = MLP(z_cat)                → (B, 1) → scalar
+z_t summarizes a KV chunk (chunk index, key-norm mean/std, memory pressure) and is
+optionally fed to the GatedRecurrentUpdater's gate (GatedUpdaterConfig.feature_dim).
 """
 
 from __future__ import annotations
@@ -28,12 +11,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
-from megatron.rl.compaction.learned.models.belief import BeliefMemory
-from megatron.rl.compaction.learned.models.compactor import compactor_transformer_config
 
 
 # ---------------------------------------------------------------------------
@@ -142,73 +119,3 @@ class ChunkFeatureExtractor:
     ) -> torch.Tensor:
         """Convenience wrapper that returns the (FEATURE_DIM,) vector directly."""
         return self.extract(chunk_keys, chunk_index, current_memory_slots).vector
-
-
-class ValueHead(nn.Module):
-    """MLP mapping belief state → scalar value estimate.
-
-    Parameters
-    ----------
-    n_layers:    Number of transformer layers (= BeliefMemory.n_layers).
-    d_model:     Per-layer key/value dimension (= BeliefMemory.d_model).
-    hidden_dim:  Hidden dimension of the two-layer MLP.
-    feature_dim: Dimension of optional z_t feature vector fed to the gate.
-                 Pass 0 (default) to use only the pooled memory representation.
-    """
-
-    def __init__(
-        self,
-        n_layers: int,
-        d_model: int,
-        hidden_dim: int = 256,
-        feature_dim: int = 0,
-        params_dtype: torch.dtype = torch.float32,
-        pg_collection=None,
-    ) -> None:
-        super().__init__()
-        self.n_layers = n_layers
-        self.d_model = d_model
-        self.feature_dim = feature_dim
-
-        in_dim = n_layers * d_model + feature_dim
-        config = compactor_transformer_config(hidden_dim, n_heads=1, ffn_hidden_size=hidden_dim,
-                                              params_dtype=params_dtype)
-        tp_group = pg_collection.tp if pg_collection is not None else None
-        lin = dict(config=config, init_method=config.init_method, gather_output=False,
-                   bias=True, skip_bias_add=False, is_expert=False, tp_group=tp_group)
-        self.fc1 = TEColumnParallelLinear(in_dim, hidden_dim, **lin)
-        self.fc2 = TEColumnParallelLinear(hidden_dim, hidden_dim, **lin)
-        self.fc3 = TEColumnParallelLinear(hidden_dim, 1, **lin)
-
-    def forward(
-        self,
-        memory: BeliefMemory,
-        features: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Estimate value from belief state.
-
-        Parameters
-        ----------
-        memory:   BeliefMemory with keys of shape (n_layers, B, C, d_model).
-        features: Optional z_t feature vector, shape (B, feature_dim) or
-                  (feature_dim,) which is broadcast over the batch.
-
-        Returns: (B,) float tensor — per-sample value estimate.
-        """
-        # Pool over the C memory slots: (n_layers, B, C, d) → (B, n_layers, d)
-        keys_pooled = memory.keys.mean(dim=2)           # (n_layers, B, d)
-        keys_pooled = keys_pooled.permute(1, 0, 2)     # (B, n_layers, d)
-        B = keys_pooled.shape[0]
-        flat = keys_pooled.reshape(B, -1)               # (B, n_layers * d)
-
-        if features is not None:
-            if features.dim() == 1:
-                features = features.unsqueeze(0).expand(B, -1)
-            flat = torch.cat([flat, features], dim=-1)  # (B, n_layers*d + feature_dim)
-
-        h, _ = self.fc1(flat)
-        h = F.gelu(h)
-        h, _ = self.fc2(h)
-        h = F.gelu(h)
-        out, _ = self.fc3(h)
-        return out.squeeze(-1)                          # (B,)

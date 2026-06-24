@@ -5,10 +5,6 @@
 Covers:
   - still/types.py — CompactKV, StudentFn canonical aliases
   - BeliefCompactorTrainer + ChunkFeatureExtractor (z_t injection)
-  - BeliefCompactorTrainer + CurriculumScheduler (loss_weights update per step)
-  - BeliefCompactorTrainer + ValueHead (value_mean in log dict)
-  - BeliefCompactorTrainer + all three optional extras together
-  - eval._greedy_generate — context accumulation across decode steps
   - TrajectoryDataset + trajectory_collate_fn
 """
 
@@ -19,17 +15,14 @@ from torch.utils.data import DataLoader
 
 from megatron.rl.compaction.learned.models.belief import BeliefMemory, BeliefUpdater
 from megatron.rl.compaction.learned.models.compactor import PerceiverCompactor, PerceiverConfig
-from megatron.rl.compaction.learned.training.curriculum import CurriculumScheduler
 from megatron.rl.compaction.learned.training.data import Trajectory, TrainingProbe
 from megatron.rl.compaction.learned.training.data import TrajectoryDataset, trajectory_collate_fn
 from megatron.rl.compaction.learned.models.value import ChunkFeatureExtractor, FEATURE_DIM
-from megatron.rl.compaction.learned.training.losses import CompactorLossWeights
 from megatron.rl.compaction.learned.training.data import PipelineConfig
 from megatron.rl.compaction.learned.training.training import BeliefCompactorTrainer
 from megatron.rl.compaction.learned.training.data import CompactorTrainerConfig
 from megatron.rl.compaction.learned.training.data import CompactKV, StudentFn
 from megatron.rl.compaction.learned.models.belief import GatedRecurrentUpdater, GatedUpdaterConfig
-from megatron.rl.compaction.learned.models.value import ValueHead
 
 
 # ---------------------------------------------------------------------------
@@ -160,116 +153,6 @@ class TestBeliefStillTrainerFeatures:
                                          feature_extractor=ext)
             log = trainer.train_trajectory(_make_trajectory(), _student_fn)
             assert isinstance(log, dict) and "total" in log
-
-
-# ---------------------------------------------------------------------------
-# BeliefCompactorTrainer + CurriculumScheduler
-# ---------------------------------------------------------------------------
-
-class TestBeliefStillTrainerCurriculum:
-    def test_scheduler_advances_loss_weights(self):
-        updater = _belief_updater()
-        opt = torch.optim.SGD(updater.parameters(), lr=1e-3)
-        scheduler = CurriculumScheduler.default_4stage(steps_per_stage=1)
-        trainer = BeliefCompactorTrainer(updater, opt, CompactorTrainerConfig(), scheduler=scheduler)
-        # Use differentiable student_fn so loss.requires_grad=True → _step fires
-        traj = _make_trajectory(n_chunks=4, add_probe_at=2)
-        trainer.train_trajectory(traj, _student_fn_with_grad)
-        # After one optimizer step, the scheduler should have advanced once
-        total_steps = scheduler.stage_idx * 1 + scheduler.steps_in_stage
-        assert total_steps >= 1
-
-    def test_no_scheduler_config_unchanged(self):
-        updater = _belief_updater()
-        opt = torch.optim.SGD(updater.parameters(), lr=1e-3)
-        config = CompactorTrainerConfig(
-            loss_weights=CompactorLossWeights(teacher_kl=1.0, future_kl=0.5)
-        )
-        trainer = BeliefCompactorTrainer(updater, opt, config)
-        traj = _make_trajectory()
-        trainer.train_trajectory(traj, _student_fn_with_grad)
-        # Without scheduler, loss_weights should not change
-        assert trainer.config.loss_weights.teacher_kl == pytest.approx(1.0)
-        assert trainer.config.loss_weights.future_kl == pytest.approx(0.5)
-
-    def test_scheduler_updates_loss_weights_between_bptt_windows(self):
-        updater = _belief_updater()
-        opt = torch.optim.SGD(updater.parameters(), lr=1e-3)
-        # Short BPTT window to force multiple optimizer steps per trajectory
-        config = CompactorTrainerConfig(truncated_bptt_steps=2)
-        scheduler = CurriculumScheduler.default_4stage(steps_per_stage=100)
-        trainer = BeliefCompactorTrainer(updater, opt, config, scheduler=scheduler)
-        # 6 chunks, probe at 1 → 3 BPTT windows (chunks 0-1, 2-3, 4-5)
-        traj = _make_trajectory(n_chunks=6, add_probe_at=1)
-        trainer.train_trajectory(traj, _student_fn_with_grad)
-        # At least one BPTT window had a probe and triggered _step → scheduler advanced
-        total_steps = scheduler.stage_idx * 100 + scheduler.steps_in_stage
-        assert total_steps >= 1
-
-
-# ---------------------------------------------------------------------------
-# BeliefCompactorTrainer + ValueHead
-# ---------------------------------------------------------------------------
-
-class TestBeliefStillTrainerValueHead:
-    def test_value_mean_in_log_when_value_head_provided(self):
-        updater = _belief_updater()
-        opt = torch.optim.SGD(updater.parameters(), lr=1e-3)
-        value_head = ValueHead(n_layers=L, d_model=D)
-        trainer = BeliefCompactorTrainer(updater, opt, CompactorTrainerConfig(),
-                                     value_head=value_head)
-        traj = _make_trajectory()
-        log = trainer.train_trajectory(traj, _student_fn)
-        assert "value_mean" in log
-        assert isinstance(log["value_mean"], float)
-
-    def test_no_value_head_key_absent(self):
-        updater = _belief_updater()
-        opt = torch.optim.SGD(updater.parameters(), lr=1e-3)
-        trainer = BeliefCompactorTrainer(updater, opt, CompactorTrainerConfig())
-        traj = _make_trajectory()
-        log = trainer.train_trajectory(traj, _student_fn)
-        assert "value_mean" not in log
-
-    def test_value_head_not_trained_without_rl_targets(self):
-        # ValueHead gradients must not flow back unless explicitly enabled.
-        # Use _student_fn_with_grad so the updater IS trained (eliminating the
-        # "no optimizer step at all" degenerate case).
-        updater = _belief_updater()
-        opt = torch.optim.SGD(updater.parameters(), lr=1e-3)
-        value_head = ValueHead(n_layers=L, d_model=D)
-        trainer = BeliefCompactorTrainer(updater, opt, CompactorTrainerConfig(),
-                                     value_head=value_head)
-        params_before = [p.clone() for p in value_head.parameters()]
-        traj = _make_trajectory(n_chunks=4, add_probe_at=2)
-        trainer.train_trajectory(traj, _student_fn_with_grad)
-        for p_before, p_after in zip(params_before, value_head.parameters()):
-            assert torch.allclose(p_before, p_after), "ValueHead was updated without RL targets"
-
-
-# ---------------------------------------------------------------------------
-# BeliefCompactorTrainer — all extras wired together
-# ---------------------------------------------------------------------------
-
-class TestBeliefStillTrainerFullWiring:
-    def test_all_extras_together(self):
-        updater = _gated_updater(feature_dim=FEATURE_DIM)
-        opt = torch.optim.SGD(updater.parameters(), lr=1e-3)
-        extractor = ChunkFeatureExtractor(memory_budget=C, max_chunks=64)
-        value_head = ValueHead(n_layers=L, d_model=D, feature_dim=FEATURE_DIM)
-        scheduler = CurriculumScheduler.default_4stage(steps_per_stage=10)
-        config = CompactorTrainerConfig(truncated_bptt_steps=2)
-        trainer = BeliefCompactorTrainer(
-            updater, opt, config,
-            feature_extractor=extractor,
-            value_head=value_head,
-            scheduler=scheduler,
-        )
-        traj = _make_trajectory(n_chunks=6, add_probe_at=3)
-        log = trainer.train_trajectory(traj, _student_fn)
-        assert "total" in log
-        assert "value_mean" in log
-        assert torch.isfinite(torch.tensor(log["total"]))
 
 
 # ---------------------------------------------------------------------------

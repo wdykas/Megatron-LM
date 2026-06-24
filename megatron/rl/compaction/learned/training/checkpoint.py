@@ -6,16 +6,15 @@ The compactor is a Megatron ``MegatronModule`` built from TransformerEngine
 layers, so it is checkpointed the same way the main model is: via
 ``megatron.core.dist_checkpointing``. The model weights are stored as a
 *sharded* state dict (which correctly handles TE ``_extra_state``), while the
-model config, optimizer state, scheduler state, and step are stored as *common*
-(replicated) state. A checkpoint is therefore a **directory**, not a ``.pt``.
+model config, optimizer state, and step are stored as *common* (replicated)
+state. A checkpoint is therefore a **directory**, not a ``.pt``.
 
 This requires ``torch.distributed`` + Megatron model-parallel state to be
 initialized (always true inside the RL training loop). The async file writer
 also needs a working multiprocessing context — present under ``torchrun``.
 
 Usage — save:
-    save_checkpoint(compactor, "run/step_0001000", step=1000,
-                    optimizer=opt, scheduler=curriculum)
+    save_checkpoint(compactor, "run/step_0001000", step=1000, optimizer=opt)
 
 Usage — load:
     model, meta = load_checkpoint("run/step_0001000", map_location="cuda")
@@ -76,13 +75,12 @@ def save_checkpoint(
     path: str | Path,
     step: int = 0,
     optimizer: Any | None = None,
-    scheduler: Any | None = None,
     metadata: dict | None = None,
 ) -> None:
     """Save a compactor checkpoint (a directory) via dist_checkpointing.
 
-    The model is saved as a sharded state dict; config/optimizer/scheduler/step
-    are saved as common (replicated) state.
+    The model is saved as a sharded state dict; config/optimizer/step are saved as
+    common (replicated) state.
     """
     path = Path(path)
     model_type, config_dict = _model_type_and_config(model)
@@ -105,8 +103,6 @@ def save_checkpoint(
             # Offline (plain torch optimizer, single-process): no sharded path; the
             # replicated tensors go in the common store.
             sharded_sd["optimizer"] = optimizer.state_dict()
-    if scheduler is not None and hasattr(scheduler, "state_dict"):
-        sharded_sd["scheduler"] = scheduler.state_dict()
 
     path.mkdir(parents=True, exist_ok=True)
     dist_checkpointing.save(sharded_sd, str(path))
@@ -169,15 +165,3 @@ def load_optimizer_state(
     if "optimizer" not in common:
         raise KeyError(f"Checkpoint at {path} has no optimizer state.")
     optimizer.load_state_dict(common["optimizer"])
-
-
-def load_scheduler_state(
-    path: str | Path,
-    scheduler: Any,
-    map_location: str | torch.device = "cuda",
-) -> None:
-    """Restore scheduler state (common) from a dist-checkpoint directory."""
-    common = dist_checkpointing.load_common_state_dict(str(path))
-    if "scheduler" not in common:
-        raise KeyError(f"Checkpoint at {path} has no scheduler state.")
-    scheduler.load_state_dict(common["scheduler"])

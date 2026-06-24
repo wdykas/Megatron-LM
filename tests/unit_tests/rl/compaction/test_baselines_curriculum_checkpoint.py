@@ -1,6 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Tests for H2O, StreamingLLM, CurriculumScheduler, and checkpoint I/O."""
+"""Tests for H2O, StreamingLLM, and checkpoint I/O."""
 
 import os
 import tempfile
@@ -14,16 +14,10 @@ from megatron.rl.compaction.kv import (
     CompactionResult,
 )
 from megatron.rl.compaction.kv.benchmark import KVCompactionBenchmark
-from megatron.rl.compaction.learned.training.curriculum import (
-    CurriculumStage,
-    CurriculumScheduler,
-)
-from megatron.rl.compaction.learned.training.losses import CompactorLossWeights
 from megatron.rl.compaction.learned.training.checkpoint import (
     save_checkpoint,
     load_checkpoint,
     load_optimizer_state,
-    load_scheduler_state,
     CheckpointMeta,
 )
 from megatron.rl.compaction.learned.models.compactor import PerceiverConfig, PerceiverCompactor
@@ -197,112 +191,6 @@ class TestStreamingLLMCompressor:
         assert algorithms == {"topk", "omp", "h2o", "streaming"}
 
 
-# ===========================================================================
-# CurriculumScheduler
-# ===========================================================================
-
-class TestCurriculumScheduler:
-    def _make(self, steps_per_stage=10):
-        return CurriculumScheduler.default_4stage(steps_per_stage)
-
-    def test_initial_stage_zero(self):
-        sched = self._make()
-        assert sched.stage_idx == 0
-
-    def test_first_step_returns_stage0_weights(self):
-        sched = self._make(steps_per_stage=5)
-        w = sched.step()
-        assert w.teacher_kl == 1.0
-        assert w.future_kl == 0.0   # stage 0: still_warmup
-
-    def test_advances_stage(self):
-        sched = self._make(steps_per_stage=3)
-        for _ in range(3):
-            sched.step()
-        assert sched.stage_idx == 1   # now in stage 1 (belief_still)
-
-    def test_stage_1_has_future_kl(self):
-        sched = self._make(steps_per_stage=2)
-        for _ in range(2):
-            sched.step()   # exhaust stage 0
-        w = sched.step()   # first step of stage 1
-        assert w.future_kl > 0.0
-
-    def test_all_4_stages_reached(self):
-        sched = self._make(steps_per_stage=1)
-        stage_names = set()
-        for _ in range(10):
-            stage_names.add(sched.stage_name)
-            sched.step()
-        assert "still_warmup" in stage_names
-        assert "belief_still" in stage_names
-        assert "retrieval_focus" in stage_names
-        assert "value_directed" in stage_names
-
-    def test_last_stage_does_not_end(self):
-        """After all stages are exhausted, stays in the last one."""
-        sched = self._make(steps_per_stage=2)
-        for _ in range(100):
-            sched.step()
-        assert sched.stage_idx == 3   # stays in last stage
-
-    def test_stage_4_has_path_consistency(self):
-        sched = self._make(steps_per_stage=1)
-        for _ in range(3):
-            sched.step()   # skip stages 0-2
-        w = sched.step()
-        assert w.path_consistency > 0.0
-
-    def test_total_steps_counter(self):
-        sched = self._make()
-        for _ in range(7):
-            sched.step()
-        assert sched.total_steps == 7
-
-    def test_steps_in_stage(self):
-        sched = self._make(steps_per_stage=5)
-        for _ in range(7):
-            sched.step()
-        assert sched.steps_in_stage == 2   # 7 steps: 5 in stage 0, 2 in stage 1
-
-    def test_stage_progress(self):
-        sched = self._make(steps_per_stage=10)
-        for _ in range(5):
-            sched.step()
-        assert sched.stage_progress == pytest.approx(0.5)
-
-    def test_custom_stages(self):
-        stages = [
-            CurriculumStage("a", 3, CompactorLossWeights(teacher_kl=2.0)),
-            CurriculumStage("b", 3, CompactorLossWeights(teacher_kl=0.5)),
-        ]
-        sched = CurriculumScheduler(stages)
-        w = sched.step()
-        assert w.teacher_kl == 2.0
-        for _ in range(3):
-            sched.step()
-        w = sched.step()
-        assert w.teacher_kl == 0.5
-
-    def test_empty_stages_raises(self):
-        with pytest.raises(ValueError, match="non-empty"):
-            CurriculumScheduler([])
-
-    def test_state_dict_roundtrip(self):
-        sched = self._make(steps_per_stage=5)
-        for _ in range(7):
-            sched.step()
-        state = sched.state_dict()
-        sched2 = self._make(steps_per_stage=5)
-        sched2.load_state_dict(state)
-        assert sched2.total_steps == 7
-        assert sched2.stage_idx == sched.stage_idx
-
-
-# ===========================================================================
-# Checkpoint I/O
-# ===========================================================================
-
 @pytest.mark.skip(
     reason="checkpoint.py uses collective Megatron dist_checkpointing whose async "
     "writer spawns a multiprocessing Manager that re-imports the entry module — it "
@@ -408,20 +296,6 @@ class TestCheckpointIO:
         finally:
             os.unlink(path)
 
-    def test_scheduler_save_load(self):
-        sched = CurriculumScheduler.default_4stage(steps_per_stage=5)
-        for _ in range(7):
-            sched.step()
-        model = self._perceiver()
-        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
-            path = f.name
-        try:
-            save_checkpoint(model, path, scheduler=sched)
-            sched2 = CurriculumScheduler.default_4stage(steps_per_stage=5)
-            load_scheduler_state(path, sched2)
-            assert sched2.total_steps == 7
-        finally:
-            os.unlink(path)
 
     def test_unsupported_model_raises(self):
         import torch.nn as nn

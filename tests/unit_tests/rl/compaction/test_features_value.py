@@ -1,6 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Tests for ChunkFeatureExtractor, ValueHead, and path_consistency_loss."""
+"""Tests for ChunkFeatureExtractor and path_consistency_loss."""
 
 import pytest
 import torch
@@ -11,7 +11,6 @@ from megatron.rl.compaction.learned.models.value import (
     ChunkFeatures,
     FEATURE_DIM,
 )
-from megatron.rl.compaction.learned.models.value import ValueHead
 from megatron.rl.compaction.learned.models.belief import BeliefMemory
 from megatron.rl.compaction.learned.training.losses import path_consistency_loss
 from megatron.rl.compaction.learned.models.belief import BeliefUpdater
@@ -104,47 +103,6 @@ class TestChunkFeatureExtractor:
         v0 = extractor.batch_extract(keys, chunk_index=0)
         v5 = extractor.batch_extract(keys, chunk_index=50)
         assert not torch.allclose(v0, v5)
-
-
-# ---------------------------------------------------------------------------
-# ValueHead
-# ---------------------------------------------------------------------------
-
-class TestValueHead:
-    def test_output_shape(self):
-        vh = ValueHead(n_layers=2, d_model=16, hidden_dim=32)
-        mem = _belief(n_layers=2, B=3, C=4, d=16)
-        out = vh(mem)
-        assert out.shape == (3,)
-
-    def test_with_features(self):
-        vh = ValueHead(n_layers=2, d_model=16, hidden_dim=32, feature_dim=4)
-        mem = _belief(n_layers=2, B=2, C=4, d=16)
-        feat = torch.randn(2, 4)
-        out = vh(mem, features=feat)
-        assert out.shape == (2,)
-
-    def test_broadcast_features(self):
-        """1D feature vector is broadcast over batch."""
-        vh = ValueHead(n_layers=2, d_model=16, hidden_dim=32, feature_dim=4)
-        mem = _belief(n_layers=2, B=3, C=4, d=16)
-        feat = torch.randn(4)   # no batch dim
-        out = vh(mem, features=feat)
-        assert out.shape == (3,)
-
-    def test_grad_flows(self):
-        vh = ValueHead(n_layers=2, d_model=16, hidden_dim=32)
-        mem = _belief(n_layers=2, B=1, C=4, d=16)
-        mem.keys.requires_grad_(True)
-        out = vh(mem)
-        out.sum().backward()
-        assert mem.keys.grad is not None
-
-    def test_no_feature_dim_no_error(self):
-        vh = ValueHead(n_layers=3, d_model=32, hidden_dim=64, feature_dim=0)
-        mem = _belief(n_layers=3, B=2, C=8, d=32)
-        out = vh(mem, features=None)
-        assert out.shape == (2,)
 
 
 # ---------------------------------------------------------------------------
