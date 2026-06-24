@@ -568,24 +568,11 @@ class CompactorLosses:
         target_ids:            torch.Tensor | None = None,
         retrieval_ids:         torch.Tensor | None = None,
         weighted_kl_rho:       float = 1.0,
-        # POMDP predictive coding (optional):
-        predictions:           torch.Tensor | None = None,       # (n_layers, B, C, d)
-        actual_keys:           list[torch.Tensor] | None = None, # n_layers × (B, T, d)
         # KV reconstruction (optional — use when student_fn unavailable):
         compact_keys:          list[torch.Tensor] | None = None, # n_layers × (B, C, d)
         compact_values:        list[torch.Tensor] | None = None, # n_layers × (B, C, d)
         full_keys:             list[torch.Tensor] | None = None, # n_layers × (B, T, d)
         full_values:           list[torch.Tensor] | None = None, # n_layers × (B, T, d)
-        # Future KV reconstruction (NextLat belief-state test):
-        future_memory_keys:    list[torch.Tensor] | None = None, # n_layers × (B, C, d)
-        future_memory_values:  list[torch.Tensor] | None = None, # n_layers × (B, C, d)
-        # Dynamics prediction (NextLat-style):
-        pred_keys:             list[torch.Tensor] | None = None,
-        pred_values:           list[torch.Tensor] | None = None,
-        dyn_target_keys:       list[torch.Tensor] | None = None,
-        dyn_target_values:     list[torch.Tensor] | None = None,
-        # Future horizon KL (position-weighted):
-        future_horizon_gamma:  float = 1.0,
     ) -> "CompactorLossTerms":
         """Compute all requested loss terms and return their weighted sum.
 
@@ -603,20 +590,18 @@ class CompactorLosses:
         target_ids:            Ground-truth token IDs (for supervised task CE loss).
         retrieval_ids:         Token IDs for exact-recall probes (names, numbers, etc).
         weighted_kl_rho:       Confidence-weighting strength for weighted_kl term.
-        predictions:           Slot predictions of R_t from GatedRecurrentUpdater.update().
-        actual_keys:           Actual chunk keys R_t per layer.
         compact_keys/values:   Compact memory KV for kv_reconstruction loss.
         full_keys/values:      Original full KV for kv_reconstruction loss.
-        future_memory_keys/values: Old memory M_{t-1} KV for future_kv_reconstruction loss.
-        pred_keys/values:      Dynamics head predictions of M_{t+1}.
-        dyn_target_keys/values: Stop-gradient targets (actual M_{t+1}) for dynamics loss.
-        future_horizon_gamma:  Exponential position weight decay for future_horizon_kl.
+
+        NOTE: the recurrent path (train_compactor_trajectory) computes the per-chunk
+        objectives — predictive, future_kv_reconstruction, dynamics, future_horizon_kl
+        — directly from the loss functions; this combiner only handles the
+        probe-distillation terms plus kv_reconstruction (used by the single-pass
+        trainer when no student model is available).
         """
         device = (
             full_logits.device if full_logits is not None
             else compact_keys[0].device if compact_keys is not None
-            else actual_keys[0].device if actual_keys is not None
-            else predictions.device if predictions is not None
             else compact_logits.device if compact_logits is not None
             else torch.device("cpu")
         )
@@ -647,34 +632,11 @@ class CompactorLosses:
         if weights.weighted_kl > 0.0 and full_logits is not None and compact_logits is not None:
             wkl = weighted_kl_loss(full_logits, compact_logits, temperature, rho=weighted_kl_rho)
 
-        pred_loss: torch.Tensor | None = None
-        if weights.predictive > 0.0 and predictions is not None and actual_keys is not None:
-            pred_loss = predictive_coding_loss(predictions, actual_keys)
-
         kv_recon: torch.Tensor | None = None
         if (weights.kv_reconstruction > 0.0
                 and compact_keys is not None and compact_values is not None
                 and full_keys is not None and full_values is not None):
             kv_recon = kv_reconstruction_loss(compact_keys, compact_values, full_keys, full_values)
-
-        fut_kv_recon: torch.Tensor | None = None
-        if (weights.future_kv_reconstruction > 0.0
-                and future_memory_keys is not None and future_memory_values is not None
-                and full_keys is not None and full_values is not None):
-            fut_kv_recon = future_kv_reconstruction_loss(
-                future_memory_keys, future_memory_values, full_keys, full_values,
-            )
-
-        dyn_loss: torch.Tensor | None = None
-        if (weights.dynamics > 0.0
-                and pred_keys is not None and pred_values is not None
-                and dyn_target_keys is not None and dyn_target_values is not None):
-            dyn_loss = dynamics_prediction_loss(pred_keys, pred_values, dyn_target_keys, dyn_target_values)
-
-        fh_kl: torch.Tensor | None = None
-        if (weights.future_horizon_kl > 0.0
-                and full_logits is not None and compact_logits is not None):
-            fh_kl = future_horizon_kl_loss(full_logits, compact_logits, temperature, gamma=future_horizon_gamma)
 
         total = torch.zeros([], device=device)
         if t_kl is not None:
@@ -689,16 +651,8 @@ class CompactorLosses:
             total = total + weights.retrieval * retr
         if wkl is not None:
             total = total + weights.weighted_kl * wkl
-        if pred_loss is not None:
-            total = total + weights.predictive * pred_loss
         if kv_recon is not None:
             total = total + weights.kv_reconstruction * kv_recon
-        if fut_kv_recon is not None:
-            total = total + weights.future_kv_reconstruction * fut_kv_recon
-        if dyn_loss is not None:
-            total = total + weights.dynamics * dyn_loss
-        if fh_kl is not None:
-            total = total + weights.future_horizon_kl * fh_kl
 
         return CompactorLossTerms(
             teacher_kl=t_kl,
@@ -708,10 +662,10 @@ class CompactorLosses:
             retrieval=retr,
             weighted_kl=wkl,
             path_consistency=None,  # computed separately via path_consistency_loss()
-            predictive=pred_loss,
+            predictive=None,
             kv_reconstruction=kv_recon,
-            future_kv_reconstruction=fut_kv_recon,
-            dynamics=dyn_loss,
-            future_horizon_kl=fh_kl,
+            future_kv_reconstruction=None,
+            dynamics=None,
+            future_horizon_kl=None,
             total=total,
         )
