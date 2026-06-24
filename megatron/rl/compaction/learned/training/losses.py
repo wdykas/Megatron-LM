@@ -420,10 +420,12 @@ def future_kv_reconstruction_loss(
 
 
 def dynamics_prediction_loss(pred_keys, pred_values, target_keys, target_values):
-    """Train dynamics head: predict M_{t+1} from M_t (NextLat-style).
+    """NextLat latent-dynamics loss: predicted next memory vs. the real M_{t+1}.
 
-    SmoothL1 against stop-gradient targets so only the dynamics head
-    trains, not the memory representation.
+    SmoothL1 against stop-gradient targets (the real next memory). The prediction
+    is produced head-free by rolling the updater forward on its own predicted next
+    chunk (see train_compactor_trajectory), so the gradient trains the predict head
+    and the transition — shaping the representation to be predictable.
     """
     n_layers = len(pred_keys)
     total = torch.zeros([], device=pred_keys[0].device, dtype=pred_keys[0].dtype)

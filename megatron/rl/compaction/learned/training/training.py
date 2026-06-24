@@ -180,15 +180,21 @@ def train_compactor_trajectory(
         compact_vals_list = [memory.values[l] for l in range(memory.n_layers)]
         compact_kv = [(compact_keys_list[l], compact_vals_list[l]) for l in range(memory.n_layers)]
 
-        # NextLat dynamics-prediction loss (predict M_{t+1} via the dynamics head)
-        dyn_pred = None
+        # NextLat dynamics loss (head-free): the updater IS the latent dynamics model.
+        # Roll one step forward in latent space using the compactor's OWN predicted
+        # next chunk (preds = pred_R_t from the predict head) and the SAME update():
+        #   M_pred = U_θ(M_t, pred_R_t)
+        # then match the real next memory M_{t+1} (stop-grad target). Gradient flows
+        # into the predict head + the transition, so the representation is trained to
+        # be predictable — no separate dynamics head required.
         if (cfg.loss_weights.dynamics > 0.0
-                and hasattr(updater, 'predict_next_memory')
+                and preds is not None
                 and memory_before_update is not None):
-            dyn_pred = updater.predict_next_memory(memory_before_update)
-        if dyn_pred is not None:
+            pred_chunk = [preds[l] for l in range(preds.shape[0])]   # per-layer (B, C, d)
+            imagined, _, _ = updater.update(memory_before_update, pred_chunk, pred_chunk)
             dyn_l = dynamics_prediction_loss(
-                dyn_pred[0], dyn_pred[1],
+                [imagined.keys[l] for l in range(imagined.n_layers)],
+                [imagined.values[l] for l in range(imagined.n_layers)],
                 [memory.keys[l] for l in range(memory.n_layers)],
                 [memory.values[l] for l in range(memory.n_layers)],
             )

@@ -53,7 +53,6 @@ def init_compactor_from_kv(runtime_state: Any, args, n_attn_layers: int, d_kv: i
         n_heads=n_heads,
         d_kv=d_kv,
         n_attn_layers=n_attn_layers,
-        use_dynamics_head=getattr(args, "rl_compaction_compactor_use_dynamics_head", False),
     )
     _dtype = (torch.bfloat16 if getattr(args, 'bf16', False)
               else torch.float16 if getattr(args, 'fp16', False)
@@ -117,9 +116,6 @@ def init_compactor_from_kv(runtime_state: Any, args, n_attn_layers: int, d_kv: i
     # Warn on loss weights that are silently inert online (term enabled but its
     # precondition is off, so it contributes no gradient).
     _w = trainer_cfg.loss_weights
-    if _w.dynamics > 0.0 and not getattr(args, "rl_compaction_compactor_use_dynamics_head", False):
-        log_single_rank(logger, logging.WARNING,
-                        "[STILL online] dynamics loss > 0 but --use-dynamics-head is off; it is skipped.")
     if _w.future_horizon_kl > 0.0 and (trainer_cfg.future_horizon_gamma >= 1.0 or _use_teacher_kl):
         log_single_rank(logger, logging.WARNING,
                         "[STILL online] future-horizon-KL > 0 is inert online (needs gamma < 1.0 and "

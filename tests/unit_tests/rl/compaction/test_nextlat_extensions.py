@@ -4,13 +4,12 @@
 
 Covers:
   - future_kv_reconstruction_loss: belief-state predictive test
-  - dynamics_prediction_loss: NextLat-style dynamics head training
+  - dynamics_prediction_loss: NextLat latent-dynamics loss
   - future_horizon_kl_loss: position-weighted KL distillation
-  - GatedRecurrentUpdater.predict_next_memory: dynamics head enable/disable
+  - head-free NextLat dynamics: train_compactor_trajectory(dynamics>0) trains the
+    compactor (no dedicated dynamics head)
   - CompactorLossWeights: new fields default to 0.0, appear in as_dict()
   - CompactorTrainerConfig: new fields and their defaults
-
-All tests run on CPU. No GPU required.
 """
 
 from __future__ import annotations
@@ -32,7 +31,12 @@ from megatron.rl.compaction.learned.training.losses import (
     future_kv_reconstruction_loss,
     teacher_kl_loss,
 )
-from megatron.rl.compaction.learned.training.data import CompactorTrainerConfig
+from megatron.rl.compaction.learned.training.data import (
+    CompactorTrainerConfig,
+    Trajectory,
+    TrainingProbe,
+)
+from megatron.rl.compaction.learned.training.training import train_compactor_trajectory
 
 
 # ---------------------------------------------------------------------------
@@ -74,14 +78,8 @@ def _make_logits(B=B, seq=T, vocab=VOCAB, *, seed=0, requires_grad=False):
     return torch.randn(B, seq, vocab, requires_grad=requires_grad)
 
 
-def _make_gru_cfg(use_dynamics_head=False):
-    return GatedUpdaterConfig(
-        n_compress=C,
-        n_heads=2,
-        d_kv=D,
-        n_attn_layers=N_LAYERS,
-        use_dynamics_head=use_dynamics_head,
-    )
+def _make_gru_cfg():
+    return GatedUpdaterConfig(n_compress=C, n_heads=2, d_kv=D, n_attn_layers=N_LAYERS)
 
 
 def _make_belief_memory(n_layers=N_LAYERS, B=B, C=C, d=D, *, seed=0):
@@ -275,86 +273,39 @@ class TestFutureHorizonKlLoss(unittest.TestCase):
 # TestGatedRecurrentUpdaterDynamicsHead
 # ---------------------------------------------------------------------------
 
-class TestGatedRecurrentUpdaterDynamicsHead(unittest.TestCase):
-    """Tests for GatedRecurrentUpdater.predict_next_memory."""
+class TestHeadFreeDynamics(unittest.TestCase):
+    """The NextLat dynamics loss trains the compactor with NO dedicated head.
 
-    def _make_chunk_kv(self, seed=0):
-        """Return chunk keys/values as lists of (B, T, d) tensors."""
-        return _make_kv_list(n_layers=N_LAYERS, B=B, seq=T, d=D, seed=seed)
+    train_compactor_trajectory rolls the updater forward on its own predicted next
+    chunk (M_pred = U(M_t, pred_R_t)) and matches the real M_{t+1}.
+    """
 
-    def test_predict_returns_none_when_disabled(self):
-        """use_dynamics_head=False -> predict_next_memory returns None."""
-        cfg     = _make_gru_cfg(use_dynamics_head=False)
-        updater = GatedRecurrentUpdater(cfg)
-        memory  = _make_belief_memory()
+    def _traj(self, n_chunks=3, seed=0):
+        chunks = []
+        for c in range(n_chunks):
+            k, v = _make_kv_list(seq=T, seed=seed + c)
+            chunks.append((k, v))
+        return Trajectory(chunks=chunks, probes_by_chunk={}, rollout_return=0.0)
 
-        result = updater.predict_next_memory(memory)
-        self.assertIsNone(
-            result,
-            msg="predict_next_memory should return None when use_dynamics_head=False",
+    def test_no_dynamics_head_attribute(self):
+        updater = GatedRecurrentUpdater(_make_gru_cfg())
+        self.assertFalse(hasattr(updater, "dynamics_key_heads"))
+        self.assertFalse(hasattr(updater, "predict_next_memory"))
+
+    def test_dynamics_loss_reported_and_trains_compactor(self):
+        updater = GatedRecurrentUpdater(_make_gru_cfg())
+        opt = torch.optim.SGD(updater.parameters(), lr=1e-2)
+        cfg = CompactorTrainerConfig(
+            loss_weights=CompactorLossWeights(kv_reconstruction=0.0, dynamics=1.0),
         )
+        before = [p.detach().clone() for p in updater.parameters()]
+        log = train_compactor_trajectory(updater, opt, self._traj(), student_fn=None, cfg=cfg)
 
-    def test_predict_returns_correct_shape(self):
-        """use_dynamics_head=True -> returns (pred_keys, pred_values) each of length n_layers."""
-        cfg     = _make_gru_cfg(use_dynamics_head=True)
-        updater = GatedRecurrentUpdater(cfg)
-        memory  = _make_belief_memory()
-
-        result = updater.predict_next_memory(memory)
-        self.assertIsNotNone(result, msg="predict_next_memory should not return None")
-
-        pred_keys, pred_values = result
-        self.assertEqual(len(pred_keys),   N_LAYERS,
-                         msg=f"Expected {N_LAYERS} pred_keys entries, got {len(pred_keys)}")
-        self.assertEqual(len(pred_values), N_LAYERS,
-                         msg=f"Expected {N_LAYERS} pred_values entries, got {len(pred_values)}")
-
-        expected_shape = (B, C, D)
-        for l in range(N_LAYERS):
-            self.assertEqual(
-                tuple(pred_keys[l].shape), expected_shape,
-                msg=f"pred_keys[{l}] shape {tuple(pred_keys[l].shape)} != {expected_shape}",
-            )
-            self.assertEqual(
-                tuple(pred_values[l].shape), expected_shape,
-                msg=f"pred_values[{l}] shape {tuple(pred_values[l].shape)} != {expected_shape}",
-            )
-
-    def test_dynamics_head_gradient_flows(self):
-        """backward through dynamics_prediction_loss gives non-zero grad for dynamics head params."""
-        cfg     = _make_gru_cfg(use_dynamics_head=True)
-        updater = GatedRecurrentUpdater(cfg)
-        memory  = _make_belief_memory()
-
-        # Get predictions from the dynamics head
-        result = updater.predict_next_memory(memory)
-        self.assertIsNotNone(result)
-        pred_keys, pred_values = result
-
-        # Targets are the current memory (arbitrary — just need gradient to flow)
-        target_keys   = [memory.keys[l].detach() for l in range(N_LAYERS)]
-        target_values = [memory.values[l].detach() for l in range(N_LAYERS)]
-
-        loss = dynamics_prediction_loss(pred_keys, pred_values, target_keys, target_values)
-        loss.backward()
-
-        # Check that dynamics head parameters received non-zero gradients
-        head_params_with_grad = []
-        for name, param in updater.named_parameters():
-            if ("dynamics_key_heads" in name or "dynamics_val_heads" in name):
-                if param.grad is not None and param.grad.abs().sum().item() > 0:
-                    head_params_with_grad.append(name)
-
-        self.assertGreater(
-            len(head_params_with_grad), 0,
-            msg=(
-                "Expected at least one dynamics head parameter to have non-zero grad "
-                "after backward, but none did. "
-                "dynamics_key_heads/dynamics_val_heads params: "
-                + str([n for n, _ in updater.named_parameters()
-                       if "dynamics" in n])
-            ),
-        )
+        # The dynamics term is computed and reported...
+        self.assertIn("dynamics", log)
+        # ...and it actually moves the compactor weights (representation is trained).
+        changed = any(not torch.equal(b, p) for b, p in zip(before, updater.parameters()))
+        self.assertTrue(changed, msg="dynamics-only training did not update any compactor params")
 
 
 # ---------------------------------------------------------------------------

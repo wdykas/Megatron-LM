@@ -251,7 +251,6 @@ class GatedUpdaterConfig:
     dropout:             float = 0.0
     feature_dim:         int = 0
     share_across_layers: bool = False
-    use_dynamics_head:   bool = False
 
     def __post_init__(self) -> None:
         if self.d_kv % self.n_heads != 0:
@@ -417,20 +416,6 @@ class GatedRecurrentUpdater(MegatronModule):
         self.slot_pos = nn.Parameter(
             torch.randn(1, cfg.n_compress, cfg.d_kv) * (cfg.d_kv ** -0.5)
         )
-        n_head_sets = 1 if cfg.share_across_layers else cfg.n_attn_layers
-        if cfg.use_dynamics_head:
-            tp_group = pg_collection.tp if pg_collection is not None else None
-            lin = dict(config=config, init_method=config.init_method, gather_output=False,
-                       bias=False, skip_bias_add=False, is_expert=False, tp_group=tp_group)
-            self.dynamics_key_heads = nn.ModuleList([
-                TEColumnParallelLinear(cfg.d_kv, cfg.d_kv, **lin) for _ in range(n_head_sets)
-            ])
-            self.dynamics_val_heads = nn.ModuleList([
-                TEColumnParallelLinear(cfg.d_kv, cfg.d_kv, **lin) for _ in range(n_head_sets)
-            ])
-        else:
-            self.dynamics_key_heads = None
-            self.dynamics_val_heads = None
 
     def _module(self, l: int) -> _GatedLayerUpdater:
         return self._layer_modules[0 if self.cfg.share_across_layers else l]
@@ -484,20 +469,6 @@ class GatedRecurrentUpdater(MegatronModule):
         """BeliefUpdater-compatible interface — returns only the new memory."""
         new_memory, _, _ = self.update(memory, chunk_keys, chunk_values, features)
         return new_memory
-
-    def predict_next_memory(self, memory):
-        """Predict M_{t+1} keys and values from M_t. Returns (pred_keys, pred_values) or None."""
-        if self.dynamics_key_heads is None:
-            return None
-        pred_keys, pred_values = [], []
-        for l in range(memory.n_layers):
-            head_idx = 0 if self.cfg.share_across_layers else l
-            mk, mv = memory.layer(l)
-            pk, _ = self.dynamics_key_heads[head_idx](mk)
-            pv, _ = self.dynamics_val_heads[head_idx](mv)
-            pred_keys.append(pk)
-            pred_values.append(pv)
-        return pred_keys, pred_values
 
     def initial_compress(
         self,

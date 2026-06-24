@@ -2372,11 +2372,9 @@ def _add_rl_args(parser):
                             'Replaces kv_recon as the compactor training signal.')
     # NextLat latent-dynamics regularizers (arXiv 2511.05963) for the online compactor.
     group.add_argument('--rl-compaction-compactor-dynamics', type=float, default=0.0,
-                       help='Weight for the NextLat dynamics-prediction loss: a dedicated head predicts '
-                            'M_{t+1} from M_t, trained via SmoothL1 against stop-grad targets. '
-                            'Requires --rl-compaction-compactor-use-dynamics-head.')
-    group.add_argument('--rl-compaction-compactor-use-dynamics-head', action='store_true', default=False,
-                       help='Add a dynamics head to the GatedRecurrentUpdater (needed for the dynamics loss).')
+                       help='Weight for the NextLat dynamics loss (head-free): roll the updater forward '
+                            'on its OWN predicted next chunk to get M_pred = U(M_t, pred_R_t), then match '
+                            'the real M_{t+1} via SmoothL1 against stop-grad targets.')
     group.add_argument('--rl-compaction-compactor-future-kv-reconstruction', type=float, default=0.0,
                        help='Weight for the NextLat future-KV-reconstruction loss: old memory M_{t-1} must '
                             'answer queries drawn from the future chunk t (belief-state sufficiency test).')
