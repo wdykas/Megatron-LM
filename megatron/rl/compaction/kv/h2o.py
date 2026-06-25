@@ -10,7 +10,6 @@ from the cited paper.
 """
 from __future__ import annotations
 
-import math
 import time
 
 import torch
@@ -19,8 +18,6 @@ import torch.nn.functional as F
 from .compressors import (
     CompactionResult,
     _mass_features,
-    _attention_output,
-    _nnls_pgd,
     _fit_bias,
     _fit_values,
 )

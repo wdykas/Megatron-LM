@@ -1,7 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import json
-import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal  # Literal used by RolloutTrace.final_status

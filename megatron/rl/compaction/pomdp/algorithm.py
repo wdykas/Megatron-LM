@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 from .prompts import BELIEF_UPDATE_PROMPT_TEMPLATE
-from .types import Action, BeliefState, Observation, new_id
+from .types import Action, BeliefState, Observation
 
 logger = logging.getLogger(__name__)
 

@@ -121,8 +121,7 @@ class JsonlPomdpTraceStore:
         return ref
 
     def put_observation(self, obs: Observation) -> None:
-        run_dir = self._run_dir(obs.observation_id.split("_")[0] if "_" in obs.observation_id else "unknown")
-        # Observations are keyed by observation_id; store in per-run file.
+        # Observations are keyed by observation_id; store in a flat per-trace file.
         # We rely on callers to pass observations before transitions reference them.
         self._append_jsonl(os.path.join(self._trace_dir, "observations.jsonl"), obs.to_dict())
 

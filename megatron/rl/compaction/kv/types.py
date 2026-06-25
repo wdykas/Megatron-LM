@@ -1,6 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 

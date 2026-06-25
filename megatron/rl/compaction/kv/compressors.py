@@ -26,12 +26,10 @@ StreamingLLM:      Xiao et al., 2023  (arXiv:2309.17453)
 from __future__ import annotations
 
 import math
-import time
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 import torch
-import torch.nn.functional as F
 
 from .types import KVMask
 

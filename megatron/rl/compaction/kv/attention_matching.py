@@ -18,7 +18,6 @@ import torch
 from .compressors import (
     CompactionResult,
     _mass_features,
-    _attention_output,
     _nnls_pgd,
     _fit_bias,
     _fit_values,

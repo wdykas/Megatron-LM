@@ -17,12 +17,9 @@ This module provides:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-import torch
-
-from megatron.rl.compaction.learned.training.data import Trajectory, TrainingProbe, CompactorTrainerConfig, CompactKV, StudentFn
-from megatron.rl.compaction.learned.training.losses import CompactorLosses, CompactorLossWeights
+from megatron.rl.compaction.learned.training.data import Trajectory, TrainingProbe
 
 
 @dataclass

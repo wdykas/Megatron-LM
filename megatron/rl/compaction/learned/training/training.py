@@ -48,7 +48,7 @@ def train_compactor_trajectory(
     # All loss/weight helpers used in the per-chunk loop, hoisted here so they are
     # imported once per trajectory (not per chunk/probe) and visible in one place.
     from megatron.rl.compaction.learned.training.losses import (
-        CompactorLosses, predictive_coding_loss, consistency_loss,
+        predictive_coding_loss, consistency_loss,
         kv_reconstruction_loss, future_kv_reconstruction_loss,
         dynamics_prediction_loss, future_horizon_kl_loss,
     )
@@ -393,7 +393,6 @@ class SinglePassCompactorTrainer:
 
     def eval_step(self, keys_per_layer, values_per_layer, probes, student_fn):
         """Validation step — no gradient, no optimizer."""
-        from megatron.rl.compaction.learned.training.losses import CompactorLosses
 
         cfg = self.config
         with torch.no_grad():

@@ -36,11 +36,10 @@ student forward pass, use kv/rope.py to strip them before saving.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 
 import torch
 
-from megatron.rl.compaction.learned.training.data import CompactKV, Trajectory, TrainingProbe
+from megatron.rl.compaction.learned.training.data import Trajectory, TrainingProbe
 from megatron.rl.compaction.learned.training.data import PipelineConfig
 from megatron.rl.compaction.kv.megatron_hook import MegatronInferenceHook
 

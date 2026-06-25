@@ -1,6 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -60,7 +59,6 @@ class PomdpTrainingExporter:
 
     def export_transition(self, transition_id: str) -> CompactTrainingSample:
         transition = self._store.get_transition(transition_id)
-        belief = self._store.get_belief_state(transition.belief_state_id)
 
         # Retrieve action.
         try:
