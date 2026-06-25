@@ -1,12 +1,16 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""H2O KV compressors (heavy-hitter oracle).
+"""H2O KV compressor (Heavy-Hitter Oracle).
 
 Source: Zhang et al., 2023 (arXiv:2306.14048).
 
-Shared types/helpers (CompactionResult, KVCompressor protocol, attention-math
-primitives) live in `compressors.py`; this module holds only the algorithm(s)
-from the cited paper.
+Paper-exact policy: the retained KV budget is split between the most-recent
+tokens (recent/local window) and the heavy hitters, where a token's
+heavy-hitter score is the *accumulated* attention probability it has received
+(F_score(j) = Σ_i softmax(q_i·K)_j summed over queries i). Retained keys and
+values are kept unchanged — H2O selects, it does not refit K or V.
+
+Shared types/helpers live in `compressors.py`.
 """
 from __future__ import annotations
 
@@ -16,49 +20,39 @@ import time
 import torch
 import torch.nn.functional as F
 
-from .compressors import (
-    CompactionResult,
-    _fit_bias,
-    _fit_values,
-)
+from .compressors import CompactionResult
 
-
-# ---------------------------------------------------------------------------
-# H2OAccumulator  (paper-faithful — accumulates real softmax weights per step)
-# ---------------------------------------------------------------------------
 
 class H2OAccumulator:
-    """Paper-faithful H2O: heavy-hitter eviction from real softmax attention mass.
+    """Paper-exact H2O: recent window + heavy hitters by accumulated attention.
 
-    Online: call ``update(attn_weights)`` after every decode step with the actual
-    softmax attention weights, then ``compress()`` to evict lowest-mass tokens.
-    Offline (benchmark/eval): call ``compress(..., ref_queries=...)`` and it scores
-    keys by the total softmax attention they receive over those queries.
+    The score of a key is the total softmax attention probability it received,
+    accumulated over queries (Σ_i softmax(q_i·K)_j). The budget is split into a
+    recent window (the last ``recent_ratio`` of the budget) and heavy hitters
+    (the rest, by accumulated score). Retained K/V are the originals — no fitting.
+
+    Heavy-hitter scores come from, in priority order: ``accumulated_scores``, the
+    online state built by ``update()`` (call once per decode step), or — offline —
+    the softmax attention over ``ref_queries`` passed to ``compress()``.
 
     Parameters
     ----------
-    n_sink:     Number of initial tokens to always preserve (default 4).
-    fit_bias:   NNLS bias fitting after selection (requires ref_queries; default False).
-    fit_values: OLS value fitting after selection (requires ref_queries; default False).
+    recent_ratio: Fraction of the budget reserved for the recent window. The
+                  paper uses an even split (0.5): half recent, half heavy.
     """
 
-    def __init__(self, n_sink: int = 4, fit_bias: bool = False, fit_values: bool = False) -> None:
-        if n_sink < 0:
-            raise ValueError(f"n_sink must be >= 0, got {n_sink}")
-        self.n_sink = n_sink
-        self.fit_bias = fit_bias
-        self.fit_values = fit_values
+    def __init__(self, recent_ratio: float = 0.5) -> None:
+        if not 0.0 <= recent_ratio <= 1.0:
+            raise ValueError(f"recent_ratio must be in [0, 1], got {recent_ratio}")
+        self.recent_ratio = recent_ratio
         self._accumulated: torch.Tensor | None = None
 
     @property
     def strategy(self) -> str:
-        suffix = "+bias+values" if (self.fit_bias and self.fit_values) else \
-                 "+bias" if self.fit_bias else \
-                 "+values" if self.fit_values else ""
-        return f"h2o_paper_sink{self.n_sink}{suffix}"
+        return f"h2o_recent{self.recent_ratio:g}"
 
     def update(self, attn_weights: torch.Tensor) -> None:
-        """Accumulate attention weights from one decode step.
+        """Accumulate softmax attention weights from one decode step.
 
         attn_weights: (T,) or (H, T) — averaged over heads if 2-D.
         """
@@ -86,13 +80,7 @@ class H2OAccumulator:
         step_id: int = 0,
         accumulated_scores: torch.Tensor | None = None,
     ) -> CompactionResult:
-        """Compress by evicting the lowest-attention-mass tokens.
-
-        Heavy-hitter scores come from (in priority order): ``accumulated_scores``,
-        then the online state built by ``update()``, then — for offline benchmarking
-        — the real softmax attention mass each key receives over ``ref_queries``.
-        The offline path is paper-faithful (normalized softmax).
-        """
+        """Retain the recent window plus the top heavy hitters within ``budget``."""
         scores = accumulated_scores if accumulated_scores is not None else self._accumulated
         if scores is None:
             if ref_queries is None:
@@ -101,47 +89,36 @@ class H2OAccumulator:
                     "decode step (online), pass accumulated_scores, or pass ref_queries "
                     "to score offline."
                 )
-            # Offline H2O: total softmax attention each key received over the queries.
+            # Offline H2O score: total softmax attention each key received over the
+            # queries (the paper's accumulated-attention F_score).
             d = keys.shape[1]
             scores = torch.softmax(ref_queries @ keys.T / math.sqrt(d), dim=-1).sum(dim=0)
-        if (self.fit_bias or self.fit_values) and ref_queries is None:
-            raise ValueError("ref_queries required when fit_bias or fit_values is True.")
 
         t0 = time.perf_counter()
         T = keys.shape[0]
         budget = max(1, min(budget, T))
-        n_sink = min(self.n_sink, budget)
 
-        sink_positions = list(range(n_sink))
+        # Recent window: the last n_recent positions, always kept.
+        n_recent = min(budget, round(budget * self.recent_ratio))
+        recent_positions = list(range(T - n_recent, T)) if n_recent > 0 else []
 
-        n_heavy = budget - n_sink
-        if n_heavy > 0 and T > n_sink:
+        # Heavy hitters: top scorers among the remaining (non-recent) positions.
+        n_heavy = budget - n_recent
+        if n_heavy > 0 and T > n_recent:
             heavy_scores = scores[:T].clone()
-            heavy_scores[:n_sink] = -torch.inf
-            n_select = min(n_heavy, T - n_sink)
-            heavy_positions = sorted(heavy_scores.topk(n_select).indices.tolist())
+            heavy_scores[T - n_recent:] = -torch.inf   # exclude the recent window
+            n_select = min(n_heavy, T - n_recent)
+            heavy_positions = heavy_scores.topk(n_select).indices.tolist()
         else:
             heavy_positions = []
 
-        positions = sorted(set(sink_positions + heavy_positions))
-        C_k = keys[positions]
-
-        if self.fit_bias and ref_queries is not None:
-            beta, _ = _fit_bias(keys, C_k, ref_queries)
-        else:
-            beta = torch.zeros(len(positions), device=keys.device, dtype=keys.dtype)
-
-        if self.fit_values and ref_queries is not None:
-            C_v = _fit_values(keys, values, C_k, beta, ref_queries)
-        else:
-            C_v = values[positions]
-
+        positions = sorted(set(recent_positions + heavy_positions))
         return CompactionResult(
             run_id=run_id, step_id=step_id,
             retained_positions=positions,
-            compacted_keys=C_k, compacted_values=C_v, bias=beta,
+            compacted_keys=keys[positions],
+            compacted_values=values[positions],
+            bias=torch.zeros(len(positions), device=keys.device, dtype=keys.dtype),
             strategy=self.strategy, original_length=T,
             wall_time_s=time.perf_counter() - t0,
         )
-
-

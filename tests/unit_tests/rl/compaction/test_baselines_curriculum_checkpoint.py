@@ -47,21 +47,22 @@ def _kv_torch(n_layers=2, B=1, T=16, d=16):
 # ===========================================================================
 
 class TestH2OAccumulator:
-    def test_offline_scores_from_ref_queries(self):
-        """Offline path: scores keys by real softmax mass over ref_queries."""
-        h2o = H2OAccumulator(n_sink=2)
+    def test_recent_window_always_kept(self):
+        """The recent window (last n_recent positions) is always retained."""
+        h2o = H2OAccumulator(recent_ratio=0.5)
         K, V, Q = _kv_np(T=40)
         r = h2o.compress(K, V, 10, ref_queries=Q, run_id="r", step_id=0)
         assert isinstance(r, CompactionResult)
         assert len(r.retained_positions) == 10
-        assert all(pos in r.retained_positions for pos in range(2))
+        # recent_ratio=0.5, budget=10 -> 5 recent = last 5 positions [35..39]
+        assert all(pos in r.retained_positions for pos in range(35, 40))
         assert r.retained_positions == sorted(r.retained_positions)
 
-    def test_online_update_then_compress(self):
-        """Online path: accumulated softmax weights drive heavy-hitter selection."""
-        h2o = H2OAccumulator(n_sink=2)
+    def test_heavy_hitters_selected(self):
+        """Heavy hitters (high accumulated attention) outside recent are kept."""
+        # recent_ratio=0 -> pure heavy-hitter selection by accumulated score.
+        h2o = H2OAccumulator(recent_ratio=0.0)
         K, V, _ = _kv_np(T=20)
-        # Make positions 5 and 11 the heavy hitters via accumulated mass.
         for _ in range(3):
             w = torch.zeros(20)
             w[5] = 1.0
@@ -71,23 +72,32 @@ class TestH2OAccumulator:
         assert 5 in r.retained_positions
         assert 11 in r.retained_positions
 
-    def test_accumulated_scores_argument(self):
-        h2o = H2OAccumulator(n_sink=0, fit_bias=False, fit_values=False)
+    def test_recent_plus_heavy_split(self):
+        """Budget splits into recent window + heavy hitters from the rest."""
+        h2o = H2OAccumulator(recent_ratio=0.5)
         K, V, _ = _kv_np(T=10)
-        scores = torch.arange(10, dtype=torch.float32)
-        r = h2o.compress(K, V, 3, accumulated_scores=scores, run_id="r", step_id=0)
-        # Highest-score positions are the last three.
-        assert r.retained_positions == [7, 8, 9]
+        scores = torch.arange(10, dtype=torch.float32)  # position 9 highest, but it's recent
+        r = h2o.compress(K, V, 4, accumulated_scores=scores, run_id="r", step_id=0)
+        # budget=4, 2 recent = [8,9]; 2 heavy from [0..7] by score = [6,7]
+        assert r.retained_positions == [6, 7, 8, 9]
 
     def test_requires_scores(self):
         """Without update(), accumulated_scores, or ref_queries it must error."""
-        h2o = H2OAccumulator(n_sink=2)
+        h2o = H2OAccumulator()
         K, V, _ = _kv_np()
         with pytest.raises(RuntimeError):
             h2o.compress(K, V, 8, run_id="r", step_id=0)
 
+    def test_no_value_fitting(self):
+        """Paper-exact: retained values are the originals, bias is zero."""
+        h2o = H2OAccumulator(recent_ratio=0.0)
+        K, V, _ = _kv_np(T=10)
+        r = h2o.compress(K, V, 4, accumulated_scores=torch.arange(10.0), run_id="r", step_id=0)
+        assert torch.allclose(r.compacted_values, V[r.retained_positions])
+        assert (r.bias == 0).all()
+
     def test_reset_clears_state(self):
-        h2o = H2OAccumulator(n_sink=0)
+        h2o = H2OAccumulator()
         h2o.update(torch.ones(8))
         h2o.reset()
         K, V, _ = _kv_np(T=8)
@@ -95,13 +105,13 @@ class TestH2OAccumulator:
             h2o.compress(K, V, 4, run_id="r", step_id=0)
 
     def test_strategy_string(self):
-        assert "h2o_paper" in H2OAccumulator(n_sink=4).strategy
+        assert "h2o_recent" in H2OAccumulator().strategy
 
     def test_in_benchmark(self):
         bench = KVCompactionBenchmark()
         K, V, Q = _kv_np(T=40)
         results = bench.run(
-            compressors={"h2o": H2OAccumulator(n_sink=2)},
+            compressors={"h2o": H2OAccumulator()},
             keys=K, values=V, ref_queries=Q, eval_queries=Q, budget=10,
         )
         assert len(results) == 1
@@ -184,7 +194,7 @@ class TestStreamingLLMCompressor:
             compressors={
                 "topk":      TopKCompressor(),
                 "omp":       OMPCompressor(),
-                "h2o":       H2OAccumulator(n_sink=4),
+                "h2o":       H2OAccumulator(),
                 "streaming": StreamingLLMCompressor(n_sink=4),
             },
             keys=K, values=V, ref_queries=Q, eval_queries=Q, budget=12,
