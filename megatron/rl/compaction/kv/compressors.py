@@ -12,8 +12,8 @@ Algorithms
 ----------
 TopKCompressor         — top-k by RMS attention weight; fast heuristic baseline.
 OMPCompressor          — greedy key selection via Orthogonal Matching Pursuit.
-H2OProxyCompressor     — H2O with ref_queries as proxy for accumulated mass.
-H2OAccumulator         — paper-faithful H2O; call update() after each decode step.
+H2OAccumulator         — paper-faithful H2O heavy-hitter eviction; accumulates real
+                         softmax mass online (update()) or scores ref_queries offline.
 StreamingLLMCompressor — attention sinks + recent window; no query-based scoring.
 
 References

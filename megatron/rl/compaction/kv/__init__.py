@@ -8,7 +8,7 @@ from .selectors import (
 from .megatron_hook import MegatronInferenceHook, NullHook
 from .compressors import CompactionResult, KVCompressor
 from .attention_matching import TopKCompressor, OMPCompressor   # Zweiger et al. 2026
-from .h2o import H2OProxyCompressor, H2OAccumulator             # Zhang et al. 2023
+from .h2o import H2OAccumulator                                 # Zhang et al. 2023
 from .streaming_llm import StreamingLLMCompressor               # Xiao et al. 2023
 from .benchmark import KVCompactionBenchmark, CompactionBenchmarkResult
 
@@ -22,7 +22,6 @@ __all__ = [
     "KVCompressor",
     "TopKCompressor",
     "OMPCompressor",
-    "H2OProxyCompressor",
     "H2OAccumulator",
     "StreamingLLMCompressor",
     "KVCompactionBenchmark",

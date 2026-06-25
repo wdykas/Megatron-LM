@@ -9,7 +9,6 @@ import numpy as np
 import torch
 
 from megatron.rl.compaction.kv import (
-    H2OProxyCompressor,
     H2OAccumulator,
     StreamingLLMCompressor,
     CompactionResult,
@@ -41,70 +40,6 @@ def _kv_torch(n_layers=2, B=1, T=16, d=16):
     keys   = [torch.randn(B, T, d) for _ in range(n_layers)]
     values = [torch.randn(B, T, d) for _ in range(n_layers)]
     return keys, values
-
-
-# ===========================================================================
-# H2OProxyCompressor
-# ===========================================================================
-
-class TestH2OProxyCompressor:
-    def test_result_type(self):
-        h2o = H2OProxyCompressor()
-        K, V, Q = _kv_np()
-        r = h2o.compress(K, V, 8, ref_queries=Q, run_id="r", step_id=0)
-        assert isinstance(r, CompactionResult)
-
-    def test_budget_respected(self):
-        h2o = H2OProxyCompressor(n_sink=2)
-        K, V, Q = _kv_np(T=40)
-        r = h2o.compress(K, V, 10, ref_queries=Q, run_id="r", step_id=0)
-        assert len(r.retained_positions) == 10
-
-    def test_sink_positions_always_included(self):
-        h2o = H2OProxyCompressor(n_sink=4)
-        K, V, Q = _kv_np(T=30)
-        r = h2o.compress(K, V, 8, ref_queries=Q, run_id="r", step_id=0)
-        assert all(pos in r.retained_positions for pos in range(4))
-
-    def test_positions_sorted(self):
-        h2o = H2OProxyCompressor(n_sink=2)
-        K, V, Q = _kv_np(T=20)
-        r = h2o.compress(K, V, 6, ref_queries=Q, run_id="r", step_id=0)
-        assert r.retained_positions == sorted(r.retained_positions)
-
-    def test_budget_larger_than_T(self):
-        h2o = H2OProxyCompressor(n_sink=2)
-        K, V, Q = _kv_np(T=5)
-        r = h2o.compress(K, V, 20, ref_queries=Q, run_id="r", step_id=0)
-        assert len(r.retained_positions) == 5
-
-    def test_no_bias_option(self):
-        h2o = H2OProxyCompressor(n_sink=2, fit_bias=False, fit_values=False)
-        K, V, Q = _kv_np()
-        r = h2o.compress(K, V, 8, ref_queries=Q, run_id="r", step_id=0)
-        assert (r.bias == 0).all()
-
-    def test_strategy_string(self):
-        h2o = H2OProxyCompressor(n_sink=4)
-        assert "h2o" in h2o.strategy
-        assert "sink4" in h2o.strategy
-
-    def test_n_sink_zero(self):
-        h2o = H2OProxyCompressor(n_sink=0, fit_bias=False, fit_values=False)
-        K, V, Q = _kv_np()
-        r = h2o.compress(K, V, 8, ref_queries=Q, run_id="r", step_id=0)
-        assert len(r.retained_positions) == 8
-
-    def test_in_benchmark(self):
-        """H2O plugs into KVCompactionBenchmark without error."""
-        bench = KVCompactionBenchmark()
-        K, V, Q = _kv_np(T=40)
-        results = bench.run(
-            compressors={"h2o": H2OProxyCompressor(n_sink=2)},
-            keys=K, values=V, ref_queries=Q, eval_queries=Q, budget=10,
-        )
-        assert len(results) == 1
-        assert results[0].algorithm == "h2o"
 
 
 # ===========================================================================
@@ -249,7 +184,7 @@ class TestStreamingLLMCompressor:
             compressors={
                 "topk":      TopKCompressor(),
                 "omp":       OMPCompressor(),
-                "h2o":       H2OProxyCompressor(n_sink=4),
+                "h2o":       H2OAccumulator(n_sink=4),
                 "streaming": StreamingLLMCompressor(n_sink=4),
             },
             keys=K, values=V, ref_queries=Q, eval_queries=Q, budget=12,
