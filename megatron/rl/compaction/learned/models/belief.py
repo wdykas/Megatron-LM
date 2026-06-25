@@ -38,7 +38,6 @@ from megatron.rl.compaction.learned.models.compactor import (
     CrossAttention,
     FeedForward,
     compactor_transformer_config,
-    _count_attention_layers,
 )
 
 
@@ -224,18 +223,16 @@ class BeliefUpdater(nn.Module):
 class GatedUpdaterConfig:
     """Configuration for GatedRecurrentUpdater.
 
-    Use ``GatedUpdaterConfig.from_transformer_config()`` to construct — do not
-    set ``d_kv`` or ``n_attn_layers`` by hand.
+    ``d_kv`` and ``n_attn_layers`` come from the actual captured KV (each rank's
+    local partition dim and the number of attention layers that exposed a KV cache
+    in the forward pass — see capture/kv_capture.py), not from a model config.
 
     Attributes
     ----------
     n_compress:          Number of compact slots C (memory budget).
     n_heads:             Number of attention heads.
-    d_kv:                Flattened KV dimension per token
-                         (= kv_channels × num_query_groups from TransformerConfig).
-                         Set automatically by ``from_transformer_config``.
-    n_attn_layers:       Number of attention layers (excludes Mamba layers).
-                         Set automatically by ``from_transformer_config``.
+    d_kv:                Flattened KV dimension per token (captured local KV width).
+    n_attn_layers:       Number of attention layers that produced a captured KV cache.
     d_ff:                Feed-forward hidden dim. Default: 4 × d_kv.
     dropout:             Dropout rate.
     share_across_layers: If True, one set of updater weights for all layers.
@@ -258,25 +255,6 @@ class GatedUpdaterConfig:
             raise ValueError(f"n_compress must be >= 1, got {self.n_compress}")
         if self.n_attn_layers < 1:
             raise ValueError(f"n_attn_layers must be >= 1, got {self.n_attn_layers}")
-
-    @classmethod
-    def from_transformer_config(
-        cls,
-        transformer_config,
-        n_compress: int,
-        n_heads: int = 8,
-        **kwargs,
-    ) -> "GatedUpdaterConfig":
-        """Construct from a Megatron TransformerConfig."""
-        d_kv = transformer_config.kv_channels * transformer_config.num_query_groups
-        n_attn_layers = _count_attention_layers(transformer_config)
-        return cls(
-            n_compress=n_compress,
-            n_heads=n_heads,
-            d_kv=d_kv,
-            n_attn_layers=n_attn_layers,
-            **kwargs,
-        )
 
     @property
     def ff_dim(self) -> int:

@@ -82,20 +82,6 @@ def compactor_transformer_config(
 
 
 # ---------------------------------------------------------------------------
-# Helper: count attention layers from a TransformerConfig
-# ---------------------------------------------------------------------------
-
-def _count_attention_layers(transformer_config) -> int:
-    """Return the number of attention (non-Mamba) layers in the model."""
-    pattern = getattr(transformer_config, 'hybrid_layer_pattern', None)
-    if not pattern:
-        return transformer_config.num_layers
-    from megatron.core.ssm.mamba_hybrid_layer_allocation import get_hybrid_layer_counts
-    counts = get_hybrid_layer_counts(pattern)
-    return sum(v for k, v in counts.items() if k not in ('M', '*'))
-
-
-# ---------------------------------------------------------------------------
 # Building blocks (standard Megatron modules, replicated)
 # ---------------------------------------------------------------------------
 
@@ -187,8 +173,9 @@ class FeedForward(nn.Module):
 class PerceiverConfig:
     """Configuration for the PerceiverCompactor.
 
-    Use ``PerceiverConfig.from_transformer_config()`` to construct — do not
-    set ``d_kv`` or ``n_attn_layers`` by hand.
+    ``d_kv`` and ``n_attn_layers`` come from the actual captured KV (each rank's
+    local partition dim and the number of attention layers that exposed a KV cache
+    in the forward pass — see capture/kv_capture.py), not from a model config.
     """
 
     n_compress: int
@@ -206,13 +193,6 @@ class PerceiverConfig:
             raise ValueError(f"n_compress must be >= 1, got {self.n_compress}")
         if self.n_attn_layers < 1:
             raise ValueError(f"n_attn_layers must be >= 1, got {self.n_attn_layers}")
-
-    @classmethod
-    def from_transformer_config(cls, transformer_config, n_compress: int, n_heads: int = 8, **kwargs) -> "PerceiverConfig":
-        """Construct from a Megatron TransformerConfig (derives d_kv, n_attn_layers)."""
-        d_kv = transformer_config.kv_channels * transformer_config.num_query_groups
-        n_attn_layers = _count_attention_layers(transformer_config)
-        return cls(n_compress=n_compress, n_heads=n_heads, d_kv=d_kv, n_attn_layers=n_attn_layers, **kwargs)
 
     @property
     def d_head(self) -> int:
