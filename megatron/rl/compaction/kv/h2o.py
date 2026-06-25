@@ -10,6 +10,7 @@ from the cited paper.
 """
 from __future__ import annotations
 
+import math
 import time
 
 import torch
@@ -115,12 +116,12 @@ class H2OProxyCompressor:
 # ---------------------------------------------------------------------------
 
 class H2OAccumulator:
-    """Paper-faithful H2O: accumulates real softmax attention weights across steps.
+    """Paper-faithful H2O: heavy-hitter eviction from real softmax attention mass.
 
-    Call ``update(attn_weights)`` after every decode step with the actual
-    softmax attention weights. Then call ``compress()`` to evict lowest-mass tokens.
-
-    For offline benchmarking without per-step weights use H2OProxyCompressor.
+    Online: call ``update(attn_weights)`` after every decode step with the actual
+    softmax attention weights, then ``compress()`` to evict lowest-mass tokens.
+    Offline (benchmark/eval): call ``compress(..., ref_queries=...)`` and it scores
+    keys by the total softmax attention they receive over those queries.
 
     Parameters
     ----------
@@ -173,17 +174,25 @@ class H2OAccumulator:
         step_id: int = 0,
         accumulated_scores: torch.Tensor | None = None,
     ) -> CompactionResult:
-        """Compress using accumulated attention weights.
+        """Compress by evicting the lowest-attention-mass tokens.
 
-        ref_queries: required only when fit_bias or fit_values is True.
-        accumulated_scores: override internal state (useful for offline testing).
+        Heavy-hitter scores come from (in priority order): ``accumulated_scores``,
+        then the online state built by ``update()``, then — for offline benchmarking
+        — the real softmax attention mass each key receives over ``ref_queries``.
+        The last path is paper-faithful (normalized softmax), unlike
+        H2OProxyCompressor's cheaper unnormalized-exp approximation.
         """
         scores = accumulated_scores if accumulated_scores is not None else self._accumulated
         if scores is None:
-            raise RuntimeError(
-                "No accumulated attention weights. "
-                "Call update() after each decode step, or pass accumulated_scores."
-            )
+            if ref_queries is None:
+                raise RuntimeError(
+                    "H2OAccumulator needs heavy-hitter scores: call update() after each "
+                    "decode step (online), pass accumulated_scores, or pass ref_queries "
+                    "to score offline."
+                )
+            # Offline H2O: total softmax attention each key received over the queries.
+            d = keys.shape[1]
+            scores = torch.softmax(ref_queries @ keys.T / math.sqrt(d), dim=-1).sum(dim=0)
         if (self.fit_bias or self.fit_values) and ref_queries is None:
             raise ValueError("ref_queries required when fit_bias or fit_values is True.")
 

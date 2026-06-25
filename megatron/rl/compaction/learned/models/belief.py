@@ -97,17 +97,6 @@ class BeliefMemory:
             step=0,
         )
 
-    @classmethod
-    def zero_from_compactor(
-        cls,
-        compactor,
-        batch: int,
-        device: torch.device | str | None = None,
-    ) -> "BeliefMemory":
-        """Create zero belief matching a compactor's dimensions."""
-        cfg = compactor.cfg
-        return cls.zero(cfg.n_attn_layers, batch, cfg.n_compress, cfg.d_kv, device=device)
-
     # --- utilities ---------------------------------------------------------
 
     def layer(self, l: int) -> tuple[torch.Tensor, torch.Tensor]:

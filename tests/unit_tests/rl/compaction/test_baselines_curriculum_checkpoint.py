@@ -10,6 +10,7 @@ import torch
 
 from megatron.rl.compaction.kv import (
     H2OProxyCompressor,
+    H2OAccumulator,
     StreamingLLMCompressor,
     CompactionResult,
 )
@@ -100,6 +101,72 @@ class TestH2OProxyCompressor:
         K, V, Q = _kv_np(T=40)
         results = bench.run(
             compressors={"h2o": H2OProxyCompressor(n_sink=2)},
+            keys=K, values=V, ref_queries=Q, eval_queries=Q, budget=10,
+        )
+        assert len(results) == 1
+        assert results[0].algorithm == "h2o"
+
+
+# ===========================================================================
+# H2OAccumulator  (paper-faithful true H2O — the eval baseline)
+# ===========================================================================
+
+class TestH2OAccumulator:
+    def test_offline_scores_from_ref_queries(self):
+        """Offline path: scores keys by real softmax mass over ref_queries."""
+        h2o = H2OAccumulator(n_sink=2)
+        K, V, Q = _kv_np(T=40)
+        r = h2o.compress(K, V, 10, ref_queries=Q, run_id="r", step_id=0)
+        assert isinstance(r, CompactionResult)
+        assert len(r.retained_positions) == 10
+        assert all(pos in r.retained_positions for pos in range(2))
+        assert r.retained_positions == sorted(r.retained_positions)
+
+    def test_online_update_then_compress(self):
+        """Online path: accumulated softmax weights drive heavy-hitter selection."""
+        h2o = H2OAccumulator(n_sink=2)
+        K, V, _ = _kv_np(T=20)
+        # Make positions 5 and 11 the heavy hitters via accumulated mass.
+        for _ in range(3):
+            w = torch.zeros(20)
+            w[5] = 1.0
+            w[11] = 0.8
+            h2o.update(w)
+        r = h2o.compress(K, V, 6, run_id="r", step_id=0)
+        assert 5 in r.retained_positions
+        assert 11 in r.retained_positions
+
+    def test_accumulated_scores_argument(self):
+        h2o = H2OAccumulator(n_sink=0, fit_bias=False, fit_values=False)
+        K, V, _ = _kv_np(T=10)
+        scores = torch.arange(10, dtype=torch.float32)
+        r = h2o.compress(K, V, 3, accumulated_scores=scores, run_id="r", step_id=0)
+        # Highest-score positions are the last three.
+        assert r.retained_positions == [7, 8, 9]
+
+    def test_requires_scores(self):
+        """Without update(), accumulated_scores, or ref_queries it must error."""
+        h2o = H2OAccumulator(n_sink=2)
+        K, V, _ = _kv_np()
+        with pytest.raises(RuntimeError):
+            h2o.compress(K, V, 8, run_id="r", step_id=0)
+
+    def test_reset_clears_state(self):
+        h2o = H2OAccumulator(n_sink=0)
+        h2o.update(torch.ones(8))
+        h2o.reset()
+        K, V, _ = _kv_np(T=8)
+        with pytest.raises(RuntimeError):
+            h2o.compress(K, V, 4, run_id="r", step_id=0)
+
+    def test_strategy_string(self):
+        assert "h2o_paper" in H2OAccumulator(n_sink=4).strategy
+
+    def test_in_benchmark(self):
+        bench = KVCompactionBenchmark()
+        K, V, Q = _kv_np(T=40)
+        results = bench.run(
+            compressors={"h2o": H2OAccumulator(n_sink=2)},
             keys=K, values=V, ref_queries=Q, eval_queries=Q, budget=10,
         )
         assert len(results) == 1
