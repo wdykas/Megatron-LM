@@ -127,11 +127,12 @@ class TestGetKvMatrices:
         hook = MegatronInferenceHook(ctx)
         assert hook.get_kv_matrices() is None
 
-    def test_returns_none_for_mla(self):
+    def test_raises_for_mla(self):
         ctx = _make_context()
         ctx.cache_mla_latent = True
         hook = MegatronInferenceHook(ctx)
-        assert hook.get_kv_matrices() is None
+        with pytest.raises(NotImplementedError, match="MLA"):
+            hook.get_kv_matrices()
 
     def test_seq_len_partial_block(self):
         # 6 tokens in 2 blocks of size 4: block 0 full, block 1 has 2 tokens
@@ -167,6 +168,13 @@ class TestGetAttentionScores:
         ctx.total_request_count = 0
         hook = MegatronInferenceHook(ctx)
         assert hook.approx_attention_scores() == []
+
+    def test_raises_for_mla(self):
+        ctx = _make_context()
+        ctx.cache_mla_latent = True
+        hook = MegatronInferenceHook(ctx)
+        with pytest.raises(NotImplementedError, match="MLA"):
+            hook.approx_attention_scores()
 
     def test_scores_are_positive(self):
         ctx = _make_context(seq_len=10)
@@ -251,18 +259,20 @@ class TestApplyMask:
         v0 = buf[0, 0, bid0, 0, 0, 0].item()
         assert abs(v0 - 3.0) < 1e-5  # token 2 (0-indexed) had value 3.0
 
-    def test_no_op_when_no_active_requests(self):
+    def test_raises_when_no_active_requests(self):
         ctx = _make_context(seq_len=8)
         ctx.total_request_count = 0
         hook = MegatronInferenceHook(ctx)
         mask = self._make_mask([0, 1], 8)
-        hook.apply_mask(mask)   # must not raise
+        with pytest.raises(RuntimeError):
+            hook.apply_mask(mask)
 
-    def test_no_op_when_no_buffer(self):
+    def test_raises_when_no_buffer(self):
         ctx = _make_context(seq_len=8)
         ctx.memory_buffer = None
         hook = MegatronInferenceHook(ctx)
-        hook.apply_mask(self._make_mask([0], 8))   # must not raise
+        with pytest.raises(RuntimeError):
+            hook.apply_mask(self._make_mask([0], 8))
 
     def test_cross_block_boundary(self):
         # Keep tokens 3 and 4 which span block 0 (pos 3) and block 1 (pos 0)
@@ -356,12 +366,13 @@ class TestApplyBeliefMemory:
         with pytest.raises(RuntimeError, match="batch size"):
             hook.apply_belief_memory(memory)
 
-    def test_no_op_when_no_active(self):
+    def test_raises_when_no_active(self):
         ctx = _make_context(seq_len=4)
         ctx.total_request_count = 0
         hook = MegatronInferenceHook(ctx)
         memory = self._make_memory(n_layers=1, B=1, C=3, d_model=4)
-        hook.apply_belief_memory(memory)  # must not raise
+        with pytest.raises(RuntimeError):
+            hook.apply_belief_memory(memory)
 
     def test_budget_larger_than_block_size(self):
         ctx = _make_context(n_layers=1, n_heads=1, d_head=4, block_size=4, seq_len=4)
@@ -371,6 +382,23 @@ class TestApplyBeliefMemory:
         hook.apply_belief_memory(memory)
         assert ctx.request_kv_block_counts[0].item() == 3
         assert ctx.request_last_kv_block_offset[0].item() == 0  # (9-1)%4=0
+
+    def test_for_request_injects_single(self):
+        # paused=1 so request 0 is paused and request 1 is the single active one.
+        ctx = _make_context(n_layers=2, n_heads=1, d_head=4, block_size=4, seq_len=8, paused=1)
+        hook = MegatronInferenceHook(ctx)
+        C = 3
+        memory = self._make_memory(n_layers=2, B=1, C=C, d_model=4)
+        hook.apply_belief_memory_for_request(0, memory)
+        assert ctx.request_kv_block_counts[1].item() == 1
+        assert ctx.request_last_kv_block_offset[1].item() == 2
+
+    def test_for_request_raises_out_of_range(self):
+        ctx = _make_context(seq_len=4)
+        hook = MegatronInferenceHook(ctx)
+        memory = self._make_memory(n_layers=1, B=1, C=3, d_model=4)
+        with pytest.raises(RuntimeError, match="b_local"):
+            hook.apply_belief_memory_for_request(5, memory)
 
 
 # ---------------------------------------------------------------------------

@@ -100,6 +100,34 @@ class MegatronInferenceHook:
         return cls(context, tp_group=tp_group)
 
     # ------------------------------------------------------------------
+    # Shared context access
+    # ------------------------------------------------------------------
+
+    def _context_kv(self) -> tuple[Any, torch.Tensor, int] | None:
+        """Return (ctx, memory_buffer, n_active) for the live cache.
+
+        Returns None when there is no KV to read yet — the cache is not
+        allocated or no requests are active.  This is a normal transient state
+        for callers that poll every step.
+
+        Hard-fails (NotImplementedError) on MLA caches: their latent KV layout
+        is unsupported, so silently skipping would hide a misconfiguration.
+        """
+        ctx = self._ctx
+        if getattr(ctx, "cache_mla_latent", False):
+            raise NotImplementedError(
+                "MLA (multi-latent attention) KV caches use a different layout and "
+                "are not supported by KV compaction."
+            )
+        buf = getattr(ctx, "memory_buffer", None)
+        if buf is None:
+            return None
+        n_active = ctx.total_request_count - ctx.paused_request_count
+        if n_active <= 0:
+            return None
+        return ctx, buf, n_active
+
+    # ------------------------------------------------------------------
     # InferenceEngineHook protocol
     # ------------------------------------------------------------------
 
@@ -115,14 +143,10 @@ class MegatronInferenceHook:
         Returns a flat list of floats (one per KV position) for the FIRST
         active request.  Returns [] when no active request or KV unavailable.
         """
-        ctx = self._ctx
-        if not hasattr(ctx, "memory_buffer") or ctx.memory_buffer is None:
+        got = self._context_kv()
+        if got is None:
             return []
-        if getattr(ctx, "cache_mla_latent", False):
-            return []
-        n_active = ctx.total_request_count - ctx.paused_request_count
-        if n_active <= 0:
-            return []
+        ctx, buf, _ = got
 
         b_global = ctx.paused_request_count  # first active request
         BS = ctx.block_size_tokens
@@ -133,7 +157,6 @@ class MegatronInferenceHook:
             return []
 
         block_ids = ctx.request_to_kv_block_ids[b_global, :n_blocks]
-        buf = ctx.memory_buffer   # (2, n_layers, total_blocks, BS, H, D)
         n_layers = ctx.num_attention_layers
 
         # keys: (n_layers, n_blocks, BS, H, D) → (n_layers, seq_len, H*D)
@@ -159,22 +182,19 @@ class MegatronInferenceHook:
         schedule.  For per-request selection, extend KVMask with a batch
         dimension.
         """
-        ctx = self._ctx
-        if not hasattr(ctx, "memory_buffer") or ctx.memory_buffer is None:
-            return
-        if getattr(ctx, "cache_mla_latent", False):
-            return
+        got = self._context_kv()
+        if got is None:
+            raise RuntimeError(
+                "apply_mask: no live KV cache to compact (engine not allocated "
+                "or no active requests)."
+            )
+        ctx, buf, n_active = got
 
         retained = sorted(mask.retained_positions)
         n_retained = len(retained)
         if n_retained == 0:
-            return
+            raise RuntimeError("apply_mask: retained_positions is empty; nothing to keep.")
 
-        n_active = ctx.total_request_count - ctx.paused_request_count
-        if n_active <= 0:
-            return
-
-        buf = ctx.memory_buffer   # (2, n_layers, total_blocks, BS, H, D)
         BS = ctx.block_size_tokens
         n_layers = ctx.num_attention_layers
 
@@ -233,24 +253,13 @@ class MegatronInferenceHook:
         With all_gather=True, H_local is replaced by the full num_attention_heads
         after an all-gather across the TP group.
 
-        Returns None when:
-            • No active requests are currently in the context.
-            • The model uses MLA (multi-latent attention) — not yet supported.
-            • memory_buffer is not yet allocated.
+        Returns None when no active requests are in the context or the
+        memory_buffer is not yet allocated.  Hard-fails on MLA caches.
         """
-        ctx = self._ctx
-
-        if not hasattr(ctx, "memory_buffer") or ctx.memory_buffer is None:
+        got = self._context_kv()
+        if got is None:
             return None
-
-        if ctx.cache_mla_latent:
-            # MLA format: (n_layers, total_blocks, block_size, kv_reduced_dim)
-            # Different layout — not yet supported for compaction research.
-            return None
-
-        n_active = ctx.total_request_count - ctx.paused_request_count
-        if n_active <= 0:
-            return None
+        ctx, buf, n_active = got
 
         active_slice = slice(ctx.paused_request_count, ctx.total_request_count)
         block_counts = ctx.request_kv_block_counts[active_slice].cpu()          # (B,)
@@ -263,7 +272,6 @@ class MegatronInferenceHook:
         max_seq = int(seq_lens.max().item())
         B = n_active
 
-        buf = ctx.memory_buffer   # (2, n_layers, total_blocks, BS, H_local, d_head)
         n_layers = ctx.num_attention_layers
         H = ctx.num_attention_heads_per_partition
         D = ctx.hidden_size_per_attention_head
@@ -308,135 +316,34 @@ class MegatronInferenceHook:
 
         return keys_per_layer, vals_per_layer
 
-    def apply_belief_memory(self, memory: Any) -> None:
-        """Inject compact BeliefMemory into the live KV cache.
+    def _inject_compact_request(
+        self,
+        ctx: Any,
+        buf: torch.Tensor,
+        b_global: int,
+        keys: torch.Tensor,   # (n_layers, C, d_model)
+        values: torch.Tensor,  # (n_layers, C, d_model)
+    ) -> None:
+        """Replace one request's paged KV with the C compact synthetic tokens.
 
-        Replaces the current paged KV for every active request with the C
-        synthetic tokens from ``memory``.  The old blocks are freed and new
-        blocks (ceil(C / block_size)) are allocated and filled.
-
-        ``memory.keys`` shape: (n_layers, B, C, d_model)
-        ``memory.values`` shape: (n_layers, B, C, d_model)
-
-        where d_model = H_local * d_head (TP-partition-local).
-        B must equal the number of active requests.
-
-        Raises RuntimeError when the block allocator cannot satisfy the
-        allocation (out of KV memory).
+        Frees the request's old blocks, allocates ceil(C / block_size) fresh
+        blocks, writes the compact KV into them, and updates the metadata.
+        Raises RuntimeError when the allocator is exhausted.
         """
-        ctx = self._ctx
-        if not hasattr(ctx, "memory_buffer") or ctx.memory_buffer is None:
-            return
-        if getattr(ctx, "cache_mla_latent", False):
-            return
-
-        n_active = ctx.total_request_count - ctx.paused_request_count
-        if n_active <= 0:
-            return
-
-        buf = ctx.memory_buffer   # (2, n_layers, total_blocks, BS, H, D)
         BS = ctx.block_size_tokens
         n_layers = ctx.num_attention_layers
         H, D = buf.shape[-2], buf.shape[-1]
-
-        # memory.keys: (n_layers, B, C, d_model)
-        compact_keys = memory.keys    # stays on its device (possibly different from buf)
-        compact_vals = memory.values
-        B_mem, C = compact_keys.shape[1], compact_keys.shape[2]
-
-        if B_mem != n_active:
-            raise RuntimeError(
-                f"apply_belief_memory: memory batch size {B_mem} != "
-                f"active request count {n_active}"
-            )
-
+        C = keys.shape[1]
         n_new_blocks = math.ceil(C / BS)
-        new_last_offset = (C - 1) % BS
 
-        for b_local in range(n_active):
-            b_global = ctx.paused_request_count + b_local
-            n_old_blocks = int(ctx.request_kv_block_counts[b_global].item())
-            old_block_ids = ctx.request_to_kv_block_ids[b_global, :n_old_blocks].to(buf.device)
-
-            # Allocate fresh blocks for compact memory
-            new_block_ids = ctx.block_allocator.allocate_memory_blocks(n_new_blocks)
-            if new_block_ids is None:
-                raise RuntimeError(
-                    f"apply_belief_memory: cannot allocate {n_new_blocks} KV blocks "
-                    f"(allocator exhausted).  Reduce n_compress or increase kv-cache-size."
-                )
-            new_block_ids = new_block_ids.to(buf.device)
-
-            # Free old blocks
-            ctx.block_allocator.release_memory_blocks(old_block_ids)
-            ctx.request_to_kv_block_ids[b_global, :n_old_blocks] = -1
-
-            # Write compact KV into new blocks
-            # compact_keys[layer, b_local] shape: (C, d_model) = (C, H*D)
-            for layer in range(n_layers):
-                k_compact = compact_keys[layer, b_local].to(buf.device)  # (C, H*D)
-                v_compact = compact_vals[layer, b_local].to(buf.device)
-
-                # Reshape: (C, H, D)
-                k_compact = k_compact.reshape(C, H, D)
-                v_compact = v_compact.reshape(C, H, D)
-
-                for bi in range(n_new_blocks):
-                    start = bi * BS
-                    end = min(start + BS, C)
-                    chunk = end - start
-                    buf[0, layer, new_block_ids[bi], :chunk] = k_compact[start:end]
-                    buf[1, layer, new_block_ids[bi], :chunk] = v_compact[start:end]
-
-            # Update metadata
-            ctx.request_to_kv_block_ids[b_global, :n_new_blocks] = new_block_ids
-            ctx.request_kv_block_counts[b_global] = n_new_blocks
-            ctx.request_last_kv_block_offset[b_global] = new_last_offset
-
-    def apply_belief_memory_for_request(self, b_local: int, memory: Any) -> None:
-        """Inject compact BeliefMemory into the KV cache for a single request.
-
-        Same as apply_belief_memory() but operates on one batch element only.
-        ``memory`` must have batch size 1 (memory.keys shape: (n_layers, 1, C, d_model)).
-
-        This is the per-request variant used by BeliefServerCompactor when
-        the engine has multiple active requests and only one needs updating.
-        """
-        ctx = self._ctx
-        if not hasattr(ctx, "memory_buffer") or ctx.memory_buffer is None:
-            return
-        if getattr(ctx, "cache_mla_latent", False):
-            return
-
-        n_active = ctx.total_request_count - ctx.paused_request_count
-        if b_local >= n_active:
-            raise RuntimeError(
-                f"apply_belief_memory_for_request: b_local={b_local} >= "
-                f"n_active={n_active}"
-            )
-
-        buf = ctx.memory_buffer   # (2, n_layers, total_blocks, BS, H, D)
-        BS = ctx.block_size_tokens
-        n_layers = ctx.num_attention_layers
-        H, D = buf.shape[-2], buf.shape[-1]
-
-        # memory.keys: (n_layers, 1, C, d_model)
-        C = memory.keys.shape[2]
-        compact_keys = memory.keys   # (n_layers, 1, C, d_model)
-        compact_vals = memory.values
-
-        n_new_blocks = math.ceil(C / BS)
-        new_last_offset = (C - 1) % BS
-
-        b_global = ctx.paused_request_count + b_local
         n_old_blocks = int(ctx.request_kv_block_counts[b_global].item())
         old_block_ids = ctx.request_to_kv_block_ids[b_global, :n_old_blocks].to(buf.device)
 
         new_block_ids = ctx.block_allocator.allocate_memory_blocks(n_new_blocks)
         if new_block_ids is None:
             raise RuntimeError(
-                f"apply_belief_memory_for_request: cannot allocate {n_new_blocks} "
-                "KV blocks (allocator exhausted)."
+                f"apply_belief_memory: cannot allocate {n_new_blocks} KV blocks "
+                "(allocator exhausted). Reduce n_compress or increase kv-cache-size."
             )
         new_block_ids = new_block_ids.to(buf.device)
 
@@ -444,10 +351,8 @@ class MegatronInferenceHook:
         ctx.request_to_kv_block_ids[b_global, :n_old_blocks] = -1
 
         for layer in range(n_layers):
-            k_compact = compact_keys[layer, 0].to(buf.device)   # (C, d_model)
-            v_compact = compact_vals[layer, 0].to(buf.device)
-            k_compact = k_compact.reshape(C, H, D)
-            v_compact = v_compact.reshape(C, H, D)
+            k_compact = keys[layer].to(buf.device).reshape(C, H, D)
+            v_compact = values[layer].to(buf.device).reshape(C, H, D)
             for bi in range(n_new_blocks):
                 start = bi * BS
                 end = min(start + BS, C)
@@ -457,4 +362,58 @@ class MegatronInferenceHook:
 
         ctx.request_to_kv_block_ids[b_global, :n_new_blocks] = new_block_ids
         ctx.request_kv_block_counts[b_global] = n_new_blocks
-        ctx.request_last_kv_block_offset[b_global] = new_last_offset
+        ctx.request_last_kv_block_offset[b_global] = (C - 1) % BS
+
+    def apply_belief_memory(self, memory: Any) -> None:
+        """Inject compact BeliefMemory into the live KV cache for every request.
+
+        Replaces the current paged KV for each active request with the C
+        synthetic tokens from ``memory`` (keys/values shape
+        (n_layers, B, C, d_model), d_model = H_local * d_head). B must equal the
+        number of active requests. Raises RuntimeError on allocator exhaustion.
+        """
+        got = self._context_kv()
+        if got is None:
+            raise RuntimeError(
+                "apply_belief_memory: no live KV cache (engine not allocated "
+                "or no active requests)."
+            )
+        ctx, buf, n_active = got
+
+        B_mem = memory.keys.shape[1]
+        if B_mem != n_active:
+            raise RuntimeError(
+                f"apply_belief_memory: memory batch size {B_mem} != "
+                f"active request count {n_active}"
+            )
+
+        for b_local in range(n_active):
+            b_global = ctx.paused_request_count + b_local
+            self._inject_compact_request(
+                ctx, buf, b_global, memory.keys[:, b_local], memory.values[:, b_local]
+            )
+
+    def apply_belief_memory_for_request(self, b_local: int, memory: Any) -> None:
+        """Inject compact BeliefMemory into the KV cache for a single request.
+
+        Same as apply_belief_memory() but for one batch element; ``memory`` has
+        batch size 1 (keys shape (n_layers, 1, C, d_model)). Used by
+        BeliefServerCompactor when only one of several active requests updates.
+        """
+        got = self._context_kv()
+        if got is None:
+            raise RuntimeError(
+                "apply_belief_memory_for_request: no live KV cache (engine not "
+                "allocated or no active requests)."
+            )
+        ctx, buf, n_active = got
+        if b_local >= n_active:
+            raise RuntimeError(
+                f"apply_belief_memory_for_request: b_local={b_local} >= "
+                f"n_active={n_active}"
+            )
+
+        b_global = ctx.paused_request_count + b_local
+        self._inject_compact_request(
+            ctx, buf, b_global, memory.keys[:, 0], memory.values[:, 0]
+        )
