@@ -16,13 +16,12 @@ Usage
 
     # During prefill:
     engine.prefill(prompt_tokens)
-    collector.on_step(len(prompt_tokens), teacher_logits=engine.last_logits,
-                      query_tokens=prompt_tokens)
+    collector.on_step(teacher_logits=engine.last_logits, query_tokens=prompt_tokens)
 
     # During decode:
     for _ in range(max_new_tokens):
         engine.step(...)
-        collector.on_step(1)
+        collector.on_step()
 
     trajectory = collector.end_rollout()
 
@@ -68,7 +67,6 @@ class HookTrajectoryCollector:
         self._chunks: list[tuple[list[torch.Tensor], list[torch.Tensor]]] = []
         self._probes_by_chunk: dict[int, list[TrainingProbe]] = {}
         self._chunk_start_len: int = 0
-        self._cumul_kv_len: int = 0
         self._probe_count: int = 0
 
     # ------------------------------------------------------------------
@@ -80,24 +78,22 @@ class HookTrajectoryCollector:
         self._chunks = []
         self._probes_by_chunk = {}
         self._chunk_start_len = 0
-        self._cumul_kv_len = 0
         self._probe_count = 0
 
     def on_step(
         self,
-        n_new_tokens: int,
         teacher_logits: torch.Tensor | None = None,  # (B, n_new, vocab)
         query_tokens: torch.Tensor | None = None,    # (B, n_new)
         answer_tokens: torch.Tensor | None = None,   # (B, n_ans) — gold targets for task loss
     ) -> None:
-        """Record one inference step.
+        """Record one inference step, cutting any newly-completed chunks.
 
-        Call this after each prefill or decode step.  The hook is queried
-        for the cumulative KV cache; any newly completed chunks are stored.
+        Call this after each prefill or decode step.  The hook is queried for
+        the cumulative KV cache; the new tokens' length is read from the cache
+        tensor itself, so no token count is passed in.
 
         Parameters
         ----------
-        n_new_tokens:    Number of new tokens added to the KV cache this step.
         teacher_logits:  Model output logits (B, n_new, vocab) for this step.
                          When None, task loss requires answer_tokens instead.
         query_tokens:    Input token IDs for this step (B, n_new).
@@ -105,30 +101,16 @@ class HookTrajectoryCollector:
                          When set (even without teacher_logits), enables task-loss
                          value-directed training without a live teacher model.
         """
-        kv = self._hook.get_kv_matrices()
-        if kv is None:
-            self._cumul_kv_len += n_new_tokens
-            return
-
-        keys_per_layer, values_per_layer = kv
-        # Use actual tensor length (authoritative even if n_new_tokens is wrong)
-        self._cumul_kv_len = keys_per_layer[0].shape[1]
+        keys_per_layer, values_per_layer = self._require_kv()
+        cumul = keys_per_layer[0].shape[1]
 
         cfg = self._cfg
-        while self._cumul_kv_len - self._chunk_start_len >= cfg.chunk_size:
+        while cumul - self._chunk_start_len >= cfg.chunk_size:
             chunk_end = self._chunk_start_len + cfg.chunk_size
             chunk_idx = len(self._chunks)
-
-            chunk_keys = [
-                k[:, self._chunk_start_len:chunk_end, :].detach()
-                for k in keys_per_layer
-            ]
-            chunk_vals = [
-                v[:, self._chunk_start_len:chunk_end, :].detach()
-                for v in values_per_layer
-            ]
-            self._chunks.append((chunk_keys, chunk_vals))
-
+            self._chunks.append(
+                self._slice_chunk(keys_per_layer, values_per_layer, self._chunk_start_len, chunk_end)
+            )
             self._maybe_add_probe(chunk_idx, teacher_logits, query_tokens, answer_tokens)
             self._chunk_start_len = chunk_end
 
@@ -139,28 +121,17 @@ class HookTrajectoryCollector:
         nothing is silently dropped.  Training code should handle variable-
         length chunks.
         """
-        kv = self._hook.get_kv_matrices()
-        remaining = self._cumul_kv_len - self._chunk_start_len
-
-        if kv is not None and remaining > 0:
-            keys_per_layer, values_per_layer = kv
-            chunk_keys = [
-                k[:, self._chunk_start_len:self._cumul_kv_len, :].detach()
-                for k in keys_per_layer
-            ]
-            chunk_vals = [
-                v[:, self._chunk_start_len:self._cumul_kv_len, :].detach()
-                for v in values_per_layer
-            ]
-            self._chunks.append((chunk_keys, chunk_vals))
+        keys_per_layer, values_per_layer = self._require_kv()
+        cumul = keys_per_layer[0].shape[1]
+        if cumul > self._chunk_start_len:
+            self._chunks.append(
+                self._slice_chunk(keys_per_layer, values_per_layer, self._chunk_start_len, cumul)
+            )
 
         if not self._chunks:
-            import warnings
-            warnings.warn(
-                "HookTrajectoryCollector.end_rollout: no KV chunks captured. "
-                "The KV hook may have returned None for every on_step call. "
-                "This trajectory will be empty and skipped during training.",
-                stacklevel=2,
+            raise RuntimeError(
+                "HookTrajectoryCollector captured no KV: the cache was empty for the "
+                "whole rollout. The compactor cannot train on an empty trajectory."
             )
         return Trajectory(
             chunks=self._chunks,
@@ -170,6 +141,26 @@ class HookTrajectoryCollector:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _require_kv(self) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        kv = self._hook.get_kv_matrices()
+        if kv is None:
+            raise RuntimeError(
+                "MegatronInferenceHook returned no KV matrices; the hook is not "
+                "capturing. Check that KV capture is enabled on this rank."
+            )
+        return kv
+
+    @staticmethod
+    def _slice_chunk(
+        keys_per_layer: list[torch.Tensor],
+        values_per_layer: list[torch.Tensor],
+        start: int,
+        end: int,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        keys = [k[:, start:end, :].detach() for k in keys_per_layer]
+        vals = [v[:, start:end, :].detach() for v in values_per_layer]
+        return keys, vals
 
     def _maybe_add_probe(
         self,
@@ -183,7 +174,7 @@ class HookTrajectoryCollector:
             return
         if cfg.max_probes is not None and self._probe_count >= cfg.max_probes:
             return
-        # Need at least query_tokens; teacher_logits optional (task loss works without them)
+        # A probe needs query_tokens; teacher_logits is optional (task loss works without).
         if query_tokens is None:
             return
 

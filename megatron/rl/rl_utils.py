@@ -653,11 +653,7 @@ def get_environment_rollouts(
                                     _resp_ids, dtype=torch.long, device="cpu"
                                 ).unsqueeze(0)  # (1, S_resp)
 
-                            _n_toks = len(group[0].response_tokens) if (
-                                group and hasattr(group[0], "response_tokens") and group[0].response_tokens
-                            ) else 1
                             traj_collector.on_step(
-                                n_new_tokens=max(_n_toks, 1),
                                 query_tokens=_resp,
                                 answer_tokens=_resp,
                             )

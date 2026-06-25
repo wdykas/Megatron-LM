@@ -7,7 +7,7 @@ import torch
 
 from megatron.rl.compaction.learned.capture.hook_collector import HookTrajectoryCollector
 from megatron.rl.compaction.learned.training.data import PipelineConfig
-from megatron.rl.compaction.learned.training.data import Trajectory, TrainingProbe
+from megatron.rl.compaction.learned.training.data import TrainingProbe
 from megatron.rl.compaction.kv.megatron_hook import NullHook
 
 
@@ -46,6 +46,10 @@ class FakeHook:
         self._cumul_len += n_tokens
         return n_tokens
 
+    def reset(self):
+        """Simulate a fresh inference cache for a new rollout."""
+        self._cumul_len = 0
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -67,27 +71,27 @@ def _tokens(B=1, S=4, V=64):
 # ---------------------------------------------------------------------------
 
 class TestHookTrajectoryCollectorBasic:
-    def test_empty_rollout_returns_trajectory(self):
+    def test_empty_rollout_raises(self):
+        """A rollout that captured no KV is a hard error, not an empty trajectory."""
         hook = FakeHook()
         c = HookTrajectoryCollector(hook, PipelineConfig(chunk_size=16))
         c.begin_rollout()
-        traj = c.end_rollout()
-        assert isinstance(traj, Trajectory)
-        assert traj.n_chunks == 0
+        with pytest.raises(RuntimeError):
+            c.end_rollout()
 
-    def test_null_hook_returns_empty_trajectory(self):
+    def test_null_hook_raises(self):
+        """A hook that never captures KV must fail loudly on the first step."""
         c = HookTrajectoryCollector(NullHook(), PipelineConfig(chunk_size=16))
         c.begin_rollout()
-        c.on_step(32)   # NullHook.get_kv_matrices() returns None → nothing stored
-        traj = c.end_rollout()
-        assert traj.n_chunks == 0
+        with pytest.raises(RuntimeError):
+            c.on_step()
 
     def test_single_chunk_exact(self):
         hook = FakeHook()
         c = HookTrajectoryCollector(hook, PipelineConfig(chunk_size=16))
         c.begin_rollout()
         hook.advance(16)
-        c.on_step(16)
+        c.on_step()
         traj = c.end_rollout()
         assert traj.n_chunks == 1
         keys, vals = traj.chunks[0]
@@ -99,7 +103,7 @@ class TestHookTrajectoryCollectorBasic:
         c = HookTrajectoryCollector(hook, PipelineConfig(chunk_size=16))
         c.begin_rollout()
         hook.advance(32)
-        c.on_step(32)
+        c.on_step()
         traj = c.end_rollout()
         assert traj.n_chunks == 2
 
@@ -108,7 +112,7 @@ class TestHookTrajectoryCollectorBasic:
         c = HookTrajectoryCollector(hook, PipelineConfig(chunk_size=16))
         c.begin_rollout()
         hook.advance(20)
-        c.on_step(20)
+        c.on_step()
         traj = c.end_rollout()
         # 16-token chunk + 4-token partial
         assert traj.n_chunks == 2
@@ -122,16 +126,17 @@ class TestHookTrajectoryCollectorBasic:
 
         c.begin_rollout()
         hook.advance(16)
-        c.on_step(16)
-        traj1 = c.end_rollout()
-        assert traj1.n_chunks == 1
+        c.on_step()
+        assert c.end_rollout().n_chunks == 1
 
-        # Second rollout from fresh hook
-        hook2 = FakeHook()
-        c2 = HookTrajectoryCollector(hook2, PipelineConfig(chunk_size=16))
-        c2.begin_rollout()
-        traj2 = c2.end_rollout()
-        assert traj2.n_chunks == 0
+        # Reuse the same collector for a second rollout with a fresh cache.
+        # begin_rollout() must clear _chunk_start_len, otherwise the 32-token
+        # cache would be re-chunked from offset 16 and yield only one chunk.
+        hook.reset()
+        c.begin_rollout()
+        hook.advance(32)
+        c.on_step()
+        assert c.end_rollout().n_chunks == 2
 
     def test_multiple_on_step_calls(self):
         """Prefill (many tokens) then decode (one token at a time)."""
@@ -141,12 +146,12 @@ class TestHookTrajectoryCollectorBasic:
 
         # Prefill: 8 tokens in one call
         hook.advance(8)
-        c.on_step(8)
+        c.on_step()
 
         # Decode: 8 more tokens, one at a time
         for _ in range(8):
             hook.advance(1)
-            c.on_step(1)
+            c.on_step()
 
         traj = c.end_rollout()
         # 16 tokens total / 8 per chunk = 2 chunks
@@ -159,7 +164,7 @@ class TestHookTrajectoryCollectorProbes:
         c = HookTrajectoryCollector(hook, PipelineConfig(chunk_size=16, probe_stride=1, probe_query_len=8))
         c.begin_rollout()
         hook.advance(16)
-        c.on_step(16, teacher_logits=_logits(S=16), query_tokens=_tokens(S=16))
+        c.on_step(teacher_logits=_logits(S=16), query_tokens=_tokens(S=16))
         traj = c.end_rollout()
         assert 0 in traj.probes_by_chunk
         probe = traj.probes_by_chunk[0][0]
@@ -172,7 +177,7 @@ class TestHookTrajectoryCollectorProbes:
         c = HookTrajectoryCollector(hook, PipelineConfig(chunk_size=16, probe_stride=1))
         c.begin_rollout()
         hook.advance(16)
-        c.on_step(16)   # no teacher_logits → no probe
+        c.on_step()   # no teacher_logits → no probe
         traj = c.end_rollout()
         assert len(traj.probes_by_chunk) == 0
 
@@ -182,7 +187,7 @@ class TestHookTrajectoryCollectorProbes:
         c.begin_rollout()
         hook.advance(32)
         # Feed logits at one big step (4 chunks worth)
-        c.on_step(32, teacher_logits=_logits(S=32), query_tokens=_tokens(S=32))
+        c.on_step(teacher_logits=_logits(S=32), query_tokens=_tokens(S=32))
         traj = c.end_rollout()
         # Chunks 0, 1, 2, 3 — probes only at 0 and 2 (stride=2)
         for idx in traj.probes_by_chunk:
@@ -195,7 +200,7 @@ class TestHookTrajectoryCollectorProbes:
         ))
         c.begin_rollout()
         hook.advance(64)
-        c.on_step(64, teacher_logits=_logits(S=64), query_tokens=_tokens(S=64))
+        c.on_step(teacher_logits=_logits(S=64), query_tokens=_tokens(S=64))
         traj = c.end_rollout()
         total_probes = sum(len(ps) for ps in traj.probes_by_chunk.values())
         assert total_probes <= 2
@@ -208,7 +213,7 @@ class TestHookTrajectoryCollectorProbes:
         ))
         c.begin_rollout()
         hook.advance(16)
-        c.on_step(16, teacher_logits=_logits(S=16), query_tokens=_tokens(S=16))
+        c.on_step(teacher_logits=_logits(S=16), query_tokens=_tokens(S=16))
         traj = c.end_rollout()
         probe = traj.probes_by_chunk[0][0]
         # Only 16 tokens available in this step
@@ -221,7 +226,7 @@ class TestHookTrajectoryCollectorKVContent:
         c = HookTrajectoryCollector(hook, PipelineConfig(chunk_size=8))
         c.begin_rollout()
         hook.advance(8)
-        c.on_step(8)
+        c.on_step()
         traj = c.end_rollout()
         keys, vals = traj.chunks[0]
         assert len(keys) == 3
@@ -234,7 +239,7 @@ class TestHookTrajectoryCollectorKVContent:
         c = HookTrajectoryCollector(hook, PipelineConfig(chunk_size=8))
         c.begin_rollout()
         hook.advance(24)
-        c.on_step(24)
+        c.on_step()
         traj = c.end_rollout()
         assert traj.n_chunks == 3
         total_tokens = sum(traj.chunks[i][0][0].shape[1] for i in range(traj.n_chunks))
@@ -245,7 +250,7 @@ class TestHookTrajectoryCollectorKVContent:
         c = HookTrajectoryCollector(hook, PipelineConfig(chunk_size=16))
         c.begin_rollout()
         hook.advance(16)
-        c.on_step(16)
+        c.on_step()
         traj = c.end_rollout()
         keys, vals = traj.chunks[0]
         for k in keys:
@@ -256,7 +261,7 @@ class TestHookTrajectoryCollectorKVContent:
         c = HookTrajectoryCollector(hook, PipelineConfig(chunk_size=8))
         c.begin_rollout()
         hook.advance(8)
-        c.on_step(8)
+        c.on_step()
         traj = c.end_rollout()
         keys, _ = traj.chunks[0]
         assert keys[0].shape[0] == 4
