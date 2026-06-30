@@ -26,6 +26,8 @@ class Headers(Enum):
     PREFILL_DONE = auto()   # prefill engine -> coord: request finished prefill, KV staged
     SEND_KV = auto()        # coord -> prefill engine: ship request's KV to a decode instance
     RECV_KV = auto()        # coord -> decode engine: receive KV then admit + generate
+    KV_READ_DONE = auto()   # decode engine -> coord: one-sided read drained (release credit + KV)
+    RELEASE_KV = auto()     # coord -> prefill engine: release the request's pinned KV blocks
 
 
 class UnknownHeaderError(Exception):

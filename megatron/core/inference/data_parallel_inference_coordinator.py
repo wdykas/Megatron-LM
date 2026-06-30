@@ -4,6 +4,7 @@ import errno
 import faulthandler
 import json
 import logging
+import os
 import signal
 import socket
 from collections import deque
@@ -185,6 +186,18 @@ class DataParallelInferenceCoordinator:
         self._disagg = make_disagg_router(disagg_router) if disaggregated else None
         self._engine_layouts: dict = {}
         self._req_meta: dict = {}
+        # Credit-based flow control for one-sided (pull) prefill instances: bound
+        # the number of outstanding (submitted-but-read-done) hand-offs per prefill
+        # to <= the window, so the prefill can never reuse a Mamba hold-ring slot /
+        # KV pin whose data the decode hasn't read yet (hard no-overwrite guarantee).
+        # The window MUST be <= the engine's hold-ring depth (_disagg_mamba_hold_slots).
+        # Released by the decode's KV_READ_DONE ack. Push instances are not
+        # throttled (they don't ack and have their own staging window).
+        self._engine_is_pull: dict = {}        # prefill identity -> bool
+        self._disagg_prefill_of: dict = {}     # request_id -> prefill identity (for RELEASE/credit)
+        self._disagg_outstanding: dict = {}     # prefill identity -> outstanding count
+        self._disagg_submit_queue: dict = {}    # prefill identity -> deque of (rid, prompt, sp)
+        self._disagg_credit_window = int(os.environ.get("MEGATRON_DISAGG_CREDIT_WINDOW", "32"))
         # time.sleep(5)  # Give data parallel ranks time to spawn and connect.
         for _ in range(data_parallel_size):
             identity, payload = self.router_socket.recv_multipart()
@@ -293,12 +306,61 @@ class DataParallelInferenceCoordinator:
 
     def _route_submit_disagg(self, request_id, prompt, sampling_params):
         """Hop 1: forward a new request to a prefill engine; stash its prompt +
-        sampling so they can be forwarded to the chosen decode engine later."""
+        sampling so they can be forwarded to the chosen decode engine later.
+
+        For one-sided (pull) prefill instances, apply credit-based flow control:
+        if the instance already has ``_disagg_credit_window`` outstanding
+        hand-offs, queue the request instead of submitting; it is released when a
+        decode KV_READ_DONE ack frees a credit. This bounds outstanding hand-offs
+        to the prefill's hold-ring/pin window -- the hard no-overwrite guarantee."""
         self._req_meta[request_id] = (prompt, sampling_params)
         prefill_id = self._disagg.route_submit(request_id)
+        if not self._engine_is_pull.get(prefill_id, False):
+            # Push (or unknown) prefill: submit directly, no flow control / credit
+            # (push has its own staging window and sends no read-done ack).
+            self._disagg_send(
+                prefill_id, Headers.SUBMIT_REQUEST, request_id, prompt, sampling_params
+            )
+            return
+        if self._disagg_outstanding.get(prefill_id, 0) >= self._disagg_credit_window:
+            self._disagg_submit_queue.setdefault(prefill_id, deque()).append(
+                (request_id, prompt, sampling_params)
+            )
+            return
+        self._disagg_do_submit(prefill_id, request_id, prompt, sampling_params)
+
+    def _disagg_do_submit(self, prefill_id, request_id, prompt, sampling_params):
+        """Submit a (possibly previously queued) request to ``prefill_id`` and
+        charge a credit so the flow-control window tracks it until read-done."""
+        self._disagg_prefill_of[request_id] = prefill_id
+        self._disagg_outstanding[prefill_id] = self._disagg_outstanding.get(prefill_id, 0) + 1
         self._disagg_send(
             prefill_id, Headers.SUBMIT_REQUEST, request_id, prompt, sampling_params
         )
+
+    def _disagg_release_credit(self, request_id):
+        """Free the credit a request held on its prefill instance (on read-done
+        or drop) and submit the next queued request for that instance, if any."""
+        prefill_id = self._disagg_prefill_of.pop(request_id, None)
+        if prefill_id is None:
+            return
+        self._disagg_outstanding[prefill_id] = max(
+            0, self._disagg_outstanding.get(prefill_id, 0) - 1
+        )
+        q = self._disagg_submit_queue.get(prefill_id)
+        if q:
+            rid, prompt, sp = q.popleft()
+            self._disagg_do_submit(prefill_id, rid, prompt, sp)
+
+    def _handle_kv_read_done(self, request_id):
+        """Hop 3 (one-sided): the decode finished its READ. Release the prefill's
+        pinned KV blocks (RELEASE_KV) and the flow-control credit -- which submits
+        the next queued request for that prefill, if any. Best-effort: a missing
+        mapping (duplicate/late ack, already-dropped request) is ignored."""
+        prefill_id = self._disagg_prefill_of.get(request_id)
+        if prefill_id is not None:
+            self._disagg_send(prefill_id, Headers.RELEASE_KV, request_id)
+        self._disagg_release_credit(request_id)
 
     def _drop_disagg_request(self, request_id, reason):
         """Drop an unroutable disagg request and clear all per-request
@@ -311,6 +373,12 @@ class DataParallelInferenceCoordinator:
         logging.error("Coordinator: dropping disagg request %s: %s", request_id, reason)
         self._disagg.forget(request_id)
         self._req_meta.pop(request_id, None)
+        # Release any pinned KV + flow-control credit the prefill holds for this
+        # request, so a drop doesn't leak the pin or stall the credit window.
+        prefill_id = self._disagg_prefill_of.get(request_id)
+        if prefill_id is not None:
+            self._disagg_send(prefill_id, Headers.RELEASE_KV, request_id)
+        self._disagg_release_credit(request_id)
         self.request_id_to_rank.pop(request_id, None)
         self.request_id_to_client_id.pop(request_id, None)
         self.request_id_to_client_request_id.pop(request_id, None)
@@ -500,12 +568,15 @@ class DataParallelInferenceCoordinator:
             if header == Headers.REGISTER_ROLE:
                 # Disaggregated engine registration (dynamic, order-independent):
                 # role + this instance's KV layouts.
-                _, role, layouts = deserialized_payload
+                _, role, layouts, *rest = deserialized_payload
                 if sender_identity not in self.identities_of_data_parallel_ranks:
                     self.identities_of_data_parallel_ranks.append(sender_identity)
                     self._register_rank_identity(sender_identity)
                 self._disagg.register(sender_identity, role)
                 self._engine_layouts[sender_identity] = layouts
+                # is_pull (one-sided backend) -> apply credit flow control to this
+                # prefill instance. Absent (older engines / push) -> unthrottled.
+                self._engine_is_pull[sender_identity] = bool(rest[0]) if rest else False
                 continue
 
             if header == Headers.CONNECT:
@@ -604,6 +675,12 @@ class DataParallelInferenceCoordinator:
                 # inspects it -- it only relays it to the decode in RECV_KV.
                 handoff = deserialized_payload[2] if len(deserialized_payload) > 2 else None
                 self._handle_prefill_done(request_id, handoff)
+
+            elif header == Headers.KV_READ_DONE:
+                # Disaggregated hop 3 (one-sided): the decode finished its READ;
+                # release the prefill's pinned KV + a flow-control credit.
+                assert self.disaggregated, "KV_READ_DONE on a non-disaggregated coordinator"
+                self._handle_kv_read_done(deserialized_payload[1])
 
             elif header in (
                 Headers.PAUSE,
