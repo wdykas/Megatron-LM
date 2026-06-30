@@ -21,13 +21,20 @@ from megatron.core.inference.disaggregation import kv_reshard, mamba_reshard, ut
 
 
 def pull_static_meta(backend, my_layout, kv_dims, mamba_dims=None):
-    """(prefill, one-sided) This rank's **request-invariant** pull metadata:
-    region meta (NIXL agent + buffer layout), KV buffer geometry, Mamba geometry,
-    and shard identity. None of it changes between requests, so it is built once
-    and merged with :func:`pull_request_meta` per request -- keeping the
-    per-request control message down to block references rather than re-shipping
-    this (sizable) blob. ``kv_dims`` is ``{num_layers, total_blocks, block_size,
-    heads, hidden, elem}``; ``mamba_dims`` the hold-ring geometry (or ``None``)."""
+    """(prefill) This rank's request-invariant pull metadata. Built once and
+    merged with :func:`pull_request_meta` (``{**static, **request}``) per request,
+    so the per-request hand-off carries only block references, not this blob.
+
+    Pipeline: engine gathers it once at registration -> attached to PREFILL_DONE
+    -> consumed by the decode's ``post_pull_request_kv``.
+
+    Args:
+        backend: this rank's one-sided (NIXL) transport, regions already registered.
+        my_layout: this rank's ``KVShardLayout`` (gives the shard identity).
+        kv_dims: KV buffer geometry ``{num_layers, total_blocks, block_size, heads,
+            hidden, elem}``.
+        mamba_dims: Mamba hold-ring geometry, or ``None`` for non-hybrid models.
+    """
     return {
         "transport": "nixl",
         "shard_key": list(my_layout.kv_shard_key()),
@@ -39,13 +46,23 @@ def pull_static_meta(backend, my_layout, kv_dims, mamba_dims=None):
 
 
 def pull_request_meta(ref_payload):
-    """(prefill, one-sided) A request's block-level references (from
-    ``context.export_request_kv_ref``): block ids / hashes / count, Mamba slot,
-    snapshots, layout tag. These are **replicated across the MP group** -- every
-    rank schedules identically -- so one rank's copy is authoritative for all.
-    Merged onto each rank's :func:`pull_static_meta` (``{**static, **request}``)
-    to form that rank's hand-off; the decode READs the blocks from the registered
-    ``memory_buffer`` (no copy)."""
+    """(prefill) A request's block-level references -- the per-request half of the
+    hand-off. Selects only the fields that vary per request, dropping the static
+    geometry in ``ref_payload`` (that goes in :func:`pull_static_meta` instead).
+    Replicated across the MP group (every rank schedules identically), so one
+    rank's copy is authoritative for all; merged onto each rank's
+    :func:`pull_static_meta` to form the hand-off.
+
+    Pipeline: engine builds it per request in ``_disagg_publish_kv`` -> attached
+    to PREFILL_DONE -> the decode's ``post_pull_request_kv`` READs these blocks
+    from the registered ``memory_buffer`` (no copy).
+
+    Args:
+        ref_payload: the dict returned by ``context.export_request_kv_ref(request_id)``.
+
+    Returns:
+        ``{layout, block_ids, block_hashes, block_count, mamba_src_slot, snapshots}``.
+    """
     return {
         "layout": ref_payload["layout"],
         "block_ids": ref_payload["block_ids"],
@@ -59,11 +76,16 @@ def pull_request_meta(ref_payload):
 @dataclass
 class NixlPullRecv:
     """Decode side: an in-flight one-sided READ of a request's blocks.
-    :meth:`finish` waits the read, then registers block hashes + binds the Mamba
-    slot (the KV already landed in the allocated blocks), mirroring
+    :meth:`finish` waits the read, then commits -- registers block hashes + binds
+    the Mamba slot (the KV already landed in the allocated blocks), mirroring
     ``DecodeRecv.finish``. If the prefill published Mamba prefix-cache
-    ``snapshots``, a second READ pulls them after the KV commit (their slots are
-    protected by the KV pin)."""
+    ``snapshots``, a second READ pulls them after the KV commit.
+
+    The Mamba *end-state* is never pinned -- it moves by value through the
+    reset-safe hold-ring. The only pin is the **KV block** ref-count pin (held on
+    the prefill during the hand-off); the prefill's snapshot slots stay valid for
+    the second READ only as a side effect of it, since snapshot eviction is gated
+    on the KV block ref-count being 0."""
 
     handles: List[Any]
     block_ids: List[int]
@@ -92,8 +114,12 @@ class NixlPullRecv:
 
 
 def _ctx_kv_dims(ctx) -> dict:
-    """KV ``memory_buffer`` geometry for the local rank: ``(2, L, total_blocks,
-    block_size, heads, hidden)``."""
+    """(decode) This rank's live KV ``memory_buffer`` geometry ``{num_layers,
+    total_blocks, block_size, heads, hidden, elem}`` -- the *destination*
+    (``dst_dims``) side of the byte-offset math in
+    :func:`_kv_fragment_descriptors`. The matching *source* geometry arrives over
+    the wire as the hand-off's ``kv_dims`` (built by :func:`pull_static_meta`):
+    same schema, two sources (local read here vs. relayed from the prefill)."""
     mb = ctx.memory_buffer
     return {
         "num_layers": int(mb.shape[1]),
@@ -107,7 +133,7 @@ def _ctx_kv_dims(ctx) -> dict:
 
 def _kv_fragment_descriptors(src_dims, dst_dims, src_block, dst_block,
                              src_layer_slice, dst_layer_slice, src_head_slice, dst_head_slice):
-    """Byte ``(local_off, remote_off, nbytes)`` READ descriptors for one block's
+    """Byte ``(local_offset, remote_offset, nbytes)`` READ descriptors for one block's
     head/layer fragment, coalesced to the contiguous minimum.
 
     In the row-major ``(2, num_layers, total_blocks, block_size, heads, hidden)``
@@ -139,18 +165,18 @@ def _kv_fragment_descriptors(src_dims, dst_dims, src_block, dst_block,
         nbytes = src_block_size * src_heads * hidden * elem
         for kv in (0, 1):
             for src_layer, dst_layer in zip(src_layer_ids, dst_layer_ids):
-                src_off = (((kv * src_num_layers + src_layer) * src_total_blocks + src_block) * src_block_size) * src_heads * hidden * elem
-                dst_off = (((kv * dst_num_layers + dst_layer) * dst_total_blocks + dst_block) * dst_block_size) * dst_heads * hidden * elem
-                descriptors.append((dst_off, src_off, nbytes))  # (local=dst, remote=src, nbytes)
+                src_offset = (((kv * src_num_layers + src_layer) * src_total_blocks + src_block) * src_block_size) * src_heads * hidden * elem
+                dst_offset = (((kv * dst_num_layers + dst_layer) * dst_total_blocks + dst_block) * dst_block_size) * dst_heads * hidden * elem
+                descriptors.append((dst_offset, src_offset, nbytes))  # (local=dst, remote=src, nbytes)
         return descriptors
     head_count = src_head_slice.stop - src_head_slice.start
     nbytes = head_count * hidden * elem
     for kv in (0, 1):
         for src_layer, dst_layer in zip(src_layer_ids, dst_layer_ids):
             for token in range(src_block_size):
-                src_off = ((((kv * src_num_layers + src_layer) * src_total_blocks + src_block) * src_block_size + token) * src_heads + src_head_slice.start) * hidden * elem
-                dst_off = ((((kv * dst_num_layers + dst_layer) * dst_total_blocks + dst_block) * dst_block_size + token) * dst_heads + dst_head_slice.start) * hidden * elem
-                descriptors.append((dst_off, src_off, nbytes))
+                src_offset = ((((kv * src_num_layers + src_layer) * src_total_blocks + src_block) * src_block_size + token) * src_heads + src_head_slice.start) * hidden * elem
+                dst_offset = ((((kv * dst_num_layers + dst_layer) * dst_total_blocks + dst_block) * dst_block_size + token) * dst_heads + dst_head_slice.start) * hidden * elem
+                descriptors.append((dst_offset, src_offset, nbytes))
     return descriptors
 
 
@@ -166,7 +192,7 @@ def _mamba_dims_from(conv, ssm) -> dict:
 
 
 def _mamba_band_descriptor(src_dims, dst_dims, is_conv, transfer, src_slot, dst_slot):
-    """One byte ``(local_off, remote_off, nbytes)`` READ descriptor for a Mamba
+    """One byte ``(local_offset, remote_offset, nbytes)`` READ descriptor for a Mamba
     reshard ``transfer`` -- a band of one layer in the conv (channel) or ssm
     (head) buffer. The band is contiguous at fixed ``(layer, slot)``, so it's a
     single descriptor; conv and ssm share the stride math and differ only in the
@@ -180,9 +206,9 @@ def _mamba_band_descriptor(src_dims, dst_dims, is_conv, transfer, src_slot, dst_
     src_n_slots, dst_n_slots = src_dims["n_slots"], dst_dims["n_slots"]
     unit_bytes = unit * dst_dims["elem"]
     nbytes = (transfer.src_hi - transfer.src_lo) * unit_bytes
-    src_off = ((transfer.src_layer * src_n_slots + src_slot) * src_index_dim + transfer.src_lo) * unit_bytes
-    dst_off = ((transfer.dst_layer * dst_n_slots + dst_slot) * dst_index_dim + transfer.dst_lo) * unit_bytes
-    return (dst_off, src_off, nbytes)
+    src_offset = ((transfer.src_layer * src_n_slots + src_slot) * src_index_dim + transfer.src_lo) * unit_bytes
+    dst_offset = ((transfer.dst_layer * dst_n_slots + dst_slot) * dst_index_dim + transfer.dst_lo) * unit_bytes
+    return (dst_offset, src_offset, nbytes)
 
 
 def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
