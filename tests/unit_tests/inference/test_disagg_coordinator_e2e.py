@@ -133,11 +133,9 @@ def init_mp(monkeypatch):
     monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1")
     # This test exercises the push coordinator-native 2-hop: its dummy engine
     # emits a bare (push-protocol) PREFILL_DONE and relies on SEND_KV draining
-    # staged KV. Pin the push backend so it is deterministic regardless of which
-    # transports the container provides (``auto`` would pick NIXL when present,
-    # whose pull protocol this dummy does not drive). The NIXL pull path is
-    # covered by its own coordinator-native test.
-    monkeypatch.setenv("MEGATRON_KV_TRANSFER_BACKEND", "nccl")
+    # staged KV. The backend is chosen explicitly via set_disaggregation_config's
+    # kv_transport_backend (default "nccl" -- the push path this dummy drives); the
+    # NIXL pull path is covered by its own coordinator-native test.
     Utils.initialize_model_parallel()
     yield
     Utils.destroy_model_parallel()
