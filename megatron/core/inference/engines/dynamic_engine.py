@@ -640,6 +640,10 @@ class DynamicInferenceEngine(AbstractEngine):
         self._disagg_backend = None  # lazily-created KV transport backend
         self._disagg_pending_sends = {}  # request_id -> PrefillHandoff
         self._disagg_pending_recvs = {}  # request_id -> (recv, prompt, sampling_params)
+        # (decode, one-sided) request_ids whose READ has drained, queued for a
+        # KV_READ_DONE ack so the coordinator releases a credit + the prefill
+        # releases the request's pinned KV blocks.
+        self._disagg_pending_acks = []
         self._disagg_max_inflight = 8
         # (prefill, one-sided, hybrid) depth of the reset-safe Mamba hold-ring
         # published end-states are copied into; capped to the live slot count.
@@ -812,15 +816,17 @@ class DynamicInferenceEngine(AbstractEngine):
         per-rank region meta + source block ids, relayed opaque by the
         coordinator. Both paths yield an object with a ``finish(engine)`` that
         commits, so the rest is symmetric."""
+        backend = self._disagg_get_backend()
         # Backpressure: complete + admit the oldest in-flight receive once the
         # window is full (collective: identical pending set across MP ranks).
         while len(self._disagg_pending_recvs) >= self._disagg_max_inflight:
             oldest = next(iter(self._disagg_pending_recvs))
             rv, p, sp = self._disagg_pending_recvs.pop(oldest)
             rv.finish(self)
+            if backend.is_pull:
+                self._disagg_pending_acks.append(oldest)
             self.add_request(oldest, p, sampling_params=SamplingParams.deserialize(sp))
 
-        backend = self._disagg_get_backend()
         if backend.is_pull:
             recv = post_pull_request_kv(self, backend, handoff, self._disagg_my_layout)
         else:
@@ -834,7 +840,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 dst_mamba_layouts=self._disagg_instance_mamba_layouts,
             )
         if recv is None:
-            # No KV to receive (shouldn't happen header-free): admit directly.
+            # No KV received: for pull it means the decode KV cache was full, so
+            # we admit to re-prefill. The prefill still pinned its blocks, so ack
+            # to release the credit + pin (else its flow-control credit leaks).
+            if backend.is_pull:
+                self._disagg_pending_acks.append(request_id)
             sp = SamplingParams.deserialize(sampling_params)
             self.add_request(request_id, prompt, sampling_params=sp)
             return
@@ -850,6 +860,7 @@ class DynamicInferenceEngine(AbstractEngine):
         (registers the prefix-cache blocks) and admit the request."""
         if getattr(self, "disagg_role", None) is None:
             return
+        is_pull = self._disagg_get_backend().is_pull
         for request_id in list(self._disagg_pending_sends):
             self._disagg_pending_sends.pop(request_id).wait()
         for request_id in list(self._disagg_pending_recvs):
@@ -864,8 +875,22 @@ class DynamicInferenceEngine(AbstractEngine):
                     "re-prefilling from prompt instead of using handed-off KV",
                     request_id,
                 )
+            if is_pull:
+                # One-sided READ drained -> release the prefill's pin + a credit.
+                self._disagg_pending_acks.append(request_id)
             sp = SamplingParams.deserialize(sampling_params)
             self.add_request(request_id, prompt, sampling_params=sp)
+
+        # Flush read-done acks: the MP coordinator tells the coordinator each
+        # pulled request has drained. Queue is identical across MP ranks
+        # (collective finish), so clearing it is consistent.
+        if self._disagg_pending_acks:
+            if self.use_coordinator and self.is_mp_coordinator:
+                for rid in self._disagg_pending_acks:
+                    self.socket_for_receiving_requests.send(
+                        msgpack.packb([Headers.KV_READ_DONE.value, rid], use_bin_type=True)
+                    )
+            self._disagg_pending_acks.clear()
 
     @internal_api
     async def start_listening_to_data_parallel_coordinator(
@@ -1039,9 +1064,15 @@ class DynamicInferenceEngine(AbstractEngine):
             # instance's KV layouts so the coordinator can 2-hop route + plan
             # reshards. Otherwise: an empty string is the registration ping.
             if disagg:
+                # Report whether this engine uses a one-sided (pull) backend, so
+                # the coordinator applies credit-based flow control (bounding
+                # outstanding hand-offs to the prefill's hold-ring/pin window) only
+                # for pull instances; push instances are unthrottled as before.
+                is_pull = bool(getattr(self.context, "disagg_pull_mode", False))
                 self.socket_for_receiving_requests.send(
                     msgpack.packb(
-                        [Headers.REGISTER_ROLE.value, self.disagg_role, self.disagg_instance_layouts],
+                        [Headers.REGISTER_ROLE.value, self.disagg_role,
+                         self.disagg_instance_layouts, is_pull],
                         use_bin_type=True,
                     )
                 )
@@ -2731,6 +2762,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 # absent for push backends.
                 handoff = data[5] if len(data) > 5 else None
                 self._disagg_recv_kv(data[1], data[2], data[3], data[4], handoff)
+            elif header == Headers.RELEASE_KV:
+                # (prefill, one-sided) the decode finished its READ -- release the
+                # request's pinned KV blocks (Mamba used the reset-safe ring, no pin).
+                self.context.disagg_release_pinned(data[1])
             elif header == Headers.SET_GENERATION_EPOCH:
                 new_generation_epoch = data[1]
             else:

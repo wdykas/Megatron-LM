@@ -4395,6 +4395,20 @@ class DynamicInferenceContext(BaseInferenceContext):
                     # No hold-ring (e.g. decode-only context): publish the live
                     # slot (windowed by-reference fallback).
                     mamba_src_slot = live_slot
+        # Pin the KV blocks (ref-count) so they survive this request's release
+        # into the prefix cache and cannot be reallocated/overwritten before the
+        # decode's one-sided READ. Released on the RELEASE_KV ack
+        # (disagg_release_pinned). Reset-safe: the per-step reset doesn't touch
+        # block_ref_counts (only the epoch-level allocator reset does, when no
+        # hand-offs are outstanding). The coordinator's credit window bounds how
+        # many such pins/ring slots can be outstanding -> a hard no-overwrite
+        # guarantee. (Mamba uses the reset-safe ring above, not a pin.)
+        self.kv_block_allocator.block_ref_counts[
+            torch.tensor(block_ids, dtype=torch.int64)
+        ] += 1
+        if not hasattr(self, "disagg_pinned"):
+            self.disagg_pinned = {}
+        self.disagg_pinned[request_id] = list(block_ids)
         return {
             "layout": layout,
             "block_count": block_count,
@@ -4406,6 +4420,26 @@ class DynamicInferenceContext(BaseInferenceContext):
             "block_hashes": block_hashes,
             "mamba_src_slot": mamba_src_slot,
         }
+
+    def disagg_release_pinned(self, request_id: int) -> None:
+        """(prefill, one-sided) Release the KV blocks pinned for ``request_id`` by
+        :meth:`export_request_kv_ref`, on the decode's read-done ack (RELEASE_KV).
+        Idempotent; guarded so a stray ack can't drive a ref-count negative."""
+        pinned = getattr(self, "disagg_pinned", None)
+        if not pinned:
+            return
+        block_ids = pinned.pop(request_id, None)
+        if not block_ids:
+            return
+        ids = torch.tensor(block_ids, dtype=torch.int64)
+        # Runs from the engine's coordinator-message loop, outside inference_mode,
+        # but the allocator's ref-count tensors are inference tensors -- wrap the
+        # inplace release like the other allocator mutations do.
+        with torch.inference_mode():
+            # Only release blocks that still carry our pin (guard against an
+            # intervening epoch-level allocator reset that zeroed ref counts).
+            if bool((self.kv_block_allocator.block_ref_counts[ids] > 0).all()):
+                self.kv_block_allocator.release_memory_blocks(ids)
 
     def disagg_pull_alloc(
         self, block_count: int, *, want_mamba: bool = False

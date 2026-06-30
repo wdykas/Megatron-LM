@@ -27,6 +27,13 @@ def _coord():
     c._disagg = DisaggRouting()
     c._engine_layouts = {b"p0": ["PREFILL_LAYOUTS"], b"d0": ["DECODE_LAYOUTS"]}
     c._req_meta = {}
+    # Credit flow-control state (push by default -> unthrottled, like a real
+    # push-backend registration with no is_pull flag).
+    c._engine_is_pull = {}
+    c._disagg_prefill_of = {}
+    c._disagg_outstanding = {}
+    c._disagg_submit_queue = {}
+    c._disagg_credit_window = 32
     c._disagg.register(b"p0", "prefill")
     c._disagg.register(b"d0", "decode")
     c.sent = []  # (identity, [header, *parts])
