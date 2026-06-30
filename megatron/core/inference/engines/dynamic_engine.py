@@ -902,20 +902,51 @@ class DynamicInferenceEngine(AbstractEngine):
             return
         self._disagg_pending_recvs[request_id] = (recv, prompt, sampling_params)
 
+    def _disagg_ready_recvs(self, is_pull):
+        """Pending receive ids (insertion order) ready to admit THIS step.
+
+        Push (NCCL): all pending -- the matched-collective recvs are waited in
+        :meth:`_disagg_complete_pending`'s ``finish``. Pull (one-sided): the
+        subset whose READ has drained on *every* MP rank -- each rank polls its
+        handles non-blockingly, then the per-rank done flags are AND-reduced over
+        the MP group (``MIN`` all-reduce) so admission stays collective. Requests
+        not yet done everywhere stay pending and are rechecked next step."""
+        pending = list(self._disagg_pending_recvs)
+        if not is_pull or not pending:
+            return pending
+        local = [self._disagg_pending_recvs[rid][0].poll() for rid in pending]
+        flags = torch.tensor(
+            [1 if d else 0 for d in local],
+            dtype=torch.int32, device=self.context.memory_buffer.device,
+        )
+        # MIN over the MP group == logical AND: admit only where all ranks agree.
+        torch.distributed.all_reduce(
+            flags, op=torch.distributed.ReduceOp.MIN, group=self.pg_collection.mp
+        )
+        return [rid for rid, f in zip(pending, flags.tolist()) if f]
+
     def _disagg_complete_pending(self):
-        """Reap KV transfers posted on the previous step.
+        """Reap KV transfers posted on a previous step.
 
         Collective across the MP group: the pending sets were populated from
-        TP-broadcast coordinator messages, so every rank completes the same
-        requests in the same (insertion) order. Prefill: wait each send and
-        release its staged KV. Decode: wait each receive, import the KV
-        (registers the prefix-cache blocks) and admit the request."""
+        TP-broadcast coordinator messages, so every rank holds the same requests
+        in the same (insertion) order. Prefill: wait each send and release its
+        staged KV. Decode: admit each receive that has landed, import its KV
+        (registers the prefix-cache blocks), and continue generation.
+
+        For one-sided pulls the receive completion is non-blocking: rather than
+        waiting on a possibly-slow READ, :meth:`_disagg_ready_recvs` polls each
+        and admits only those done on *every* MP rank (deferring the rest to a
+        later step), so a lagging transfer never stalls the loop. Admission stays
+        in lockstep across ranks because that "done on all ranks" set is
+        AND-reduced over the MP group -- if ranks admitted different requests the
+        next forward step would diverge."""
         if getattr(self, "disagg_role", None) is None:
             return
         is_pull = self._disagg_get_backend().is_pull
         for request_id in list(self._disagg_pending_sends):
             self._disagg_pending_sends.pop(request_id).wait()
-        for request_id in list(self._disagg_pending_recvs):
+        for request_id in self._disagg_ready_recvs(is_pull):
             recv, prompt, sampling_params = self._disagg_pending_recvs.pop(request_id)
             imported = recv.finish(self)
             if imported is None:
