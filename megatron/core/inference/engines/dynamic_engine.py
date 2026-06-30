@@ -35,10 +35,12 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
 from megatron.core.inference.disaggregation.kv_reshard import KVShardLayout
-from megatron.core.inference.disaggregation.kv_transfer import (
+from megatron.core.inference.disaggregation.kv_transfer_pull import (
     post_pull_request_kv,
-    post_recv_request_kv_resharded,
     publish_request_kv,
+)
+from megatron.core.inference.disaggregation.kv_transfer_push import (
+    post_recv_request_kv_resharded,
     send_request_kv_resharded,
 )
 from megatron.core.inference.disaggregation.mamba_reshard import MambaShardLayout
