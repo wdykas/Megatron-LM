@@ -4003,6 +4003,42 @@ class DynamicInferenceContext(BaseInferenceContext):
             return None
         return int(matches[0, 0].item())
 
+    def _disagg_export_prologue(self, request_id, internal_idx):
+        """Shared head of :meth:`export_request_kv` / :meth:`export_request_kv_ref`:
+        resolve the request's slot, cap to the prompt-covering block count, and
+        return ``(internal_idx, block_ids, block_hashes)`` -- or ``None`` when
+        there's nothing to export. Raises ``NotImplementedError`` for the MLA
+        latent cache.
+
+        The cap matches the decode's header-free ``ceil(prompt_len/block_size)``:
+        the prefill allocates one extra block for its discarded generated token
+        when the prompt is block-aligned, which the decode never receives."""
+        if getattr(self, "cache_mla_latent", False):
+            raise NotImplementedError(
+                "disaggregated KV transfer does not support the MLA latent KV cache"
+            )
+        if internal_idx is None:
+            internal_idx = self._resolve_internal_request_slot(request_id)
+        if internal_idx is None:
+            return None
+        block_count = int(self.request_kv_block_counts[internal_idx].item())
+        cap = getattr(self, "disagg_prompt_block_count", {}).pop(request_id, None)
+        if cap is not None:
+            block_count = min(block_count, cap)
+        if block_count <= 0:
+            return None
+        block_ids = self.request_to_kv_block_ids[internal_idx, :block_count].tolist()
+        if (
+            getattr(self.kv_block_allocator, "enable_prefix_caching", False)
+            and hasattr(self.kv_block_allocator, "block_hashes")
+        ):
+            block_hashes = self.kv_block_allocator.block_hashes[
+                torch.tensor(block_ids, dtype=torch.int64)
+            ].tolist()
+        else:
+            block_hashes = [-1] * block_count
+        return internal_idx, block_ids, block_hashes
+
     def export_request_kv(
         self, request_id: int, internal_idx: Optional[int] = None
     ) -> Optional[Dict[str, Any]]:
@@ -4028,37 +4064,19 @@ class DynamicInferenceContext(BaseInferenceContext):
         * ``layout`` — version tag (``"std_attn_v1"`` for pure
           attention, ``"hybrid_v1"`` when Mamba state rides along).
         """
-        if getattr(self, "cache_mla_latent", False):
-            raise NotImplementedError(
-                "disaggregated KV transfer does not support the MLA latent KV cache"
-            )
-
-        if internal_idx is None:
-            internal_idx = self._resolve_internal_request_slot(request_id)
-        if internal_idx is None:
+        prologue = self._disagg_export_prologue(request_id, internal_idx)
+        if prologue is None:
             return None
-
-        block_count = int(self.request_kv_block_counts[internal_idx].item())
-        # Cap to the prompt-covering block count (recorded at SUBMIT for the
-        # disagg prefill path) so the export matches the decode side's
-        # header-free ceil(prompt_len/block_size); the prefill allocates one
-        # extra block for its discarded generated token when the prompt is
-        # block-aligned, which the decode never receives.
-        cap = getattr(self, "disagg_prompt_block_count", {}).pop(request_id, None)
-        if cap is not None:
-            block_count = min(block_count, cap)
-        if block_count <= 0:
-            return None
-        block_ids = self.request_to_kv_block_ids[internal_idx, :block_count].tolist()
-        if not block_ids:
-            return None
+        internal_idx, block_ids, block_hashes = prologue
+        block_count = len(block_ids)
 
         memory_buffer = self.memory_buffer
         # memory_buffer shape: (2, L, total_blocks, block_size, heads, hidden)
         _, num_layers, total_blocks, block_size, heads, hidden = memory_buffer.shape
         # DISAGG-DEBUG: a stale/out-of-range block id here is a classic async
         # CUDA illegal-memory-access; surface it as a clean Python error with
-        # the request's block bookkeeping so we can see the mismatch.
+        # the request's block bookkeeping (``raw_count`` = uncapped) so we can
+        # see the mismatch.
         raw_count = int(self.request_kv_block_counts[internal_idx].item())
         bad = [b for b in block_ids if b < 0 or b >= total_blocks]
         assert not bad, (
@@ -4072,16 +4090,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         for i, bid in enumerate(block_ids):
             staging[i] = memory_buffer[:, :, bid, :, :, :]
-
-        if (
-            getattr(self.kv_block_allocator, "enable_prefix_caching", False)
-            and hasattr(self.kv_block_allocator, "block_hashes")
-        ):
-            block_hashes = self.kv_block_allocator.block_hashes[
-                torch.tensor(block_ids, dtype=torch.int64)
-            ].tolist()
-        else:
-            block_hashes = [-1] * block_count
 
         # Wire-format tag for the staged payload (versioned). The importer
         # checks it before reading the bytes, so an external consumer -- e.g. a
@@ -4291,33 +4299,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         for i, bid in enumerate(local_block_ids):
             memory_buffer[:, :, bid, :, :, :] = staging[i]
 
-        # Register hashes so the engine's prefix-cache match treats these
-        # blocks as already populated. Filter -1 sentinels because the
-        # allocator's registry can't represent them.
-        block_hashes_in = list(payload.get("block_hashes") or [])
-        if len(block_hashes_in) == block_count and getattr(
-            self.kv_block_allocator, "enable_prefix_caching", False
-        ):
-            valid_pairs = [
-                (bid, h)
-                for bid, h in zip(local_block_ids, block_hashes_in)
-                if h is not None and h != -1
-            ]
-            if valid_pairs:
-                ids_to_register = [bid for bid, _ in valid_pairs]
-                hashes_to_register = [h for _, h in valid_pairs]
-                self.kv_block_allocator.register_kv_block_hashes(
-                    ids_to_register, hashes_to_register
-                )
-
-        # We allocated with ref_count=1; the engine's request lifecycle
-        # will increment again on match. Release once here to balance
-        # the books — the matched-block path expects ref_count to grow
-        # from the cached (ref_count==0) state.
-        if getattr(self.kv_block_allocator, "enable_prefix_caching", False):
-            self.kv_block_allocator.release_memory_blocks(
-                torch.tensor(local_block_ids, dtype=torch.int64)
-            )
+        # Register hashes + release the alloc-time pin (shared with the pull
+        # path's disagg_pull_commit; see _disagg_register_and_release).
+        self._disagg_register_and_release(
+            local_block_ids, list(payload.get("block_hashes") or [])
+        )
 
         result: Dict[str, Any] = {
             "block_ids": local_block_ids,
@@ -4348,32 +4334,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         linger in the prefix cache, which is the (windowed) lifetime guarantee.
         Returns ``None`` when the request has no exportable KV. Raises
         ``NotImplementedError`` for the MLA latent cache (unsupported)."""
-        if getattr(self, "cache_mla_latent", False):
-            raise NotImplementedError(
-                "disaggregated KV transfer does not support the MLA latent KV cache"
-            )
-        if internal_idx is None:
-            internal_idx = self._resolve_internal_request_slot(request_id)
-        if internal_idx is None:
+        prologue = self._disagg_export_prologue(request_id, internal_idx)
+        if prologue is None:
             return None
-        block_count = int(self.request_kv_block_counts[internal_idx].item())
-        cap = getattr(self, "disagg_prompt_block_count", {}).pop(request_id, None)
-        if cap is not None:
-            block_count = min(block_count, cap)
-        if block_count <= 0:
-            return None
-        block_ids = self.request_to_kv_block_ids[internal_idx, :block_count].tolist()
-        if not block_ids:
-            return None
+        internal_idx, block_ids, block_hashes = prologue
+        block_count = len(block_ids)
         _, num_layers, _, _, heads, hidden = self.memory_buffer.shape
-        if getattr(self.kv_block_allocator, "enable_prefix_caching", False) and hasattr(
-            self.kv_block_allocator, "block_hashes"
-        ):
-            block_hashes = self.kv_block_allocator.block_hashes[
-                torch.tensor(block_ids, dtype=torch.int64)
-            ].tolist()
-        else:
-            block_hashes = [-1] * block_count
         layout = "std_attn_v1"
         mamba_src_slot = -1
         if getattr(self, "is_hybrid_model", False):
@@ -4608,6 +4574,25 @@ class DynamicInferenceContext(BaseInferenceContext):
                     mamba_dst_slot = int(s)
         return {"block_ids": block_ids, "mamba_dst_slot": mamba_dst_slot}
 
+    def _disagg_register_and_release(self, block_ids: list, block_hashes: list) -> None:
+        """Commit received/pulled KV blocks into the prefix cache: register the
+        valid (block, hash) pairs (dropping -1 sentinels the registry can't hold)
+        and release the alloc-time ``ref_count=1`` pin, so the engine's
+        prefix-cache match grows from the cached ``ref_count==0`` state. Shared
+        tail of :meth:`import_request_kv` (push) and :meth:`disagg_pull_commit`
+        (pull)."""
+        if not getattr(self.kv_block_allocator, "enable_prefix_caching", False):
+            return
+        if len(block_hashes) == len(block_ids):
+            valid = [(b, h) for b, h in zip(block_ids, block_hashes) if h is not None and h != -1]
+            if valid:
+                self.kv_block_allocator.register_kv_block_hashes(
+                    [b for b, _ in valid], [h for _, h in valid]
+                )
+        self.kv_block_allocator.release_memory_blocks(
+            torch.tensor(block_ids, dtype=torch.int64)
+        )
+
     def disagg_pull_commit(
         self, block_ids: list, block_hashes: list, mamba_dst_slot: int = -1
     ) -> Dict[str, Any]:
@@ -4620,19 +4605,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         :meth:`import_request_kv` minus the staging copy (the data arrived via
         the one-sided READ)."""
         block_hashes = list(block_hashes or [])
-        pc = getattr(self.kv_block_allocator, "enable_prefix_caching", False)
-        if pc and len(block_hashes) == len(block_ids):
-            valid = [
-                (b, h) for b, h in zip(block_ids, block_hashes) if h is not None and h != -1
-            ]
-            if valid:
-                self.kv_block_allocator.register_kv_block_hashes(
-                    [b for b, _ in valid], [h for _, h in valid]
-                )
-        if pc:
-            self.kv_block_allocator.release_memory_blocks(
-                torch.tensor(block_ids, dtype=torch.int64)
-            )
+        self._disagg_register_and_release(block_ids, block_hashes)
         result: Dict[str, Any] = {"block_ids": block_ids, "block_hashes": block_hashes}
         if mamba_dst_slot >= 0:
             self._pending_disagg_mamba_slot = mamba_dst_slot
