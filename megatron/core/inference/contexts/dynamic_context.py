@@ -4541,22 +4541,65 @@ class DynamicInferenceContext(BaseInferenceContext):
             if bool((self.kv_block_allocator.block_ref_counts[ids] > 0).all()):
                 self.kv_block_allocator.release_memory_blocks(ids)
 
+    def disagg_pull_match_prefix(self, block_hashes: list) -> Dict[str, Any]:
+        """(decode, one-sided) Longest prefix of the prefill's published
+        ``block_hashes`` already resident in this rank's KV prefix cache, so the
+        pull can skip re-transferring those blocks. Returns
+        ``{"reused_block_ids", "match_len"}``; transiently pins the reused blocks
+        (``ref_count += 1``) so they survive eviction until the matching
+        :meth:`disagg_pull_commit` releases them. Empty when prefix caching is
+        off or nothing matches."""
+        empty = {"reused_block_ids": [], "match_len": 0}
+        if not getattr(self.kv_block_allocator, "enable_prefix_caching", False):
+            return empty
+        hashes = list(block_hashes or [])
+        kv_hash_to_block = getattr(self.kv_block_allocator, "kv_hash_to_block_id", None)
+        if not hashes or not kv_hash_to_block:
+            return empty
+        # Forward scan stops at the first unhashed (-1, the trailing partial
+        # block) or non-resident hash, yielding the longest resident prefix.
+        reused: list = []
+        for h in hashes:
+            if h is None or h == -1 or h not in kv_hash_to_block:
+                break
+            reused.append(int(kv_hash_to_block[h]))
+        if not reused:
+            return empty
+        self.kv_block_allocator.block_ref_counts[
+            torch.tensor(reused, dtype=torch.int64)
+        ] += 1
+        return {"reused_block_ids": reused, "match_len": len(reused)}
+
+    def disagg_pull_unmatch(self, reused_block_ids: list) -> None:
+        """(decode, one-sided) Release the transient pin taken by
+        :meth:`disagg_pull_match_prefix` -- used on the failure path when the
+        suffix allocation fails and the pull is abandoned."""
+        if reused_block_ids:
+            self.kv_block_allocator.release_memory_blocks(
+                torch.tensor(list(reused_block_ids), dtype=torch.int64)
+            )
+
     def disagg_pull_alloc(
         self, block_count: int, *, want_mamba: bool = False
     ) -> Optional[Dict[str, Any]]:
         """(decode, one-sided) Allocate destination KV blocks (and a Mamba slot)
         for an incoming pull. Returns ``{"block_ids", "mamba_dst_slot"}`` (slot
-        ``-1`` when none), or ``None`` if the KV allocation fails. The caller
-        READs the peer's data into these, then calls :meth:`disagg_pull_commit`."""
-        ids_t = self.kv_block_allocator.allocate_memory_blocks(block_count)
-        if ids_t is None:
-            return None
-        block_ids = ids_t.tolist()
-        total_blocks = self.memory_buffer.shape[2]
-        bad = [b for b in block_ids if b < 0 or b >= total_blocks]
-        assert not bad and len(block_ids) == block_count, (
-            f"DISAGG_PULL_ALLOC bad ids={bad} n={len(block_ids)} block_count={block_count}"
-        )
+        ``-1`` when none), or ``None`` if the KV allocation fails. ``block_count``
+        may be 0 (full prefix hit: no KV to pull, but a Mamba slot may still be
+        needed). The caller READs the peer's data into these, then calls
+        :meth:`disagg_pull_commit`."""
+        if block_count > 0:
+            ids_t = self.kv_block_allocator.allocate_memory_blocks(block_count)
+            if ids_t is None:
+                return None
+            block_ids = ids_t.tolist()
+            total_blocks = self.memory_buffer.shape[2]
+            bad = [b for b in block_ids if b < 0 or b >= total_blocks]
+            assert not bad and len(block_ids) == block_count, (
+                f"DISAGG_PULL_ALLOC bad ids={bad} n={len(block_ids)} block_count={block_count}"
+            )
+        else:
+            block_ids = []
         mamba_dst_slot = -1
         if want_mamba and getattr(self, "is_hybrid_model", False):
             mm = getattr(self, "mamba_metadata", None)
