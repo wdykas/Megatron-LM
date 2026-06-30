@@ -842,6 +842,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 self, backend, handoff, self._disagg_my_layout,
                 src_layouts=self._disagg_layouts(src_layout_dicts),
                 dst_layouts=self._disagg_instance_kv_layouts,
+                src_mamba_layouts=self._disagg_mamba_layouts(src_layout_dicts),
+                dst_mamba_layouts=self._disagg_instance_mamba_layouts,
+                my_mamba_layout=self._disagg_my_mamba_layout,
             )
         else:
             recv = post_recv_request_kv_resharded(

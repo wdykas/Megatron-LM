@@ -436,6 +436,7 @@ def publish_request_kv(backend, ref_payload, my_layout):
         "block_hashes": ref_payload["block_hashes"],
         "block_count": ref_payload["block_count"],
         "mamba_src_slot": ref_payload.get("mamba_src_slot", -1),
+        "mamba_dims": ref_payload.get("mamba_dims"),
         "snapshots": ref_payload.get("snapshots", []),
         "layout": ref_payload["layout"],
         # geometry of the prefill rank's KV buffer, for hetero (fragment) reads
@@ -527,8 +528,42 @@ def _kv_fragment_triples(src_dims, dst_dims, src_block, dst_block,
     return triples
 
 
+def _mamba_dims_from(conv, ssm) -> dict:
+    """Mamba conv/ssm geometry for a local live buffer pair. conv:
+    ``(num_mamba_layers, n_slots, conv_dim, d_conv)``; ssm:
+    ``(num_mamba_layers, n_slots, nheads, headdim, d_state)``."""
+    return {
+        "n_slots": int(conv.shape[1]), "conv_dim": int(conv.shape[2]), "d_conv": int(conv.shape[3]),
+        "nheads": int(ssm.shape[2]), "headdim": int(ssm.shape[3]), "d_state": int(ssm.shape[4]),
+        "elem": int(conv.element_size()),
+    }
+
+
+def _mamba_band_triple(src_dims, dst_dims, is_conv, t, src_slot, dst_slot):
+    """One byte ``(local_off, remote_off, nbytes)`` triple for a Mamba reshard
+    transfer ``t`` (a conv-channel or ssm-head band of one layer). The band is
+    contiguous at fixed ``(layer, slot)``, so it's a single descriptor."""
+    elem = dst_dims["elem"]
+    if is_conv:
+        d_conv = dst_dims["d_conv"]
+        s_cd, d_cd = src_dims["conv_dim"], dst_dims["conv_dim"]
+        s_ns, d_ns = src_dims["n_slots"], dst_dims["n_slots"]
+        nbytes = (t.src_hi - t.src_lo) * d_conv * elem
+        soff = ((t.src_layer * s_ns + src_slot) * s_cd + t.src_lo) * d_conv * elem
+        doff = ((t.dst_layer * d_ns + dst_slot) * d_cd + t.dst_lo) * d_conv * elem
+    else:
+        hd, ds = dst_dims["headdim"], dst_dims["d_state"]
+        s_nh, d_nh = src_dims["nheads"], dst_dims["nheads"]
+        s_ns, d_ns = src_dims["n_slots"], dst_dims["n_slots"]
+        nbytes = (t.src_hi - t.src_lo) * hd * ds * elem
+        soff = ((t.src_layer * s_ns + src_slot) * s_nh + t.src_lo) * hd * ds * elem
+        doff = ((t.dst_layer * d_ns + dst_slot) * d_nh + t.dst_lo) * hd * ds * elem
+    return (doff, soff, nbytes)
+
+
 def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
-                         src_layouts=None, dst_layouts=None):
+                         src_layouts=None, dst_layouts=None,
+                         src_mamba_layouts=None, dst_mamba_layouts=None, my_mamba_layout=None):
     """(decode, one-sided) Allocate destination blocks and issue the one-sided
     READ(s) pulling the request's KV into them. Returns a :class:`NixlPullRecv`,
     or ``None`` if the decode KV cache is full (re-prefill).
@@ -575,19 +610,20 @@ def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
     # --- hetero (TP-remap) fragment pull ---
     if not src_layouts or not dst_layouts:
         raise NotImplementedError("hetero pull requires src/dst layouts")
-    if any(int(h.get("mamba_src_slot", -1)) >= 0 for h in rank_handoffs):
-        raise NotImplementedError(
-            "hetero (TP-remap) pull for hybrid/Mamba models is not yet supported"
-        )
-    alloc = engine.context.disagg_pull_alloc(block_count, want_mamba=False)
+    want_mamba = any(int(h.get("mamba_src_slot", -1)) >= 0 for h in rank_handoffs)
+    if want_mamba and (not src_mamba_layouts or not dst_mamba_layouts or my_mamba_layout is None):
+        raise NotImplementedError("hetero Mamba pull requires Mamba shard layouts")
+    alloc = engine.context.disagg_pull_alloc(block_count, want_mamba=want_mamba)
     if alloc is None:
         return None
     dst_block_ids = alloc["block_ids"]
+    mamba_dst_slot = alloc["mamba_dst_slot"]
     dst_dims = _ctx_kv_dims(engine.context)
     by_rank = {int(h["global_rank"]): h for h in rank_handoffs}
     src_by_rank = {l.global_rank: l for l in src_layouts}
     plan = kv_reshard.plan_kv_reshard(src_layouts, dst_layouts)
     handles = []
+    # Attention KV: head/layer fragments, one fragment READ per source rank.
     for t in utils.transfers_for_dst(plan, my_layout.global_rank):
         h = by_rank.get(t.src_rank)
         src_layout = src_by_rank.get(t.src_rank)
@@ -603,8 +639,27 @@ def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
             )
         if triples:
             handles.append(backend.begin_pull_raw(h["region_meta"], "kv", triples))
+
+    # Mamba state: conv-channel / ssm-head bands from each source rank's hold-ring.
+    if want_mamba and mamba_dst_slot >= 0:
+        ctx = engine.context
+        m_dst = _mamba_dims_from(ctx.mamba_conv_states, ctx.mamba_ssm_states)
+        plan_m = mamba_reshard.plan_mamba_reshard(src_mamba_layouts, dst_mamba_layouts)
+        banded: dict = {}  # (region_name, src_rank) -> [triple, ...]
+        for t in utils.transfers_for_dst(plan_m, my_mamba_layout.global_rank):
+            h = by_rank.get(t.src_rank)
+            if h is None or h.get("mamba_dims") is None:
+                continue
+            region = "mamba_conv" if t.is_conv else "mamba_ssm"
+            triple = _mamba_band_triple(
+                h["mamba_dims"], m_dst, t.is_conv, t, int(h["mamba_src_slot"]), mamba_dst_slot
+            )
+            banded.setdefault((region, t.src_rank), []).append(triple)
+        for (region, src_rank), triples in banded.items():
+            handles.append(backend.begin_pull_raw(by_rank[src_rank]["region_meta"], region, triples))
+
     return NixlPullRecv(
         handles=handles, block_ids=dst_block_ids,
         block_hashes=list(rank_handoffs[0].get("block_hashes") or []),
-        mamba_dst_slot=-1, backend=backend, peer_meta=None, snapshots=[],
+        mamba_dst_slot=mamba_dst_slot, backend=backend, peer_meta=None, snapshots=[],
     )

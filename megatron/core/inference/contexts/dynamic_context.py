@@ -4424,7 +4424,28 @@ class DynamicInferenceContext(BaseInferenceContext):
             "block_ids": block_ids,
             "block_hashes": block_hashes,
             "mamba_src_slot": mamba_src_slot,
+            "mamba_dims": self._disagg_mamba_hold_dims(),
             "snapshots": self._export_snapshot_refs(block_ids),
+        }
+
+    def _disagg_mamba_hold_dims(self) -> Optional[Dict[str, Any]]:
+        """Geometry of this rank's Mamba hold-ring, so a decode rank with a
+        different TP can compute byte offsets of conv-channel / ssm-head bands
+        for a hetero (fragment) READ. conv hold: (num_mamba_layers, n_ring,
+        conv_dim, d_conv); ssm hold: (num_mamba_layers, n_ring, nheads, headdim,
+        d_state)."""
+        hc = getattr(self, "disagg_mamba_hold_conv", None)
+        hs = getattr(self, "disagg_mamba_hold_ssm", None)
+        if hc is None or hs is None:
+            return None
+        return {
+            "n_slots": int(hc.shape[1]),
+            "conv_dim": int(hc.shape[2]),
+            "d_conv": int(hc.shape[3]),
+            "nheads": int(hs.shape[2]),
+            "headdim": int(hs.shape[3]),
+            "d_state": int(hs.shape[4]),
+            "elem": int(hc.element_size()),
         }
 
     def _export_snapshot_refs(self, block_ids: list) -> list:
