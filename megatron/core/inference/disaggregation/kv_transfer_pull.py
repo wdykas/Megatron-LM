@@ -85,7 +85,17 @@ class NixlPullRecv:
     reset-safe hold-ring. The only pin is the **KV block** ref-count pin (held on
     the prefill during the hand-off); the prefill's snapshot slots stay valid for
     the second READ only as a side effect of it, since snapshot eviction is gated
-    on the KV block ref-count being 0."""
+    on the KV block ref-count being 0.
+
+    Attributes:
+        handles: pollable transport handles for the in-flight READ(s).
+        block_ids: destination KV block ids (reused prefix + newly pulled).
+        block_hashes: per-block hashes to register on commit.
+        mamba_dst_slot: destination Mamba slot, or -1 if not hybrid.
+        backend: the one-sided transport (for the second, snapshot READ).
+        peer_meta: the single source's region meta (snapshot READ); None if multi-source.
+        snapshots: prefill's Mamba snapshot refs to pull, or empty.
+    """
 
     handles: List[Any]
     block_ids: List[int]
@@ -96,6 +106,15 @@ class NixlPullRecv:
     snapshots: List = field(default_factory=list)
 
     def finish(self, engine: Any) -> Optional[dict]:
+        """Wait the READ(s), commit the KV (register hashes + bind Mamba slot),
+        and pull any Mamba snapshots.
+
+        Args:
+            engine: the decode engine (uses ``engine.context`` to commit).
+
+        Returns:
+            The import result dict from ``disagg_pull_commit``.
+        """
         for h in self.handles:
             h.wait()
         with torch.inference_mode():
@@ -119,7 +138,11 @@ def _ctx_kv_dims(ctx) -> dict:
     (``dst_dims``) side of the byte-offset math in
     :func:`_kv_fragment_descriptors`. The matching *source* geometry arrives over
     the wire as the hand-off's ``kv_dims`` (built by :func:`pull_static_meta`):
-    same schema, two sources (local read here vs. relayed from the prefill)."""
+    same schema, two sources (local read here vs. relayed from the prefill).
+
+    Args:
+        ctx: the decode :class:`DynamicInferenceContext` (reads ``memory_buffer``).
+    """
     mb = ctx.memory_buffer
     return {
         "num_layers": int(mb.shape[1]),
@@ -144,7 +167,19 @@ def _kv_fragment_descriptors(src_dims, dst_dims, src_block, dst_block,
     TP remap) is contiguous only per ``(kv, layer, token)`` -> one descriptor
     each. The full-head form reproduces exactly the whole-block stride math, so
     the same-TP case moves blocks at the minimal descriptor count without a
-    separate code path. ``kv`` indexes the key (0) / value (1) cache."""
+    separate code path. ``kv`` indexes the key (0) / value (1) cache.
+
+    Args:
+        src_dims: source (prefill) KV geometry, from the hand-off's ``kv_dims``.
+        dst_dims: destination (decode) KV geometry, from :func:`_ctx_kv_dims`.
+        src_block: source physical block id.
+        dst_block: destination physical block id.
+        src_layer_slice / dst_layer_slice: layer range on each side (a ``slice``).
+        src_head_slice / dst_head_slice: head range on each side (a ``slice``).
+
+    Returns:
+        A list of ``(local_offset, remote_offset, nbytes)`` byte descriptors.
+    """
     hidden = dst_dims["hidden"]
     elem = dst_dims["elem"]
     src_num_layers, src_total_blocks, src_block_size, src_heads = (
@@ -181,9 +216,13 @@ def _kv_fragment_descriptors(src_dims, dst_dims, src_block, dst_block,
 
 
 def _mamba_dims_from(conv, ssm) -> dict:
-    """Mamba conv/ssm geometry for a local live buffer pair. conv:
-    ``(num_mamba_layers, n_slots, conv_dim, d_conv)``; ssm:
-    ``(num_mamba_layers, n_slots, nheads, headdim, d_state)``."""
+    """Mamba conv/ssm geometry for a local live buffer pair, as
+    ``{n_slots, conv_dim, d_conv, nheads, headdim, d_state, elem}``.
+
+    Args:
+        conv: conv-state buffer ``(num_mamba_layers, n_slots, conv_dim, d_conv)``.
+        ssm: ssm-state buffer ``(num_mamba_layers, n_slots, nheads, headdim, d_state)``.
+    """
     return {
         "n_slots": int(conv.shape[1]), "conv_dim": int(conv.shape[2]), "d_conv": int(conv.shape[3]),
         "nheads": int(ssm.shape[2]), "headdim": int(ssm.shape[3]), "d_state": int(ssm.shape[4]),
@@ -196,7 +235,17 @@ def _mamba_band_descriptor(src_dims, dst_dims, is_conv, transfer, src_slot, dst_
     reshard ``transfer`` -- a band of one layer in the conv (channel) or ssm
     (head) buffer. The band is contiguous at fixed ``(layer, slot)``, so it's a
     single descriptor; conv and ssm share the stride math and differ only in the
-    indexed dim and the contiguous per-unit size."""
+    indexed dim and the contiguous per-unit size.
+
+    Args:
+        src_dims / dst_dims: source / destination Mamba geometry (:func:`_mamba_dims_from`).
+        is_conv: True for a conv-state band, False for an ssm-state band.
+        transfer: the Mamba reshard transfer (layer + ``[lo, hi)`` band on each side).
+        src_slot / dst_slot: source / destination Mamba slot index.
+
+    Returns:
+        One ``(local_offset, remote_offset, nbytes)`` byte descriptor.
+    """
     if is_conv:
         src_index_dim, dst_index_dim = src_dims["conv_dim"], dst_dims["conv_dim"]
         unit = dst_dims["d_conv"]
@@ -226,7 +275,23 @@ def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
     path. Mamba state is pulled as conv/ssm bands. Mamba prefix-cache snapshots
     are carried only when a single prefill rank holds this request's shard (so the
     second, snapshot READ resolves against one peer); a multi-source TP remap
-    skips them."""
+    skips them.
+
+    Args:
+        engine: the decode engine (uses ``engine.context`` to alloc/match blocks).
+        backend: this rank's one-sided (NIXL) transport.
+        rank_handoffs: the per-prefill-rank hand-offs relayed from PREFILL_DONE
+            (each ``{**pull_static_meta, **pull_request_meta}``).
+        my_layout: this decode rank's :class:`KVShardLayout`.
+        src_layouts / dst_layouts: full prefill / decode KV layout lists (drive
+            the reshard plan).
+        src_mamba_layouts / dst_mamba_layouts / my_mamba_layout: the Mamba
+            analogues, required only for hybrid models.
+
+    Returns:
+        A :class:`NixlPullRecv` to complete later, or ``None`` if the decode KV
+        cache is full.
+    """
     if not rank_handoffs:
         return None
     if not src_layouts or not dst_layouts:
