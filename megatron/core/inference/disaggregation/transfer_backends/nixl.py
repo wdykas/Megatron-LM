@@ -1,58 +1,41 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""NIXL (one-sided RDMA) KV transfer backend for disaggregated inference.
+"""NIXL (one-sided RDMA) pull-based KV transfer backend for disaggregated
+inference, following the reference NIXL backend.
 
-Pull-based, following the reference NIXL backend
-(github.com/nvcsathe/Megatron-LM dynamo-integration) and vLLM's NIXL connector:
-
-* each rank registers its paged KV buffers (and, for hybrid models, the Mamba
-  state buffers) **once** with a local NIXL agent and exports the agent metadata
-  **once** -- not per request;
-* the decode rank issues one-sided ``READ``s that copy specific entries (KV
-  blocks, Mamba slots) straight from the prefill's registered buffer into its
-  own, addressed by index via stride math -- no staging copy.
-
-Registering once is what keeps repeated hand-offs working: NIXL's
-``loadRemoteMD`` rejects re-loading an already-known agent
-(``NIXL_ERR_NOT_ALLOWED``), so the exported metadata must be stable across
-requests. The control plane (our in-job coordinator, or Dynamo's frontend) only
-relays the opaque pull meta from the prefill to the decode.
-
-Optional: imports ``nixl`` lazily and :func:`is_available` reports whether the
-container provides it, so the disaggregation package does not hard-depend on it.
-Selected explicitly via ``--disagg-kv-transport-backend nixl`` (threaded to the
-engine's disaggregation config), never an env var.
+Each rank registers its paged KV (and Mamba) buffers once; the decode rank then
+READs specific entries straight from the prefill's buffer by index, with no
+staging copy or per-request registration. ``nixl`` is imported lazily
+(:func:`is_available` reports availability); selected via
+``--disagg-kv-transport-backend nixl``.
 """
 
 from __future__ import annotations
 
 import base64
+import logging
 import os
 import time
 from typing import Any, Dict, List, Optional
-
-import torch
 
 from megatron.core.inference.disaggregation.transfer_backends.base import (
     KVTransportBackend,
     PullRegion,
 )
 
-# UCX transports/config NIXL needs for intra-node GPU<->GPU transfer. The
-# container often ships ``UCX_TLS=tcp`` (host-only) and leaves the memtype
-# cache on, which makes UCX treat CUDA pointers as host memory and stall. We
-# set sane defaults *before the agent is created* unless the operator already
-# pinned them. cuda_ipc/cuda_copy carry GPU memory; tcp/sm/self are needed for
-# the agent's own intra-agent setup; the memtype cache must be off so UCX
-# re-queries pointer types (torch may have allocated GPU memory before UCX's
-# hooks installed).
-_UCX_DEFAULTS = {
+logger = logging.getLogger(__name__)
+
+# Recommended UCX env for GPU KV transfer (we only inspect + warn, never set):
+#   * UCX_TLS must include a CUDA transport; ``UCX_TLS=tcp`` (host-only) degrades
+#     NIXL to host memory and stalls.
+#   * UCX_MEMTYPE_CACHE=n so UCX re-queries pointer types instead of
+#     misclassifying CUDA pointers as host memory.
+_UCX_RECOMMENDED = {
     "UCX_TLS": "cuda_ipc,cuda_copy,tcp,sm,self",
     "UCX_MEMTYPE_CACHE": "n",
 }
 
 _POLL_INTERVAL_S = 0.0005
-_POLL_TIMEOUT_S = 30.0
 
 
 def is_available() -> bool:
@@ -65,16 +48,29 @@ def is_available() -> bool:
         return False
 
 
-def _apply_ucx_defaults() -> None:
-    # Memtype cache off (safe default; respect an explicit operator setting).
-    os.environ.setdefault("UCX_MEMTYPE_CACHE", _UCX_DEFAULTS["UCX_MEMTYPE_CACHE"])
-    # UCX_TLS must include CUDA transports for GPU KV. Containers frequently
-    # pin ``UCX_TLS=tcp`` (host-only), which silently degrades NIXL to host
-    # memory and stalls; force the GPU-capable set when CUDA transports are
-    # absent, but leave an already-CUDA-capable value untouched.
+def _check_ucx_env() -> None:
+    """Warn (never mutate) if the UCX environment looks unfit for GPU KV
+    transfer, leaving the decision to the operator."""
+    issues = []
     tls = os.environ.get("UCX_TLS")
     if not tls or "cuda" not in tls.lower():
-        os.environ["UCX_TLS"] = _UCX_DEFAULTS["UCX_TLS"]
+        issues.append(
+            f"UCX_TLS={tls!r} has no CUDA transport; GPU KV may degrade to host "
+            f"memory and stall. Recommended: UCX_TLS={_UCX_RECOMMENDED['UCX_TLS']}"
+        )
+    cache = os.environ.get("UCX_MEMTYPE_CACHE")
+    if cache is None or cache.lower() not in ("n", "no"):
+        issues.append(
+            f"UCX_MEMTYPE_CACHE={cache!r}; with the memtype cache on, UCX may "
+            f"misclassify CUDA pointers as host memory. Recommended: "
+            f"UCX_MEMTYPE_CACHE={_UCX_RECOMMENDED['UCX_MEMTYPE_CACHE']}"
+        )
+    if issues:
+        logger.warning(
+            "NIXL KV transport: UCX environment may be unfit for GPU transfer; "
+            "set these before launch to avoid stalls:\n  - %s",
+            "\n  - ".join(issues),
+        )
 
 
 class NixlPullHandle:
@@ -94,23 +90,16 @@ class NixlPullHandle:
         self._done = st == "DONE"
         return self._done
 
-    def wait(self, timeout_s: float = _POLL_TIMEOUT_S) -> None:
-        deadline = time.monotonic() + timeout_s
+    def wait(self) -> None:
         while not self.poll():
-            if time.monotonic() > deadline:
-                raise TimeoutError("NIXL transfer did not complete within timeout")
             time.sleep(_POLL_INTERVAL_S)
 
 
 class NixlTransportBackend(KVTransportBackend):
-    """Per-rank NIXL agent owning a registration over the paged KV buffers.
-
-    One-sided: implements :meth:`register_regions` / :meth:`export_regions_meta`
-    (publish the registered buffers' layout) plus :meth:`begin_pull` (remote
-    READ) and :meth:`begin_push` (remote WRITE), so a single rank moves entries
-    by index in either direction. The two-sided ``send``/``recv`` interface is
-    left unimplemented (inherits the base ``NotImplementedError``).
-    """
+    """Per-rank NIXL agent owning one registration over the paged KV buffers.
+    One-sided: register once, then :meth:`begin_pull` (READ) / :meth:`begin_push`
+    (WRITE) move entries by index in either direction. The two-sided send/recv
+    interface is left unimplemented."""
 
     is_pull = True
 
@@ -129,7 +118,7 @@ class NixlTransportBackend(KVTransportBackend):
     def init(self, *, group: Optional[object] = None, **kwargs) -> None:
         if self._init:
             return
-        _apply_ucx_defaults()
+        _check_ucx_env()
         from nixl._api import nixl_agent, nixl_agent_config
 
         if self._agent_name is None:
@@ -142,10 +131,8 @@ class NixlTransportBackend(KVTransportBackend):
 
     # --- one-sided family: register once, READ or WRITE entries -----------
     def register_regions(self, regions: Dict[str, PullRegion]) -> None:
-        """Register each region's buffer with the agent once and export the
-        agent metadata so the regions are reachable for remote READ/WRITE. The
-        registration is for the backend's lifetime; the export is the only one,
-        so peers load it exactly once."""
+        """Register each region's buffer with the agent once (for the backend's
+        lifetime) and export the agent metadata, so peers load it exactly once."""
         assert self._init, "NixlTransportBackend.init() not called"
         assert not self._regions, "register_regions called more than once"
         for name, region in regions.items():
@@ -178,11 +165,10 @@ class NixlTransportBackend(KVTransportBackend):
         )
 
     def begin_pull_raw(self, peer_meta: dict, region_name: str, triples: list) -> NixlPullHandle:
-        """Remote READ of arbitrary byte sub-ranges within a single registered
-        region -- used for hetero-TP fragment reads, where a decode rank pulls
-        head/layer sub-ranges of blocks rather than whole entries. ``triples`` is
-        a list of ``(local_byte_off, remote_byte_off, nbytes)`` relative to the
-        region base on each side. All batched into one transfer."""
+        """Remote READ of arbitrary byte sub-ranges of one region -- for hetero-TP
+        fragment reads (head/layer sub-ranges, not whole entries). ``triples``:
+        ``(local_byte_off, remote_byte_off, nbytes)`` relative to each side's
+        region base; all batched into one transfer."""
         assert self._init, "NixlTransportBackend.init() not called"
         if not triples:
             return NixlPullHandle(self._agent, None)
@@ -199,10 +185,8 @@ class NixlTransportBackend(KVTransportBackend):
 
     def _begin(self, op: str, peer_meta: dict, items: list) -> NixlPullHandle:
         """Issue one one-sided transfer (``op`` = READ/WRITE) batching every
-        ``(region, local_index, remote_index)`` in ``items``. ``local_descs``
-        always address this rank's registered regions and ``remote_descs`` the
-        peer's; ``op`` sets the data direction. Identity layout only (peer and
-        local region share num_outer / inner_bytes) -- hetero TP is future work."""
+        ``(region, local_index, remote_index)`` in ``items``. Identity layout
+        only -- peer and local region must share num_outer / inner_bytes."""
         assert self._init, "NixlTransportBackend.init() not called"
         if not items:
             return NixlPullHandle(self._agent, None)
