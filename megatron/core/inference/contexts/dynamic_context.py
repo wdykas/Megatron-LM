@@ -4334,6 +4334,118 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return result
 
+    # --- one-sided (pull) hand-off: move KV by block reference, no copy -----
+    def export_request_kv_ref(
+        self, request_id: int, internal_idx: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
+        """(prefill, one-sided) Capture a request's KV *by reference* -- block
+        ids + hashes + Mamba slot -- with no copy. The decode peer READs these
+        blocks straight from this rank's registered ``memory_buffer``, so the
+        blocks must stay valid until read; after the request frees its slot they
+        linger in the prefix cache, which is the (windowed) lifetime guarantee.
+        Returns ``None`` when unexportable (same conditions as
+        :meth:`export_request_kv`)."""
+        if getattr(self, "cache_mla_latent", False):
+            return None
+        if internal_idx is None:
+            internal_idx = self._resolve_internal_request_slot(request_id)
+        if internal_idx is None:
+            return None
+        block_count = int(self.request_kv_block_counts[internal_idx].item())
+        cap = getattr(self, "disagg_prompt_block_count", {}).pop(request_id, None)
+        if cap is not None:
+            block_count = min(block_count, cap)
+        if block_count <= 0:
+            return None
+        block_ids = self.request_to_kv_block_ids[internal_idx, :block_count].tolist()
+        if not block_ids:
+            return None
+        _, num_layers, _, _, heads, hidden = self.memory_buffer.shape
+        if getattr(self.kv_block_allocator, "enable_prefix_caching", False) and hasattr(
+            self.kv_block_allocator, "block_hashes"
+        ):
+            block_hashes = self.kv_block_allocator.block_hashes[
+                torch.tensor(block_ids, dtype=torch.int64)
+            ].tolist()
+        else:
+            block_hashes = [-1] * block_count
+        layout = "std_attn_v1"
+        mamba_src_slot = -1
+        if getattr(self, "is_hybrid_model", False):
+            mm = getattr(self, "mamba_metadata", None)
+            slot_tensor = getattr(mm, "request_to_mamba_state_idx", None) if mm else None
+            if slot_tensor is not None:
+                mamba_src_slot = int(slot_tensor[internal_idx].item())
+            if mamba_src_slot >= 0:
+                layout = "hybrid_v1"
+        return {
+            "layout": layout,
+            "block_count": block_count,
+            "block_size_tokens": int(self.block_size_tokens),
+            "num_layers": int(num_layers),
+            "num_heads_per_partition": int(heads),
+            "hidden_per_head": int(hidden),
+            "block_ids": block_ids,
+            "block_hashes": block_hashes,
+            "mamba_src_slot": mamba_src_slot,
+        }
+
+    def disagg_pull_alloc(
+        self, block_count: int, *, want_mamba: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        """(decode, one-sided) Allocate destination KV blocks (and a Mamba slot)
+        for an incoming pull. Returns ``{"block_ids", "mamba_dst_slot"}`` (slot
+        ``-1`` when none), or ``None`` if the KV allocation fails. The caller
+        READs the peer's data into these, then calls :meth:`disagg_pull_commit`."""
+        ids_t = self.kv_block_allocator.allocate_memory_blocks(block_count)
+        if ids_t is None:
+            return None
+        block_ids = ids_t.tolist()
+        total_blocks = self.memory_buffer.shape[2]
+        bad = [b for b in block_ids if b < 0 or b >= total_blocks]
+        assert not bad and len(block_ids) == block_count, (
+            f"DISAGG_PULL_ALLOC bad ids={bad} n={len(block_ids)} block_count={block_count}"
+        )
+        mamba_dst_slot = -1
+        if want_mamba and getattr(self, "is_hybrid_model", False):
+            mm = getattr(self, "mamba_metadata", None)
+            if mm is not None:
+                s = mm.allocate_slot()
+                if s is not None:
+                    mamba_dst_slot = int(s)
+        return {"block_ids": block_ids, "mamba_dst_slot": mamba_dst_slot}
+
+    def disagg_pull_commit(
+        self, block_ids: list, block_hashes: list, mamba_dst_slot: int = -1
+    ) -> Dict[str, Any]:
+        """(decode, one-sided) After the READ has landed the peer's KV into
+        ``block_ids`` (and Mamba into ``mamba_dst_slot``), register the block
+        hashes so the prefix-cache match treats them as populated, balance the
+        allocator ref-count (we allocated with ref_count=1; the matched-block
+        path expects to grow from the cached ref_count==0 state), and bind the
+        Mamba slot for the next :meth:`add_request`. Mirrors the tail of
+        :meth:`import_request_kv` minus the staging copy (the data arrived via
+        the one-sided READ)."""
+        block_hashes = list(block_hashes or [])
+        pc = getattr(self.kv_block_allocator, "enable_prefix_caching", False)
+        if pc and len(block_hashes) == len(block_ids):
+            valid = [
+                (b, h) for b, h in zip(block_ids, block_hashes) if h is not None and h != -1
+            ]
+            if valid:
+                self.kv_block_allocator.register_kv_block_hashes(
+                    [b for b, _ in valid], [h for _, h in valid]
+                )
+        if pc:
+            self.kv_block_allocator.release_memory_blocks(
+                torch.tensor(block_ids, dtype=torch.int64)
+            )
+        result: Dict[str, Any] = {"block_ids": block_ids, "block_hashes": block_hashes}
+        if mamba_dst_slot >= 0:
+            self._pending_disagg_mamba_slot = mamba_dst_slot
+            result["mamba_slot"] = mamba_dst_slot
+        return result
+
     def _import_mamba_state(self, payload: Dict[str, Any]) -> Optional[int]:
         """Allocate a Mamba slot, write the end-state, and rehydrate
         per-block snapshots so the decode worker's prefix cache works.

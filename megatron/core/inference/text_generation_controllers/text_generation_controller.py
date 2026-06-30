@@ -1679,9 +1679,18 @@ class TextGenerationController:
         # SEND_KV names the decode target.
         if getattr(context, "disagg_stage_prefill_kv", False) and finished_idxs.numel() > 0:
             staged_kv = context.disagg_staged_kv
+            # One-sided (pull) backends capture KV *by reference* (block ids +
+            # Mamba slot, no copy): the decode READs these blocks straight from
+            # the registered buffer, which stays valid in the prefix cache until
+            # read. Push backends copy a staging tensor here, since the original
+            # blocks are recycled before SEND_KV ships them.
+            pull_mode = getattr(context, "disagg_pull_mode", False)
             for fidx in finished_idxs.tolist():
                 req_id = int(context.request_ids[fidx].item())
-                payload = context.export_request_kv(req_id, internal_idx=int(fidx))
+                if pull_mode:
+                    payload = context.export_request_kv_ref(req_id, internal_idx=int(fidx))
+                else:
+                    payload = context.export_request_kv(req_id, internal_idx=int(fidx))
                 if payload is not None:
                     staged_kv[req_id] = payload
 
