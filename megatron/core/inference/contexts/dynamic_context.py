@@ -4013,8 +4013,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         recycled (the disaggregation prefill hand-off stages here, since the
         context frees the slot during the step before the engine's finish loop).
 
-        Returns ``None`` when the request is unknown, has no KV blocks,
-        or uses the MLA latent cache (which we don't yet support).
+        Returns ``None`` when the request is unknown or has no KV blocks.
+        Raises ``NotImplementedError`` for the MLA latent cache (unsupported).
         Otherwise returns a dict with:
 
         * ``staging_tensor`` — KV blocks for the request, shape
@@ -4029,7 +4029,9 @@ class DynamicInferenceContext(BaseInferenceContext):
           attention, ``"hybrid_v1"`` when Mamba state rides along).
         """
         if getattr(self, "cache_mla_latent", False):
-            return None
+            raise NotImplementedError(
+                "disaggregated KV transfer does not support the MLA latent KV cache"
+            )
 
         if internal_idx is None:
             internal_idx = self._resolve_internal_request_slot(request_id)
@@ -4250,7 +4252,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         if layout not in ("std_attn_v1", "hybrid_v1"):
             return None
         if getattr(self, "cache_mla_latent", False):
-            return None
+            raise NotImplementedError(
+                "disaggregated KV transfer does not support the MLA latent KV cache"
+            )
 
         memory_buffer = self.memory_buffer
         _, num_layers, _, block_size, heads, hidden = memory_buffer.shape
@@ -4343,10 +4347,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         blocks straight from this rank's registered ``memory_buffer``, so the
         blocks must stay valid until read; after the request frees its slot they
         linger in the prefix cache, which is the (windowed) lifetime guarantee.
-        Returns ``None`` when unexportable (same conditions as
-        :meth:`export_request_kv`)."""
+        Returns ``None`` when the request has no exportable KV. Raises
+        ``NotImplementedError`` for the MLA latent cache (unsupported)."""
         if getattr(self, "cache_mla_latent", False):
-            return None
+            raise NotImplementedError(
+                "disaggregated KV transfer does not support the MLA latent KV cache"
+            )
         if internal_idx is None:
             internal_idx = self._resolve_internal_request_slot(request_id)
         if internal_idx is None:

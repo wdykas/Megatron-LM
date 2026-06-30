@@ -43,7 +43,7 @@ from megatron.core.inference.disaggregation.kv_transfer import (
 )
 from megatron.core.inference.disaggregation.mamba_reshard import MambaShardLayout
 from megatron.core.inference.disaggregation.transfer_backends.base import (
-    get_kv_transport_backend,
+    construct_kv_transport_backend,
 )
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.headers import Headers, UnknownHeaderError
@@ -555,12 +555,16 @@ class DynamicInferenceEngine(AbstractEngine):
     def set_disaggregation_config(
         self, *, role, instance_layouts, identity, total_instances,
         world_group, spawn_coordinator, disagg_router="round_robin",
+        kv_transport_backend="nccl",
     ):
         """Mark this engine as a disaggregated prefill/decode shard.
 
         Call before :meth:`start_listening_to_data_parallel_coordinator`.
 
         Args:
+            kv_transport_backend: KV transport, ``"nccl"`` (two-sided push) or
+                ``"nixl"`` (one-sided pull). Explicit -- chosen by the caller, not
+                an env var or auto-detection.
             role: ``"prefill"`` or ``"decode"``.
             instance_layouts: KV-shard layout dicts for every rank of this
                 instance (so the coordinator can build reshard plans).
@@ -582,6 +586,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.disagg_world_group = world_group
         self.disagg_spawn_coordinator = spawn_coordinator
         self.disagg_router_name = disagg_router
+        self._disagg_kv_transport_backend = kv_transport_backend
         # Precompute the immutable per-rank/instance layouts once: they're fixed
         # for the engine's life, so building them here (instead of rescanning +
         # rebuilding on every hand-off) keeps the send/recv path cheap.
@@ -615,7 +620,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # copying a staging tensor. Construct eagerly here for pull backends;
             # push (NCCL) backends keep their lazy first-use init unchanged.
             self.context.disagg_pull_mode = False
-            backend = get_kv_transport_backend()
+            backend = construct_kv_transport_backend(self._disagg_kv_transport_backend)
             if backend.is_pull:
                 backend.init()
                 self._disagg_register_pull_regions(backend)  # sets disagg_pull_mode
@@ -638,6 +643,7 @@ class DynamicInferenceEngine(AbstractEngine):
           (and staged-KV memory) so prefill can't outrun decode.
         """
         self._disagg_backend = None  # lazily-created KV transport backend
+        self._disagg_kv_transport_backend = "nccl"  # set explicitly by set_disaggregation_config
         self._disagg_pending_sends = {}  # request_id -> PrefillHandoff
         self._disagg_pending_recvs = {}  # request_id -> (recv, prompt, sampling_params)
         # (decode, one-sided) request_ids whose READ has drained, queued for a
@@ -660,16 +666,16 @@ class DynamicInferenceEngine(AbstractEngine):
         return [MambaShardLayout(**d["mamba"]) for d in dicts if d.get("mamba")]
 
     def _disagg_get_backend(self):
-        """Lazily construct the KV transport backend, selected by
-        ``MEGATRON_KV_TRANSFER_BACKEND`` (default ``auto``): NIXL (one-sided pull)
-        when the container provides it, else NCCL (two-sided push). The engine
-        branches on ``backend.is_pull`` -- everything else is transport-agnostic.
+        """Lazily construct the KV transport backend named by the disaggregation
+        config (``kv_transport_backend``: ``"nccl"`` two-sided push, or ``"nixl"``
+        one-sided pull). The engine branches on ``backend.is_pull`` -- everything
+        else is transport-agnostic.
 
         One-sided backends register this rank's paged KV (+ Mamba) buffers once
         here, so a peer can READ entries by block/slot index without any
         per-request registration."""
         if self._disagg_backend is None:
-            backend = get_kv_transport_backend()
+            backend = construct_kv_transport_backend(self._disagg_kv_transport_backend)
             backend.init()
             if backend.is_pull:
                 self._disagg_register_pull_regions(backend)
