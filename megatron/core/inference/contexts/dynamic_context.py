@@ -4374,10 +4374,27 @@ class DynamicInferenceContext(BaseInferenceContext):
         if getattr(self, "is_hybrid_model", False):
             mm = getattr(self, "mamba_metadata", None)
             slot_tensor = getattr(mm, "request_to_mamba_state_idx", None) if mm else None
-            if slot_tensor is not None:
-                mamba_src_slot = int(slot_tensor[internal_idx].item())
-            if mamba_src_slot >= 0:
+            live_slot = int(slot_tensor[internal_idx].item()) if slot_tensor is not None else -1
+            if live_slot >= 0:
                 layout = "hybrid_v1"
+                # Copy the live Mamba end-state into the reset-safe hold-ring and
+                # publish the RING index (not the live slot): the live slot is
+                # LIFO-recycled by the next prefill and wiped by reset, but the
+                # ring is disagg-owned and untouched, so the decode's READ stays
+                # correct without pinning. A ring slot is reused only after
+                # hold_n more publishes -- far beyond the decode's read lag.
+                hold_conv = getattr(self, "disagg_mamba_hold_conv", None)
+                if hold_conv is not None:
+                    n = self.disagg_mamba_hold_n
+                    ring = self.disagg_mamba_hold_count % n
+                    self.disagg_mamba_hold_count += 1
+                    self.disagg_mamba_hold_conv[:, ring] = self.mamba_conv_states[:, live_slot]
+                    self.disagg_mamba_hold_ssm[:, ring] = self.mamba_ssm_states[:, live_slot]
+                    mamba_src_slot = ring
+                else:
+                    # No hold-ring (e.g. decode-only context): publish the live
+                    # slot (windowed by-reference fallback).
+                    mamba_src_slot = live_slot
         return {
             "layout": layout,
             "block_count": block_count,
