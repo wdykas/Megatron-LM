@@ -430,6 +430,7 @@ def publish_request_kv(backend, ref_payload, my_layout):
     return {
         "transport": "nixl",
         "shard_key": list(my_layout.kv_shard_key()),
+        "global_rank": int(my_layout.global_rank),
         "region_meta": backend.export_regions_meta(),
         "block_ids": ref_payload["block_ids"],
         "block_hashes": ref_payload["block_hashes"],
@@ -437,6 +438,15 @@ def publish_request_kv(backend, ref_payload, my_layout):
         "mamba_src_slot": ref_payload.get("mamba_src_slot", -1),
         "snapshots": ref_payload.get("snapshots", []),
         "layout": ref_payload["layout"],
+        # geometry of the prefill rank's KV buffer, for hetero (fragment) reads
+        "kv_dims": {
+            "num_layers": ref_payload["num_layers"],
+            "total_blocks": ref_payload["total_blocks"],
+            "block_size": ref_payload["block_size_tokens"],
+            "heads": ref_payload["num_heads_per_partition"],
+            "hidden": ref_payload["hidden_per_head"],
+            "elem": ref_payload["elem_size"],
+        },
     }
 
 
@@ -452,7 +462,7 @@ class NixlPullRecv:
     block hashes -- the snapshot slots are protected from eviction by the KV pin,
     so no hold-ring is needed."""
 
-    handle: Any
+    handles: List[Any]
     block_ids: List[int]
     block_hashes: List[int]
     mamba_dst_slot: int
@@ -461,7 +471,8 @@ class NixlPullRecv:
     snapshots: List = field(default_factory=list)
 
     def finish(self, engine: Any) -> Optional[dict]:
-        self.handle.wait()
+        for h in self.handles:
+            h.wait()
         with torch.inference_mode():
             result = engine.context.disagg_pull_commit(
                 self.block_ids, self.block_hashes, self.mamba_dst_slot
@@ -477,37 +488,123 @@ class NixlPullRecv:
             return result
 
 
-def post_pull_request_kv(engine, backend, rank_handoffs, my_layout):
-    """(decode, one-sided) Select this rank's counterpart source (identity reshard:
-    match KV shard key), allocate destination blocks (+ a Mamba slot), and issue
-    the one-sided READ pulling the peer's blocks straight into them. Returns a
-    :class:`NixlPullRecv`, or ``None`` if the decode KV cache is full (the caller
-    then admits the request to re-prefill from the prompt)."""
-    my_key = list(my_layout.kv_shard_key())
-    src = next((h for h in rank_handoffs if h.get("shard_key") == my_key), None)
-    if src is None:
-        raise NotImplementedError(
-            f"pull hand-off: no source shard matching key {my_key} "
-            "(non-identity reshard over a one-sided backend is not yet supported)"
+def _ctx_kv_dims(ctx) -> dict:
+    """KV ``memory_buffer`` geometry for the local rank: ``(2, L, total_blocks,
+    block_size, heads, hidden)``."""
+    mb = ctx.memory_buffer
+    return {
+        "num_layers": int(mb.shape[1]),
+        "total_blocks": int(mb.shape[2]),
+        "block_size": int(mb.shape[3]),
+        "heads": int(mb.shape[4]),
+        "hidden": int(mb.shape[5]),
+        "elem": int(mb.element_size()),
+    }
+
+
+def _kv_fragment_triples(src_dims, dst_dims, src_block, dst_block,
+                         src_lslice, dst_lslice, src_hslice, dst_hslice):
+    """Byte ``(local_off, remote_off, nbytes)`` triples (relative to each side's
+    ``memory_buffer`` base) to READ a head/layer fragment of one block. In the
+    row-major ``(2, L, total_blocks, BS, heads, hidden)`` buffer, a head range is
+    contiguous only per ``(k, layer, token)``, so we emit one descriptor per
+    ``(k, layer, token)`` of ``head_count*hidden`` elements."""
+    HD = dst_dims["hidden"]
+    elem = dst_dims["elem"]
+    head_n = src_hslice.stop - src_hslice.start
+    nbytes = head_n * HD * elem
+    sL, sTB, sBS, sH = src_dims["num_layers"], src_dims["total_blocks"], src_dims["block_size"], src_dims["heads"]
+    dL, dTB, dBS, dH = dst_dims["num_layers"], dst_dims["total_blocks"], dst_dims["block_size"], dst_dims["heads"]
+    src_layers = range(src_lslice.start, src_lslice.stop)
+    dst_layers = range(dst_lslice.start, dst_lslice.stop)
+    triples = []
+    for k in (0, 1):
+        for sl, dl in zip(src_layers, dst_layers):
+            for t in range(sBS):
+                soff = ((((k * sL + sl) * sTB + src_block) * sBS + t) * sH + src_hslice.start) * HD * elem
+                doff = ((((k * dL + dl) * dTB + dst_block) * dBS + t) * dH + dst_hslice.start) * HD * elem
+                triples.append((doff, soff, nbytes))  # (local=dst, remote=src, nbytes)
+    return triples
+
+
+def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
+                         src_layouts=None, dst_layouts=None):
+    """(decode, one-sided) Allocate destination blocks and issue the one-sided
+    READ(s) pulling the request's KV into them. Returns a :class:`NixlPullRecv`,
+    or ``None`` if the decode KV cache is full (re-prefill).
+
+    Identity reshard (same prefill/decode TP+PP): the decode pulls its 1:1
+    counterpart's whole blocks (+ Mamba slot/snapshots). Hetero reshard (TP
+    remap): the decode assembles its head/layer shard from fragments of one-or-
+    more prefill ranks, driven by ``kv_reshard.plan_kv_reshard`` -- one
+    fragment READ per contributing source rank."""
+    if not rank_handoffs:
+        return None
+    block_count = int(rank_handoffs[0]["block_count"])
+    identity = True
+    if src_layouts:
+        identity = (
+            src_layouts[0].tp_size == my_layout.tp_size
+            and src_layouts[0].pp_size == my_layout.pp_size
         )
-    want_mamba = int(src.get("mamba_src_slot", -1)) >= 0
-    alloc = engine.context.disagg_pull_alloc(int(src["block_count"]), want_mamba=want_mamba)
+
+    if identity:
+        my_key = list(my_layout.kv_shard_key())
+        src = next((h for h in rank_handoffs if h.get("shard_key") == my_key), None)
+        if src is None:
+            raise NotImplementedError(f"pull hand-off: no source shard matching key {my_key}")
+        want_mamba = int(src.get("mamba_src_slot", -1)) >= 0
+        alloc = engine.context.disagg_pull_alloc(block_count, want_mamba=want_mamba)
+        if alloc is None:
+            return None
+        dst_block_ids = alloc["block_ids"]
+        mamba_dst_slot = alloc["mamba_dst_slot"]
+        transfers = [("kv", s, d) for s, d in zip(src["block_ids"], dst_block_ids)]
+        if want_mamba and mamba_dst_slot >= 0:
+            ms = int(src["mamba_src_slot"])
+            transfers.append(("mamba_conv", ms, mamba_dst_slot))
+            transfers.append(("mamba_ssm", ms, mamba_dst_slot))
+        handle = backend.begin_pull(src["region_meta"], transfers)
+        return NixlPullRecv(
+            handles=[handle], block_ids=dst_block_ids,
+            block_hashes=list(src.get("block_hashes") or []), mamba_dst_slot=mamba_dst_slot,
+            backend=backend, peer_meta=src["region_meta"],
+            snapshots=list(src.get("snapshots") or []),
+        )
+
+    # --- hetero (TP-remap) fragment pull ---
+    if not src_layouts or not dst_layouts:
+        raise NotImplementedError("hetero pull requires src/dst layouts")
+    if any(int(h.get("mamba_src_slot", -1)) >= 0 for h in rank_handoffs):
+        raise NotImplementedError(
+            "hetero (TP-remap) pull for hybrid/Mamba models is not yet supported"
+        )
+    alloc = engine.context.disagg_pull_alloc(block_count, want_mamba=False)
     if alloc is None:
         return None
     dst_block_ids = alloc["block_ids"]
-    mamba_dst_slot = alloc["mamba_dst_slot"]
-    transfers = [("kv", s, d) for s, d in zip(src["block_ids"], dst_block_ids)]
-    if want_mamba and mamba_dst_slot >= 0:
-        ms = int(src["mamba_src_slot"])
-        transfers.append(("mamba_conv", ms, mamba_dst_slot))
-        transfers.append(("mamba_ssm", ms, mamba_dst_slot))
-    handle = backend.begin_pull(src["region_meta"], transfers)
+    dst_dims = _ctx_kv_dims(engine.context)
+    by_rank = {int(h["global_rank"]): h for h in rank_handoffs}
+    src_by_rank = {l.global_rank: l for l in src_layouts}
+    plan = kv_reshard.plan_kv_reshard(src_layouts, dst_layouts)
+    handles = []
+    for t in utils.transfers_for_dst(plan, my_layout.global_rank):
+        h = by_rank.get(t.src_rank)
+        src_layout = src_by_rank.get(t.src_rank)
+        if h is None or src_layout is None:
+            continue
+        sl, sh = t.src_layer_slice(src_layout), t.src_head_slice(src_layout)
+        dl, dh = t.dst_layer_slice(my_layout), t.dst_head_slice(my_layout)
+        triples = []
+        for i in range(block_count):
+            triples += _kv_fragment_triples(
+                h["kv_dims"], dst_dims, int(h["block_ids"][i]), int(dst_block_ids[i]),
+                sl, dl, sh, dh,
+            )
+        if triples:
+            handles.append(backend.begin_pull_raw(h["region_meta"], "kv", triples))
     return NixlPullRecv(
-        handle=handle,
-        block_ids=dst_block_ids,
-        block_hashes=list(src.get("block_hashes") or []),
-        mamba_dst_slot=mamba_dst_slot,
-        backend=backend,
-        peer_meta=src["region_meta"],
-        snapshots=list(src.get("snapshots") or []),
+        handles=handles, block_ids=dst_block_ids,
+        block_hashes=list(rank_handoffs[0].get("block_hashes") or []),
+        mamba_dst_slot=-1, backend=backend, peer_meta=None, snapshots=[],
     )

@@ -4416,6 +4416,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             "num_layers": int(num_layers),
             "num_heads_per_partition": int(heads),
             "hidden_per_head": int(hidden),
+            # Full memory_buffer geometry, so a decode rank with a different TP
+            # layout can compute byte offsets of head/layer sub-ranges for a
+            # hetero (fragment) READ. (2, L, total_blocks, BS, heads, hidden).
+            "total_blocks": int(self.memory_buffer.shape[2]),
+            "elem_size": int(self.memory_buffer.element_size()),
             "block_ids": block_ids,
             "block_hashes": block_hashes,
             "mamba_src_slot": mamba_src_slot,

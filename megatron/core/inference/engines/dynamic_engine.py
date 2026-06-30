@@ -838,7 +838,11 @@ class DynamicInferenceEngine(AbstractEngine):
             self.add_request(oldest, p, sampling_params=SamplingParams.deserialize(sp))
 
         if backend.is_pull:
-            recv = post_pull_request_kv(self, backend, handoff, self._disagg_my_layout)
+            recv = post_pull_request_kv(
+                self, backend, handoff, self._disagg_my_layout,
+                src_layouts=self._disagg_layouts(src_layout_dicts),
+                dst_layouts=self._disagg_instance_kv_layouts,
+            )
         else:
             recv = post_recv_request_kv_resharded(
                 self, self._disagg_my_layout,
