@@ -105,16 +105,10 @@ class PrefillHandoff:
         self.keepalive.clear()
 
 
-# Transfer matching is by POST-ORDER, not by tag. Every two-sided (push)
-# backend we use matches a recv to a send by the order they are posted on a
-# (src, dst) pair: NCCL ignores the P2P tag entirely, and gloo matches same-tag
-# ops FIFO. So correctness rests on a single invariant: the send side and the
-# recv side enumerate the transfers for each (src, dst) pair in the SAME order.
-# They do -- both iterate the deterministic reshard plan (attention transfers,
-# then Mamba), and the coordinator emits each request's SEND_KV/RECV_KV in a
-# consistent request order, so concurrent in-flight requests stay ordered too.
-# No tags are needed; a new state-bearing layer type just extends the ordered
-# enumeration on both sides.
+# Push transfers match by POST-ORDER, not tag, so the send and recv sides must
+# enumerate each (src, dst) pair's transfers in the SAME order. They do: both
+# walk the deterministic reshard plan (attention, then Mamba), and the
+# coordinator emits SEND_KV/RECV_KV in a consistent request order.
 
 
 def send_request_kv_resharded(
@@ -586,12 +580,19 @@ def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
         if src is None:
             raise NotImplementedError(f"pull hand-off: no source shard matching key {my_key}")
         want_mamba = int(src.get("mamba_src_slot", -1)) >= 0
-        alloc = engine.context.disagg_pull_alloc(block_count, want_mamba=want_mamba)
+        # Partial transfer: reuse the longest block prefix the decode already has
+        # cached and pull only the missing suffix. dst block table = reused (in
+        # order) + newly allocated; only src blocks beyond the match are READ.
+        match = engine.context.disagg_pull_match_prefix(src.get("block_hashes") or [])
+        reused, k = match["reused_block_ids"], match["match_len"]
+        alloc = engine.context.disagg_pull_alloc(block_count - k, want_mamba=want_mamba)
         if alloc is None:
+            engine.context.disagg_pull_unmatch(reused)
             return None
-        dst_block_ids = alloc["block_ids"]
+        new_ids = alloc["block_ids"]
+        dst_block_ids = list(reused) + list(new_ids)
         mamba_dst_slot = alloc["mamba_dst_slot"]
-        transfers = [("kv", s, d) for s, d in zip(src["block_ids"], dst_block_ids)]
+        transfers = [("kv", s, d) for s, d in zip(src["block_ids"][k:], new_ids)]
         if want_mamba and mamba_dst_slot >= 0:
             ms = int(src["mamba_src_slot"])
             transfers.append(("mamba_conv", ms, mamba_dst_slot))
@@ -610,10 +611,16 @@ def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
     want_mamba = any(int(h.get("mamba_src_slot", -1)) >= 0 for h in rank_handoffs)
     if want_mamba and (not src_mamba_layouts or not dst_mamba_layouts or my_mamba_layout is None):
         raise NotImplementedError("hetero Mamba pull requires Mamba shard layouts")
-    alloc = engine.context.disagg_pull_alloc(block_count, want_mamba=want_mamba)
+    # Partial transfer: reuse the longest cached block prefix (hashes are
+    # TP-independent, so the decode's resident shard for those tokens is valid)
+    # and pull only blocks [k, block_count) as fragments.
+    match = engine.context.disagg_pull_match_prefix(rank_handoffs[0].get("block_hashes") or [])
+    reused, k = match["reused_block_ids"], match["match_len"]
+    alloc = engine.context.disagg_pull_alloc(block_count - k, want_mamba=want_mamba)
     if alloc is None:
+        engine.context.disagg_pull_unmatch(reused)
         return None
-    dst_block_ids = alloc["block_ids"]
+    dst_block_ids = list(reused) + list(alloc["block_ids"])
     mamba_dst_slot = alloc["mamba_dst_slot"]
     dst_dims = _ctx_kv_dims(engine.context)
     by_rank = {int(h["global_rank"]): h for h in rank_handoffs}
@@ -621,6 +628,7 @@ def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
     plan = kv_reshard.plan_kv_reshard(src_layouts, dst_layouts)
     handles = []
     # Attention KV: head/layer fragments, one fragment READ per source rank.
+    # Only the missing suffix [k, block_count) is pulled.
     for t in utils.transfers_for_dst(plan, my_layout.global_rank):
         h = by_rank.get(t.src_rank)
         src_layout = src_by_rank.get(t.src_rank)
@@ -629,7 +637,7 @@ def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
         sl, sh = t.src_layer_slice(src_layout), t.src_head_slice(src_layout)
         dl, dh = t.dst_layer_slice(my_layout), t.dst_head_slice(my_layout)
         triples = []
-        for i in range(block_count):
+        for i in range(k, block_count):
             triples += _kv_fragment_triples(
                 h["kv_dims"], dst_dims, int(h["block_ids"][i]), int(dst_block_ids[i]),
                 sl, dl, sh, dh,
