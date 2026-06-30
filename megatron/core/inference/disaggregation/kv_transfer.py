@@ -435,6 +435,7 @@ def publish_request_kv(backend, ref_payload, my_layout):
         "block_hashes": ref_payload["block_hashes"],
         "block_count": ref_payload["block_count"],
         "mamba_src_slot": ref_payload.get("mamba_src_slot", -1),
+        "snapshots": ref_payload.get("snapshots", []),
         "layout": ref_payload["layout"],
     }
 
@@ -444,19 +445,36 @@ class NixlPullRecv:
     """Decode side: an in-flight one-sided READ of a request's blocks. :meth:`finish`
     waits the read, then registers block hashes + binds the Mamba slot (the KV
     already landed directly in the allocated blocks), mirroring DecodeRecv.finish
-    so the engine path is symmetric with the push backend."""
+    so the engine path is symmetric with the push backend.
+
+    If the prefill published Mamba prefix-cache ``snapshots`` (hybrid), a second
+    one-sided READ pulls them by reference after the KV commit has registered the
+    block hashes -- the snapshot slots are protected from eviction by the KV pin,
+    so no hold-ring is needed."""
 
     handle: Any
     block_ids: List[int]
     block_hashes: List[int]
     mamba_dst_slot: int
+    backend: Any = None
+    peer_meta: Optional[dict] = None
+    snapshots: List = field(default_factory=list)
 
     def finish(self, engine: Any) -> Optional[dict]:
         self.handle.wait()
         with torch.inference_mode():
-            return engine.context.disagg_pull_commit(
+            result = engine.context.disagg_pull_commit(
                 self.block_ids, self.block_hashes, self.mamba_dst_slot
             )
+            if self.snapshots and self.backend is not None:
+                # Resolve hashes -> local blocks (now registered by the commit),
+                # allocate snapshot slots, READ the peer's snapshots into them by
+                # reference, then register hash->block for prefix-cache sub-hits.
+                plan = engine.context.disagg_snapshot_pull_plan(self.snapshots)
+                if plan is not None:
+                    self.backend.begin_pull(self.peer_meta, plan["transfers"]).wait()
+                    engine.context.disagg_snapshot_commit(plan["block_ids"], plan["hashes"])
+            return result
 
 
 def post_pull_request_kv(engine, backend, rank_handoffs, my_layout):
@@ -489,4 +507,7 @@ def post_pull_request_kv(engine, backend, rank_handoffs, my_layout):
         block_ids=dst_block_ids,
         block_hashes=list(src.get("block_hashes") or []),
         mamba_dst_slot=mamba_dst_slot,
+        backend=backend,
+        peer_meta=src["region_meta"],
+        snapshots=list(src.get("snapshots") or []),
     )

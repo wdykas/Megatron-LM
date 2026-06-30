@@ -727,6 +727,16 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Destination side: READ straight into the live slots.
                     regions["mamba_conv"] = PullRegion(conv, 1)
                     regions["mamba_ssm"] = PullRegion(ssm, 1)
+            # Mamba prefix-cache snapshots (block-boundary states). Unlike the
+            # end-state pool, the snapshot allocator is NOT reset mid-rollout and
+            # its slots are evictable only when the KV block's ref-count is 0 --
+            # so the KV pin already protects a published request's snapshots.
+            # Move them by reference (both sides register the live snapshot
+            # buffers); no hold-ring needed.
+            sa = getattr(ctx, "mamba_slot_allocator", None)
+            if sa is not None and getattr(sa, "conv_states", None) is not None:
+                regions["snap_conv"] = PullRegion(sa.conv_states, 1)
+                regions["snap_ssm"] = PullRegion(sa.ssm_states, 1)
         backend.register_regions(regions)
         ctx.disagg_pull_mode = True
 
