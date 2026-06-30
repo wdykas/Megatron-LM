@@ -8,6 +8,46 @@ allocator attached to a bare context."""
 import torch
 
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.disaggregation.kv_transfer import _kv_fragment_triples
+
+
+def _kv_dims(L, TB, BS, H, HD, elem=2):
+    return {"num_layers": L, "total_blocks": TB, "block_size": BS,
+            "heads": H, "hidden": HD, "elem": elem}
+
+
+def test_full_head_fragment_coalesces_to_whole_block_descriptors():
+    """A full-head fragment (the same-TP case) must coalesce to one descriptor
+    per (k, layer) -- byte-identical to the whole-entry stride math the old
+    index-based begin_pull produced: addr = (o*total_blocks + block)*inner."""
+    L, TB, BS, H, HD, elem = 3, 16, 4, 5, 8, 2
+    dims = _kv_dims(L, TB, BS, H, HD, elem)
+    src_block, dst_block = 7, 2
+    triples = _kv_fragment_triples(
+        dims, dims, src_block, dst_block,
+        range(0, L), range(0, L), range(0, H), range(0, H),
+    )
+    # 2 (k) * L descriptors, NOT 2*L*BS.
+    assert len(triples) == 2 * L
+    inner = BS * H * HD * elem
+    expected = []
+    for o in range(2 * L):  # o == k*L + layer, flattened outer index
+        expected.append(((o * TB + dst_block) * inner, (o * TB + src_block) * inner, inner))
+    assert triples == expected
+
+
+def test_partial_head_fragment_splits_per_token():
+    """A partial head range (a TP remap) is contiguous only per token, so it
+    must emit one descriptor per (k, layer, token)."""
+    L, TB, BS, H, HD, elem = 2, 16, 4, 8, 8, 2
+    src = _kv_dims(L, TB, BS, H, HD, elem)
+    dst = _kv_dims(L, TB, BS, H, HD, elem)
+    # Pull heads [0:4) of an 8-head buffer -> partial -> per-token split.
+    triples = _kv_fragment_triples(
+        src, dst, 7, 2, range(0, L), range(0, L), range(0, 4), range(0, 4),
+    )
+    assert len(triples) == 2 * L * BS
+    assert all(nb == 4 * HD * elem for _, _, nb in triples)
 
 
 class _FakeKVAllocator:
