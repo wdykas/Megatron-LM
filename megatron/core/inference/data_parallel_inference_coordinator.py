@@ -200,7 +200,7 @@ class DataParallelInferenceCoordinator:
         self._disagg_credit_window = int(os.environ.get("MEGATRON_DISAGG_CREDIT_WINDOW", "32"))
         # time.sleep(5)  # Give data parallel ranks time to spawn and connect.
         for _ in range(data_parallel_size):
-            identity, payload = self.router_socket.recv_multipart()
+            identity, _ = self.router_socket.recv_multipart()
             assert identity not in self.identities_of_data_parallel_ranks
             self.identities_of_data_parallel_ranks.append(identity)
         logging.info("Inference Coordinator: Connected with data parallel ranks...")

@@ -7,18 +7,13 @@ from process groups, role-layout validation, global KV dims)."""
 
 from __future__ import annotations
 
-import functools
 from dataclasses import asdict, dataclass
 from typing import Any, List, Tuple
 
 import torch.distributed as dist
 
 from megatron.core.inference.disaggregation.kv_reshard import KVShardLayout
-from megatron.core.inference.shards_spec import (
-    InferenceShardSpec,
-    parse_inference_shards_spec,
-    spec_declares_disaggregation,
-)
+from megatron.core.inference.shards_spec import InferenceShardSpec
 from megatron.core.utils import get_pg_rank, get_pg_size
 
 PREFILL = "prefill"
@@ -65,37 +60,6 @@ def _validate_disagg_specs(specs: List[InferenceShardSpec]) -> int:
         "disaggregation needs at least one prefill shard and one decode shard."
     )
     return sum(s.dp for s in decode)
-
-
-@functools.lru_cache(maxsize=None)
-def disagg_refit_pools(inference_shards, world_size: int, rank: int = None) -> Tuple[int, int]:
-    """Map an ``--inference-shards`` spec to ``(num_dst_pools, dst_pool_index)``
-    for :func:`~megatron.core.resharding.refit.swap_model_weights`.
-
-    Memoized: the result is a pure function of the (process-constant) spec,
-    world size, and this rank, so callers can invoke it once per rollout without
-    re-parsing the spec each time.
-
-    Disaggregated serving refits the source (training) model into each shard's
-    inference model -- disjoint rank windows, possibly at different parallelism
-    -- so the refit runs one collective pass per shard. This returns the pool
-    count and the window containing ``rank``. Returns ``(1, 0)`` (the
-    single-destination default) when the spec is absent or not disaggregated, so
-    callers can pass the result unconditionally. Framework-agnostic: any
-    framework that describes its topology with an inference-shards spec can use
-    it to drive ``swap_model_weights``.
-    """
-    if rank is None:
-        rank = dist.get_rank()
-    if not (inference_shards and spec_declares_disaggregation(inference_shards)):
-        return 1, 0
-    specs = parse_inference_shards_spec(inference_shards, world_size)
-    offset = 0
-    for index, s in enumerate(specs):
-        if offset <= rank < offset + s.world_size:
-            return len(specs), index
-        offset += s.world_size
-    raise RuntimeError(f"rank {rank} not in any disagg shard window")
 
 
 def _global_kv_dims(engine, pg) -> Tuple[int, int]:
@@ -248,7 +212,6 @@ def configure_prebuilt_disagg_engine(
         role=role,
         instance_layouts=layouts,
         identity=replica_id,
-        total_instances=total_instances,
         world_group=None,  # default world group for the cross-shard addr broadcast
         spawn_coordinator=(rank == 0),
         disagg_router=disagg_router,

@@ -322,7 +322,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.disagg_role = None
         self.disagg_instance_layouts = None
         self.disagg_identity = None
-        self.disagg_total_instances = None
         self.disagg_world_group = None
         self.disagg_spawn_coordinator = False
         self.disagg_router_name = "round_robin"  # routing policy the coordinator resolves
@@ -556,7 +555,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.capture_stats = capture_stats
 
     def set_disaggregation_config(
-        self, *, role, instance_layouts, identity, total_instances,
+        self, *, role, instance_layouts, identity,
         world_group, spawn_coordinator, disagg_router="round_robin",
         kv_transport_backend="nccl",
     ):
@@ -573,7 +572,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 instance (so the coordinator can build reshard plans).
             identity: unique ZMQ identity for this instance's MP-coordinator
                 (must differ across shards/instances).
-            total_instances: total prefill+decode instances (coordinator sizing).
             world_group: process group spanning all disagg ranks (used to
                 broadcast the coordinator address across shards).
             spawn_coordinator: whether THIS rank spawns the single coordinator.
@@ -585,7 +583,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.disagg_role = role
         self.disagg_instance_layouts = instance_layouts
         self.disagg_identity = identity
-        self.disagg_total_instances = total_instances
         self.disagg_world_group = world_group
         self.disagg_spawn_coordinator = spawn_coordinator
         self.disagg_router_name = disagg_router
