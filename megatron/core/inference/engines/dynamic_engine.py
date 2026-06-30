@@ -641,6 +641,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self._disagg_pending_sends = {}  # request_id -> PrefillHandoff
         self._disagg_pending_recvs = {}  # request_id -> (recv, prompt, sampling_params)
         self._disagg_max_inflight = 8
+        # (prefill, one-sided, hybrid) depth of the reset-safe Mamba hold-ring
+        # published end-states are copied into; capped to the live slot count.
+        self._disagg_mamba_hold_slots = 64
 
     # --- disaggregated KV handoff (coordinator-driven) -------------------
     def _disagg_layouts(self, dicts):
@@ -675,7 +678,20 @@ class DynamicInferenceEngine(AbstractEngine):
         along the paging axis: KV blocks (axis 2 of the ``(2, L, blocks, BS, H,
         HD)`` buffer), Mamba slots (axis 1 of the ``(layers, slots, *state)``
         buffers). Sets ``context.disagg_pull_mode`` so the prefill staging hook
-        captures block references instead of copying a staging tensor."""
+        captures block references instead of copying a staging tensor.
+
+        KV moves by reference -- both sides register the live ``memory_buffer``,
+        the decode READs the prefill's blocks straight from it, and prefix-cache
+        retention keeps them valid until read (no copy, the large payload).
+
+        Mamba moves through a small **reset-safe hold-ring** on the prefill: the
+        live Mamba slot pool is LIFO and reset mid-rollout, so a published
+        end-state read by reference would race an immediate slot reuse (or be
+        wiped by ``reset_mamba_state``). Instead the prefill registers a
+        disagg-owned ring buffer the engine never touches and copies each
+        published end-state into a ring slot (a few KB); the decode READs the
+        ring into its live slot. No slot pinning, no synchronization -- the
+        prefill resets/recycles freely while the decode pulls on its own clock."""
         from megatron.core.inference.disaggregation.transfer_backends.base import (
             PullRegion,
         )
@@ -686,8 +702,27 @@ class DynamicInferenceEngine(AbstractEngine):
             conv = getattr(ctx, "mamba_conv_states", None)
             ssm = getattr(ctx, "mamba_ssm_states", None)
             if conv is not None and ssm is not None:
-                regions["mamba_conv"] = PullRegion(conv, 1)
-                regions["mamba_ssm"] = PullRegion(ssm, 1)
+                if self.disagg_role == "prefill":
+                    # Source side: publish from a reset-safe hold-ring, sized to
+                    # the live slot capacity (capped) so a ring slot is reused
+                    # only after far more publishes than the decode's read lag.
+                    n_ring = min(int(conv.shape[1]), self._disagg_mamba_hold_slots)
+                    ctx.disagg_mamba_hold_conv = torch.empty(
+                        (conv.shape[0], n_ring, *conv.shape[2:]),
+                        dtype=conv.dtype, device=conv.device,
+                    )
+                    ctx.disagg_mamba_hold_ssm = torch.empty(
+                        (ssm.shape[0], n_ring, *ssm.shape[2:]),
+                        dtype=ssm.dtype, device=ssm.device,
+                    )
+                    ctx.disagg_mamba_hold_n = n_ring
+                    ctx.disagg_mamba_hold_count = 0
+                    regions["mamba_conv"] = PullRegion(ctx.disagg_mamba_hold_conv, 1)
+                    regions["mamba_ssm"] = PullRegion(ctx.disagg_mamba_hold_ssm, 1)
+                else:
+                    # Destination side: READ straight into the live slots.
+                    regions["mamba_conv"] = PullRegion(conv, 1)
+                    regions["mamba_ssm"] = PullRegion(ssm, 1)
         backend.register_regions(regions)
         ctx.disagg_pull_mode = True
 
