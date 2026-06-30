@@ -4416,10 +4416,104 @@ class DynamicInferenceContext(BaseInferenceContext):
             "num_layers": int(num_layers),
             "num_heads_per_partition": int(heads),
             "hidden_per_head": int(hidden),
+            # Full memory_buffer geometry, so a decode rank with a different TP
+            # layout can compute byte offsets of head/layer sub-ranges for a
+            # hetero (fragment) READ. (2, L, total_blocks, BS, heads, hidden).
+            "total_blocks": int(self.memory_buffer.shape[2]),
+            "elem_size": int(self.memory_buffer.element_size()),
             "block_ids": block_ids,
             "block_hashes": block_hashes,
             "mamba_src_slot": mamba_src_slot,
+            "mamba_dims": self._disagg_mamba_hold_dims(),
+            "snapshots": self._export_snapshot_refs(block_ids),
         }
+
+    def _disagg_mamba_hold_dims(self) -> Optional[Dict[str, Any]]:
+        """Geometry of this rank's Mamba hold-ring, so a decode rank with a
+        different TP can compute byte offsets of conv-channel / ssm-head bands
+        for a hetero (fragment) READ. conv hold: (num_mamba_layers, n_ring,
+        conv_dim, d_conv); ssm hold: (num_mamba_layers, n_ring, nheads, headdim,
+        d_state)."""
+        hc = getattr(self, "disagg_mamba_hold_conv", None)
+        hs = getattr(self, "disagg_mamba_hold_ssm", None)
+        if hc is None or hs is None:
+            return None
+        return {
+            "n_slots": int(hc.shape[1]),
+            "conv_dim": int(hc.shape[2]),
+            "d_conv": int(hc.shape[3]),
+            "nheads": int(hs.shape[2]),
+            "headdim": int(hs.shape[3]),
+            "d_state": int(hs.shape[4]),
+            "elem": int(hc.element_size()),
+        }
+
+    def _export_snapshot_refs(self, block_ids: list) -> list:
+        """(prefill, one-sided) Per-block Mamba snapshot references for the
+        request: ``[(block_hash, snapshot_slot), ...]`` for blocks that have a
+        cached boundary snapshot and a valid hash. By reference (no copy): the
+        decode READs these snapshot slots from this rank's registered snapshot
+        buffers, which the KV pin keeps from being evicted until read."""
+        sa = getattr(self, "mamba_slot_allocator", None)
+        if sa is None or not block_ids:
+            return []
+        block_to_slot = getattr(sa, "block_to_slot", None)
+        kv = getattr(self, "kv_block_allocator", None)
+        if block_to_slot is None or kv is None or not hasattr(kv, "block_hashes"):
+            return []
+        refs = []
+        for bid in block_ids:
+            slot = int(block_to_slot[bid].item())
+            if slot < 0:
+                continue
+            h = int(kv.block_hashes[bid].item())
+            if h == -1:
+                continue
+            refs.append((h, slot))
+        return refs
+
+    def disagg_snapshot_pull_plan(self, snapshot_pairs: list) -> Optional[Dict[str, Any]]:
+        """(decode, one-sided) Given the prefill's ``[(block_hash, src_slot), ...]``,
+        resolve each hash to a local attention block (registered by the KV commit),
+        allocate a local snapshot slot, and return the READ plan
+        ``{"transfers", "block_ids", "hashes"}`` -- transfers are
+        ``(region, src_slot, local_slot)`` for snap_conv + snap_ssm. Returns
+        ``None`` if there is nothing to pull. Mirrors the resolve+allocate half of
+        :meth:`_import_mamba_snapshots`; the READ fills the slots, then
+        :meth:`disagg_snapshot_commit` registers the hashes."""
+        sa = getattr(self, "mamba_slot_allocator", None)
+        kv = getattr(self, "kv_block_allocator", None)
+        if sa is None or kv is None or not snapshot_pairs:
+            return None
+        hash_to_block = getattr(kv, "kv_hash_to_block_id", None)
+        if not hash_to_block:
+            return None
+        target_blocks, hashes, src_slots = [], [], []
+        for h, src_slot in snapshot_pairs:
+            local_bid = hash_to_block.get(h)
+            if local_bid is None:
+                continue
+            target_blocks.append(int(local_bid))
+            hashes.append(h)
+            src_slots.append(int(src_slot))
+        if not target_blocks:
+            return None
+        local_slots = sa.allocate_slots_batch(target_blocks)
+        if not local_slots or any(s is None or s < 0 for s in local_slots):
+            return None
+        transfers = []
+        for src, dst in zip(src_slots, local_slots):
+            transfers.append(("snap_conv", int(src), int(dst)))
+            transfers.append(("snap_ssm", int(src), int(dst)))
+        return {"transfers": transfers, "block_ids": target_blocks, "hashes": hashes}
+
+    def disagg_snapshot_commit(self, block_ids: list, hashes: list) -> None:
+        """(decode, one-sided) After the snapshot READ has landed, register the
+        hash->block mapping in the slot allocator so prefix-cache sub-hits restore
+        the Mamba state at these boundaries."""
+        sa = getattr(self, "mamba_slot_allocator", None)
+        if sa is not None and block_ids:
+            sa.register_block_hashes_batch(block_ids, hashes)
 
     def disagg_release_pinned(self, request_id: int) -> None:
         """(prefill, one-sided) Release the KV blocks pinned for ``request_id`` by
