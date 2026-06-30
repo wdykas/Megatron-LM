@@ -37,7 +37,8 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
 from megatron.core.inference.disaggregation.kv_reshard import KVShardLayout
 from megatron.core.inference.disaggregation.kv_transfer_pull import (
     post_pull_request_kv,
-    publish_request_kv,
+    pull_request_meta,
+    pull_static_meta,
 )
 from megatron.core.inference.disaggregation.kv_transfer_push import (
     post_recv_request_kv_resharded,
@@ -652,6 +653,11 @@ class DynamicInferenceEngine(AbstractEngine):
         # KV_READ_DONE ack so the coordinator releases a credit + the prefill
         # releases the request's pinned KV blocks.
         self._disagg_pending_acks = []
+        # (prefill, one-sided) per-MP-rank request-invariant pull metadata,
+        # gathered once (lazily on the first publish) so PREFILL_DONE needs no
+        # per-request gather. None until gathered; a list on the MP coordinator,
+        # [] on other ranks.
+        self._disagg_pull_static_metas = None
         self._disagg_max_inflight = 8
         # (prefill, one-sided, hybrid) depth of the reset-safe Mamba hold-ring
         # published end-states are copied into; capped to the live slot count.
@@ -748,42 +754,63 @@ class DynamicInferenceEngine(AbstractEngine):
         backend.register_regions(regions)
         ctx.disagg_pull_mode = True
 
-    def _disagg_publish_kv(self, request_id):
-        """(prefill, one-sided backends) Build this rank's per-request hand-off
-        (static region meta + the request's source block ids / Mamba slot) and
-        gather them to the MP coordinator. Returns the gathered handoff (list of
-        per-rank metas) on the coordinator rank, ``None`` elsewhere -- the
-        coordinator rank attaches it to PREFILL_DONE and the control plane relays
-        it, opaque, to the decode's RECV_KV.
-
-        Collective across the MP group (gather). No copy and no per-request
-        registration: the decode READs these blocks straight from the registered
-        ``memory_buffer``; they remain valid in the prefix cache until read (a
-        read-done ack would make the lifetime exact rather than windowed -- the
-        robust follow-up)."""
-        ref = self.context.disagg_staged_kv.pop(request_id, None)
-        rank_meta = None
-        if ref is not None:
-            rank_meta = publish_request_kv(
-                self._disagg_get_backend(), ref, self._disagg_my_layout
-            )
-        else:
-            logging.warning(
-                "disagg prefill: PREFILL_DONE publish for request %s has no staged "
-                "KV ref; skipping", request_id,
-            )
-
+    def _disagg_gather_pull_static_metas(self):
+        """Gather every MP rank's request-invariant pull metadata to the MP
+        coordinator **once** (region meta + buffer geometry never change). The
+        coordinator caches the per-rank list and thereafter synthesizes each
+        request's hand-off locally, so PREFILL_DONE carries no per-request gather.
+        Collective across the MP group -- all ranks must call it in lockstep."""
+        ctx = self.context
+        _, num_layers, total_blocks, block_size, heads, hidden = ctx.memory_buffer.shape
+        kv_dims = {
+            "num_layers": int(num_layers), "total_blocks": int(total_blocks),
+            "block_size": int(block_size), "heads": int(heads), "hidden": int(hidden),
+            "elem": int(ctx.memory_buffer.element_size()),
+        }
+        mamba_dims = ctx._disagg_mamba_hold_dims() if hasattr(ctx, "_disagg_mamba_hold_dims") else None
+        static = pull_static_meta(
+            self._disagg_get_backend(), self._disagg_my_layout, kv_dims, mamba_dims
+        )
         mp_group = self.pg_collection.mp
         gathered = (
             [None] * torch.distributed.get_world_size(mp_group)
             if self.is_mp_coordinator else None
         )
         torch.distributed.gather_object(
-            rank_meta, gathered, dst=get_pg_src_rank(mp_group), group=mp_group
+            static, gathered, dst=get_pg_src_rank(mp_group), group=mp_group
         )
-        if self.is_mp_coordinator:
-            return [m for m in gathered if m is not None]
-        return None
+        self._disagg_pull_static_metas = (
+            [m for m in gathered if m is not None] if self.is_mp_coordinator else []
+        )
+
+    def _disagg_publish_kv(self, request_id):
+        """(prefill, one-sided backends) Build the request's hand-off **without a
+        per-request gather**. Each rank's request-invariant pull metadata (region
+        meta + geometry) is gathered once, lazily, on the first publish
+        (:meth:`_disagg_gather_pull_static_metas`); thereafter the MP coordinator
+        synthesizes the per-rank list locally by merging those cached statics with
+        this request's block references. The block references are replicated
+        across MP ranks (every rank schedules identically), so this rank's copy is
+        authoritative for all. Returns the list on the coordinator rank, ``None``
+        elsewhere -- attached to PREFILL_DONE and relayed, opaque, to RECV_KV.
+
+        No copy and no per-request registration: the decode READs the blocks from
+        the registered ``memory_buffer``; they stay valid in the prefix cache
+        (pinned at staging) until the read-done ack releases them. The lazy gather
+        is the only collective, and it runs at most once."""
+        if self._disagg_pull_static_metas is None:
+            self._disagg_gather_pull_static_metas()  # one-time collective (all MP ranks)
+        ref = self.context.disagg_staged_kv.pop(request_id, None)
+        if not self.is_mp_coordinator:
+            return None
+        if ref is None:
+            logging.warning(
+                "disagg prefill: PREFILL_DONE publish for request %s has no staged "
+                "KV ref; skipping", request_id,
+            )
+            return None
+        request_meta = pull_request_meta(ref)
+        return [{**static, **request_meta} for static in self._disagg_pull_static_metas]
 
     def _disagg_send_kv(self, request_id, dst_layout_dicts):
         """(prefill) post the staged KV for ``request_id`` to the decode

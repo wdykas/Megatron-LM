@@ -20,32 +20,39 @@ import torch
 from megatron.core.inference.disaggregation import kv_reshard, mamba_reshard, utils
 
 
-def publish_request_kv(backend, ref_payload, my_layout):
-    """(prefill, one-sided) Build this rank's per-request hand-off: the static
-    region meta plus the request's source block ids / Mamba slot. No copy -- the
-    decode READs these from the registered ``memory_buffer``. ``ref_payload``
-    comes from ``context.export_request_kv_ref``."""
+def pull_static_meta(backend, my_layout, kv_dims, mamba_dims=None):
+    """(prefill, one-sided) This rank's **request-invariant** pull metadata:
+    region meta (NIXL agent + buffer layout), KV buffer geometry, Mamba geometry,
+    and shard identity. None of it changes between requests, so it is built once
+    and merged with :func:`pull_request_meta` per request -- keeping the
+    per-request control message down to block references rather than re-shipping
+    this (sizable) blob. ``kv_dims`` is ``{num_layers, total_blocks, block_size,
+    heads, hidden, elem}``; ``mamba_dims`` the hold-ring geometry (or ``None``)."""
     return {
         "transport": "nixl",
         "shard_key": list(my_layout.kv_shard_key()),
         "global_rank": int(my_layout.global_rank),
         "region_meta": backend.export_regions_meta(),
+        "kv_dims": kv_dims,
+        "mamba_dims": mamba_dims,
+    }
+
+
+def pull_request_meta(ref_payload):
+    """(prefill, one-sided) A request's block-level references (from
+    ``context.export_request_kv_ref``): block ids / hashes / count, Mamba slot,
+    snapshots, layout tag. These are **replicated across the MP group** -- every
+    rank schedules identically -- so one rank's copy is authoritative for all.
+    Merged onto each rank's :func:`pull_static_meta` (``{**static, **request}``)
+    to form that rank's hand-off; the decode READs the blocks from the registered
+    ``memory_buffer`` (no copy)."""
+    return {
+        "layout": ref_payload["layout"],
         "block_ids": ref_payload["block_ids"],
         "block_hashes": ref_payload["block_hashes"],
         "block_count": ref_payload["block_count"],
         "mamba_src_slot": ref_payload.get("mamba_src_slot", -1),
-        "mamba_dims": ref_payload.get("mamba_dims"),
         "snapshots": ref_payload.get("snapshots", []),
-        "layout": ref_payload["layout"],
-        # geometry of the prefill rank's KV buffer, for hetero (fragment) reads
-        "kv_dims": {
-            "num_layers": ref_payload["num_layers"],
-            "total_blocks": ref_payload["total_blocks"],
-            "block_size": ref_payload["block_size_tokens"],
-            "heads": ref_payload["num_heads_per_partition"],
-            "hidden": ref_payload["hidden_per_head"],
-            "elem": ref_payload["elem_size"],
-        },
     }
 
 
