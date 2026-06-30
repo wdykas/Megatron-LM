@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import abc
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Tuple
 
 PREFILL = "prefill"
 DECODE = "decode"
@@ -80,11 +80,6 @@ class DisaggRouting(DisaggRouter):
             if identity in pool:
                 pool.remove(identity)
 
-    @property
-    def ready(self) -> bool:
-        """Whether at least one prefill and one decode engine are registered."""
-        return bool(self.prefill_engines) and bool(self.decode_engines)
-
     # --- per-request routing ----------------------------------------------
 
     def route_submit(self, request_id: int):
@@ -112,10 +107,6 @@ class DisaggRouting(DisaggRouter):
         self._req_decode[request_id] = dec
         prefill = self._req_prefill.get(request_id)
         return prefill, dec
-
-    def decode_of(self, request_id: int) -> Optional[object]:
-        """The decode engine a request was routed to (for reply accounting)."""
-        return self._req_decode.get(request_id)
 
     def forget(self, request_id: int) -> None:
         """Drop per-request state once the reply has been routed to the client."""

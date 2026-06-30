@@ -57,13 +57,10 @@ def _routing(n_prefill=1, n_decode=2):
     return r
 
 
-def test_registration_partitions_by_role_and_readiness():
+def test_registration_partitions_by_role():
     r = DisaggRouting()
-    assert not r.ready
     r.register("p0", "prefill")
-    assert not r.ready                      # no decode yet
     r.register("d0", "decode")
-    assert r.ready
     r.register("p0", "prefill")             # idempotent
     assert r.prefill_engines == ["p0"] and r.decode_engines == ["d0"]
     with pytest.raises(ValueError):
@@ -78,7 +75,6 @@ def test_submit_goes_to_prefill_then_prefill_done_picks_decode_round_robin():
     assert r.route_prefill_done(0) == ("p0", "d0")
     assert r.route_prefill_done(1) == ("p0", "d1")
     assert r.route_prefill_done(2) == ("p0", "d0")
-    assert r.decode_of(1) == "d1"
 
 
 def test_submit_round_robins_across_multiple_prefill():
@@ -91,13 +87,13 @@ def test_submit_round_robins_across_multiple_prefill():
     assert r.route_prefill_done(2)[0] == "p0"
 
 
-def test_reply_accounting_and_forget():
+def test_forget_clears_request_state():
     r = _routing()
     r.route_submit(7)
-    r.route_prefill_done(7)
-    assert r.decode_of(7) is not None
+    assert r.route_prefill_done(7)[0] == "p0"   # the prefill that ran it
     r.forget(7)
-    assert r.decode_of(7) is None
+    # forget dropped the pairing -- the prefill is no longer remembered
+    assert r.route_prefill_done(7)[0] is None
 
 
 def test_remove_engine_drops_from_pool():
