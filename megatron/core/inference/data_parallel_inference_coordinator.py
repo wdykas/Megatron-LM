@@ -315,11 +315,19 @@ class DataParallelInferenceCoordinator:
         self.request_id_to_client_id.pop(request_id, None)
         self.request_id_to_client_request_id.pop(request_id, None)
 
-    def _handle_prefill_done(self, request_id):
+    def _handle_prefill_done(self, request_id, handoff=None):
         """Hop 2: a prefill engine staged a request's KV. Pick a decode engine,
         tell prefill where to ship the KV (SEND_KV) and decode where to receive
         it + the prompt to admit (RECV_KV). The KV bytes move engine->engine via
         the transport backend; only control flows through the coordinator.
+
+        ``handoff`` is an opaque payload some transport backends attach to
+        PREFILL_DONE (pull backends: the prefill's per-rank READ descriptors).
+        When present, the prefill has already published its KV and does nothing
+        more, so the coordinator relays the handoff in RECV_KV and skips SEND_KV;
+        when absent (push backends), it does the classic SEND_KV + RECV_KV. The
+        coordinator stays transport-agnostic -- it only checks whether a handoff
+        rode along, never what it means.
 
         Drops the request (with a logged warning) rather than crashing the
         coordinator loop if its state is missing -- e.g. a duplicate/late
@@ -347,9 +355,12 @@ class DataParallelInferenceCoordinator:
                 f"missing KV layouts (prefill={prefill_id}, decode={decode_id})",
             )
             return
-        self._disagg_send(prefill_id, Headers.SEND_KV, request_id, dst_layouts)
+        if handoff is None:
+            # Push backend: instruct the prefill to ship the KV.
+            self._disagg_send(prefill_id, Headers.SEND_KV, request_id, dst_layouts)
         self._disagg_send(
-            decode_id, Headers.RECV_KV, request_id, src_layouts, prompt, sampling_params
+            decode_id, Headers.RECV_KV, request_id, src_layouts, prompt, sampling_params,
+            handoff,
         )
 
     def _send_to_engine(self, identity, payload):
@@ -588,7 +599,11 @@ class DataParallelInferenceCoordinator:
                 # prefill (KV staged). Pick a decode engine and wire the handoff.
                 assert self.disaggregated, "PREFILL_DONE on a non-disaggregated coordinator"
                 request_id = deserialized_payload[1]
-                self._handle_prefill_done(request_id)
+                # Pull backends ride their per-rank READ descriptors here as an
+                # opaque handoff; push backends omit it. The coordinator never
+                # inspects it -- it only relays it to the decode in RECV_KV.
+                handoff = deserialized_payload[2] if len(deserialized_payload) > 2 else None
+                self._handle_prefill_done(request_id, handoff)
 
             elif header in (
                 Headers.PAUSE,

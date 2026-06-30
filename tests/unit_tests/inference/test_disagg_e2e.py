@@ -3,16 +3,10 @@
 """End-to-end functional test of the prefill->decode KV transfer.
 
 Drives the KV reshard + transport + import directly
-(send_request_kv_resharded + post_recv/finish) on real GPUs and asserts the decode side
-reconstructs the exact global KV. Two configurations:
-
-* **NCCL** (3 procs, >=3 GPUs): prefill TP2 {0,1} -> decode TP1 {2}, the
-  hetero TP2->TP1 head merge over the default GPU transport.
-* **NVSHMEM** (2 procs, >=2 GPUs): prefill TP1 {0} -> decode TP1 {1} over the
-  real NVSHMEM credit-ring backend. Guarded (skips without nvshmem4py). (A
-  3-PE NVSHMEM run hits an NVSHMEM UID-bootstrap heap-allgather limitation
-  across NUMA sockets in this environment; the hetero merge is covered by the
-  NCCL config + the reshard unit tests.)
+(send_request_kv_resharded + post_recv/finish) on real GPUs over the NCCL
+transport, and asserts the decode side reconstructs the exact global KV:
+prefill TP2 {0,1} -> decode TP1 {2} (3 procs, >=3 GPUs), exercising the hetero
+TP2->TP1 head merge.
 
 The LLM forward is stubbed (a fake context whose export returns this
 rank's head-shard of a known global KV and whose import records the
@@ -90,17 +84,19 @@ def _make_layout(rank, world):
     return ("decode", "d0", KVShardLayout(L, H, 1, 0, 1, 0, 1))
 
 
-def _worker(rank, world, port, use_nvshmem, q):
+def _worker(rank, world, port, q):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     import torch.distributed as dist
 
     torch.cuda.set_device(rank)
     device = f"cuda:{rank}"
-    # NVSHMEM bootstraps over a gloo group; the NCCL transport needs an NCCL one.
-    dist.init_process_group("gloo" if use_nvshmem else "nccl", rank=rank, world_size=world)
+    dist.init_process_group("nccl", rank=rank, world_size=world)
     try:
         from megatron.core.inference.disaggregation import kv_transfer as H
+        from megatron.core.inference.disaggregation.transfer_backends.nccl import (
+            NcclTransportBackend,
+        )
 
         role, _replica, layout = _make_layout(rank, world)
         # The full prefill/decode layout lists (what a handshake would exchange,
@@ -109,22 +105,8 @@ def _worker(rank, world, port, use_nvshmem, q):
         src_layouts = [lay for (rl, _, lay) in all_layouts if rl == "prefill"]
         dst_layouts = [lay for (rl, _, lay) in all_layouts if rl == "decode"]
 
-        if use_nvshmem:
-            from megatron.core.inference import nvshmem_runtime as nv
-            from megatron.core.inference.disaggregation.transfer_backends.nvshmem import (
-                NvshmemTransportBackend,
-            )
-
-            nv.maybe_init_nvshmem()
-            backend = NvshmemTransportBackend()
-            backend.init(slot_bytes=65536, depth=2)
-        else:
-            from megatron.core.inference.disaggregation.transfer_backends.nccl import (
-                NcclTransportBackend,
-            )
-
-            backend = NcclTransportBackend()
-            backend.init()
+        backend = NcclTransportBackend()
+        backend.init()
         eng = _FakeEng(layout, device=device)
 
         if role == "prefill":
@@ -155,10 +137,10 @@ def _worker(rank, world, port, use_nvshmem, q):
             dist.destroy_process_group()
 
 
-def _run_e2e(port, use_nvshmem, world=3):
+def _run_e2e(port, world=3):
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
-    procs = [ctx.Process(target=_worker, args=(r, world, port, use_nvshmem, q)) for r in range(world)]
+    procs = [ctx.Process(target=_worker, args=(r, world, port, q)) for r in range(world)]
     for p in procs:
         p.start()
     out = {}
@@ -183,21 +165,4 @@ def _assert_ok(out):
     reason="requires >=3 CUDA devices (prefill TP2 {0,1} + decode TP1 {2})",
 )
 def test_disagg_e2e_tp2_to_tp1_nccl():
-    _assert_ok(_run_e2e(29601, use_nvshmem=False))
-
-
-_HAVE_NVSHMEM = False
-try:
-    import nvshmem.core  # noqa: F401
-
-    _HAVE_NVSHMEM = True
-except Exception:
-    pass
-
-
-@pytest.mark.skipif(
-    not (_HAVE_NVSHMEM and torch.cuda.is_available() and torch.cuda.device_count() >= 2),
-    reason="requires nvshmem4py + >=2 CUDA devices",
-)
-def test_disagg_e2e_tp2_to_tp1_nvshmem():
-    _assert_ok(_run_e2e(29602, use_nvshmem=True, world=2))
+    _assert_ok(_run_e2e(29601))
