@@ -8,7 +8,7 @@ allocator attached to a bare context."""
 import torch
 
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
-from megatron.core.inference.disaggregation.kv_transfer import _kv_fragment_triples
+from megatron.core.inference.disaggregation.kv_transfer_pull import _kv_fragment_triples
 
 
 def _kv_dims(L, TB, BS, H, HD, elem=2):
