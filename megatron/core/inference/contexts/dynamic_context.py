@@ -4193,7 +4193,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             return None
 
         snapshot_pairs = []  # list of (block_id, slot, hash)
-        block_id_tensor = torch.tensor(block_ids, dtype=torch.int64)
         for bid in block_ids:
             slot = int(block_to_slot[bid].item())
             if slot < 0:

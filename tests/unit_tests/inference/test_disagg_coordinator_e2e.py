@@ -157,7 +157,6 @@ async def _run_disagg_e2e():
         role=role,
         instance_layouts=[_layout(rank)],
         identity="prefill" if role == "prefill" else "decode_s1_dp0",
-        total_instances=2,
         world_group=None,
         spawn_coordinator=(rank == 0),  # rank 0's engine spawns the shared coordinator
     )
