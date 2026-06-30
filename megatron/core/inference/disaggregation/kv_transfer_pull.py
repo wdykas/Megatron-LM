@@ -199,7 +199,6 @@ def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
     want_mamba = any(int(h.get("mamba_src_slot", -1)) >= 0 for h in rank_handoffs)
     if want_mamba and (not src_mamba_layouts or not dst_mamba_layouts or my_mamba_layout is None):
         raise NotImplementedError("Mamba pull requires Mamba shard layouts")
-
     # Partial transfer: reuse the longest block prefix the decode already has
     # cached (hashes are TP-independent) and pull only blocks [k, block_count).
     # dst block table = reused (in order) + newly allocated.
