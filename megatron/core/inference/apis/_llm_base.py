@@ -352,11 +352,6 @@ class _MegatronLLMBase:
         return self._is_primary_rank
 
     @property
-    def disagg_role(self) -> Optional[str]:
-        """``"prefill"`` / ``"decode"`` if this is a disaggregated shard, else None."""
-        return self._disagg_setup.role if self._disagg_setup is not None else None
-
-    @property
     def engine(self) -> "DynamicInferenceEngine":
         """The underlying :class:`DynamicInferenceEngine`."""
         return self._engine
