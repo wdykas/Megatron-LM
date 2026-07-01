@@ -3988,11 +3988,11 @@ class DynamicInferenceContext(BaseInferenceContext):
     # --- Disaggregated KV export / import (prefill -> decode handoff) ---
 
     def _disagg_resolve_export_blocks(self, request_id, internal_idx):
-        """[shared] Shared head of export_request_kv / export_request_kv_ref.
+        """[shared] Shared head of export_request_kv / export_request_kv_ref:
+        returns ``(internal_idx, block_ids, block_hashes)`` for the request.
 
-        Returns ``(internal_idx, block_ids, block_hashes)`` for the request, or
-        ``None`` only for an empty prompt (0 prompt-covering blocks, nothing to
-        hand off). Raises for the MLA latent cache.
+        Raises for the MLA latent cache and for an empty prompt (disaggregation
+        doesn't support prompt-less requests).
 
         ``block_ids`` is capped to the prompt-covering count
         (``ceil(prompt_len/block_size)``): a block-aligned prompt makes the
@@ -4010,7 +4010,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         if cap is not None:
             block_count = min(block_count, cap)
         if block_count <= 0:
-            return None
+            raise ValueError("disaggregation does not support empty prompts")
         block_ids = self.request_to_kv_block_ids[internal_idx, :block_count].tolist()
         if (
             self.kv_block_allocator.enable_prefix_caching
@@ -4025,16 +4025,15 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def export_request_kv(
         self, request_id: int, internal_idx: int
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """[push] Stage a request's KV (and Mamba state) for off-GPU transfer.
 
         ``internal_idx`` is the request's live slot -- the staging hook captures
         it *before* the slot is recycled (the context frees the slot during the
         step, before the engine's finish loop runs).
 
-        Returns ``None`` only for an empty prompt (no prompt KV to hand off).
-        Raises ``NotImplementedError`` for the MLA latent cache (unsupported).
-        Otherwise returns a dict with:
+        Raises for the MLA latent cache and for an empty prompt (both unsupported).
+        Returns a dict with:
 
         * ``staging_tensor`` — KV blocks for the request, shape
           ``(num_blocks, 2, num_layers, block_size_tokens,
@@ -4044,44 +4043,25 @@ class DynamicInferenceContext(BaseInferenceContext):
         * ``mamba_payload`` — present only for hybrid models. A dict
           with ``conv_states``, ``ssm_states``, and their shape/dtype
           descriptors so the decode side can rebuild matching tensors.
-        * ``layout`` — version tag (``"std_attn_v1"`` for pure
-          attention, ``"hybrid_v1"`` when Mamba state rides along).
         """
-        resolved = self._disagg_resolve_export_blocks(request_id, internal_idx)
-        if resolved is None:
-            return None
-        internal_idx, block_ids, block_hashes = resolved
+        internal_idx, block_ids, block_hashes = self._disagg_resolve_export_blocks(
+            request_id, internal_idx
+        )
         block_count = len(block_ids)
 
         memory_buffer = self.memory_buffer
         # memory_buffer shape: (2, L, total_blocks, block_size, heads, hidden)
-        _, num_layers, total_blocks, block_size, heads, hidden = memory_buffer.shape
-        # A stale/out-of-range block id here is a classic async CUDA illegal-memory
-        # access; surface it as a clean Python error with the request's block
-        # bookkeeping (``raw_count`` = uncapped) so we can see the mismatch.
-        raw_count = int(self.request_kv_block_counts[internal_idx].item())
-        out_of_range_ids = [b for b in block_ids if b < 0 or b >= total_blocks]
-        assert not out_of_range_ids, (
-            f"DISAGG_EXPORT req={request_id}: block_ids out of range {out_of_range_ids} "
-            f"(total_blocks={total_blocks}, block_count={block_count}, raw_count={raw_count})"
-        )
+        _, num_layers, _, block_size, heads, hidden = memory_buffer.shape
         # Gather the request's blocks in one op: (2, L, n, BS, H, HD) -> staging
         # (n, 2, L, BS, H, HD). contiguous() gives an owned buffer to hand off.
         block_ids_tensor = torch.tensor(block_ids, dtype=torch.int64, device=memory_buffer.device)
         staging = memory_buffer[:, :, block_ids_tensor].permute(2, 0, 1, 3, 4, 5).contiguous()
 
-        # Versioned wire-format tag; the importer checks it before reading the
-        # payload, so a format change bumps the version instead of mis-reading.
-        layout = "std_attn_v1"
         mamba_payload: Optional[Dict[str, Any]] = None
-
         if self.is_hybrid_model:
             mamba_payload = self._export_mamba_state(internal_idx, block_ids=block_ids)
-            if mamba_payload is not None:
-                layout = "hybrid_v1"
 
         result: Dict[str, Any] = {
-            "layout": layout,
             "block_count": block_count,
             "block_size_tokens": int(self.block_size_tokens),
             "num_layers": int(num_layers),
@@ -4106,27 +4086,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         if block_to_slot is None or not hasattr(self.kv_block_allocator, "block_hashes"):
             return
         block_hashes = self.kv_block_allocator.block_hashes
-        for bid in block_ids:
-            slot = int(block_to_slot[bid].item())
-            if slot < 0:
-                continue
-            h = int(block_hashes[bid].item())
-            if h == -1:
+        # One gather+sync each (not an .item() per block): slot/hash for every id.
+        slots = block_to_slot[
+            torch.as_tensor(block_ids, dtype=torch.int64, device=block_to_slot.device)
+        ].tolist()
+        hashes = block_hashes[
+            torch.as_tensor(block_ids, dtype=torch.int64, device=block_hashes.device)
+        ].tolist()
+        for bid, slot, h in zip(block_ids, slots, hashes):
+            if slot < 0 or h == -1:
                 continue
             yield bid, slot, h
-
-    @staticmethod
-    def _mamba_state_descriptor(conv, ssm) -> Dict[str, Any]:
-        """[shared] Wire descriptor (shape/dtype + tensor) for a conv/ssm state
-        pair, so the decode side can rebuild matching tensors."""
-        return {
-            "conv_states_shape": list(conv.shape),
-            "ssm_states_shape": list(ssm.shape),
-            "conv_states_dtype": str(conv.dtype),
-            "ssm_states_dtype": str(ssm.dtype),
-            "conv_states_tensor": conv,
-            "ssm_states_tensor": ssm,
-        }
 
     def _export_mamba_state(
         self, internal_idx: int, block_ids: Optional[list] = None
@@ -4160,8 +4130,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         ssm_slice = self.mamba_ssm_states[:, slot_idx].contiguous().clone()
 
         result: Dict[str, Any] = {
-            "num_mamba_layers": int(self.mamba_conv_states.shape[0]),
-            **self._mamba_state_descriptor(conv_slice, ssm_slice),
+            "conv_states_tensor": conv_slice,
+            "ssm_states_tensor": ssm_slice,
         }
 
         snapshots = self._export_mamba_snapshots(block_ids or [])
@@ -4196,7 +4166,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         conv = sa.conv_states[:, slot_tensor].contiguous().clone().transpose(0, 1).contiguous()
         ssm = sa.ssm_states[:, slot_tensor].contiguous().clone().transpose(0, 1).contiguous()
 
-        return {"block_hashes": hashes, **self._mamba_state_descriptor(conv, ssm)}
+        return {
+            "block_hashes": hashes,
+            "conv_states_tensor": conv,
+            "ssm_states_tensor": ssm,
+        }
 
     def import_request_kv(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """[push] Inject a staged KV (and optional Mamba) payload into this context.
@@ -4217,9 +4191,6 @@ class DynamicInferenceContext(BaseInferenceContext):
           this engine will add via :attr:`_pending_disagg_mamba_slot`;
           the engine's add path picks it up automatically.
         """
-        layout = payload.get("layout")
-        if layout not in ("std_attn_v1", "hybrid_v1"):
-            return None
         if self.cache_mla_latent:
             raise NotImplementedError(
                 "disaggregated KV transfer does not support the MLA latent KV cache"
@@ -4240,9 +4211,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             return None
 
         block_count = int(payload["block_count"])
-        if block_count <= 0:
-            return None
-
         local_block_ids_tensor = self.kv_block_allocator.allocate_memory_blocks(
             block_count
         )
@@ -4287,26 +4255,21 @@ class DynamicInferenceContext(BaseInferenceContext):
     # --- one-sided (pull) hand-off: move KV by block reference, no copy -----
     def export_request_kv_ref(
         self, request_id: int, internal_idx: int
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """[pull] (prefill, one-sided) Capture a request's KV *by reference* -- block
         ids + hashes + Mamba slot -- with no copy. The decode peer READs these
         blocks straight from this rank's registered ``memory_buffer``, so the
         blocks must stay valid until read; after the request frees its slot they
         linger in the prefix cache, which is the (windowed) lifetime guarantee.
-        Returns ``None`` only for an empty prompt (nothing to hand off). Raises
-        ``NotImplementedError`` for the MLA latent cache (unsupported)."""
-        resolved = self._disagg_resolve_export_blocks(request_id, internal_idx)
-        if resolved is None:
-            return None
-        internal_idx, block_ids, block_hashes = resolved
+        Raises for the MLA latent cache and for an empty prompt (both unsupported)."""
+        internal_idx, block_ids, block_hashes = self._disagg_resolve_export_blocks(
+            request_id, internal_idx
+        )
         block_count = len(block_ids)
-        _, num_layers, _, _, heads, hidden = self.memory_buffer.shape
-        layout = "std_attn_v1"
         mamba_src_slot = -1
         if self.is_hybrid_model:
             live_slot = int(self.mamba_metadata.request_to_mamba_state_idx[internal_idx].item())
             if live_slot >= 0:
-                layout = "hybrid_v1"
                 # Copy the live Mamba end-state into the reset-safe hold-ring and
                 # publish the RING index (not the live slot): the live slot is
                 # LIFO-recycled by the next prefill and wiped by reset, but the
@@ -4330,28 +4293,19 @@ class DynamicInferenceContext(BaseInferenceContext):
             torch.tensor(block_ids, dtype=torch.int64)
         ] += 1
         self.disagg_pinned[request_id] = list(block_ids)
+        # Only the per-request fields; the static geometry (kv_dims/mamba_dims/
+        # region meta) rides pull_static_meta, so pull_request_meta drops the rest.
         return {
-            "layout": layout,
             "block_count": block_count,
-            "block_size_tokens": int(self.block_size_tokens),
-            "num_layers": int(num_layers),
-            "num_heads_per_partition": int(heads),
-            "hidden_per_head": int(hidden),
-            # Full memory_buffer geometry, so a decode rank with a different TP
-            # layout can compute byte offsets of head/layer sub-ranges for a
-            # hetero (fragment) READ. (2, L, total_blocks, BS, heads, hidden).
-            "total_blocks": int(self.memory_buffer.shape[2]),
-            "elem_size": int(self.memory_buffer.element_size()),
             "block_ids": block_ids,
             "block_hashes": block_hashes,
             "mamba_src_slot": mamba_src_slot,
-            "mamba_dims": self._disagg_mamba_hold_dims(),
             "snapshots": self._export_snapshot_refs(block_ids),
         }
 
     def disagg_export_request_kv(
         self, request_id: int, internal_idx: int
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """[shared] Capture a finished request's KV for the disagg hand-off, dispatching on
         this context's transport mode: by-reference (pull/NIXL, no copy) or a
         staging copy (push/NCCL). The caller stages the result until the

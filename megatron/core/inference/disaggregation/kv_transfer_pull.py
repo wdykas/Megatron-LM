@@ -36,8 +36,6 @@ def pull_static_meta(backend, my_layout, kv_dims, mamba_dims=None):
         mamba_dims: Mamba hold-ring geometry, or ``None`` for non-hybrid models.
     """
     return {
-        "transport": "nixl",
-        "shard_key": list(my_layout.kv_shard_key()),
         "global_rank": int(my_layout.global_rank),
         "region_meta": backend.export_regions_meta(),
         "kv_dims": kv_dims,
@@ -61,10 +59,9 @@ def pull_request_meta(ref_payload):
         ref_payload: the dict returned by ``context.export_request_kv_ref(request_id)``.
 
     Returns:
-        ``{layout, block_ids, block_hashes, block_count, mamba_src_slot, snapshots}``.
+        ``{block_ids, block_hashes, block_count, mamba_src_slot, snapshots}``.
     """
     return {
-        "layout": ref_payload["layout"],
         "block_ids": ref_payload["block_ids"],
         "block_hashes": ref_payload["block_hashes"],
         "block_count": ref_payload["block_count"],

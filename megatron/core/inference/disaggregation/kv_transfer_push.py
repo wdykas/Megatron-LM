@@ -58,32 +58,17 @@ def derive_decode_schema(engine: Any, prompt_token_ids) -> dict:
         "block_hashes": block_hashes,
         "attn_dtype": mb.dtype,
         "has_mamba": False,
-        "has_snapshots": False,
     }
     if getattr(ctx, "is_hybrid_model", False):
         conv = ctx.mamba_conv_states  # (num_mamba_layers, max_requests, *conv_state)
         ssm = ctx.mamba_ssm_states
-        nml = int(conv.shape[0])
-        conv_state = tuple(int(x) for x in conv.shape[2:])
-        ssm_state = tuple(int(x) for x in ssm.shape[2:])
         meta["has_mamba"] = True
+        # The decode rebuilds conv/ssm from its own Mamba layout; only the
+        # dtypes aren't derivable there, so they're all the schema carries.
         meta["mamba"] = {
-            "num_mamba_layers": nml,
-            "conv_shape": (nml, *conv_state),
             "conv_dtype": conv.dtype,
-            "ssm_shape": (nml, *ssm_state),
             "ssm_dtype": ssm.dtype,
         }
-        n_snap = len(block_hashes)  # one snapshot per complete block
-        if getattr(ctx, "mamba_slot_allocator", None) is not None and n_snap > 0:
-            meta["has_snapshots"] = True
-            meta["snapshots"] = {
-                "block_hashes": block_hashes,
-                "conv_shape": (n_snap, nml, *conv_state),
-                "conv_dtype": conv.dtype,
-                "ssm_shape": (n_snap, nml, *ssm_state),
-                "ssm_dtype": ssm.dtype,
-            }
     return meta
 
 
@@ -211,7 +196,6 @@ class DecodeRecv:
             ] = sub
         m = self.meta
         payload = {
-            "layout": "std_attn_v1",
             "block_count": m["block_count"],
             "block_size_tokens": m["block_size_tokens"],
             "num_layers": self.my_layout.local_num_layers(),
@@ -246,14 +230,7 @@ class DecodeRecv:
                         f"dst_shape={tuple(dst.shape)} recv={tuple(sub.shape)} src={t.src_rank}"
                     )
                     self.mamba_ssm[t.dst_layer, t.dst_lo : t.dst_hi, :, :] = sub
-            ml = self.my_mamba_layout
-            payload["layout"] = "hybrid_v1"
             payload["mamba_payload"] = {
-                "num_mamba_layers": ml.num_layers,
-                "conv_states_shape": [ml.conv_dim_local, ml.d_conv],
-                "ssm_states_shape": [ml.nheads_local, ml.headdim, ml.d_state],
-                "conv_states_dtype": str(self.mamba_conv.dtype),
-                "ssm_states_dtype": str(self.mamba_ssm.dtype),
                 "conv_states_tensor": self.mamba_conv,
                 "ssm_states_tensor": self.mamba_ssm,
             }
