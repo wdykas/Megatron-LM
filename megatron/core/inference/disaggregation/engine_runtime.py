@@ -131,26 +131,25 @@ class DisaggEngineRuntime:
         # context (while the slot is still valid) -- the engine's finish loop
         # runs after the context has freed the slot. send_kv drains it.
         ctx = self.context
-        if ctx is not None:
-            ctx.disagg_stage_prefill_kv = role == "prefill"
-            ctx.disagg_staged_kv = {}
-            # request_id -> prompt block count, recorded at SUBMIT. Caps the
-            # exported KV to the prompt-covering blocks so it matches the decode
-            # side's header-free block_count = ceil(prompt_len/block_size); the
-            # prefill otherwise allocates one extra block for its (discarded)
-            # generated token when prompt_len is block-aligned.
-            ctx.disagg_prompt_block_count = {}
-            # One-sided (pull) backends must register their KV buffers and set
-            # disagg_pull_mode *before* the first prefill completes, so the
-            # controller's staging hook captures block references rather than
-            # copying a staging tensor. Construct eagerly here for pull backends;
-            # push (NCCL) backends keep their lazy first-use init unchanged.
-            ctx.disagg_pull_mode = False
-            backend = construct_kv_transport_backend(self.kv_transport_backend)
-            if backend.is_pull:
-                backend.init()
-                self.register_pull_regions(backend)  # sets disagg_pull_mode
-                self.backend = backend
+        ctx.disagg_stage_prefill_kv = role == "prefill"
+        ctx.disagg_staged_kv = {}
+        # request_id -> prompt block count, recorded at SUBMIT. Caps the exported
+        # KV to the prompt-covering blocks so it matches the decode side's
+        # header-free block_count = ceil(prompt_len/block_size); the prefill
+        # otherwise allocates one extra block for its (discarded) generated token
+        # when prompt_len is block-aligned.
+        ctx.disagg_prompt_block_count = {}
+        # One-sided (pull) backends must register their KV buffers and set
+        # disagg_pull_mode *before* the first prefill completes, so the
+        # controller's staging hook captures block references rather than copying
+        # a staging tensor. Construct eagerly here for pull backends; push (NCCL)
+        # backends keep their lazy first-use init unchanged.
+        ctx.disagg_pull_mode = False
+        backend = construct_kv_transport_backend(self.kv_transport_backend)
+        if backend.is_pull:
+            backend.init()
+            self.register_pull_regions(backend)  # sets disagg_pull_mode
+            self.backend = backend
 
     # --- engine proxies (read at call time; set on the engine in
     # start_listening after this runtime is constructed) -----------------
