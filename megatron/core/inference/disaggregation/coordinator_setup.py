@@ -205,9 +205,6 @@ def configure_prebuilt_disagg_engine(
             "disaggregation requires prefix caching (enable_prefix_caching=True); "
             "the decode side admits handed-off KV via a prefix-cache hit."
         )
-        # MLA's latent KV cache isn't derivable header-free, so the decode side
-        # can't reconstruct the schema. Reject it up front with a clear message
-        # rather than crash the engine loop at send/recv time.
         assert not getattr(ctx, "cache_mla_latent", False), (
             "disaggregation does not support the MLA latent KV cache "
             "(cache_mla_latent=True)."
