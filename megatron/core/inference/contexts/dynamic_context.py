@@ -3984,7 +3984,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     # --- Disaggregated KV export / import (prefill -> decode handoff) ---
 
     def _resolve_internal_request_slot(self, request_id: int) -> Optional[int]:
-        """Reverse-lookup the engine-internal slot index for ``request_id``.
+        """[shared] Reverse-lookup the engine-internal slot index for ``request_id``.
 
         The context indexes block / mamba bookkeeping by an internal
         slot counter (``total_request_count`` at the time the request
@@ -4002,7 +4002,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         return int(matches[0, 0].item())
 
     def _disagg_resolve_export_blocks(self, request_id, internal_idx):
-        """Resolve a request to the KV blocks to export -- shared by
+        """[shared] Resolve a request to the KV blocks to export -- shared by
         :meth:`export_request_kv` / :meth:`export_request_kv_ref`. Resolves the
         slot, caps to the prompt-covering block count, and returns
         ``(internal_idx, block_ids, block_hashes)`` -- or ``None`` when there's
@@ -4040,7 +4040,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     def export_request_kv(
         self, request_id: int, internal_idx: Optional[int] = None
     ) -> Optional[Dict[str, Any]]:
-        """Stage a request's KV (and Mamba state) for off-GPU transfer.
+        """[push] Stage a request's KV (and Mamba state) for off-GPU transfer.
 
         ``internal_idx`` overrides the request_id->slot reverse lookup -- the
         caller passes the still-valid slot when exporting *before* the slot is
@@ -4119,7 +4119,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     def _export_mamba_state(
         self, internal_idx: int, block_ids: Optional[list] = None
     ) -> Optional[Dict[str, Any]]:
-        """Stage a request's Mamba state — both the live end-state and
+        """[push] Stage a request's Mamba state — both the live end-state and
         the per-block-boundary snapshots — for off-GPU transfer.
 
         The end-state binds to the decode worker's request slot via
@@ -4174,7 +4174,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         return result
 
     def _export_mamba_snapshots(self, block_ids: list) -> Optional[Dict[str, Any]]:
-        """Collect per-block Mamba snapshots for the listed attention block IDs.
+        """[push] Collect per-block Mamba snapshots for the listed attention block IDs.
 
         Returns a dict carrying staged ``conv`` / ``ssm`` tensors of
         shape ``(num_snapshots, num_mamba_layers, *state_shape)`` plus
@@ -4235,7 +4235,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         }
 
     def import_request_kv(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Inject a staged KV (and optional Mamba) payload into this context.
+        """[push] Inject a staged KV (and optional Mamba) payload into this context.
 
         ``payload['staging_tensor']`` is expected to be already
         populated with the remote K/V data (typically by the NIXL
@@ -4324,7 +4324,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     def export_request_kv_ref(
         self, request_id: int, internal_idx: Optional[int] = None
     ) -> Optional[Dict[str, Any]]:
-        """(prefill, one-sided) Capture a request's KV *by reference* -- block
+        """[pull] (prefill, one-sided) Capture a request's KV *by reference* -- block
         ids + hashes + Mamba slot -- with no copy. The decode peer READs these
         blocks straight from this rank's registered ``memory_buffer``, so the
         blocks must stay valid until read; after the request frees its slot they
@@ -4397,7 +4397,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     def disagg_export_request_kv(
         self, request_id: int, internal_idx: Optional[int] = None
     ) -> Optional[Dict[str, Any]]:
-        """Capture a finished request's KV for the disagg hand-off, dispatching on
+        """[shared] Capture a finished request's KV for the disagg hand-off, dispatching on
         this context's transport mode: by-reference (pull/NIXL, no copy) or a
         staging copy (push/NCCL). The caller stages the result until the
         coordinator's SEND_KV names the decode target."""
@@ -4406,7 +4406,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         return self.export_request_kv(request_id, internal_idx=internal_idx)
 
     def _disagg_mamba_hold_dims(self) -> Optional[Dict[str, Any]]:
-        """Geometry of this rank's Mamba hold-ring, so a decode rank with a
+        """[pull] Geometry of this rank's Mamba hold-ring, so a decode rank with a
         different TP can compute byte offsets of conv-channel / ssm-head bands
         for a hetero (fragment) READ. conv hold: (num_mamba_layers, n_ring,
         conv_dim, d_conv); ssm hold: (num_mamba_layers, n_ring, nheads, headdim,
@@ -4426,7 +4426,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         }
 
     def _export_snapshot_refs(self, block_ids: list) -> list:
-        """(prefill, one-sided) Per-block Mamba snapshot references for the
+        """[pull] (prefill, one-sided) Per-block Mamba snapshot references for the
         request: ``[(block_hash, snapshot_slot), ...]`` for blocks that have a
         cached boundary snapshot and a valid hash. By reference (no copy): the
         decode READs these snapshot slots from this rank's registered snapshot
@@ -4485,7 +4485,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         return {"transfers": transfers, "block_ids": target_blocks, "hashes": hashes}
 
     def disagg_snapshot_commit(self, block_ids: list, hashes: list) -> None:
-        """(decode, one-sided) After the snapshot READ has landed, register the
+        """[pull] (decode, one-sided) After the snapshot READ has landed, register the
         hash->block mapping in the slot allocator so prefix-cache sub-hits restore
         the Mamba state at these boundaries."""
         sa = self.mamba_slot_allocator
@@ -4493,7 +4493,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             sa.register_block_hashes_batch(block_ids, hashes)
 
     def disagg_release_pinned(self, request_id: int) -> None:
-        """(prefill, one-sided) Release the KV blocks pinned for ``request_id`` by
+        """[pull] (prefill, one-sided) Release the KV blocks pinned for ``request_id`` by
         :meth:`export_request_kv_ref`, on the decode's read-done ack (RELEASE_KV).
         Idempotent; guarded so a stray ack can't drive a ref-count negative."""
         if not self.disagg_pinned:
@@ -4580,7 +4580,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         return {"block_ids": block_ids, "mamba_dst_slot": mamba_dst_slot}
 
     def _disagg_register_and_release(self, block_ids: list, block_hashes: list) -> None:
-        """Commit received/pulled KV blocks into the prefix cache: register the
+        """[shared] Commit received/pulled KV blocks into the prefix cache: register the
         valid (block, hash) pairs (dropping -1 sentinels the registry can't hold)
         and release the alloc-time ``ref_count=1`` pin, so the engine's
         prefix-cache match grows from the cached ``ref_count==0`` state. Shared
@@ -4618,7 +4618,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         return result
 
     def _import_mamba_state(self, payload: Dict[str, Any]) -> Optional[int]:
-        """Allocate a Mamba slot, write the end-state, and rehydrate
+        """[push] Allocate a Mamba slot, write the end-state, and rehydrate
         per-block snapshots so the decode worker's prefix cache works.
 
         Returns the allocated slot index, or ``None`` if the model is
@@ -4663,7 +4663,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         return slot_idx
 
     def _import_mamba_snapshots(self, snapshots: Dict[str, Any]) -> None:
-        """Populate the local :class:`MambaSlotAllocator` with snapshots
+        """[push] Populate the local :class:`MambaSlotAllocator` with snapshots
         the prefill peer captured at attention block boundaries.
 
         For each ``(block_hash, conv_state, ssm_state)`` triple we:
