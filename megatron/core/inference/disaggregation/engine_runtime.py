@@ -103,6 +103,9 @@ class DisaggEngineRuntime:
         self.pending_recvs = {}  # request_id -> (recv, prompt, sampling_params)
         self.pending_acks = []
         self.pull_static_metas = None
+        # Backpressure window: max KV transfers posted-but-not-yet-reaped at once,
+        # bounding concurrent transfers, staged-KV memory, and how far prefill can
+        # run ahead of decode. TODO(peter): test what values are good for this.
         self.max_inflight = 8
         # (prefill, one-sided, hybrid) depth of the reset-safe Mamba hold-ring
         # published end-states are copied into; capped to the live slot count.
