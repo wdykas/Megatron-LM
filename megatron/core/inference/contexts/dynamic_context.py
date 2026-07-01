@@ -1262,6 +1262,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         # update_requests() (CPU phase), executed by transfer_bookkeeping_to_gpu().
         self._pending_mamba_zeros: list = []
         self._pending_mamba_restores: list = []
+        # Mamba slot pre-bound by a disaggregated KV import (decode side), consumed
+        # on the next prefill admit; None when no hand-off is pending.
+        self._pending_disagg_mamba_slot: Optional[int] = None
+        # request_id -> pinned KV block ids (prefill pull side); the pin holds the
+        # blocks for the decode's one-sided READ until its RELEASE_KV ack.
+        self.disagg_pinned: dict = {}
 
         # Allocate large non-graphed buffers.
         need_static_addr = (
@@ -3026,7 +3032,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             # present, reuse the imported Mamba state and skip the
             # restoration / zeroing paths (the state is already correct
             # on the GPU).
-            preset_slot = getattr(self, "_pending_disagg_mamba_slot", None)
+            preset_slot = self._pending_disagg_mamba_slot
             if preset_slot is not None:
                 mamba_idx = int(preset_slot)
                 self._pending_disagg_mamba_slot = None
@@ -4183,7 +4189,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         without prefix caching) or when none of the request's blocks
         have a slot allocated.
         """
-        slot_allocator = getattr(self, "mamba_slot_allocator", None)
+        slot_allocator = self.mamba_slot_allocator
         if slot_allocator is None or not block_ids:
             return None
 
@@ -4371,8 +4377,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.kv_block_allocator.block_ref_counts[
             torch.tensor(block_ids, dtype=torch.int64)
         ] += 1
-        if not hasattr(self, "disagg_pinned"):
-            self.disagg_pinned = {}
         self.disagg_pinned[request_id] = list(block_ids)
         return {
             "layout": layout,
@@ -4430,7 +4434,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         cached boundary snapshot and a valid hash. By reference (no copy): the
         decode READs these snapshot slots from this rank's registered snapshot
         buffers, which the KV pin keeps from being evicted until read."""
-        sa = getattr(self, "mamba_slot_allocator", None)
+        sa = self.mamba_slot_allocator
         if sa is None or not block_ids:
             return []
         block_to_slot = getattr(sa, "block_to_slot", None)
@@ -4457,7 +4461,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         ``None`` if there is nothing to pull. Mirrors the resolve+allocate half of
         :meth:`_import_mamba_snapshots`; the READ fills the slots, then
         :meth:`disagg_snapshot_commit` registers the hashes."""
-        sa = getattr(self, "mamba_slot_allocator", None)
+        sa = self.mamba_slot_allocator
         kv = getattr(self, "kv_block_allocator", None)
         if sa is None or kv is None or not snapshot_pairs:
             return None
@@ -4487,7 +4491,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """(decode, one-sided) After the snapshot READ has landed, register the
         hash->block mapping in the slot allocator so prefix-cache sub-hits restore
         the Mamba state at these boundaries."""
-        sa = getattr(self, "mamba_slot_allocator", None)
+        sa = self.mamba_slot_allocator
         if sa is not None and block_ids:
             sa.register_block_hashes_batch(block_ids, hashes)
 
@@ -4495,10 +4499,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         """(prefill, one-sided) Release the KV blocks pinned for ``request_id`` by
         :meth:`export_request_kv_ref`, on the decode's read-done ack (RELEASE_KV).
         Idempotent; guarded so a stray ack can't drive a ref-count negative."""
-        pinned = getattr(self, "disagg_pinned", None)
-        if not pinned:
+        if not self.disagg_pinned:
             return
-        block_ids = pinned.pop(request_id, None)
+        block_ids = self.disagg_pinned.pop(request_id, None)
         if not block_ids:
             return
         ids = torch.tensor(block_ids, dtype=torch.int64)
@@ -4683,7 +4686,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         silently skipped per-entry; the disagg request itself still
         succeeds, only follow-up prefix-cache hits would degrade.
         """
-        slot_allocator = getattr(self, "mamba_slot_allocator", None)
+        slot_allocator = self.mamba_slot_allocator
         if slot_allocator is None:
             return
         kv_allocator = getattr(self, "kv_block_allocator", None)
