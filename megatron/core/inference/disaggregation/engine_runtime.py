@@ -490,7 +490,7 @@ class DisaggEngineRuntime:
             use_bin_type=True,
         )
 
-    def on_submit_prefill(self, request_id, prompt, sampling_params):
+    def prepare_prefill_request(self, request_id, prompt, sampling_params):
         """Prefill-only SUBMIT: run prefill (which populates the prompt KV) and
         stop right after, so the request leaves this engine with its prompt-block
         KV intact for the hand-off. The few generated tokens are discarded; decode

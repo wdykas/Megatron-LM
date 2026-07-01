@@ -2358,7 +2358,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Prefill engine: cap this new request to prefill-only, so it
                     # stops once the prompt KV is populated -- that KV is the
                     # hand-off payload; decode regenerates from the prompt.
-                    self._disagg.on_submit_prefill(request_id, prompt, sampling_params)
+                    self._disagg.prepare_prefill_request(request_id, prompt, sampling_params)
                 nvtx_range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
                 nvtx_range_pop("add_request")
