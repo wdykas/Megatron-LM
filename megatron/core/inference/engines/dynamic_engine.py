@@ -2355,8 +2355,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 request_id, prompt, sampling_params = data[1:]
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 if self._disagg is not None and self._disagg.role == "prefill":
-                    # Prefill-only: run prefill then stop, leaving the prompt KV
-                    # intact for the hand-off (see on_submit_prefill).
+                    # Prefill engine: cap this new request to prefill-only, so it
+                    # stops once the prompt KV is populated -- that KV is the
+                    # hand-off payload; decode regenerates from the prompt.
                     self._disagg.on_submit_prefill(request_id, prompt, sampling_params)
                 nvtx_range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
