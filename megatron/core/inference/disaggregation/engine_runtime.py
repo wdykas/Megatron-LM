@@ -14,6 +14,7 @@ control-plane protocol.
 
 from __future__ import annotations
 
+import functools
 import logging
 
 import torch
@@ -42,6 +43,34 @@ try:
     import msgpack
 except ImportError:
     msgpack = None
+
+
+def pull_only(method):
+    """Mark a method as valid only for one-sided (pull/NIXL) backends, and assert
+    it at call time. Defensive: catches a method wired to the wrong transport."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        assert self.is_pull, (
+            f"{method.__name__} is pull-only (one-sided/NIXL), but this engine "
+            f"uses a push backend ({self.kv_transport_backend})"
+        )
+        return method(self, *args, **kwargs)
+
+    return wrapper
+
+
+def push_only(method):
+    """Mark a method as valid only for two-sided (push/NCCL) backends, and assert
+    it at call time. Defensive: catches a method wired to the wrong transport."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        assert not self.is_pull, (
+            f"{method.__name__} is push-only (two-sided/NCCL), but this engine "
+            f"uses a pull backend ({self.kv_transport_backend})"
+        )
+        return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 class DisaggEngineRuntime:
@@ -147,7 +176,10 @@ class DisaggEngineRuntime:
         # backends keep their lazy first-use init unchanged.
         ctx.disagg_pull_mode = False
         backend = construct_kv_transport_backend(self.kv_transport_backend)
-        if backend.is_pull:
+        # Cached transport family (no side effects), read by the pull_only/
+        # push_only guards. Set before register_pull_regions (a pull_only method).
+        self.is_pull = backend.is_pull
+        if self.is_pull:
             backend.init()
             self.register_pull_regions(backend)  # sets disagg_pull_mode
             self.backend = backend
@@ -202,6 +234,7 @@ class DisaggEngineRuntime:
             self.backend = backend
         return self.backend
 
+    @pull_only
     def register_pull_regions(self, backend):
         """Register this rank's KV buffers with a one-sided backend, once, so a
         peer can READ any entry by index (no per-request registration). Each
@@ -226,40 +259,42 @@ class DisaggEngineRuntime:
         ctx = self.context
         regions = {"kv": PullRegion(ctx.memory_buffer, 2)}
         if getattr(ctx, "is_hybrid_model", False):
-            conv = getattr(ctx, "mamba_conv_states", None)
-            ssm = getattr(ctx, "mamba_ssm_states", None)
-            if conv is not None and ssm is not None:
-                if self.role == "prefill":
-                    # Register a hold-ring (not the live slots): the engine copies
-                    # each published end-state into a ring slot, reused only after
-                    # n_ring more publishes -- long past the decode's read lag, so
-                    # no pinning needed. Capped at the live slot count.
-                    n_ring = min(int(conv.shape[1]), self.mamba_hold_slots)
-                    ctx.disagg_mamba_hold_conv = torch.empty(
-                        (conv.shape[0], n_ring, *conv.shape[2:]),
-                        dtype=conv.dtype, device=conv.device,
-                    )
-                    ctx.disagg_mamba_hold_ssm = torch.empty(
-                        (ssm.shape[0], n_ring, *ssm.shape[2:]),
-                        dtype=ssm.dtype, device=ssm.device,
-                    )
-                    ctx.disagg_mamba_hold_n = n_ring
-                    ctx.disagg_mamba_hold_count = 0
-                    regions["mamba_conv"] = PullRegion(ctx.disagg_mamba_hold_conv, 1)
-                    regions["mamba_ssm"] = PullRegion(ctx.disagg_mamba_hold_ssm, 1)
-                else:
-                    # Decode: READ straight into the live slots.
-                    regions["mamba_conv"] = PullRegion(conv, 1)
-                    regions["mamba_ssm"] = PullRegion(ssm, 1)
+            # A hybrid context always allocates both (see _allocate_mamba_states).
+            conv = ctx.mamba_conv_states
+            ssm = ctx.mamba_ssm_states
+            if self.role == "prefill":
+                # Register a hold-ring (not the live slots): the engine copies
+                # each published end-state into a ring slot, reused only after
+                # n_ring more publishes -- long past the decode's read lag, so
+                # no pinning needed. Capped at the live slot count.
+                n_ring = min(int(conv.shape[1]), self.mamba_hold_slots)
+                ctx.disagg_mamba_hold_conv = torch.empty(
+                    (conv.shape[0], n_ring, *conv.shape[2:]),
+                    dtype=conv.dtype, device=conv.device,
+                )
+                ctx.disagg_mamba_hold_ssm = torch.empty(
+                    (ssm.shape[0], n_ring, *ssm.shape[2:]),
+                    dtype=ssm.dtype, device=ssm.device,
+                )
+                ctx.disagg_mamba_hold_n = n_ring
+                ctx.disagg_mamba_hold_count = 0
+                regions["mamba_conv"] = PullRegion(ctx.disagg_mamba_hold_conv, 1)
+                regions["mamba_ssm"] = PullRegion(ctx.disagg_mamba_hold_ssm, 1)
+            else:
+                # Decode: READ straight into the live slots.
+                regions["mamba_conv"] = PullRegion(conv, 1)
+                regions["mamba_ssm"] = PullRegion(ssm, 1)
             # Mamba snapshots (block-boundary states): by reference on both sides,
-            # protected by the KV pin (see the snapshot note in the docstring).
-            sa = getattr(ctx, "mamba_slot_allocator", None)
-            if sa is not None and getattr(sa, "conv_states", None) is not None:
+            # protected by the KV pin (see the snapshot note in the docstring). The
+            # snapshot allocator is optional (present only with mamba prefix cache).
+            sa = ctx.mamba_slot_allocator
+            if sa is not None:
                 regions["snap_conv"] = PullRegion(sa.conv_states, 1)
                 regions["snap_ssm"] = PullRegion(sa.ssm_states, 1)
         backend.register_regions(regions)
         ctx.disagg_pull_mode = True
 
+    @pull_only
     def gather_pull_static_metas(self):
         """Gather every MP rank's request-invariant pull metadata to the MP
         coordinator **once** (region meta + buffer geometry never change). The
@@ -289,21 +324,16 @@ class DisaggEngineRuntime:
             [m for m in gathered if m is not None] if self.is_mp_coordinator else []
         )
 
+    @pull_only
     def publish_kv(self, request_id):
-        """(prefill, one-sided backends) Build the request's hand-off **without a
-        per-request gather**. Each rank's request-invariant pull metadata (region
-        meta + geometry) is gathered once, lazily, on the first publish
-        (:meth:`gather_pull_static_metas`); thereafter the MP coordinator
-        synthesizes the per-rank list locally by merging those cached statics with
-        this request's block references. The block references are replicated
-        across MP ranks (every rank schedules identically), so this rank's copy is
-        authoritative for all. Returns the list on the coordinator rank, ``None``
-        elsewhere -- attached to PREFILL_DONE and relayed, opaque, to RECV_KV.
+        """(prefill) Build a finished request's READ descriptors for PREFILL_DONE.
 
-        No copy and no per-request registration: the decode READs the blocks from
-        the registered ``memory_buffer``; they stay valid in the prefix cache
-        (pinned at staging) until the read-done ack releases them. The lazy gather
-        is the only collective, and it runs at most once."""
+        Merges the once-gathered per-rank static metadata (see
+        :meth:`gather_pull_static_metas`) with this request's block references --
+        no per-request gather, since the block ids are replicated across MP ranks.
+        Returns the per-rank list on the MP coordinator, ``None`` elsewhere; the
+        coordinator relays it, opaque, to the decode in RECV_KV. No copy: the
+        decode READs the blocks in place, kept alive by the staging pin."""
         if self.pull_static_metas is None:
             self.gather_pull_static_metas()  # one-time collective (all MP ranks)
         ref = self.context.disagg_staged_kv.pop(request_id, None)
@@ -319,6 +349,7 @@ class DisaggEngineRuntime:
         return [{**static, **request_meta} for static in self.pull_static_metas]
 
     # --- send / receive --------------------------------------------------
+    @push_only
     def send_kv(self, request_id, dst_layout_dicts):
         """(prefill) post the staged KV for ``request_id`` to the decode
         instance (resharded to its layout). Non-blocking: the send is reaped a
@@ -485,9 +516,8 @@ class DisaggEngineRuntime:
         flag, so the coordinator can 2-hop route + plan reshards, and apply
         credit-based flow control (bounding outstanding hand-offs to the
         prefill's hold-ring/pin window) only for pull instances."""
-        is_pull = bool(getattr(self.context, "disagg_pull_mode", False))
         return msgpack.packb(
-            [Headers.REGISTER_ROLE.value, self.role, self.instance_layouts, is_pull],
+            [Headers.REGISTER_ROLE.value, self.role, self.instance_layouts, self.is_pull],
             use_bin_type=True,
         )
 
@@ -525,6 +555,7 @@ class DisaggEngineRuntime:
                 )
         nvtx_range_pop("coordinator_communication")
 
+    @pull_only
     def release_pinned(self, request_id):
         """(prefill, one-sided) the decode finished its READ -- release the
         request's pinned KV blocks (Mamba used the reset-safe ring, no pin)."""
