@@ -37,6 +37,44 @@ Pull skips `SEND_KV` (the prefill published its KV up front and does nothing
 more) and adds the `KV_READ_DONE`→`RELEASE_KV` pair, which is the outstanding/lifetime
 bookkeeping the one-sided READ needs. See the module docstring in `__init__.py`.
 
+### What each header does
+
+These are added on top of the existing aggregated headers (`SUBMIT_REQUEST`,
+`ENGINE_REPLY`, etc.); they are what turn a single-engine flow into a two-engine
+hand-off.
+
+- **`REGISTER_ROLE`** (engine → coord, once at startup). Each engine announces
+  its `role` (`"prefill"`/`"decode"`), its per-rank **KV-shard layouts**, and an
+  `is_pull` flag. Replaces the aggregated empty-string "I'm here" ping: the
+  coordinator needs the role to 2-hop route, the layouts to plan reshards when
+  prefill and decode differ in TP/PP, and `is_pull` to know whether to apply
+  flow control to that instance.
+
+- **`PREFILL_DONE`** (prefill → coord). A prefill finished a request and staged
+  its KV; it reports this instead of replying to the client (the client is
+  waiting on decode's output). For pull it also carries the **handoff
+  descriptor** — the per-rank READ metadata (block ids + buffer geometry) — which
+  the coordinator relays opaquely. Triggers hop 2: the coordinator picks a decode.
+
+- **`SEND_KV`** (coord → prefill, **push only**). Tells the prefill to ship the
+  staged KV to the chosen decode, resharded to the decode's layout. Skipped on
+  pull, where the decode reads the KV itself.
+
+- **`RECV_KV`** (coord → decode). Tells the decode a request is inbound: carries
+  the source KV layouts, the prompt + sampling params (the decode never saw the
+  original request), and — on pull — the relayed handoff descriptor. The decode
+  receives/READs the KV, admits the request via a prefix-cache hit, and generates.
+
+- **`KV_READ_DONE`** (decode → coord, **pull only**). The one-sided READ has
+  drained (only the decode knows this — RDMA gives no completion to the other
+  side). Lets the coordinator free the prefill's outstanding-hand-off slot (and
+  admit the next queued request) and know the pinned blocks are safe to release.
+
+- **`RELEASE_KV`** (coord → prefill, **pull only**). Relayed from `KV_READ_DONE`:
+  unpin the request's KV blocks so they can be reused. Two messages rather than
+  one because engines talk only to the coordinator (star topology), so the
+  decode's "done" must hop decode → coord → prefill.
+
 ## KV hand-off
 
 - **Attention KV**: registered once per engine (register-once arena). Push copies
