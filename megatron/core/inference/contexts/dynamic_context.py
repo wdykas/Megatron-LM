@@ -1079,6 +1079,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # zero the whole buffer so their views start at 0 too, and so the
         # request staging slots start with a deterministic value.
         self._cpu_bookkeeping_buf.fill_(0)
+        # Records each step's async bookkeeping H2D; the next step waits on it
+        # before reusing this pinned buffer (see transfer_bookkeeping_to_gpu).
+        self._bookkeeping_h2d_event = None
 
         _off = 0
         # Per-token state (source-of-truth lives in the coalesced buffer since
@@ -2418,19 +2421,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         tensors immediately before the H2D (GPU reads them at `[:n_active]`
         while CPU bookkeeping keeps them at `[paused_count:total_count)`).
         """
-        # The bookkeeping buffer is a single reused pinned tensor copied H2D
-        # with non_blocking=True. If the CPU overwrites it for the next step
-        # before the previous step's async copy has executed, the in-flight H2D
-        # tears -- it reads a mix of old/new bytes -- corrupting GPU bookkeeping.
-        # For hybrid models this surfaced as an out-of-range Mamba
-        # ``batch_indices`` entry and an illegal memory access in the conv
-        # update kernel, but only under fast churn (disagg prefill with
-        # num_tokens_to_generate=1, where the active batch -- and therefore the
-        # copied indices -- changes every step). Gate CPU reuse of the pinned
-        # buffer on the prior step's H2D having completed.
-        _bk_event = getattr(self, "_bookkeeping_h2d_event", None)
-        if _bk_event is not None:
-            _bk_event.synchronize()
+        # Wait for the previous step's async H2D before the CPU overwrites the
+        # shared pinned buffer, or the in-flight copy tears (reads mixed old/new
+        # bytes). Surfaced under disagg prefill's fast churn (num_tokens=1, active
+        # batch changes every step) as an out-of-range Mamba batch index and a
+        # conv-kernel illegal access.
+        if self._bookkeeping_h2d_event is not None:
+            self._bookkeeping_h2d_event.synchronize()
 
         n_active = self.total_request_count - self.paused_request_count
         active_slice = slice(self.paused_request_count, self.total_request_count)
@@ -2479,10 +2476,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_metadata.load_from_cpu(self._pending_mamba_transfer)
             self._pending_mamba_transfer = None
 
-        # Mark when the (async) H2D copies for this step have been enqueued, so
-        # the next step waits for them before overwriting the shared pinned
-        # buffer (see the synchronize at the top of this method).
-        if getattr(self, "_bookkeeping_h2d_event", None) is None:
+        # Record this step's enqueued H2D so the next step waits on it (above).
+        if self._bookkeeping_h2d_event is None:
             self._bookkeeping_h2d_event = torch.cuda.Event()
         self._bookkeeping_h2d_event.record()
 
