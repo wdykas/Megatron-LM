@@ -5,9 +5,9 @@
 The prefill registers its paged KV (+ Mamba) buffers ONCE and the decode rank
 READs the prefill's blocks straight into its own freshly-allocated blocks -- no
 staging copy, no per-request registration. The prefill publishes only references
-(block ids + Mamba slot + the static region meta); the coordinator relays them
-opaque. Mirrors the reference NIXL backend. The two-sided (push) family lives in
-``kv_transfer_push.py``.
+(block ids + Mamba slot + the static region meta); the coordinator relays them to
+the decode. Mirrors the reference NIXL backend. The two-sided (push) family lives
+in ``kv_transfer_push.py``.
 """
 
 from __future__ import annotations

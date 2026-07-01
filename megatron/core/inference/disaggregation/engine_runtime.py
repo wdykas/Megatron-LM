@@ -332,7 +332,7 @@ class DisaggEngineRuntime:
         :meth:`gather_pull_static_metas`) with this request's block references --
         no per-request gather, since the block ids are replicated across MP ranks.
         Returns the per-rank list on the MP coordinator, ``None`` elsewhere; the
-        coordinator relays it, opaque, to the decode in RECV_KV. No copy: the
+        coordinator relays it to the decode in RECV_KV. No copy: the
         decode READs the blocks in place, kept alive by the staging pin."""
         if self.pull_static_metas is None:
             self.gather_pull_static_metas()  # one-time collective (all MP ranks)
@@ -395,7 +395,7 @@ class DisaggEngineRuntime:
         Push backends (NCCL) post a matched receive against the prefill's send.
         One-sided backends (NIXL) instead allocate destination blocks and issue a
         one-sided READ of the prefill's blocks into them; ``handoff`` carries the
-        per-rank region meta + source block ids, relayed opaque by the
+        per-rank region meta + source block ids, relayed by the
         coordinator. Both paths yield an object with a ``finish(engine)`` that
         commits, so the rest is symmetric."""
         backend = self.get_backend()
