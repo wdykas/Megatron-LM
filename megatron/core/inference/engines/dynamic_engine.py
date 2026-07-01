@@ -2054,7 +2054,7 @@ class DynamicInferenceEngine(AbstractEngine):
             if records_to_send and self._disagg is not None and self._disagg.role == "prefill":
                 # Prefill-only: don't reply to the client; tell the coordinator
                 # each request finished prefill (KV staged) via PREFILL_DONE.
-                self._disagg.emit_prefill_done(records_to_send)
+                self._disagg.send_prefill_done(records_to_send)
             elif records_to_send and self.is_mp_coordinator:
                 nvtx_range_push("coordinator_communication")
                 payload = msgpack.packb(
