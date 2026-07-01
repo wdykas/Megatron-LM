@@ -4071,23 +4071,19 @@ class DynamicInferenceContext(BaseInferenceContext):
         memory_buffer = self.memory_buffer
         # memory_buffer shape: (2, L, total_blocks, block_size, heads, hidden)
         _, num_layers, total_blocks, block_size, heads, hidden = memory_buffer.shape
-        # DISAGG-DEBUG: a stale/out-of-range block id here is a classic async
-        # CUDA illegal-memory-access; surface it as a clean Python error with
-        # the request's block bookkeeping (``raw_count`` = uncapped) so we can
-        # see the mismatch.
+        # A stale/out-of-range block id here is a classic async CUDA illegal-memory
+        # access; surface it as a clean Python error with the request's block
+        # bookkeeping (``raw_count`` = uncapped) so we can see the mismatch.
         raw_count = int(self.request_kv_block_counts[internal_idx].item())
-        bad = [b for b in block_ids if b < 0 or b >= total_blocks]
-        assert not bad, (
-            f"DISAGG_EXPORT req={request_id}: block_ids out of range {bad} "
+        out_of_range_ids = [b for b in block_ids if b < 0 or b >= total_blocks]
+        assert not out_of_range_ids, (
+            f"DISAGG_EXPORT req={request_id}: block_ids out of range {out_of_range_ids} "
             f"(total_blocks={total_blocks}, block_count={block_count}, raw_count={raw_count})"
         )
-        staging = torch.empty(
-            (block_count, 2, num_layers, block_size, heads, hidden),
-            dtype=memory_buffer.dtype,
-            device=memory_buffer.device,
-        )
-        for i, bid in enumerate(block_ids):
-            staging[i] = memory_buffer[:, :, bid, :, :, :]
+        # Gather the request's blocks in one op: (2, L, n, BS, H, HD) -> staging
+        # (n, 2, L, BS, H, HD). contiguous() gives an owned buffer to hand off.
+        block_ids_tensor = torch.tensor(block_ids, dtype=torch.int64, device=memory_buffer.device)
+        staging = memory_buffer[:, :, block_ids_tensor].permute(2, 0, 1, 3, 4, 5).contiguous()
 
         # Wire-format tag for the staged payload (versioned). The importer
         # checks it before reading the bytes, so an external consumer -- e.g. a
