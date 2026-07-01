@@ -202,25 +202,26 @@ class DisaggEngineRuntime:
         return self.backend
 
     def register_pull_regions(self, backend):
-        """Register the paged KV cache (and, for hybrid models, the Mamba state
-        buffers) with a one-sided backend, once. Entries are addressed by index
-        along the paging axis: KV blocks (axis 2 of the ``(2, L, blocks, BS, H,
-        HD)`` buffer), Mamba slots (axis 1 of the ``(layers, slots, *state)``
-        buffers). Sets ``context.disagg_pull_mode`` so the prefill staging hook
-        captures block references instead of copying a staging tensor.
+        """Register this rank's KV buffers with a one-sided backend, once, so a
+        peer can READ any entry by index (no per-request registration). Each
+        region is ``(tensor, index_axis)`` -- the axis that enumerates entries:
+        KV blocks on axis 2 of ``(2, L, blocks, BS, H, HD)``, Mamba slots on axis
+        1 of ``(layers, slots, *state)``. Also sets ``context.disagg_pull_mode``,
+        which switches the prefill staging hook to capture block references
+        instead of copying.
 
-        KV moves by reference -- both sides register the live ``memory_buffer``,
-        the decode READs the prefill's blocks straight from it, and prefix-cache
-        retention keeps them valid until read (no copy, the large payload).
-
-        Mamba moves through a small **reset-safe hold-ring** on the prefill: the
-        live Mamba slot pool is LIFO and reset mid-rollout, so a published
-        end-state read by reference would race an immediate slot reuse (or be
-        wiped by ``reset_mamba_state``). Instead the prefill registers a
-        disagg-owned ring buffer the engine never touches and copies each
-        published end-state into a ring slot (a few KB); the decode READs the
-        ring into its live slot. No slot pinning, no synchronization -- the
-        prefill resets/recycles freely while the decode pulls on its own clock."""
+        Three region kinds:
+        - KV blocks: registered by reference on both sides; the decode READs the
+          prefill's blocks in place, kept alive by prefix-cache retention + the
+          hand-off pin. This is the large payload -- never copied.
+        - Mamba end-state (hybrid): the prefill can't expose its live slot (LIFO-
+          recycled and reset mid-rollout, so a READ would race reuse), so it
+          publishes into a disagg-owned hold-ring and registers that; the decode
+          reads into its live slot. See the prefill branch below.
+        - Mamba snapshots (hybrid): registered by reference on both sides -- the
+          snapshot pool isn't reset mid-rollout and the KV pin already keeps a
+          published request's snapshots alive, so no ring is needed.
+        """
         ctx = self.context
         regions = {"kv": PullRegion(ctx.memory_buffer, 2)}
         if getattr(ctx, "is_hybrid_model", False):
@@ -228,9 +229,10 @@ class DisaggEngineRuntime:
             ssm = getattr(ctx, "mamba_ssm_states", None)
             if conv is not None and ssm is not None:
                 if self.role == "prefill":
-                    # Source side: publish from a reset-safe hold-ring, sized to
-                    # the live slot capacity (capped) so a ring slot is reused
-                    # only after far more publishes than the decode's read lag.
+                    # Register a hold-ring (not the live slots): the engine copies
+                    # each published end-state into a ring slot, reused only after
+                    # n_ring more publishes -- long past the decode's read lag, so
+                    # no pinning needed. Capped at the live slot count.
                     n_ring = min(int(conv.shape[1]), self.mamba_hold_slots)
                     ctx.disagg_mamba_hold_conv = torch.empty(
                         (conv.shape[0], n_ring, *conv.shape[2:]),
@@ -245,15 +247,11 @@ class DisaggEngineRuntime:
                     regions["mamba_conv"] = PullRegion(ctx.disagg_mamba_hold_conv, 1)
                     regions["mamba_ssm"] = PullRegion(ctx.disagg_mamba_hold_ssm, 1)
                 else:
-                    # Destination side: READ straight into the live slots.
+                    # Decode: READ straight into the live slots.
                     regions["mamba_conv"] = PullRegion(conv, 1)
                     regions["mamba_ssm"] = PullRegion(ssm, 1)
-            # Mamba prefix-cache snapshots (block-boundary states). Unlike the
-            # end-state pool, the snapshot allocator is NOT reset mid-rollout and
-            # its slots are evictable only when the KV block's ref-count is 0 --
-            # so the KV pin already protects a published request's snapshots.
-            # Move them by reference (both sides register the live snapshot
-            # buffers); no hold-ring needed.
+            # Mamba snapshots (block-boundary states): by reference on both sides,
+            # protected by the KV pin (see the snapshot note in the docstring).
             sa = getattr(ctx, "mamba_slot_allocator", None)
             if sa is not None and getattr(sa, "conv_states", None) is not None:
                 regions["snap_conv"] = PullRegion(sa.conv_states, 1)
