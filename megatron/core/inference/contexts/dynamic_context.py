@@ -4032,7 +4032,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         it *before* the slot is recycled (the context frees the slot during the
         step, before the engine's finish loop runs).
 
-        Returns ``None`` when the request has no prompt KV blocks.
+        Returns ``None`` only for an empty prompt (no prompt KV to hand off).
         Raises ``NotImplementedError`` for the MLA latent cache (unsupported).
         Otherwise returns a dict with:
 
@@ -4070,11 +4070,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         block_ids_tensor = torch.tensor(block_ids, dtype=torch.int64, device=memory_buffer.device)
         staging = memory_buffer[:, :, block_ids_tensor].permute(2, 0, 1, 3, 4, 5).contiguous()
 
-        # Wire-format tag for the staged payload (versioned). The importer
-        # checks it before reading the bytes, so an external consumer -- e.g. a
-        # Dynamo prefill/decode pipeline shipping this payload over NIXL --
-        # interops on the KV format by this tag, and a format change bumps the
-        # version (std_attn_v2/...) instead of silently mis-reading.
+        # Versioned wire-format tag; the importer checks it before reading the
+        # payload, so a format change bumps the version instead of mis-reading.
         layout = "std_attn_v1"
         mamba_payload: Optional[Dict[str, Any]] = None
 
@@ -4296,7 +4293,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         blocks straight from this rank's registered ``memory_buffer``, so the
         blocks must stay valid until read; after the request frees its slot they
         linger in the prefix cache, which is the (windowed) lifetime guarantee.
-        Returns ``None`` when the request has no exportable KV. Raises
+        Returns ``None`` only for an empty prompt (nothing to hand off). Raises
         ``NotImplementedError`` for the MLA latent cache (unsupported)."""
         resolved = self._disagg_resolve_export_blocks(request_id, internal_idx)
         if resolved is None:
