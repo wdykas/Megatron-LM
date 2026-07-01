@@ -17,7 +17,6 @@ from itertools import repeat
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
-import torch.distributed as dist
 from torch import Tensor
 
 from megatron.core.inference.batch_dimensions_utils import (
@@ -34,20 +33,7 @@ from megatron.core.inference.contexts.dynamic_context import (
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
-from megatron.core.inference.disaggregation.kv_reshard import KVShardLayout
-from megatron.core.inference.disaggregation.kv_transfer_pull import (
-    post_pull_request_kv,
-    pull_request_meta,
-    pull_static_meta,
-)
-from megatron.core.inference.disaggregation.kv_transfer_push import (
-    post_recv_request_kv_resharded,
-    send_request_kv_resharded,
-)
-from megatron.core.inference.disaggregation.mamba_reshard import MambaShardLayout
-from megatron.core.inference.disaggregation.transfer_backends.base import (
-    construct_kv_transport_backend,
-)
+from megatron.core.inference.disaggregation.engine_runtime import DisaggEngineRuntime
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
@@ -225,6 +211,11 @@ class DynamicInferenceEngine(AbstractEngine):
         EngineState.STOPPED,
     )
 
+    # Disaggregation runtime; None => normal aggregated engine. Class-level
+    # default so test doubles that skip __init__ still resolve it as aggregated;
+    # __init__ sets the instance attribute, set_disaggregation_config replaces it.
+    _disagg = None
+
     @deprecate_args(
         *DEPRECATED_ARGS,
         message="Argument `{name}` has been deprecated. Only pass `controller` and `context`",
@@ -314,24 +305,13 @@ class DynamicInferenceEngine(AbstractEngine):
         # Mark the inference engine as active. Cleared in `suspend()` and re-set in `resume()`.
         InferenceMode.set_active()
 
-        # Disaggregation config (None role => normal aggregated engine). Set via
-        # set_disaggregation_config() before start_listening_to_data_parallel_coordinator.
-        # Lives here (not create_cuda_graphs, which early-returns when cuda graphs
-        # are disabled -- e.g. hybrid models -- and re-runs on recapture) so every
-        # engine always has it.
-        self.disagg_role = None
-        self.disagg_instance_layouts = None
-        self.disagg_identity = None
-        self.disagg_world_group = None
-        self.disagg_spawn_coordinator = False
-        self.disagg_router_name = "round_robin"  # routing policy the coordinator resolves
-        # Immutable per-rank/instance layouts, precomputed in
-        # set_disaggregation_config (None/empty until then).
-        self._disagg_my_layout = None
-        self._disagg_my_mamba_layout = None
-        self._disagg_instance_kv_layouts = []
-        self._disagg_instance_mamba_layouts = []
-        self._disagg_init_state()
+        # Disaggregation runtime (None => normal aggregated engine). Created by
+        # set_disaggregation_config() before start_listening. All disagg state +
+        # the 2-hop KV hand-off live in DisaggEngineRuntime, keeping this engine
+        # clean for the non-disaggregated path. Lives here (not create_cuda_graphs,
+        # which early-returns when cuda graphs are disabled -- e.g. hybrid models
+        # -- and re-runs on recapture) so every engine always has the attribute.
+        self._disagg = None
 
         # Create cuda graphs.
         self.create_cuda_graphs()
@@ -559,418 +539,16 @@ class DynamicInferenceEngine(AbstractEngine):
         world_group, spawn_coordinator, disagg_router="round_robin",
         kv_transport_backend="nccl",
     ):
-        """Mark this engine as a disaggregated prefill/decode shard.
-
-        Call before :meth:`start_listening_to_data_parallel_coordinator`.
-
-        Args:
-            kv_transport_backend: KV transport, ``"nccl"`` (two-sided push) or
-                ``"nixl"`` (one-sided pull). Explicit -- chosen by the caller, not
-                an env var or auto-detection.
-            role: ``"prefill"`` or ``"decode"``.
-            instance_layouts: KV-shard layout dicts for every rank of this
-                instance (so the coordinator can build reshard plans).
-            identity: unique ZMQ identity for this instance's MP-coordinator
-                (must differ across shards/instances).
-            world_group: process group spanning all disagg ranks (used to
-                broadcast the coordinator address across shards).
-            spawn_coordinator: whether THIS rank spawns the single coordinator.
-            disagg_router: name of the routing policy the coordinator resolves
-                (registered via ``register_disagg_router``; default round-robin).
-        """
-        assert role in ("prefill", "decode")
-        self._disagg_init_state()  # also covers engine doubles that skip __init__
-        self.disagg_role = role
-        self.disagg_instance_layouts = instance_layouts
-        self.disagg_identity = identity
-        self.disagg_world_group = world_group
-        self.disagg_spawn_coordinator = spawn_coordinator
-        self.disagg_router_name = disagg_router
-        self._disagg_kv_transport_backend = kv_transport_backend
-        # Precompute the immutable per-rank/instance layouts once: they're fixed
-        # for the engine's life, so building them here (instead of rescanning +
-        # rebuilding on every hand-off) keeps the send/recv path cheap.
-        rank = dist.get_rank()
-        self._disagg_instance_kv_layouts = self._disagg_layouts(instance_layouts)
-        self._disagg_instance_mamba_layouts = self._disagg_mamba_layouts(instance_layouts)
-        self._disagg_my_layout = next(
-            (l for l in self._disagg_instance_kv_layouts if l.global_rank == rank), None
+        """Mark this engine as a disaggregated prefill/decode shard by attaching
+        a :class:`DisaggEngineRuntime`, which holds all disagg state + the 2-hop
+        KV hand-off. Call before
+        :meth:`start_listening_to_data_parallel_coordinator`. See
+        ``DisaggEngineRuntime`` for the argument semantics."""
+        self._disagg = DisaggEngineRuntime(
+            self, role=role, instance_layouts=instance_layouts, identity=identity,
+            world_group=world_group, spawn_coordinator=spawn_coordinator,
+            disagg_router=disagg_router, kv_transport_backend=kv_transport_backend,
         )
-        assert (
-            self._disagg_my_layout is not None
-        ), f"rank {rank} not found in its disagg instance layouts"
-        self._disagg_my_mamba_layout = next(
-            (m for m in self._disagg_instance_mamba_layouts if m.global_rank == rank), None
-        )
-        # The prefill controller stages each finished request's KV into the
-        # context (while the slot is still valid) -- the engine's finish loop
-        # runs after the context has freed the slot. _disagg_send_kv drains it.
-        if self.context is not None:
-            self.context.disagg_stage_prefill_kv = role == "prefill"
-            self.context.disagg_staged_kv = {}
-            # request_id -> prompt block count, recorded at SUBMIT. Caps the
-            # exported KV to the prompt-covering blocks so it matches the decode
-            # side's header-free block_count = ceil(prompt_len/block_size); the
-            # prefill otherwise allocates one extra block for its (discarded)
-            # generated token when prompt_len is block-aligned.
-            self.context.disagg_prompt_block_count = {}
-            # One-sided (pull) backends must register their KV buffers and set
-            # disagg_pull_mode *before* the first prefill completes, so the
-            # controller's staging hook captures block references rather than
-            # copying a staging tensor. Construct eagerly here for pull backends;
-            # push (NCCL) backends keep their lazy first-use init unchanged.
-            self.context.disagg_pull_mode = False
-            backend = construct_kv_transport_backend(self._disagg_kv_transport_backend)
-            if backend.is_pull:
-                backend.init()
-                self._disagg_register_pull_regions(backend)  # sets disagg_pull_mode
-                self._disagg_backend = backend
-
-    def _disagg_init_state(self):
-        """Per-request KV hand-off state. Called from ``__init__`` and from
-        :meth:`set_disaggregation_config` (so engine doubles that skip
-        ``__init__`` still get it).
-
-        Prefill KV staging lives on the context (``context.disagg_staged_kv``,
-        populated by the controller before the slot is freed); _disagg_send_kv
-        drains it. This holds only the in-flight transfer state:
-
-        - ``_disagg_pending_{sends,recvs}``: in-flight transfers, completed one
-          step later in :meth:`_disagg_complete_pending` (collective across MP
-          ranks since coordinator messages are TP-broadcast), so the transfer
-          overlaps the engine step.
-        - ``_disagg_max_inflight``: depth window bounding concurrent hand-offs
-          (and staged-KV memory) so prefill can't outrun decode.
-        """
-        self._disagg_backend = None  # lazily-created KV transport backend
-        self._disagg_kv_transport_backend = "nccl"  # set explicitly by set_disaggregation_config
-        self._disagg_pending_sends = {}  # request_id -> PrefillHandoff
-        self._disagg_pending_recvs = {}  # request_id -> (recv, prompt, sampling_params)
-        # (decode, one-sided) request_ids whose READ has drained, queued for a
-        # KV_READ_DONE ack so the coordinator releases a credit + the prefill
-        # releases the request's pinned KV blocks.
-        self._disagg_pending_acks = []
-        # (prefill, one-sided) per-MP-rank request-invariant pull metadata,
-        # gathered once (lazily on the first publish) so PREFILL_DONE needs no
-        # per-request gather. None until gathered; a list on the MP coordinator,
-        # [] on other ranks.
-        self._disagg_pull_static_metas = None
-        self._disagg_max_inflight = 8
-        # (prefill, one-sided, hybrid) depth of the reset-safe Mamba hold-ring
-        # published end-states are copied into; capped to the live slot count.
-        self._disagg_mamba_hold_slots = 64
-
-    # --- disaggregated KV handoff (coordinator-driven) -------------------
-    def _disagg_layouts(self, dicts):
-        # Strip the optional hybrid ``mamba`` sub-dict; it's a separate layout.
-        return [KVShardLayout(**{k: v for k, v in d.items() if k != "mamba"}) for d in dicts]
-
-    def _disagg_mamba_layouts(self, dicts):
-        """MambaShardLayout list for the hybrid dicts that carry a ``mamba``
-        sub-dict (empty for non-hybrid models)."""
-        return [MambaShardLayout(**d["mamba"]) for d in dicts if d.get("mamba")]
-
-    def _disagg_get_backend(self):
-        """Lazily construct the KV transport backend named by the disaggregation
-        config (``kv_transport_backend``: ``"nccl"`` two-sided push, or ``"nixl"``
-        one-sided pull). The engine branches on ``backend.is_pull`` -- everything
-        else is transport-agnostic.
-
-        One-sided backends register this rank's paged KV (+ Mamba) buffers once
-        here, so a peer can READ entries by block/slot index without any
-        per-request registration."""
-        if self._disagg_backend is None:
-            backend = construct_kv_transport_backend(self._disagg_kv_transport_backend)
-            backend.init()
-            if backend.is_pull:
-                self._disagg_register_pull_regions(backend)
-            self._disagg_backend = backend
-        return self._disagg_backend
-
-    def _disagg_register_pull_regions(self, backend):
-        """Register the paged KV cache (and, for hybrid models, the Mamba state
-        buffers) with a one-sided backend, once. Entries are addressed by index
-        along the paging axis: KV blocks (axis 2 of the ``(2, L, blocks, BS, H,
-        HD)`` buffer), Mamba slots (axis 1 of the ``(layers, slots, *state)``
-        buffers). Sets ``context.disagg_pull_mode`` so the prefill staging hook
-        captures block references instead of copying a staging tensor.
-
-        KV moves by reference -- both sides register the live ``memory_buffer``,
-        the decode READs the prefill's blocks straight from it, and prefix-cache
-        retention keeps them valid until read (no copy, the large payload).
-
-        Mamba moves through a small **reset-safe hold-ring** on the prefill: the
-        live Mamba slot pool is LIFO and reset mid-rollout, so a published
-        end-state read by reference would race an immediate slot reuse (or be
-        wiped by ``reset_mamba_state``). Instead the prefill registers a
-        disagg-owned ring buffer the engine never touches and copies each
-        published end-state into a ring slot (a few KB); the decode READs the
-        ring into its live slot. No slot pinning, no synchronization -- the
-        prefill resets/recycles freely while the decode pulls on its own clock."""
-        from megatron.core.inference.disaggregation.transfer_backends.base import (
-            PullRegion,
-        )
-
-        ctx = self.context
-        regions = {"kv": PullRegion(ctx.memory_buffer, 2)}
-        if getattr(ctx, "is_hybrid_model", False):
-            conv = getattr(ctx, "mamba_conv_states", None)
-            ssm = getattr(ctx, "mamba_ssm_states", None)
-            if conv is not None and ssm is not None:
-                if self.disagg_role == "prefill":
-                    # Source side: publish from a reset-safe hold-ring, sized to
-                    # the live slot capacity (capped) so a ring slot is reused
-                    # only after far more publishes than the decode's read lag.
-                    n_ring = min(int(conv.shape[1]), self._disagg_mamba_hold_slots)
-                    ctx.disagg_mamba_hold_conv = torch.empty(
-                        (conv.shape[0], n_ring, *conv.shape[2:]),
-                        dtype=conv.dtype, device=conv.device,
-                    )
-                    ctx.disagg_mamba_hold_ssm = torch.empty(
-                        (ssm.shape[0], n_ring, *ssm.shape[2:]),
-                        dtype=ssm.dtype, device=ssm.device,
-                    )
-                    ctx.disagg_mamba_hold_n = n_ring
-                    ctx.disagg_mamba_hold_count = 0
-                    regions["mamba_conv"] = PullRegion(ctx.disagg_mamba_hold_conv, 1)
-                    regions["mamba_ssm"] = PullRegion(ctx.disagg_mamba_hold_ssm, 1)
-                else:
-                    # Destination side: READ straight into the live slots.
-                    regions["mamba_conv"] = PullRegion(conv, 1)
-                    regions["mamba_ssm"] = PullRegion(ssm, 1)
-            # Mamba prefix-cache snapshots (block-boundary states). Unlike the
-            # end-state pool, the snapshot allocator is NOT reset mid-rollout and
-            # its slots are evictable only when the KV block's ref-count is 0 --
-            # so the KV pin already protects a published request's snapshots.
-            # Move them by reference (both sides register the live snapshot
-            # buffers); no hold-ring needed.
-            sa = getattr(ctx, "mamba_slot_allocator", None)
-            if sa is not None and getattr(sa, "conv_states", None) is not None:
-                regions["snap_conv"] = PullRegion(sa.conv_states, 1)
-                regions["snap_ssm"] = PullRegion(sa.ssm_states, 1)
-        backend.register_regions(regions)
-        ctx.disagg_pull_mode = True
-
-    def _disagg_gather_pull_static_metas(self):
-        """Gather every MP rank's request-invariant pull metadata to the MP
-        coordinator **once** (region meta + buffer geometry never change). The
-        coordinator caches the per-rank list and thereafter synthesizes each
-        request's hand-off locally, so PREFILL_DONE carries no per-request gather.
-        Collective across the MP group -- all ranks must call it in lockstep."""
-        ctx = self.context
-        _, num_layers, total_blocks, block_size, heads, hidden = ctx.memory_buffer.shape
-        kv_dims = {
-            "num_layers": int(num_layers), "total_blocks": int(total_blocks),
-            "block_size": int(block_size), "heads": int(heads), "hidden": int(hidden),
-            "elem": int(ctx.memory_buffer.element_size()),
-        }
-        mamba_dims = ctx._disagg_mamba_hold_dims() if hasattr(ctx, "_disagg_mamba_hold_dims") else None
-        static = pull_static_meta(
-            self._disagg_get_backend(), self._disagg_my_layout, kv_dims, mamba_dims
-        )
-        mp_group = self.pg_collection.mp
-        gathered = (
-            [None] * torch.distributed.get_world_size(mp_group)
-            if self.is_mp_coordinator else None
-        )
-        torch.distributed.gather_object(
-            static, gathered, dst=get_pg_src_rank(mp_group), group=mp_group
-        )
-        self._disagg_pull_static_metas = (
-            [m for m in gathered if m is not None] if self.is_mp_coordinator else []
-        )
-
-    def _disagg_publish_kv(self, request_id):
-        """(prefill, one-sided backends) Build the request's hand-off **without a
-        per-request gather**. Each rank's request-invariant pull metadata (region
-        meta + geometry) is gathered once, lazily, on the first publish
-        (:meth:`_disagg_gather_pull_static_metas`); thereafter the MP coordinator
-        synthesizes the per-rank list locally by merging those cached statics with
-        this request's block references. The block references are replicated
-        across MP ranks (every rank schedules identically), so this rank's copy is
-        authoritative for all. Returns the list on the coordinator rank, ``None``
-        elsewhere -- attached to PREFILL_DONE and relayed, opaque, to RECV_KV.
-
-        No copy and no per-request registration: the decode READs the blocks from
-        the registered ``memory_buffer``; they stay valid in the prefix cache
-        (pinned at staging) until the read-done ack releases them. The lazy gather
-        is the only collective, and it runs at most once."""
-        if self._disagg_pull_static_metas is None:
-            self._disagg_gather_pull_static_metas()  # one-time collective (all MP ranks)
-        ref = self.context.disagg_staged_kv.pop(request_id, None)
-        if not self.is_mp_coordinator:
-            return None
-        if ref is None:
-            logging.warning(
-                "disagg prefill: PREFILL_DONE publish for request %s has no staged "
-                "KV ref; skipping", request_id,
-            )
-            return None
-        request_meta = pull_request_meta(ref)
-        return [{**static, **request_meta} for static in self._disagg_pull_static_metas]
-
-    def _disagg_send_kv(self, request_id, dst_layout_dicts):
-        """(prefill) post the staged KV for ``request_id`` to the decode
-        instance (resharded to its layout). Non-blocking: the send is reaped a
-        step later in :meth:`_disagg_complete_pending` so the transfer overlaps
-        the engine step."""
-        # Backpressure: block on the oldest in-flight send once the window is
-        # full, so prefill doesn't run arbitrarily far ahead of decode. The
-        # pending set is identical across MP ranks (TP-broadcast messages), so
-        # the drain decision is collective.
-        while len(self._disagg_pending_sends) >= self._disagg_max_inflight:
-            oldest = next(iter(self._disagg_pending_sends))
-            self._disagg_pending_sends.pop(oldest).wait()
-
-        staged = self.context.disagg_staged_kv.pop(request_id, None)
-        if staged is None:
-            # No staged KV for this request: the slot was already freed and
-            # re-exporting would fail. This can only happen on a stale/duplicate
-            # SEND_KV (the request was never staged or already shipped). Skip
-            # rather than crash the engine loop.
-            logging.warning(
-                "disagg prefill: SEND_KV for request %s has no staged KV; skipping",
-                request_id,
-            )
-            return
-        handoff = send_request_kv_resharded(
-            self, request_id, self._disagg_my_layout,
-            self._disagg_instance_kv_layouts,
-            self._disagg_layouts(dst_layout_dicts),
-            backend=self._disagg_get_backend(), payload=staged,
-            my_mamba_layout=self._disagg_my_mamba_layout,
-            src_mamba_layouts=self._disagg_instance_mamba_layouts,
-            dst_mamba_layouts=self._disagg_mamba_layouts(dst_layout_dicts),
-        )
-        if handoff is not None:
-            self._disagg_pending_sends[request_id] = handoff
-
-    def _disagg_recv_kv(self, request_id, src_layout_dicts, prompt, sampling_params,
-                        handoff=None):
-        """(decode) post the receive of ``request_id``'s KV. Non-blocking: the
-        receive is reaped a step later in :meth:`_disagg_complete_pending`, which
-        imports the KV (registers the prefix-cache blocks) and admits the
-        request -- add_request prefix-hits and continues generation.
-
-        Push backends (NCCL) post a matched receive against the prefill's send.
-        One-sided backends (NIXL) instead allocate destination blocks and issue a
-        one-sided READ of the prefill's blocks into them; ``handoff`` carries the
-        per-rank region meta + source block ids, relayed opaque by the
-        coordinator. Both paths yield an object with a ``finish(engine)`` that
-        commits, so the rest is symmetric."""
-        backend = self._disagg_get_backend()
-        # Backpressure: complete + admit the oldest in-flight receive once the
-        # window is full (collective: identical pending set across MP ranks).
-        while len(self._disagg_pending_recvs) >= self._disagg_max_inflight:
-            oldest = next(iter(self._disagg_pending_recvs))
-            rv, p, sp = self._disagg_pending_recvs.pop(oldest)
-            rv.finish(self)
-            if backend.is_pull:
-                self._disagg_pending_acks.append(oldest)
-            self.add_request(oldest, p, sampling_params=SamplingParams.deserialize(sp))
-
-        if backend.is_pull:
-            recv = post_pull_request_kv(
-                self, backend, handoff, self._disagg_my_layout,
-                src_layouts=self._disagg_layouts(src_layout_dicts),
-                dst_layouts=self._disagg_instance_kv_layouts,
-                src_mamba_layouts=self._disagg_mamba_layouts(src_layout_dicts),
-                dst_mamba_layouts=self._disagg_instance_mamba_layouts,
-                my_mamba_layout=self._disagg_my_mamba_layout,
-            )
-        else:
-            recv = post_recv_request_kv_resharded(
-                self, self._disagg_my_layout,
-                self._disagg_layouts(src_layout_dicts),
-                self._disagg_instance_kv_layouts,
-                prompt, backend=backend,
-                my_mamba_layout=self._disagg_my_mamba_layout,
-                src_mamba_layouts=self._disagg_mamba_layouts(src_layout_dicts),
-                dst_mamba_layouts=self._disagg_instance_mamba_layouts,
-            )
-        if recv is None:
-            # No KV received: for pull it means the decode KV cache was full, so
-            # we admit to re-prefill. The prefill still pinned its blocks, so ack
-            # to release the credit + pin (else its flow-control credit leaks).
-            if backend.is_pull:
-                self._disagg_pending_acks.append(request_id)
-            sp = SamplingParams.deserialize(sampling_params)
-            self.add_request(request_id, prompt, sampling_params=sp)
-            return
-        self._disagg_pending_recvs[request_id] = (recv, prompt, sampling_params)
-
-    def _disagg_ready_recvs(self, is_pull):
-        """Pending receive ids (insertion order) ready to admit THIS step.
-
-        Push (NCCL): all pending -- the matched-collective recvs are waited in
-        :meth:`_disagg_complete_pending`'s ``finish``. Pull (one-sided): the
-        subset whose READ has drained on *every* MP rank -- each rank polls its
-        handles non-blockingly, then the per-rank done flags are AND-reduced over
-        the MP group (``MIN`` all-reduce) so admission stays collective. Requests
-        not yet done everywhere stay pending and are rechecked next step."""
-        pending = list(self._disagg_pending_recvs)
-        if not is_pull or not pending:
-            return pending
-        local = [self._disagg_pending_recvs[rid][0].poll() for rid in pending]
-        flags = torch.tensor(
-            [1 if d else 0 for d in local],
-            dtype=torch.int32, device=self.context.memory_buffer.device,
-        )
-        # MIN over the MP group == logical AND: admit only where all ranks agree.
-        torch.distributed.all_reduce(
-            flags, op=torch.distributed.ReduceOp.MIN, group=self.pg_collection.mp
-        )
-        return [rid for rid, f in zip(pending, flags.tolist()) if f]
-
-    def _disagg_complete_pending(self):
-        """Reap KV transfers posted on a previous step.
-
-        Collective across the MP group: the pending sets were populated from
-        TP-broadcast coordinator messages, so every rank holds the same requests
-        in the same (insertion) order. Prefill: wait each send and release its
-        staged KV. Decode: admit each receive that has landed, import its KV
-        (registers the prefix-cache blocks), and continue generation.
-
-        For one-sided pulls the receive completion is non-blocking: rather than
-        waiting on a possibly-slow READ, :meth:`_disagg_ready_recvs` polls each
-        and admits only those done on *every* MP rank (deferring the rest to a
-        later step), so a lagging transfer never stalls the loop. Admission stays
-        in lockstep across ranks because that "done on all ranks" set is
-        AND-reduced over the MP group -- if ranks admitted different requests the
-        next forward step would diverge."""
-        if getattr(self, "disagg_role", None) is None:
-            return
-        is_pull = self._disagg_get_backend().is_pull
-        for request_id in list(self._disagg_pending_sends):
-            self._disagg_pending_sends.pop(request_id).wait()
-        for request_id in self._disagg_ready_recvs(is_pull):
-            recv, prompt, sampling_params = self._disagg_pending_recvs.pop(request_id)
-            imported = recv.finish(self)
-            if imported is None:
-                # KV import failed (e.g. decode KV cache full): the request is
-                # still admitted but without the handed-off blocks, so it
-                # re-prefills from the prompt -- correct but slower. Surface it.
-                logging.warning(
-                    "disagg decode: KV import failed for request %s; "
-                    "re-prefilling from prompt instead of using handed-off KV",
-                    request_id,
-                )
-            if is_pull:
-                # One-sided READ drained -> release the prefill's pin + a credit.
-                self._disagg_pending_acks.append(request_id)
-            sp = SamplingParams.deserialize(sampling_params)
-            self.add_request(request_id, prompt, sampling_params=sp)
-
-        # Flush read-done acks: the MP coordinator tells the coordinator each
-        # pulled request has drained. Queue is identical across MP ranks
-        # (collective finish), so clearing it is consistent.
-        if self._disagg_pending_acks:
-            if self.use_coordinator and self.is_mp_coordinator:
-                for rid in self._disagg_pending_acks:
-                    self.socket_for_receiving_requests.send(
-                        msgpack.packb([Headers.KV_READ_DONE.value, rid], use_bin_type=True)
-                    )
-            self._disagg_pending_acks.clear()
 
     @internal_api
     async def start_listening_to_data_parallel_coordinator(
@@ -1053,12 +631,12 @@ class DynamicInferenceEngine(AbstractEngine):
 
         local_ip = hostname or socket.gethostname()
 
-        disagg = self.disagg_role is not None
+        disagg = self._disagg is not None
         # Disaggregated: ONE coordinator for the whole job, sized to the total
         # prefill+decode instance count, spawned by the designated rank (the
         # prefill instance's coordinator). Otherwise: one coordinator per DP
         # group, spawned by each DP coordinator rank.
-        should_spawn = self.disagg_spawn_coordinator if disagg else self.is_dp_coordinator
+        should_spawn = self._disagg.spawn_coordinator if disagg else self.is_dp_coordinator
         if launch_inference_coordinator and should_spawn:
             spawn_context = multiprocessing.get_context('spawn')
             deterministic_mode = torch.are_deterministic_algorithms_enabled()
@@ -1086,7 +664,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     "schedule_output_path": coordinator_schedule_output_path,
                     "hostname": hostname,
                     "disaggregated": disagg,
-                    "disagg_router": self.disagg_router_name,
+                    "disagg_router": self._disagg.router_name,
                 },
             )
             self.inference_coordinator_process.start()
@@ -1122,7 +700,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # DP group from its source rank.
         bcast = [dp_addr]
         if disagg:
-            torch.distributed.broadcast_object_list(bcast, src=0, group=self.disagg_world_group)
+            torch.distributed.broadcast_object_list(bcast, src=0, group=self._disagg.world_group)
         else:
             torch.distributed.broadcast_object_list(bcast, src=dp_src, group=dp_group)
         [dp_addr] = bcast
@@ -1131,7 +709,7 @@ class DynamicInferenceEngine(AbstractEngine):
         torch.distributed.broadcast_object_list(bcast, src=mp_src, group=mp_group)
         [mp_req_addr] = bcast
 
-        identity = self.disagg_identity if disagg else f'mp-coord-{dp_rank}'
+        identity = self._disagg.identity if disagg else f'mp-coord-{dp_rank}'
         if self.is_mp_coordinator:
             # 1. Create dealer sockets where tp_rank = 0 and pp_rank = 0
             #    These will receive requests from an InferenceCoordinator.
@@ -1141,21 +719,10 @@ class DynamicInferenceEngine(AbstractEngine):
             self.socket_for_receiving_requests.connect(dp_addr)
 
             # Register with the coordinator. Disaggregated: announce role + this
-            # instance's KV layouts so the coordinator can 2-hop route + plan
-            # reshards. Otherwise: an empty string is the registration ping.
+            # instance's KV layouts (REGISTER_ROLE) so the coordinator can 2-hop
+            # route + plan reshards. Otherwise: an empty string is the ping.
             if disagg:
-                # Report whether this engine uses a one-sided (pull) backend, so
-                # the coordinator applies credit-based flow control (bounding
-                # outstanding hand-offs to the prefill's hold-ring/pin window) only
-                # for pull instances; push instances are unthrottled as before.
-                is_pull = bool(getattr(self.context, "disagg_pull_mode", False))
-                self.socket_for_receiving_requests.send(
-                    msgpack.packb(
-                        [Headers.REGISTER_ROLE.value, self.disagg_role,
-                         self.disagg_instance_layouts, is_pull],
-                        use_bin_type=True,
-                    )
-                )
+                self.socket_for_receiving_requests.send(self._disagg.registration_message())
             else:
                 self.socket_for_receiving_requests.send(b"")
 
@@ -2495,30 +2062,10 @@ class DynamicInferenceEngine(AbstractEngine):
             records_to_send = [
                 r for r in finished_request_records if r.requests[-1].status != Status.FAILED
             ]
-            if records_to_send and self.disagg_role == "prefill":
-                # Prefill-only: don't reply to the client. Tell the coordinator
-                # each request finished prefill (KV staged); it names the decode
-                # target via RECV_KV (and SEND_KV for push backends).
-                #
-                # Pull backends require EVERY MP rank to publish its KV shard here
-                # and contribute per-rank READ descriptors -- so the publish runs
-                # on all ranks (records_to_send is identical across the MP group),
-                # while only the MP coordinator emits the ZMQ control message and
-                # attaches the gathered handoff. Push backends publish nothing
-                # here; the KV ships later on SEND_KV.
-                nvtx_range_push("coordinator_communication")
-                backend = self._disagg_get_backend()
-                for r in records_to_send:
-                    rid = r.requests[-1].request_id
-                    handoff = self._disagg_publish_kv(rid) if backend.is_pull else None
-                    if self.is_mp_coordinator:
-                        parts = [Headers.PREFILL_DONE.value, rid]
-                        if handoff is not None:
-                            parts.append(handoff)
-                        self.socket_for_receiving_requests.send(
-                            msgpack.packb(parts, use_bin_type=True)
-                        )
-                nvtx_range_pop("coordinator_communication")
+            if records_to_send and self._disagg is not None and self._disagg.role == "prefill":
+                # Prefill-only: don't reply to the client; tell the coordinator
+                # each request finished prefill (KV staged) via PREFILL_DONE.
+                self._disagg.emit_prefill_done(records_to_send)
             elif records_to_send and self.is_mp_coordinator:
                 nvtx_range_push("coordinator_communication")
                 payload = msgpack.packb(
@@ -2786,8 +2333,9 @@ class DynamicInferenceEngine(AbstractEngine):
         """
 
         # Reap KV transfers posted on the previous step before admitting this
-        # step's batch (no-op unless disaggregated; collective across MP ranks).
-        self._disagg_complete_pending()
+        # step's batch (disaggregated only; collective across MP ranks).
+        if self._disagg is not None:
+            self._disagg.complete_pending()
 
         nvtx_range_push("drain_zmq_socket")
         all_messages = []
@@ -2817,35 +2365,28 @@ class DynamicInferenceEngine(AbstractEngine):
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
                 sampling_params = SamplingParams.deserialize(sampling_params)
-                if self.disagg_role == "prefill":
-                    # Prefill-only: run prefill (which populates the prompt KV)
-                    # and stop right after, so the request leaves this engine
-                    # with its prompt-block KV intact for the handoff. The few
-                    # generated tokens are discarded; decode regenerates from
-                    # the prompt (prefix-cache hit on the imported KV).
-                    sampling_params.num_tokens_to_generate = 1
-                    bs = int(self.context.block_size_tokens)
-                    self.context.disagg_prompt_block_count[request_id] = (
-                        len(prompt) + bs - 1
-                    ) // bs
+                if self._disagg is not None and self._disagg.role == "prefill":
+                    # Prefill-only: run prefill then stop, leaving the prompt KV
+                    # intact for the hand-off (see on_submit_prefill).
+                    self._disagg.on_submit_prefill(request_id, prompt, sampling_params)
                 nvtx_range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
                 nvtx_range_pop("add_request")
             elif header == Headers.SEND_KV:
                 # (prefill) ship a staged request's KV to the chosen decode
                 # instance, resharded to its layout.
-                self._disagg_send_kv(data[1], data[2])
+                self._disagg.send_kv(data[1], data[2])
             elif header == Headers.RECV_KV:
                 # (decode) receive a request's KV, import it (registers the
                 # prefix-cache blocks), then admit it for generation. ``data[5]``
                 # (pull backends) carries the prefill's published READ descriptors;
                 # absent for push backends.
                 handoff = data[5] if len(data) > 5 else None
-                self._disagg_recv_kv(data[1], data[2], data[3], data[4], handoff)
+                self._disagg.recv_kv(data[1], data[2], data[3], data[4], handoff)
             elif header == Headers.RELEASE_KV:
                 # (prefill, one-sided) the decode finished its READ -- release the
                 # request's pinned KV blocks (Mamba used the reset-safe ring, no pin).
-                self.context.disagg_release_pinned(data[1])
+                self._disagg.release_pinned(data[1])
             elif header == Headers.SET_GENERATION_EPOCH:
                 new_generation_epoch = data[1]
             else:
