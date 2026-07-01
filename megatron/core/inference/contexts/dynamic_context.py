@@ -4095,19 +4095,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 continue
             yield bid, slot, h
 
-    @staticmethod
-    def _mamba_state_descriptor(conv, ssm) -> Dict[str, Any]:
-        """[shared] Wire descriptor (shape/dtype + tensor) for a conv/ssm state
-        pair, so the decode side can rebuild matching tensors."""
-        return {
-            "conv_states_shape": list(conv.shape),
-            "ssm_states_shape": list(ssm.shape),
-            "conv_states_dtype": str(conv.dtype),
-            "ssm_states_dtype": str(ssm.dtype),
-            "conv_states_tensor": conv,
-            "ssm_states_tensor": ssm,
-        }
-
     def _export_mamba_state(
         self, internal_idx: int, block_ids: Optional[list] = None
     ) -> Optional[Dict[str, Any]]:
@@ -4140,8 +4127,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         ssm_slice = self.mamba_ssm_states[:, slot_idx].contiguous().clone()
 
         result: Dict[str, Any] = {
-            "num_mamba_layers": int(self.mamba_conv_states.shape[0]),
-            **self._mamba_state_descriptor(conv_slice, ssm_slice),
+            "conv_states_tensor": conv_slice,
+            "ssm_states_tensor": ssm_slice,
         }
 
         snapshots = self._export_mamba_snapshots(block_ids or [])
@@ -4176,7 +4163,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         conv = sa.conv_states[:, slot_tensor].contiguous().clone().transpose(0, 1).contiguous()
         ssm = sa.ssm_states[:, slot_tensor].contiguous().clone().transpose(0, 1).contiguous()
 
-        return {"block_hashes": hashes, **self._mamba_state_descriptor(conv, ssm)}
+        return {
+            "block_hashes": hashes,
+            "conv_states_tensor": conv,
+            "ssm_states_tensor": ssm,
+        }
 
     def import_request_kv(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """[push] Inject a staged KV (and optional Mamba) payload into this context.

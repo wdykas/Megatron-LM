@@ -245,13 +245,7 @@ class DecodeRecv:
                         f"dst_shape={tuple(dst.shape)} recv={tuple(sub.shape)} src={t.src_rank}"
                     )
                     self.mamba_ssm[t.dst_layer, t.dst_lo : t.dst_hi, :, :] = sub
-            ml = self.my_mamba_layout
             payload["mamba_payload"] = {
-                "num_mamba_layers": ml.num_layers,
-                "conv_states_shape": [ml.conv_dim_local, ml.d_conv],
-                "ssm_states_shape": [ml.nheads_local, ml.headdim, ml.d_state],
-                "conv_states_dtype": str(self.mamba_conv.dtype),
-                "ssm_states_dtype": str(self.mamba_ssm.dtype),
                 "conv_states_tensor": self.mamba_conv,
                 "ssm_states_tensor": self.mamba_ssm,
             }
