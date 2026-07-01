@@ -44,7 +44,7 @@ class DisaggRouter(abc.ABC):
 class DisaggRouting(DisaggRouter):
     """Sequences a request prefill-engine -> (KV handoff) -> decode-engine.
 
-    Engines are identified by their opaque transport identity (bytes for ZMQ;
+    Engines are identified by their transport identity (bytes for ZMQ;
     any hashable in tests). Holds no sockets and does no I/O -- it only decides
     *which* engine each hop goes to and remembers the per-request pairing so the
     final reply can be routed home. Selection is round-robin within each role

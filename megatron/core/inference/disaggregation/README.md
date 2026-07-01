@@ -54,7 +54,7 @@ hand-off.
   its KV; it reports this instead of replying to the client (the client is
   waiting on decode's output). For pull it also carries the **handoff
   descriptor** — the per-rank READ metadata (block ids + buffer geometry) — which
-  the coordinator relays opaquely. Triggers hop 2: the coordinator picks a decode.
+  the coordinator relays without inspecting it. Triggers hop 2: the coordinator picks a decode.
 
 - **`SEND_KV`** (coord → prefill, **push only**). Tells the prefill to ship the
   staged KV to the chosen decode, resharded to the decode's layout. Skipped on
