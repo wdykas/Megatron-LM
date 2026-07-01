@@ -305,12 +305,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Mark the inference engine as active. Cleared in `suspend()` and re-set in `resume()`.
         InferenceMode.set_active()
 
-        # Disaggregation runtime (None => normal aggregated engine). Created by
-        # set_disaggregation_config() before start_listening. All disagg state +
-        # the 2-hop KV hand-off live in DisaggEngineRuntime, keeping this engine
-        # clean for the non-disaggregated path. Lives here (not create_cuda_graphs,
-        # which early-returns when cuda graphs are disabled -- e.g. hybrid models
-        # -- and re-runs on recapture) so every engine always has the attribute.
+        # Disaggregation runtime; None => normal aggregated engine.
         self._disagg = None
 
         # Create cuda graphs.
