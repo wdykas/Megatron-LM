@@ -3991,7 +3991,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         """[shared] Shared head of export_request_kv / export_request_kv_ref.
 
         Returns ``(internal_idx, block_ids, block_hashes)`` for the request, or
-        ``None`` if there's nothing to export. Raises for the MLA latent cache.
+        ``None`` only for an empty prompt (0 prompt-covering blocks, nothing to
+        hand off). Raises for the MLA latent cache.
 
         ``block_ids`` is capped to the prompt-covering count
         (``ceil(prompt_len/block_size)``): a block-aligned prompt makes the
