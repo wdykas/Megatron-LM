@@ -4301,13 +4301,12 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Register hashes + release the alloc-time pin (shared with the pull
         # path's disagg_pull_commit; see _disagg_register_and_release).
-        self._disagg_register_and_release(
-            local_block_ids, list(payload.get("block_hashes") or [])
-        )
+        block_hashes = list(payload.get("block_hashes") or [])
+        self._disagg_register_and_release(local_block_ids, block_hashes)
 
         result: Dict[str, Any] = {
             "block_ids": local_block_ids,
-            "block_hashes": block_hashes_in,
+            "block_hashes": block_hashes,
         }
 
         mamba_payload = payload.get("mamba_payload")
