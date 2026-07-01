@@ -4327,7 +4327,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # decode's one-sided READ. Released on the RELEASE_KV ack
         # (disagg_release_pinned). Reset-safe: the per-step reset doesn't touch
         # block_ref_counts (only the epoch-level allocator reset does, when no
-        # hand-offs are outstanding). The coordinator's credit window bounds how
+        # hand-offs are outstanding). The coordinator's flow-control window bounds how
         # many such pins/ring slots can be outstanding -> a hard no-overwrite
         # guarantee. (Mamba uses the reset-safe ring above, not a pin.)
         self.kv_block_allocator.block_ref_counts[

@@ -89,7 +89,7 @@ class DisaggEngineRuntime:
     - ``max_inflight``: depth window bounding concurrent hand-offs (and staged-KV
       memory) so prefill can't outrun decode.
     - ``pending_acks``: (decode, one-sided) request_ids whose READ has drained,
-      queued for a KV_READ_DONE ack so the coordinator releases a credit + the
+      queued for a KV_READ_DONE ack so the coordinator releases an outstanding slot + the
       prefill releases the request's pinned KV blocks.
     - ``pull_static_metas``: (prefill, one-sided) per-MP-rank request-invariant
       pull metadata, gathered once (lazily on the first publish); None until
@@ -431,7 +431,7 @@ class DisaggEngineRuntime:
         if recv is None:
             # No KV received: for pull it means the decode KV cache was full, so
             # we admit to re-prefill. The prefill still pinned its blocks, so ack
-            # to release the credit + pin (else its flow-control credit leaks).
+            # to release the outstanding slot + pin (else its outstanding-slot count leaks).
             if backend.is_pull:
                 self.pending_acks.append(request_id)
             sp = SamplingParams.deserialize(sampling_params)
@@ -494,7 +494,7 @@ class DisaggEngineRuntime:
                     request_id,
                 )
             if is_pull:
-                # One-sided READ drained -> release the prefill's pin + a credit.
+                # One-sided READ drained -> release the prefill's pin + an outstanding slot.
                 self.pending_acks.append(request_id)
             sp = SamplingParams.deserialize(sampling_params)
             self.engine.add_request(request_id, prompt, sampling_params=sp)
@@ -514,7 +514,7 @@ class DisaggEngineRuntime:
     def registration_message(self):
         """REGISTER_ROLE msgpack: role + this instance's KV layouts + the is_pull
         flag, so the coordinator can 2-hop route + plan reshards, and apply
-        credit-based flow control (bounding outstanding hand-offs to the
+        outstanding-handoff flow control (bounding outstanding hand-offs to the
         prefill's hold-ring/pin window) only for pull instances."""
         return msgpack.packb(
             [Headers.REGISTER_ROLE.value, self.role, self.instance_layouts, self.is_pull],

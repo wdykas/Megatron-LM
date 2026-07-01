@@ -2,7 +2,7 @@
 
 # Disaggregated prefill→decode inference
 
-This package splits a request across two inference engines: one **prefills** the
+Disagregatted inference splits a request across two inference engines: one **prefills** the
 prompt (fills the KV cache) and another **decodes** (generates tokens). The KV
 cache computed by the prefill is handed off to the decode so it doesn't
 re-prefill. Only *control* flows through the shared coordinator; the KV *bytes*
@@ -13,6 +13,8 @@ It is transport-agnostic behind one flag, `backend.is_pull`:
 - **Push** (two-sided, NCCL): the prefill *sends* the KV to the decode.
 - **Pull** (one-sided, NIXL/RDMA): the decode *READs* the KV out of the
   prefill's registered buffer, no prefill-side action.
+
+If you want to run with no dependencies use the Push backend for best performance use the pull(Nixl) backend.
 
 ## Control protocol (2-hop)
 
@@ -27,12 +29,12 @@ Push (NCCL), 4 headers:                 Pull (NIXL), 5 headers:
   REGISTER_ROLE  engine→coord            REGISTER_ROLE  engine→coord (is_pull=True)
   PREFILL_DONE   prefill→coord            PREFILL_DONE   prefill→coord (+ READ descriptors)
   SEND_KV        coord→prefill (ship)     RECV_KV        coord→decode  (relays descriptors; decode READs)
-  RECV_KV        coord→decode  (recv)     KV_READ_DONE   decode→coord  (READ drained → free credit)
+  RECV_KV        coord→decode  (recv)     KV_READ_DONE   decode→coord  (READ drained → free an outstanding slot)
                                           RELEASE_KV     coord→prefill (unpin blocks)
 ```
 
 Pull skips `SEND_KV` (the prefill published its KV up front and does nothing
-more) and adds the `KV_READ_DONE`→`RELEASE_KV` pair, which is the credit/lifetime
+more) and adds the `KV_READ_DONE`→`RELEASE_KV` pair, which is the outstanding/lifetime
 bookkeeping the one-sided READ needs. See the module docstring in `__init__.py`.
 
 ## KV hand-off
@@ -56,7 +58,7 @@ bookkeeping the one-sided READ needs. See the module docstring in `__init__.py`.
 | `mamba_hold_slots` (64) | prefill engine runtime | reset-safe Mamba hold-ring depth |
 | `max_inflight` (8) | each engine runtime | KV transfers posted-but-not-reaped per step (step backpressure) |
 
-The credit window guarantees a pull prefill never recycles a hold-ring slot / KV
+The flow-control window guarantees a pull prefill never recycles a hold-ring slot / KV
 pin the decode hasn't READ yet (hard no-overwrite guarantee).
 
 ## Module map
@@ -75,10 +77,6 @@ pin the decode hasn't READ yet (hard no-overwrite guarantee).
 | `transfer_backends/nccl.py` | two-sided push backend (`torch.distributed` P2P) |
 | `transfer_backends/nixl.py` | one-sided pull backend (NIXL RDMA) |
 | `utils.py` | shared helpers |
-
-The prefill-side KV *export*/*import* and pull-side *match/alloc/commit* live on
-the context (`../contexts/dynamic_context.py`, the `disagg_*` / `export_request_kv*`
-methods), since they manipulate the KV cache and Mamba state directly.
 
 ## Running / testing
 
