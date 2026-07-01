@@ -23,11 +23,23 @@ class _FakeController:
     model_config = _FakeModelConfig()
 
 
+class _FakeContext:
+    """Minimal KV context: _global_kv_dims reads the attention-layer count off
+    memory_buffer.shape[1] (== global L here, since these specs are all pp=1)."""
+
+    enable_prefix_caching = True
+    is_hybrid_model = False
+
+    def __init__(self, local_layers):
+        self.memory_buffer = torch.empty(2, local_layers, 1, 1, 1, 1)
+
+
 class _RecordingEngine:
     """Captures the set_disaggregation_config kwargs for assertions."""
 
     def __init__(self):
         self.controller = _FakeController()
+        self.context = _FakeContext(L)
         self.cfg = None
 
     def set_disaggregation_config(self, **kwargs):
