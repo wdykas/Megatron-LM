@@ -1678,17 +1678,11 @@ class TextGenerationController:
         # so we must capture it here and hold it in disagg_staged_kv.
         if getattr(context, "disagg_stage_prefill_kv", False) and finished_idxs.numel() > 0:
             staged_kv = context.disagg_staged_kv
-            # Pull backends (NIXL): capture by reference (block ids + Mamba slot,
-            # no copy); the blocks stay pinned in the prefix cache and decode
-            # reads them directly. Push backends (NCCL): copy the KV into a
-            # staging tensor, since the blocks are recycled before SEND_KV ships.
-            pull_mode = getattr(context, "disagg_pull_mode", False)
+            # The context picks how to capture based on its transport mode: a
+            # by-reference pin (pull/NIXL) or a staging copy (push/NCCL).
             for fidx in finished_idxs.tolist():
                 req_id = int(context.request_ids[fidx].item())
-                if pull_mode:
-                    payload = context.export_request_kv_ref(req_id, internal_idx=int(fidx))
-                else:
-                    payload = context.export_request_kv(req_id, internal_idx=int(fidx))
+                payload = context.disagg_export_request_kv(req_id, internal_idx=int(fidx))
                 if payload is not None:
                     staged_kv[req_id] = payload
 

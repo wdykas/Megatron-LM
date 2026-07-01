@@ -4399,6 +4399,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             "snapshots": self._export_snapshot_refs(block_ids),
         }
 
+    def disagg_export_request_kv(
+        self, request_id: int, internal_idx: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Capture a finished request's KV for the disagg hand-off, dispatching on
+        this context's transport mode: by-reference (pull/NIXL, no copy) or a
+        staging copy (push/NCCL). The caller stages the result until the
+        coordinator's SEND_KV names the decode target."""
+        if getattr(self, "disagg_pull_mode", False):
+            return self.export_request_kv_ref(request_id, internal_idx=internal_idx)
+        return self.export_request_kv(request_id, internal_idx=internal_idx)
+
     def _disagg_mamba_hold_dims(self) -> Optional[Dict[str, Any]]:
         """Geometry of this rank's Mamba hold-ring, so a decode rank with a
         different TP can compute byte offsets of conv-channel / ssm-head bands
