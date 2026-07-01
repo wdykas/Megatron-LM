@@ -2369,7 +2369,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # (decode) receive a request's KV, import it (registers the
                 # prefix-cache blocks), then admit it for generation. ``data[5]``
                 # (pull backends) carries the prefill's published READ descriptors;
-                # absent for push backends.
+                # None for push backends.
                 handoff = data[5] if len(data) > 5 else None
                 self._disagg.recv_kv(data[1], data[2], data[3], data[4], handoff)
             elif header == Headers.RELEASE_KV:
