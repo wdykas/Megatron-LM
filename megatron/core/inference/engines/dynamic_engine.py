@@ -711,13 +711,11 @@ class DynamicInferenceEngine(AbstractEngine):
             self.socket_for_receiving_requests.setsockopt(zmq.IDENTITY, identity.encode('utf-8'))
             self.socket_for_receiving_requests.connect(dp_addr)
 
-            # Register with the coordinator. Disaggregated: announce role + this
-            # instance's KV layouts (REGISTER_ROLE) so the coordinator can 2-hop
-            # route + plan reshards. Otherwise: an empty string is the ping.
-            if disagg_enabled:
-                self.socket_for_receiving_requests.send(self._disagg.registration_message())
-            else:
-                self.socket_for_receiving_requests.send(b"")
+            # Register with the coordinator. Disaggregated: a REGISTER_ROLE message
+            # announcing role + KV layouts so it can 2-hop route + plan reshards.
+            # Otherwise: an empty-string ping (the coordinator just counts them).
+            registration = self._disagg.registration_message() if disagg_enabled else b""
+            self.socket_for_receiving_requests.send(registration)
 
             # 2. Create a publisher socket. This is used to publish or broadcast
             #    requests within the model parallel group
