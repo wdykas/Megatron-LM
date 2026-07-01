@@ -186,19 +186,18 @@ class DataParallelInferenceCoordinator:
         self._disagg = make_disagg_router(disagg_router) if disaggregated else None
         self._engine_layouts: dict = {}
         self._req_meta: dict = {}
-        # Credit-based flow control for one-sided (pull) prefill instances: bound
-        # the number of outstanding (submitted-but-read-done) hand-offs per prefill
-        # to <= the window, so the prefill can never reuse a Mamba hold-ring slot /
-        # KV pin whose data the decode hasn't read yet (hard no-overwrite guarantee).
-        # The window MUST be <= the engine's hold-ring depth (_disagg_mamba_hold_slots).
-        # Released by the decode's KV_READ_DONE ack. Push instances are not
-        # throttled (they don't ack and have their own staging window).
+        # Flow control for pull (one-sided) prefills: cap the hand-offs a prefill
+        # can have outstanding (submitted but not yet read-done) so it never
+        # recycles a Mamba hold-ring slot / KV pin the decode hasn't read. Push
+        # prefills aren't throttled (they copy to a staging tensor, send no ack).
         self._engine_is_pull: dict = {}        # prefill identity -> bool
         self._disagg_prefill_of: dict = {}     # request_id -> prefill identity (for RELEASE/credit)
-        self._disagg_outstanding: dict = {}     # prefill identity -> outstanding count
-        self._disagg_submit_queue: dict = {}    # prefill identity -> deque of (rid, prompt, sp)
+        self._disagg_outstanding: dict = {}    # prefill identity -> outstanding hand-off count
+        self._disagg_submit_queue: dict = {}   # prefill identity -> deque of (rid, prompt, sp)
+        # Max outstanding hand-offs per pull prefill; released by the decode's
+        # KV_READ_DONE. MUST stay <= the engine's hold-ring depth (64).
         # TODO(peter): test what values are good for this.
-        self._disagg_credit_window = 32
+        self._disagg_max_outstanding = 32
         # time.sleep(5)  # Give data parallel ranks time to spawn and connect.
         for _ in range(data_parallel_size):
             identity, _ = self.router_socket.recv_multipart()
@@ -310,7 +309,7 @@ class DataParallelInferenceCoordinator:
         sampling so they can be forwarded to the chosen decode engine later.
 
         For one-sided (pull) prefill instances, apply credit-based flow control:
-        if the instance already has ``_disagg_credit_window`` outstanding
+        if the instance already has ``_disagg_max_outstanding`` outstanding
         hand-offs, queue the request instead of submitting; it is released when a
         decode KV_READ_DONE ack frees a credit. This bounds outstanding hand-offs
         to the prefill's hold-ring/pin window -- the hard no-overwrite guarantee."""
@@ -323,7 +322,7 @@ class DataParallelInferenceCoordinator:
                 prefill_id, Headers.SUBMIT_REQUEST, request_id, prompt, sampling_params
             )
             return
-        if self._disagg_outstanding.get(prefill_id, 0) >= self._disagg_credit_window:
+        if self._disagg_outstanding.get(prefill_id, 0) >= self._disagg_max_outstanding:
             self._disagg_submit_queue.setdefault(prefill_id, deque()).append(
                 (request_id, prompt, sampling_params)
             )
