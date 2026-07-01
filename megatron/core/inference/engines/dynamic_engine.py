@@ -211,9 +211,7 @@ class DynamicInferenceEngine(AbstractEngine):
         EngineState.STOPPED,
     )
 
-    # Disaggregation runtime; None => normal aggregated engine. Class-level
-    # default so test doubles that skip __init__ still resolve it as aggregated;
-    # __init__ sets the instance attribute, set_disaggregation_config replaces it.
+    # Class-level default so test doubles that skip __init__ resolve as aggregated.
     _disagg = None
 
     @deprecate_args(
