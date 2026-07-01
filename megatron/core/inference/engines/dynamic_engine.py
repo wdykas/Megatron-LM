@@ -626,12 +626,12 @@ class DynamicInferenceEngine(AbstractEngine):
 
         local_ip = hostname or socket.gethostname()
 
-        disagg = self._disagg is not None
+        disagg_enabled = self._disagg is not None
         # Disaggregated: ONE coordinator for the whole job, sized to the total
         # prefill+decode instance count, spawned by the designated rank (the
         # prefill instance's coordinator). Otherwise: one coordinator per DP
         # group, spawned by each DP coordinator rank.
-        should_spawn = self._disagg.spawn_coordinator if disagg else self.is_dp_coordinator
+        should_spawn = self._disagg.spawn_coordinator if disagg_enabled else self.is_dp_coordinator
         if launch_inference_coordinator and should_spawn:
             spawn_context = multiprocessing.get_context('spawn')
             deterministic_mode = torch.are_deterministic_algorithms_enabled()
@@ -646,7 +646,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # coordinator loop, order-independent), so spawn with size 0
                     # -- no blocking registration count in the coordinator init.
                     "data_parallel_size": (
-                        0 if disagg else get_pg_size(self.pg_collection.dp)
+                        0 if disagg_enabled else get_pg_size(self.pg_collection.dp)
                     ),
                     "tokenizer": self.controller.tokenizer,
                     "max_requests": self.context.max_requests,
@@ -658,7 +658,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     "prefix_caching_routing_alpha": self.context.prefix_caching_routing_alpha,
                     "schedule_output_path": coordinator_schedule_output_path,
                     "hostname": hostname,
-                    "disaggregated": disagg,
+                    "disaggregated": disagg_enabled,
                     "disagg_router": self._disagg.router_name,
                 },
             )
@@ -694,7 +694,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # disagg group from the spawner (global rank 0). Otherwise: within the
         # DP group from its source rank.
         bcast = [dp_addr]
-        if disagg:
+        if disagg_enabled:
             torch.distributed.broadcast_object_list(bcast, src=0, group=self._disagg.world_group)
         else:
             torch.distributed.broadcast_object_list(bcast, src=dp_src, group=dp_group)
@@ -704,7 +704,7 @@ class DynamicInferenceEngine(AbstractEngine):
         torch.distributed.broadcast_object_list(bcast, src=mp_src, group=mp_group)
         [mp_req_addr] = bcast
 
-        identity = self._disagg.identity if disagg else f'mp-coord-{dp_rank}'
+        identity = self._disagg.identity if disagg_enabled else f'mp-coord-{dp_rank}'
         if self.is_mp_coordinator:
             # 1. Create dealer sockets where tp_rank = 0 and pp_rank = 0
             #    These will receive requests from an InferenceCoordinator.
@@ -716,7 +716,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # Register with the coordinator. Disaggregated: announce role + this
             # instance's KV layouts (REGISTER_ROLE) so the coordinator can 2-hop
             # route + plan reshards. Otherwise: an empty string is the ping.
-            if disagg:
+            if disagg_enabled:
                 self.socket_for_receiving_requests.send(self._disagg.registration_message())
             else:
                 self.socket_for_receiving_requests.send(b"")
