@@ -3988,15 +3988,15 @@ class DynamicInferenceContext(BaseInferenceContext):
     # --- Disaggregated KV export / import (prefill -> decode handoff) ---
 
     def _disagg_resolve_export_blocks(self, request_id, internal_idx):
-        """[shared] Resolve a request to the KV blocks to export -- shared by
-        :meth:`export_request_kv` / :meth:`export_request_kv_ref`. Resolves the
-        slot, caps to the prompt-covering block count, and returns
-        ``(internal_idx, block_ids, block_hashes)`` -- or ``None`` when there's
-        nothing to export. Raises ``NotImplementedError`` for the MLA latent cache.
+        """[shared] Shared head of export_request_kv / export_request_kv_ref.
 
-        The cap matches the decode's header-free ``ceil(prompt_len/block_size)``:
-        the prefill allocates one extra block for its discarded generated token
-        when the prompt is block-aligned, which the decode never receives."""
+        Returns ``(internal_idx, block_ids, block_hashes)`` for the request, or
+        ``None`` if there's nothing to export. Raises for the MLA latent cache.
+
+        ``block_ids`` is capped to the prompt-covering count
+        (``ceil(prompt_len/block_size)``): a block-aligned prompt makes the
+        prefill allocate one extra block for its discarded token, which the
+        decode -- computing the count header-free -- never expects."""
         if self.cache_mla_latent:
             raise NotImplementedError(
                 "disaggregated KV transfer does not support the MLA latent KV cache"
