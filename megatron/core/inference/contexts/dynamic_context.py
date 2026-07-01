@@ -1268,6 +1268,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         # request_id -> pinned KV block ids (prefill pull side); the pin holds the
         # blocks for the decode's one-sided READ until its RELEASE_KV ack.
         self.disagg_pinned: dict = {}
+        # Reset-safe Mamba end-state hold-ring (prefill pull side); allocated by
+        # register_pull_regions for hybrid pull, stays None otherwise.
+        self.disagg_mamba_hold_conv = None
+        self.disagg_mamba_hold_ssm = None
+        self.disagg_mamba_hold_n = 0
+        self.disagg_mamba_hold_count = 0
 
         # Allocate large non-graphed buffers.
         need_static_addr = (
@@ -4008,7 +4014,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             return None
         block_ids = self.request_to_kv_block_ids[internal_idx, :block_count].tolist()
         if (
-            getattr(self.kv_block_allocator, "enable_prefix_caching", False)
+            self.kv_block_allocator.enable_prefix_caching
             and hasattr(self.kv_block_allocator, "block_hashes")
         ):
             block_hashes = self.kv_block_allocator.block_hashes[
@@ -4147,29 +4153,18 @@ class DynamicInferenceContext(BaseInferenceContext):
         allocator has cached one or more block boundaries for the
         request's attention blocks.
         """
-        mamba_metadata = getattr(self, "mamba_metadata", None)
-        if mamba_metadata is None:
-            return None
-        slot_tensor = getattr(mamba_metadata, "request_to_mamba_state_idx", None)
-        if slot_tensor is None:
-            return None
-        slot_idx = int(slot_tensor[internal_idx].item())
+        slot_idx = int(self.mamba_metadata.request_to_mamba_state_idx[internal_idx].item())
         if slot_idx < 0:
-            return None
+            return None  # request has no Mamba slot yet
 
-        conv_states = getattr(self, "mamba_conv_states", None)
-        ssm_states = getattr(self, "mamba_ssm_states", None)
-        if conv_states is None or ssm_states is None:
-            return None
-
-        # Both buffers are shaped (num_mamba_layers, max_requests, *state_shape).
-        # Slice off this request's slot and clone so the staging tensor
-        # is self-contained for transport registration.
-        conv_slice = conv_states[:, slot_idx].contiguous().clone()
-        ssm_slice = ssm_states[:, slot_idx].contiguous().clone()
+        # Buffers are (num_mamba_layers, max_requests, *state_shape). Slice off
+        # this request's slot and clone so the staging tensor is self-contained
+        # for transport registration.
+        conv_slice = self.mamba_conv_states[:, slot_idx].contiguous().clone()
+        ssm_slice = self.mamba_ssm_states[:, slot_idx].contiguous().clone()
 
         result: Dict[str, Any] = {
-            "num_mamba_layers": int(conv_states.shape[0]),
+            "num_mamba_layers": int(self.mamba_conv_states.shape[0]),
             **self._mamba_state_descriptor(conv_slice, ssm_slice),
         }
 
@@ -4313,9 +4308,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         layout = "std_attn_v1"
         mamba_src_slot = -1
         if self.is_hybrid_model:
-            mm = getattr(self, "mamba_metadata", None)
-            slot_tensor = getattr(mm, "request_to_mamba_state_idx", None) if mm else None
-            live_slot = int(slot_tensor[internal_idx].item()) if slot_tensor is not None else -1
+            live_slot = int(self.mamba_metadata.request_to_mamba_state_idx[internal_idx].item())
             if live_slot >= 0:
                 layout = "hybrid_v1"
                 # Copy the live Mamba end-state into the reset-safe hold-ring and
@@ -4324,18 +4317,11 @@ class DynamicInferenceContext(BaseInferenceContext):
                 # ring is disagg-owned and untouched, so the decode's READ stays
                 # correct without pinning. A ring slot is reused only after
                 # hold_n more publishes -- far beyond the decode's read lag.
-                hold_conv = getattr(self, "disagg_mamba_hold_conv", None)
-                if hold_conv is not None:
-                    n = self.disagg_mamba_hold_n
-                    ring = self.disagg_mamba_hold_count % n
-                    self.disagg_mamba_hold_count += 1
-                    self.disagg_mamba_hold_conv[:, ring] = self.mamba_conv_states[:, live_slot]
-                    self.disagg_mamba_hold_ssm[:, ring] = self.mamba_ssm_states[:, live_slot]
-                    mamba_src_slot = ring
-                else:
-                    # No hold-ring (e.g. decode-only context): publish the live
-                    # slot (windowed by-reference fallback).
-                    mamba_src_slot = live_slot
+                ring = self.disagg_mamba_hold_count % self.disagg_mamba_hold_n
+                self.disagg_mamba_hold_count += 1
+                self.disagg_mamba_hold_conv[:, ring] = self.mamba_conv_states[:, live_slot]
+                self.disagg_mamba_hold_ssm[:, ring] = self.mamba_ssm_states[:, live_slot]
+                mamba_src_slot = ring
         # Pin the KV blocks (ref-count) so they survive this request's release
         # into the prefix cache and cannot be reallocated/overwritten before the
         # decode's one-sided READ. Released on the RELEASE_KV ack
@@ -4384,9 +4370,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         for a hetero (fragment) READ. conv hold: (num_mamba_layers, n_ring,
         conv_dim, d_conv); ssm hold: (num_mamba_layers, n_ring, nheads, headdim,
         d_state)."""
-        hc = getattr(self, "disagg_mamba_hold_conv", None)
-        hs = getattr(self, "disagg_mamba_hold_ssm", None)
-        if hc is None or hs is None:
+        hc = self.disagg_mamba_hold_conv
+        hs = self.disagg_mamba_hold_ssm
+        if hc is None:  # no hold-ring: non-hybrid or non-pull context
             return None
         return {
             "n_slots": int(hc.shape[1]),
@@ -4416,10 +4402,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         :meth:`_import_mamba_snapshots`; the READ fills the slots, then
         :meth:`disagg_snapshot_commit` registers the hashes."""
         sa = self.mamba_slot_allocator
-        kv = getattr(self, "kv_block_allocator", None)
-        if sa is None or kv is None or not snapshot_pairs:
+        if sa is None or not snapshot_pairs:
             return None
-        hash_to_block = getattr(kv, "kv_hash_to_block_id", None)
+        hash_to_block = getattr(self.kv_block_allocator, "kv_hash_to_block_id", None)
         if not hash_to_block:
             return None
         target_blocks, hashes, src_slots = [], [], []
@@ -4477,7 +4462,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         :meth:`disagg_pull_commit` releases them. Empty when prefix caching is
         off or nothing matches."""
         empty = {"reused_block_ids": [], "match_len": 0}
-        if not getattr(self.kv_block_allocator, "enable_prefix_caching", False):
+        if not self.kv_block_allocator.enable_prefix_caching:
             return empty
         hashes = list(block_hashes or [])
         kv_hash_to_block = getattr(self.kv_block_allocator, "kv_hash_to_block_id", None)
@@ -4529,11 +4514,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             block_ids = []
         mamba_dst_slot = -1
         if want_mamba and self.is_hybrid_model:
-            mm = getattr(self, "mamba_metadata", None)
-            if mm is not None:
-                s = mm.allocate_slot()
-                if s is not None:
-                    mamba_dst_slot = int(s)
+            s = self.mamba_metadata.allocate_slot()
+            if s is not None:
+                mamba_dst_slot = int(s)
         return {"block_ids": block_ids, "mamba_dst_slot": mamba_dst_slot}
 
     def _disagg_register_and_release(self, block_ids: list, block_hashes: list) -> None:
@@ -4543,7 +4526,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         prefix-cache match grows from the cached ``ref_count==0`` state. Shared
         tail of :meth:`import_request_kv` (push) and :meth:`disagg_pull_commit`
         (pull)."""
-        if not getattr(self.kv_block_allocator, "enable_prefix_caching", False):
+        if not self.kv_block_allocator.enable_prefix_caching:
             return
         if len(block_hashes) == len(block_ids):
             valid = [(b, h) for b, h in zip(block_ids, block_hashes) if h is not None and h != -1]
@@ -4576,37 +4559,30 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def _import_mamba_state(self, payload: Dict[str, Any]) -> Optional[int]:
         """[push] Allocate a Mamba slot, write the end-state, and rehydrate
-        per-block snapshots so the decode worker's prefix cache works.
+        per-block snapshots so the decode worker's prefix cache works. Called only
+        for hybrid models (see import_request_kv).
 
-        Returns the allocated slot index, or ``None`` if the model is
-        not hybrid, the layout is incompatible, or no slot is free.
+        Returns the allocated slot index, or ``None`` if the payload's layout is
+        incompatible or no slot is free.
         """
-        mamba_metadata = getattr(self, "mamba_metadata", None)
-        if mamba_metadata is None:
-            return None
-
-        conv_local = getattr(self, "mamba_conv_states", None)
-        ssm_local = getattr(self, "mamba_ssm_states", None)
-        if conv_local is None or ssm_local is None:
-            return None
-
+        conv_local = self.mamba_conv_states
+        ssm_local = self.mamba_ssm_states
         conv_remote = payload["conv_states_tensor"]
         ssm_remote = payload["ssm_states_tensor"]
 
-        if conv_remote.dtype != conv_local.dtype:
-            return None
-        if ssm_remote.dtype != ssm_local.dtype:
+        # The remote tensor was sliced from the same per-slot layout
+        # (num_mamba_layers, *state_shape), so it must match dtype + shape apart
+        # from the leading slot dim. Reject an incompatible payload.
+        per_slot = lambda t: t.shape[:1] + t.shape[2:]
+        if (
+            conv_remote.dtype != conv_local.dtype
+            or ssm_remote.dtype != ssm_local.dtype
+            or conv_remote.shape != per_slot(conv_local)
+            or ssm_remote.shape != per_slot(ssm_local)
+        ):
             return None
 
-        # Local layout per slot is (num_mamba_layers, *state_shape); the
-        # remote tensor was sliced from the same shape, so it must match
-        # element-by-element apart from the leading "slot" dimension.
-        if conv_remote.shape != conv_local.shape[:1] + conv_local.shape[2:]:
-            return None
-        if ssm_remote.shape != ssm_local.shape[:1] + ssm_local.shape[2:]:
-            return None
-
-        slot_idx = mamba_metadata.allocate_slot()
+        slot_idx = self.mamba_metadata.allocate_slot()
         if slot_idx is None:
             return None
         slot_idx = int(slot_idx)
@@ -4643,10 +4619,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         slot_allocator = self.mamba_slot_allocator
         if slot_allocator is None:
             return
-        kv_allocator = getattr(self, "kv_block_allocator", None)
-        if kv_allocator is None:
-            return
-        hash_to_block = getattr(kv_allocator, "kv_hash_to_block_id", None)
+        hash_to_block = getattr(self.kv_block_allocator, "kv_hash_to_block_id", None)
         if not hash_to_block:
             return
 
