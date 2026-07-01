@@ -197,7 +197,8 @@ class DataParallelInferenceCoordinator:
         self._disagg_prefill_of: dict = {}     # request_id -> prefill identity (for RELEASE/credit)
         self._disagg_outstanding: dict = {}     # prefill identity -> outstanding count
         self._disagg_submit_queue: dict = {}    # prefill identity -> deque of (rid, prompt, sp)
-        self._disagg_credit_window = int(os.environ.get("MEGATRON_DISAGG_CREDIT_WINDOW", "32"))
+        # TODO(peter): test what values are good for this.
+        self._disagg_credit_window = 32
         # time.sleep(5)  # Give data parallel ranks time to spawn and connect.
         for _ in range(data_parallel_size):
             identity, _ = self.router_socket.recv_multipart()
