@@ -80,7 +80,6 @@ class DisaggDummyEngine(DummyEngine):
     def __init__(self):
         super().__init__()
         self.context = _FakeKVContext()
-        self._disagg_backend = None
 
     async def async_step(self, *, verbose=False):
         from collections import deque as _dq
@@ -103,7 +102,7 @@ class DisaggDummyEngine(DummyEngine):
             req.status = Status.COMPLETED
             self.context.active_cnt -= 1
             to_remove.append(rid)
-            if self.disagg_role == "prefill":
+            if self._disagg.role == "prefill":
                 # prefill-stop: stage KV + tell the coordinator (no client reply).
                 # The real SEND_KV handler drains context.disagg_staged_kv (the
                 # controller stages there while the slot is still valid), so the
