@@ -109,6 +109,7 @@ class DisaggEngineRuntime:
         self.max_inflight = 8
         # (prefill, one-sided, hybrid) depth of the reset-safe Mamba hold-ring
         # published end-states are copied into; capped to the live slot count.
+        # TODO(peter): test what values are good for this.
         self.mamba_hold_slots = 64
 
         # Precompute the immutable per-rank/instance layouts once: they're fixed
