@@ -110,18 +110,14 @@ def _global_kv_dims(engine, pg) -> Tuple[int, int]:
     cfg = engine.controller.model_config
     num_heads = getattr(cfg, "num_query_groups", None) or cfg.num_attention_heads
     mb = getattr(getattr(engine, "context", None), "memory_buffer", None)
-    # A configured disagg engine always wraps an initialized dynamic context, so
-    # memory_buffer is allocated. Assert rather than fall back to cfg.num_layers:
-    # that fallback over-counts on hybrid models (it includes Mamba layers) and
-    # would silently produce a reshard plan spanning layers the cache lacks.
+    # A configured disagg engine always has an allocated memory_buffer.
     assert mb is not None, (
         "disaggregation requires a dynamic KV context with an allocated "
         "memory_buffer; got engine.context=%r" % getattr(engine, "context", None)
     )
-    # memory_buffer layer dim is this PP stage's local attention-layer count.
-    # Hybrid models do not split attention layers evenly across PP stages, so
-    # gather the per-stage counts and sum (same approach as the Mamba layer
-    # offset) rather than assuming uniform distribution.
+    # memory_buffer's layer dim is this PP stage's local attention-layer count.
+    # Hybrid models split attention layers unevenly across PP stages, so gather
+    # the per-stage counts and sum rather than assuming a uniform split.
     local_layers = int(mb.shape[1])
     pp = get_pg_size(pg.pp)
     if pp <= 1:
