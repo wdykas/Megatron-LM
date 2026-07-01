@@ -4112,6 +4112,40 @@ class DynamicInferenceContext(BaseInferenceContext):
             result["mamba_payload"] = mamba_payload
         return result
 
+    def _disagg_snapshot_block_slots(self, block_ids: list):
+        """[shared] Yield ``(block_id, snapshot_slot, block_hash)`` for each block
+        with a cached Mamba boundary snapshot and a registered hash. Empty for
+        non-hybrid / no-prefix-cache. Shared by the push (``_export_mamba_snapshots``)
+        and pull (``_export_snapshot_refs``) snapshot exporters."""
+        sa = self.mamba_slot_allocator
+        if sa is None or not block_ids:
+            return
+        block_to_slot = getattr(sa, "block_to_slot", None)
+        if block_to_slot is None or not hasattr(self.kv_block_allocator, "block_hashes"):
+            return
+        block_hashes = self.kv_block_allocator.block_hashes
+        for bid in block_ids:
+            slot = int(block_to_slot[bid].item())
+            if slot < 0:
+                continue
+            h = int(block_hashes[bid].item())
+            if h == -1:
+                continue
+            yield bid, slot, h
+
+    @staticmethod
+    def _mamba_state_descriptor(conv, ssm) -> Dict[str, Any]:
+        """[shared] Wire descriptor (shape/dtype + tensor) for a conv/ssm state
+        pair, so the decode side can rebuild matching tensors."""
+        return {
+            "conv_states_shape": list(conv.shape),
+            "ssm_states_shape": list(ssm.shape),
+            "conv_states_dtype": str(conv.dtype),
+            "ssm_states_dtype": str(ssm.dtype),
+            "conv_states_tensor": conv,
+            "ssm_states_tensor": ssm,
+        }
+
     def _export_mamba_state(
         self, internal_idx: int, block_ids: Optional[list] = None
     ) -> Optional[Dict[str, Any]]:
@@ -4156,12 +4190,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         result: Dict[str, Any] = {
             "num_mamba_layers": int(conv_states.shape[0]),
-            "conv_states_shape": list(conv_slice.shape),
-            "ssm_states_shape": list(ssm_slice.shape),
-            "conv_states_dtype": str(conv_slice.dtype),
-            "ssm_states_dtype": str(ssm_slice.dtype),
-            "conv_states_tensor": conv_slice,
-            "ssm_states_tensor": ssm_slice,
+            **self._mamba_state_descriptor(conv_slice, ssm_slice),
         }
 
         snapshots = self._export_mamba_snapshots(block_ids or [])
@@ -4182,53 +4211,21 @@ class DynamicInferenceContext(BaseInferenceContext):
         without prefix caching) or when none of the request's blocks
         have a slot allocated.
         """
-        slot_allocator = self.mamba_slot_allocator
-        if slot_allocator is None or not block_ids:
+        pairs = list(self._disagg_snapshot_block_slots(block_ids))
+        if not pairs:
             return None
-
-        # Filter to blocks that actually have a Mamba snapshot.
-        block_to_slot = getattr(slot_allocator, "block_to_slot", None)
-        if block_to_slot is None:
-            return None
-        kv_allocator = getattr(self, "kv_block_allocator", None)
-        if kv_allocator is None or not hasattr(kv_allocator, "block_hashes"):
-            return None
-
-        snapshot_pairs = []  # list of (block_id, slot, hash)
-        for bid in block_ids:
-            slot = int(block_to_slot[bid].item())
-            if slot < 0:
-                continue
-            h = int(kv_allocator.block_hashes[bid].item())
-            if h == -1:
-                continue
-            snapshot_pairs.append((bid, slot, h))
-
-        if not snapshot_pairs:
-            return None
-
-        slot_indices = [s for _, s, _ in snapshot_pairs]
-        hashes = [h for _, _, h in snapshot_pairs]
+        slot_indices = [slot for _, slot, _ in pairs]
+        hashes = [h for _, _, h in pairs]
 
         slot_tensor = torch.tensor(slot_indices, dtype=torch.int64)
-        # Slot tensors live on GPU; the gather copies the right rows out.
-        conv = slot_allocator.conv_states[:, slot_tensor].contiguous().clone()
-        ssm = slot_allocator.ssm_states[:, slot_tensor].contiguous().clone()
+        # Slot tensors live on GPU; the gather copies the right rows out, then
+        # rearrange to (num_snapshots, num_mamba_layers, *state_shape) so decode
+        # can index by snapshot rather than by layer.
+        sa = self.mamba_slot_allocator
+        conv = sa.conv_states[:, slot_tensor].contiguous().clone().transpose(0, 1).contiguous()
+        ssm = sa.ssm_states[:, slot_tensor].contiguous().clone().transpose(0, 1).contiguous()
 
-        # Rearrange to (num_snapshots, num_mamba_layers, *state_shape) so
-        # decode can index by snapshot rather than by layer.
-        conv = conv.transpose(0, 1).contiguous()
-        ssm = ssm.transpose(0, 1).contiguous()
-
-        return {
-            "block_hashes": hashes,
-            "conv_states_shape": list(conv.shape),
-            "ssm_states_shape": list(ssm.shape),
-            "conv_states_dtype": str(conv.dtype),
-            "ssm_states_dtype": str(ssm.dtype),
-            "conv_states_tensor": conv,
-            "ssm_states_tensor": ssm,
-        }
+        return {"block_hashes": hashes, **self._mamba_state_descriptor(conv, ssm)}
 
     def import_request_kv(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """[push] Inject a staged KV (and optional Mamba) payload into this context.
@@ -4427,23 +4424,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         cached boundary snapshot and a valid hash. By reference (no copy): the
         decode READs these snapshot slots from this rank's registered snapshot
         buffers, which the KV pin keeps from being evicted until read."""
-        sa = self.mamba_slot_allocator
-        if sa is None or not block_ids:
-            return []
-        block_to_slot = getattr(sa, "block_to_slot", None)
-        kv = getattr(self, "kv_block_allocator", None)
-        if block_to_slot is None or kv is None or not hasattr(kv, "block_hashes"):
-            return []
-        refs = []
-        for bid in block_ids:
-            slot = int(block_to_slot[bid].item())
-            if slot < 0:
-                continue
-            h = int(kv.block_hashes[bid].item())
-            if h == -1:
-                continue
-            refs.append((h, slot))
-        return refs
+        return [(h, slot) for _, slot, h in self._disagg_snapshot_block_slots(block_ids)]
 
     def disagg_snapshot_pull_plan(self, snapshot_pairs: list) -> Optional[Dict[str, Any]]:
         """(decode, one-sided) Given the prefill's ``[(block_hash, src_slot), ...]``,
