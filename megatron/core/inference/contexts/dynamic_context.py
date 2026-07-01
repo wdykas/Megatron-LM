@@ -4086,12 +4086,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         if block_to_slot is None or not hasattr(self.kv_block_allocator, "block_hashes"):
             return
         block_hashes = self.kv_block_allocator.block_hashes
-        for bid in block_ids:
-            slot = int(block_to_slot[bid].item())
-            if slot < 0:
-                continue
-            h = int(block_hashes[bid].item())
-            if h == -1:
+        # One gather+sync each (not an .item() per block): slot/hash for every id.
+        slots = block_to_slot[
+            torch.as_tensor(block_ids, dtype=torch.int64, device=block_to_slot.device)
+        ].tolist()
+        hashes = block_hashes[
+            torch.as_tensor(block_ids, dtype=torch.int64, device=block_hashes.device)
+        ].tolist()
+        for bid, slot, h in zip(block_ids, slots, hashes):
+            if slot < 0 or h == -1:
                 continue
             yield bid, slot, h
 
@@ -4263,7 +4266,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             request_id, internal_idx
         )
         block_count = len(block_ids)
-        _, num_layers, _, _, heads, hidden = self.memory_buffer.shape
         mamba_src_slot = -1
         if self.is_hybrid_model:
             live_slot = int(self.mamba_metadata.request_to_mamba_state_idx[internal_idx].item())
@@ -4291,21 +4293,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             torch.tensor(block_ids, dtype=torch.int64)
         ] += 1
         self.disagg_pinned[request_id] = list(block_ids)
+        # Only the per-request fields; the static geometry (kv_dims/mamba_dims/
+        # region meta) rides pull_static_meta, so pull_request_meta drops the rest.
         return {
             "block_count": block_count,
-            "block_size_tokens": int(self.block_size_tokens),
-            "num_layers": int(num_layers),
-            "num_heads_per_partition": int(heads),
-            "hidden_per_head": int(hidden),
-            # Full memory_buffer geometry, so a decode rank with a different TP
-            # layout can compute byte offsets of head/layer sub-ranges for a
-            # hetero (fragment) READ. (2, L, total_blocks, BS, heads, hidden).
-            "total_blocks": int(self.memory_buffer.shape[2]),
-            "elem_size": int(self.memory_buffer.element_size()),
             "block_ids": block_ids,
             "block_hashes": block_hashes,
             "mamba_src_slot": mamba_src_slot,
-            "mamba_dims": self._disagg_mamba_hold_dims(),
             "snapshots": self._export_snapshot_refs(block_ids),
         }
 
