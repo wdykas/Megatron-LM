@@ -1387,10 +1387,6 @@ class DynamicInferenceEngine(AbstractEngine):
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
                     request.add_event_finish()
-                    # Prefill-only disagg: the request's KV was staged by the
-                    # controller before the context freed its slot (see
-                    # disagg_stage_prefill_kv); _disagg_send_kv drains it on
-                    # SEND_KV. Nothing to capture here.
                     finished_entry = self.requests.pop(request_id)
                     finished_request = finished_entry.record[-1]
                     finished_request.generated_length = len(finished_request.generated_tokens)
