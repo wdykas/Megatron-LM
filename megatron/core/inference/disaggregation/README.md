@@ -78,12 +78,22 @@ pin the decode hasn't READ yet (hard no-overwrite guarantee).
 | `transfer_backends/nixl.py` | one-sided pull backend (NIXL RDMA) |
 | `utils.py` | shared helpers |
 
-## Running / testing
+## How to run
 
-- **Unit tests**: `tests/unit_tests/inference/test_disagg_*` (routing, partial pull).
-- **GPU smoke** (hybrid Nano, TP2→TP2, 2 GRPO iterations):
-  `mrl_internal/train_grpo_disagg_nano.sh`, with `KV_BACKEND=nccl` (push) or
-  `KV_BACKEND=nixl` (pull). Any change to shared KV code should be smoked on
-  **both** backends — a pull-only run won't exercise the push path and vice versa.
-  For NIXL, launch with `UCX_TLS=cuda_ipc,cuda_copy,tcp,sm,self UCX_MEMTYPE_CACHE=n`
-  so UCX uses GPU-direct transports instead of the degraded host-memory path.
+Disaggregation is driven by the `--inference-shards` spec: declare one or more
+prefill shards and one or more decode shards with `role=`, each at its own
+parallelism. For example, a TP2 prefill feeding a TP2 decode:
+
+```
+--inference-shards tp=2,role=prefill+tp=2,role=decode
+```
+
+Pick the KV transport with `--disagg-kv-transport-backend {nccl,nixl}` (default
+`nccl`) — `nccl` is the two-sided push path, `nixl` the one-sided pull path.
+Disaggregation requires prefix caching (the decode admits the handed-off KV via a
+prefix-cache hit), so it must be enabled on the engine.
+
+Every rank builds every shard's process groups (`new_group` is collective) but
+instantiates the model only on its own shard; global rank 0 spawns the single
+coordinator, which round-robins prefill submissions and 2-hop routes each request
+to a decode.
