@@ -1262,18 +1262,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         # update_requests() (CPU phase), executed by transfer_bookkeeping_to_gpu().
         self._pending_mamba_zeros: list = []
         self._pending_mamba_restores: list = []
-        # Mamba slot pre-bound by a disaggregated KV import (decode side), consumed
-        # on the next prefill admit; None when no hand-off is pending.
+        # decode: imported Mamba end-state slot, bound to the next prefill admit.
         self._pending_disagg_mamba_slot: Optional[int] = None
-        # request_id -> pinned KV block ids (prefill pull side); the pin holds the
-        # blocks for the decode's one-sided READ until its RELEASE_KV ack.
+        # prefill pull: request_id -> KV blocks pinned for the decode's READ.
         self.disagg_pinned: dict = {}
-        # Reset-safe Mamba end-state hold-ring (prefill pull side); allocated by
-        # register_pull_regions for hybrid pull, stays None otherwise.
-        self.disagg_mamba_hold_conv = None
-        self.disagg_mamba_hold_ssm = None
-        self.disagg_mamba_hold_n = 0
-        self.disagg_mamba_hold_count = 0
+        # prefill pull (hybrid): Mamba end-state hold-ring the decode READs;
+        # allocated by register_pull_regions, else left at these empty defaults.
+        self.disagg_mamba_hold_conv = None   # conv-state ring buffer
+        self.disagg_mamba_hold_ssm = None    # ssm-state ring buffer
+        self.disagg_mamba_hold_n = 0         # ring size (num slots)
+        self.disagg_mamba_hold_count = 0     # publishes so far == ring write cursor
 
         # Allocate large non-graphed buffers.
         need_static_addr = (
