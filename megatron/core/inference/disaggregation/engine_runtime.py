@@ -499,7 +499,7 @@ class DisaggEngineRuntime:
         bs = int(self.context.block_size_tokens)
         self.context.disagg_prompt_block_count[request_id] = (len(prompt) + bs - 1) // bs
 
-    def emit_prefill_done(self, records_to_send):
+    def send_prefill_done(self, records_to_send):
         """(prefill) Instead of replying to the client, tell the coordinator each
         request finished prefill (KV staged); it names the decode target via
         RECV_KV (and SEND_KV for push backends).
