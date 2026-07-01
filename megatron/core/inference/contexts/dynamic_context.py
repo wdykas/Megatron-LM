@@ -4086,7 +4086,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         if block_to_slot is None or not hasattr(self.kv_block_allocator, "block_hashes"):
             return
         block_hashes = self.kv_block_allocator.block_hashes
-        # One gather+sync each (not an .item() per block): slot/hash for every id.
+        # Gather slot + hash for all ids with one device sync each.
         slots = block_to_slot[
             torch.as_tensor(block_ids, dtype=torch.int64, device=block_to_slot.device)
         ].tolist()
@@ -4218,8 +4218,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             return None
         local_block_ids = local_block_ids_tensor.tolist()
 
-        # DISAGG-DEBUG: validate the decode allocator's block ids and the
-        # staging size before the in-place writes (bad bid / size skew -> async IMA).
+        # Check every block id is in range and the id/staging counts agree before
+        # writing in place -- an out-of-range id or count mismatch corrupts memory.
         total_blocks = memory_buffer.shape[2]
         bad = [b for b in local_block_ids if b < 0 or b >= total_blocks]
         assert not bad and len(local_block_ids) == block_count == staging.shape[0], (
@@ -4354,9 +4354,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         sa = self.mamba_slot_allocator
         if sa is None or not snapshot_pairs:
             return None
-        hash_to_block = getattr(self.kv_block_allocator, "kv_hash_to_block_id", None)
-        if not hash_to_block:
-            return None
+        hash_to_block = self.kv_block_allocator.kv_hash_to_block_id
         target_blocks, hashes, src_slots = [], [], []
         for h, src_slot in snapshot_pairs:
             local_bid = hash_to_block.get(h)
@@ -4368,8 +4366,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         if not target_blocks:
             return None
         local_slots = sa.allocate_slots_batch(target_blocks)
-        if not local_slots or any(s is None or s < 0 for s in local_slots):
-            return None
         transfers = []
         for src, dst in zip(src_slots, local_slots):
             transfers.append(("snap_conv", int(src), int(dst)))
@@ -4446,9 +4442,10 @@ class DynamicInferenceContext(BaseInferenceContext):
     ) -> Optional[Dict[str, Any]]:
         """(decode, one-sided) Allocate destination KV blocks (and a Mamba slot)
         for an incoming pull. Returns ``{"block_ids", "mamba_dst_slot"}`` (slot
-        ``-1`` when none), or ``None`` if the KV allocation fails. ``block_count``
-        may be 0 (full prefix hit: no KV to pull, but a Mamba slot may still be
-        needed). The caller READs the peer's data into these, then calls
+        ``-1`` when not hybrid), or ``None`` if either the KV or the Mamba slot
+        allocation fails (so the caller defers the pull). ``block_count`` may be 0
+        (full prefix hit: no KV to pull, but a Mamba slot may still be needed).
+        The caller READs the peer's data into these, then calls
         :meth:`disagg_pull_commit`."""
         if block_count > 0:
             ids_t = self.kv_block_allocator.allocate_memory_blocks(block_count)
@@ -4463,10 +4460,18 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             block_ids = []
         mamba_dst_slot = -1
-        if want_mamba and self.is_hybrid_model:
+        if want_mamba:
             s = self.mamba_metadata.allocate_slot()
-            if s is not None:
-                mamba_dst_slot = int(s)
+            if s is None:
+                # Mamba pool exhausted. A hybrid request must have a bound slot,
+                # so defer the whole pull like the KV-full path -- but first
+                # release the KV blocks we just took, or they leak.
+                if block_ids:
+                    self.kv_block_allocator.release_memory_blocks(
+                        torch.tensor(block_ids, dtype=torch.int64)
+                    )
+                return None
+            mamba_dst_slot = int(s)
         return {"block_ids": block_ids, "mamba_dst_slot": mamba_dst_slot}
 
     def _disagg_register_and_release(self, block_ids: list, block_hashes: list) -> None:

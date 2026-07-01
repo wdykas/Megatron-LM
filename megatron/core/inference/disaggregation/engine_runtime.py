@@ -308,7 +308,7 @@ class DisaggEngineRuntime:
             "block_size": int(block_size), "heads": int(heads), "hidden": int(hidden),
             "elem": int(ctx.memory_buffer.element_size()),
         }
-        mamba_dims = ctx._disagg_mamba_hold_dims() if hasattr(ctx, "_disagg_mamba_hold_dims") else None
+        mamba_dims = ctx._disagg_mamba_hold_dims()
         static = pull_static_meta(
             self.get_backend(), self.my_layout, kv_dims, mamba_dims
         )
