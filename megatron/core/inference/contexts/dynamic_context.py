@@ -4011,7 +4011,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         The cap matches the decode's header-free ``ceil(prompt_len/block_size)``:
         the prefill allocates one extra block for its discarded generated token
         when the prompt is block-aligned, which the decode never receives."""
-        if getattr(self, "cache_mla_latent", False):
+        if self.cache_mla_latent:
             raise NotImplementedError(
                 "disaggregated KV transfer does not support the MLA latent KV cache"
             )
@@ -4256,7 +4256,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         layout = payload.get("layout")
         if layout not in ("std_attn_v1", "hybrid_v1"):
             return None
-        if getattr(self, "cache_mla_latent", False):
+        if self.cache_mla_latent:
             raise NotImplementedError(
                 "disaggregated KV transfer does not support the MLA latent KV cache"
             )
