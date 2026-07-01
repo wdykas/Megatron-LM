@@ -211,7 +211,6 @@ class DecodeRecv:
             ] = sub
         m = self.meta
         payload = {
-            "layout": "std_attn_v1",
             "block_count": m["block_count"],
             "block_size_tokens": m["block_size_tokens"],
             "num_layers": self.my_layout.local_num_layers(),
@@ -247,7 +246,6 @@ class DecodeRecv:
                     )
                     self.mamba_ssm[t.dst_layer, t.dst_lo : t.dst_hi, :, :] = sub
             ml = self.my_mamba_layout
-            payload["layout"] = "hybrid_v1"
             payload["mamba_payload"] = {
                 "num_mamba_layers": ml.num_layers,
                 "conv_states_shape": [ml.conv_dim_local, ml.d_conv],

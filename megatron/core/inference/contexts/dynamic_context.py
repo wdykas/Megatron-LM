@@ -4044,8 +4044,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         * ``mamba_payload`` — present only for hybrid models. A dict
           with ``conv_states``, ``ssm_states``, and their shape/dtype
           descriptors so the decode side can rebuild matching tensors.
-        * ``layout`` — version tag (``"std_attn_v1"`` for pure
-          attention, ``"hybrid_v1"`` when Mamba state rides along).
         """
         resolved = self._disagg_resolve_export_blocks(request_id, internal_idx)
         if resolved is None:
@@ -4070,18 +4068,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         block_ids_tensor = torch.tensor(block_ids, dtype=torch.int64, device=memory_buffer.device)
         staging = memory_buffer[:, :, block_ids_tensor].permute(2, 0, 1, 3, 4, 5).contiguous()
 
-        # Versioned wire-format tag; the importer checks it before reading the
-        # payload, so a format change bumps the version instead of mis-reading.
-        layout = "std_attn_v1"
         mamba_payload: Optional[Dict[str, Any]] = None
-
         if self.is_hybrid_model:
             mamba_payload = self._export_mamba_state(internal_idx, block_ids=block_ids)
-            if mamba_payload is not None:
-                layout = "hybrid_v1"
 
         result: Dict[str, Any] = {
-            "layout": layout,
             "block_count": block_count,
             "block_size_tokens": int(self.block_size_tokens),
             "num_layers": int(num_layers),
@@ -4217,9 +4208,6 @@ class DynamicInferenceContext(BaseInferenceContext):
           this engine will add via :attr:`_pending_disagg_mamba_slot`;
           the engine's add path picks it up automatically.
         """
-        layout = payload.get("layout")
-        if layout not in ("std_attn_v1", "hybrid_v1"):
-            return None
         if self.cache_mla_latent:
             raise NotImplementedError(
                 "disaggregated KV transfer does not support the MLA latent KV cache"
@@ -4301,12 +4289,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         internal_idx, block_ids, block_hashes = resolved
         block_count = len(block_ids)
         _, num_layers, _, _, heads, hidden = self.memory_buffer.shape
-        layout = "std_attn_v1"
         mamba_src_slot = -1
         if self.is_hybrid_model:
             live_slot = int(self.mamba_metadata.request_to_mamba_state_idx[internal_idx].item())
             if live_slot >= 0:
-                layout = "hybrid_v1"
                 # Copy the live Mamba end-state into the reset-safe hold-ring and
                 # publish the RING index (not the live slot): the live slot is
                 # LIFO-recycled by the next prefill and wiped by reset, but the
@@ -4331,7 +4317,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         ] += 1
         self.disagg_pinned[request_id] = list(block_ids)
         return {
-            "layout": layout,
             "block_count": block_count,
             "block_size_tokens": int(self.block_size_tokens),
             "num_layers": int(num_layers),

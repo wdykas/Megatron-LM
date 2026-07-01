@@ -61,10 +61,9 @@ def pull_request_meta(ref_payload):
         ref_payload: the dict returned by ``context.export_request_kv_ref(request_id)``.
 
     Returns:
-        ``{layout, block_ids, block_hashes, block_count, mamba_src_slot, snapshots}``.
+        ``{block_ids, block_hashes, block_count, mamba_src_slot, snapshots}``.
     """
     return {
-        "layout": ref_payload["layout"],
         "block_ids": ref_payload["block_ids"],
         "block_hashes": ref_payload["block_hashes"],
         "block_count": ref_payload["block_count"],
