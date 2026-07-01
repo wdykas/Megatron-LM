@@ -4001,12 +4001,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             return None
         return int(matches[0, 0].item())
 
-    def _disagg_export_prologue(self, request_id, internal_idx):
-        """Shared head of :meth:`export_request_kv` / :meth:`export_request_kv_ref`:
-        resolve the request's slot, cap to the prompt-covering block count, and
-        return ``(internal_idx, block_ids, block_hashes)`` -- or ``None`` when
-        there's nothing to export. Raises ``NotImplementedError`` for the MLA
-        latent cache.
+    def _disagg_resolve_export_blocks(self, request_id, internal_idx):
+        """Resolve a request to the KV blocks to export -- shared by
+        :meth:`export_request_kv` / :meth:`export_request_kv_ref`. Resolves the
+        slot, caps to the prompt-covering block count, and returns
+        ``(internal_idx, block_ids, block_hashes)`` -- or ``None`` when there's
+        nothing to export. Raises ``NotImplementedError`` for the MLA latent cache.
 
         The cap matches the decode's header-free ``ceil(prompt_len/block_size)``:
         the prefill allocates one extra block for its discarded generated token
@@ -4062,10 +4062,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         * ``layout`` — version tag (``"std_attn_v1"`` for pure
           attention, ``"hybrid_v1"`` when Mamba state rides along).
         """
-        prologue = self._disagg_export_prologue(request_id, internal_idx)
-        if prologue is None:
+        resolved = self._disagg_resolve_export_blocks(request_id, internal_idx)
+        if resolved is None:
             return None
-        internal_idx, block_ids, block_hashes = prologue
+        internal_idx, block_ids, block_hashes = resolved
         block_count = len(block_ids)
 
         memory_buffer = self.memory_buffer
@@ -4331,10 +4331,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         linger in the prefix cache, which is the (windowed) lifetime guarantee.
         Returns ``None`` when the request has no exportable KV. Raises
         ``NotImplementedError`` for the MLA latent cache (unsupported)."""
-        prologue = self._disagg_export_prologue(request_id, internal_idx)
-        if prologue is None:
+        resolved = self._disagg_resolve_export_blocks(request_id, internal_idx)
+        if resolved is None:
             return None
-        internal_idx, block_ids, block_hashes = prologue
+        internal_idx, block_ids, block_hashes = resolved
         block_count = len(block_ids)
         _, num_layers, _, _, heads, hidden = self.memory_buffer.shape
         layout = "std_attn_v1"
