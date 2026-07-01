@@ -4097,7 +4097,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         layout = "std_attn_v1"
         mamba_payload: Optional[Dict[str, Any]] = None
 
-        if getattr(self, "is_hybrid_model", False):
+        if self.is_hybrid_model:
             mamba_payload = self._export_mamba_state(internal_idx, block_ids=block_ids)
             if mamba_payload is not None:
                 layout = "hybrid_v1"
@@ -4308,7 +4308,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         }
 
         mamba_payload = payload.get("mamba_payload")
-        if mamba_payload is not None and getattr(self, "is_hybrid_model", False):
+        if mamba_payload is not None and self.is_hybrid_model:
             slot_idx = self._import_mamba_state(mamba_payload)
             if slot_idx is not None:
                 # Pre-bind the slot so the next `_add_request` reuses it
@@ -4339,7 +4339,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         _, num_layers, _, _, heads, hidden = self.memory_buffer.shape
         layout = "std_attn_v1"
         mamba_src_slot = -1
-        if getattr(self, "is_hybrid_model", False):
+        if self.is_hybrid_model:
             mm = getattr(self, "mamba_metadata", None)
             slot_tensor = getattr(mm, "request_to_mamba_state_idx", None) if mm else None
             live_slot = int(slot_tensor[internal_idx].item()) if slot_tensor is not None else -1
@@ -4571,7 +4571,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             block_ids = []
         mamba_dst_slot = -1
-        if want_mamba and getattr(self, "is_hybrid_model", False):
+        if want_mamba and self.is_hybrid_model:
             mm = getattr(self, "mamba_metadata", None)
             if mm is not None:
                 s = mm.allocate_slot()
