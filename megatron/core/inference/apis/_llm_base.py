@@ -308,12 +308,8 @@ class _MegatronLLMBase:
         self._shutdown_called: bool = False
         self._disagg_setup = None
 
-        # Disaggregation: when the caller passes a role-tagged shard layout, mark
-        # this engine as a prefill/decode shard before the coordinator runtime
-        # starts. The shard's process groups arrive via inference_config (so the
-        # engine already runs on them); we only derive role + KV layouts here and
-        # call engine.set_disaggregation_config, which must precede
-        # start_listening_to_data_parallel_coordinator.
+        # Disaggregation: tag this engine as a prefill/decode shard from the
+        # role-tagged layout. Must run before start_listening_to_data_parallel_coordinator.
         if inference_shards is not None:
             specs = normalize_shard_specs(inference_shards, dist.get_world_size())
             self._disagg_setup = configure_prebuilt_disagg_engine(
