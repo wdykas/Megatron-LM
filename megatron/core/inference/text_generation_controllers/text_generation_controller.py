@@ -1672,18 +1672,16 @@ class TextGenerationController:
                 if valid:
                     finished_routing_block_ids[req_id] = valid
 
-        # Disaggregation (prefill engine): capture each finished request's KV
-        # shard now, while its slot is still valid -- update_requests below frees
-        # the slot during the step, before the engine's finish loop runs, so the
-        # request_id->slot lookup there would miss. Held until the coordinator's
-        # SEND_KV names the decode target.
+        # Disaggregation (prefill engine): grab each finished request's KV now.
+        # The hand-off to decode happens later, when the coordinator's SEND_KV
+        # names the target -- but update_requests (below) frees the slot first,
+        # so we must capture it here and hold it in disagg_staged_kv.
         if getattr(context, "disagg_stage_prefill_kv", False) and finished_idxs.numel() > 0:
             staged_kv = context.disagg_staged_kv
-            # One-sided (pull) backends capture KV *by reference* (block ids +
-            # Mamba slot, no copy): the decode READs these blocks straight from
-            # the registered buffer, which stays valid in the prefix cache until
-            # read. Push backends copy a staging tensor here, since the original
-            # blocks are recycled before SEND_KV ships them.
+            # Pull backends (NIXL): capture by reference (block ids + Mamba slot,
+            # no copy); the blocks stay pinned in the prefix cache and decode
+            # reads them directly. Push backends (NCCL): copy the KV into a
+            # staging tensor, since the blocks are recycled before SEND_KV ships.
             pull_mode = getattr(context, "disagg_pull_mode", False)
             for fidx in finished_idxs.tolist():
                 req_id = int(context.request_ids[fidx].item())
