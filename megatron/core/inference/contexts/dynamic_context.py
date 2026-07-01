@@ -3983,24 +3983,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     # --- Disaggregated KV export / import (prefill -> decode handoff) ---
 
-    def _resolve_internal_request_slot(self, request_id: int) -> Optional[int]:
-        """[shared] Reverse-lookup the engine-internal slot index for ``request_id``.
-
-        The context indexes block / mamba bookkeeping by an internal
-        slot counter (``total_request_count`` at the time the request
-        was added), not by the user-supplied ``request_id``. We keep the
-        mapping in ``self.request_ids[internal_idx] == user_request_id``.
-        """
-        upper = int(self.total_request_count)
-        if upper <= 0:
-            return None
-        # Search only the active portion to avoid matching stale -1 entries.
-        active = self.request_ids[:upper]
-        matches = (active == request_id).nonzero(as_tuple=False)
-        if matches.numel() == 0:
-            return None
-        return int(matches[0, 0].item())
-
     def _disagg_resolve_export_blocks(self, request_id, internal_idx):
         """[shared] Resolve a request to the KV blocks to export -- shared by
         :meth:`export_request_kv` / :meth:`export_request_kv_ref`. Resolves the
@@ -4015,10 +3997,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             raise NotImplementedError(
                 "disaggregated KV transfer does not support the MLA latent KV cache"
             )
-        if internal_idx is None:
-            internal_idx = self._resolve_internal_request_slot(request_id)
-        if internal_idx is None:
-            return None
+        # The disagg staging hook always passes the request's live slot (captured
+        # before update_requests frees it), so internal_idx is never None here.
+        assert internal_idx is not None, "disagg export requires the request's live slot"
         block_count = int(self.request_kv_block_counts[internal_idx].item())
         cap = self.disagg_prompt_block_count.pop(request_id, None)
         if cap is not None:
@@ -4038,16 +4019,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         return internal_idx, block_ids, block_hashes
 
     def export_request_kv(
-        self, request_id: int, internal_idx: Optional[int] = None
+        self, request_id: int, internal_idx: int
     ) -> Optional[Dict[str, Any]]:
         """[push] Stage a request's KV (and Mamba state) for off-GPU transfer.
 
-        ``internal_idx`` overrides the request_id->slot reverse lookup -- the
-        caller passes the still-valid slot when exporting *before* the slot is
-        recycled (the disaggregation prefill hand-off stages here, since the
-        context frees the slot during the step before the engine's finish loop).
+        ``internal_idx`` is the request's live slot -- the staging hook captures
+        it *before* the slot is recycled (the context frees the slot during the
+        step, before the engine's finish loop runs).
 
-        Returns ``None`` when the request is unknown or has no KV blocks.
+        Returns ``None`` when the request has no prompt KV blocks.
         Raises ``NotImplementedError`` for the MLA latent cache (unsupported).
         Otherwise returns a dict with:
 
@@ -4315,7 +4295,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     # --- one-sided (pull) hand-off: move KV by block reference, no copy -----
     def export_request_kv_ref(
-        self, request_id: int, internal_idx: Optional[int] = None
+        self, request_id: int, internal_idx: int
     ) -> Optional[Dict[str, Any]]:
         """[pull] (prefill, one-sided) Capture a request's KV *by reference* -- block
         ids + hashes + Mamba slot -- with no copy. The decode peer READs these
@@ -4388,7 +4368,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         }
 
     def disagg_export_request_kv(
-        self, request_id: int, internal_idx: Optional[int] = None
+        self, request_id: int, internal_idx: int
     ) -> Optional[Dict[str, Any]]:
         """[shared] Capture a finished request's KV for the disagg hand-off, dispatching on
         this context's transport mode: by-reference (pull/NIXL, no copy) or a

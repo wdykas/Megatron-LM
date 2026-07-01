@@ -102,31 +102,25 @@ class PrefillHandoff:
 
 
 def send_request_kv_resharded(
-    engine: Any,
-    request_id: int,
     my_layout,
     src_layouts: list,
     dst_layouts: list,
     *,
-    backend: Optional[KVTransportBackend] = None,
-    payload: Optional[dict] = None,
+    backend: KVTransportBackend,
+    payload: dict,
     my_mamba_layout=None,
     src_mamba_layouts: Optional[list] = None,
     dst_mamba_layouts: Optional[list] = None,
 ) -> "PrefillHandoff":
-    """Hetero-layout prefill send: reshard this rank's KV sub-blocks to the
-    decode layout and ship them. ``my_layout`` is this rank's
+    """Hetero-layout prefill send: reshard this rank's pre-exported KV to the
+    decode layout and ship it. ``my_layout`` is this rank's
     :class:`KVShardLayout`; ``src_layouts`` / ``dst_layouts`` are the full
     prefill / decode layout lists. Hybrid models also pass Mamba layouts, whose
-    conv/ssm state is resharded alongside. ``payload``, if given, is a
-    pre-exported staging dict shipped instead of re-exporting from the live
-    context (the coordinator-native path)."""
+    conv/ssm state is resharded alongside. ``payload`` is the staging dict the
+    context exported when the request was staged."""
 
     assert backend is not None, "send_request_kv_resharded requires an explicit backend"
-    if payload is None:
-        payload = engine.context.export_request_kv(request_id)
-    if payload is None:
-        raise ValueError(f"send_request_kv_resharded: request {request_id} has no exportable KV")
+    assert payload is not None, "send_request_kv_resharded requires a pre-exported payload"
     if payload.get("mamba_payload") is not None and my_mamba_layout is None:
         raise NotImplementedError(
             "hybrid (Mamba) hetero handoff requires Mamba shard layouts; "
@@ -279,7 +273,6 @@ def post_recv_request_kv_resharded(
     prompt_token_ids,
     *,
     backend: Optional[KVTransportBackend] = None,
-    device: Optional[torch.device] = None,
     my_mamba_layout=None,
     src_mamba_layouts: Optional[list] = None,
     dst_mamba_layouts: Optional[list] = None,
@@ -301,9 +294,7 @@ def post_recv_request_kv_resharded(
     bs = meta["block_size_tokens"]
     hd = meta["hidden_per_head"]
     dtype = meta["attn_dtype"]
-    if device is None:
-        mb = getattr(engine.context, "memory_buffer", None)
-        device = mb.device if mb is not None else None
+    device = engine.context.memory_buffer.device
 
     staging = torch.empty(
         bc,

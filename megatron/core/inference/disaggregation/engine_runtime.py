@@ -375,7 +375,7 @@ class DisaggEngineRuntime:
             )
             return
         handoff = send_request_kv_resharded(
-            self.engine, request_id, self.my_layout,
+            self.my_layout,
             self.instance_kv_layouts,
             self.layouts(dst_layout_dicts),
             backend=self.get_backend(), payload=staged,
