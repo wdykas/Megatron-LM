@@ -1682,9 +1682,7 @@ class TextGenerationController:
             # by-reference pin (pull/NIXL) or a staging copy (push/NCCL).
             for fidx in finished_idxs.tolist():
                 req_id = int(context.request_ids[fidx].item())
-                payload = context.disagg_export_request_kv(req_id, internal_idx=int(fidx))
-                if payload is not None:
-                    staged_kv[req_id] = payload
+                staged_kv[req_id] = context.disagg_export_request_kv(req_id, internal_idx=int(fidx))
 
         # Clone needed: update_requests mutates next_tokens in-place via tensor_swap,
         # which would corrupt the reused buffer.

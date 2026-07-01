@@ -3988,11 +3988,11 @@ class DynamicInferenceContext(BaseInferenceContext):
     # --- Disaggregated KV export / import (prefill -> decode handoff) ---
 
     def _disagg_resolve_export_blocks(self, request_id, internal_idx):
-        """[shared] Shared head of export_request_kv / export_request_kv_ref.
+        """[shared] Shared head of export_request_kv / export_request_kv_ref:
+        returns ``(internal_idx, block_ids, block_hashes)`` for the request.
 
-        Returns ``(internal_idx, block_ids, block_hashes)`` for the request, or
-        ``None`` only for an empty prompt (0 prompt-covering blocks, nothing to
-        hand off). Raises for the MLA latent cache.
+        Raises for the MLA latent cache and for an empty prompt (disaggregation
+        doesn't support prompt-less requests).
 
         ``block_ids`` is capped to the prompt-covering count
         (``ceil(prompt_len/block_size)``): a block-aligned prompt makes the
@@ -4010,7 +4010,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         if cap is not None:
             block_count = min(block_count, cap)
         if block_count <= 0:
-            return None
+            raise ValueError("disaggregation does not support empty prompts")
         block_ids = self.request_to_kv_block_ids[internal_idx, :block_count].tolist()
         if (
             self.kv_block_allocator.enable_prefix_caching
@@ -4025,16 +4025,15 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def export_request_kv(
         self, request_id: int, internal_idx: int
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """[push] Stage a request's KV (and Mamba state) for off-GPU transfer.
 
         ``internal_idx`` is the request's live slot -- the staging hook captures
         it *before* the slot is recycled (the context frees the slot during the
         step, before the engine's finish loop runs).
 
-        Returns ``None`` only for an empty prompt (no prompt KV to hand off).
-        Raises ``NotImplementedError`` for the MLA latent cache (unsupported).
-        Otherwise returns a dict with:
+        Raises for the MLA latent cache and for an empty prompt (both unsupported).
+        Returns a dict with:
 
         * ``staging_tensor`` — KV blocks for the request, shape
           ``(num_blocks, 2, num_layers, block_size_tokens,
@@ -4045,24 +4044,14 @@ class DynamicInferenceContext(BaseInferenceContext):
           with ``conv_states``, ``ssm_states``, and their shape/dtype
           descriptors so the decode side can rebuild matching tensors.
         """
-        resolved = self._disagg_resolve_export_blocks(request_id, internal_idx)
-        if resolved is None:
-            return None
-        internal_idx, block_ids, block_hashes = resolved
+        internal_idx, block_ids, block_hashes = self._disagg_resolve_export_blocks(
+            request_id, internal_idx
+        )
         block_count = len(block_ids)
 
         memory_buffer = self.memory_buffer
         # memory_buffer shape: (2, L, total_blocks, block_size, heads, hidden)
-        _, num_layers, total_blocks, block_size, heads, hidden = memory_buffer.shape
-        # A stale/out-of-range block id here is a classic async CUDA illegal-memory
-        # access; surface it as a clean Python error with the request's block
-        # bookkeeping (``raw_count`` = uncapped) so we can see the mismatch.
-        raw_count = int(self.request_kv_block_counts[internal_idx].item())
-        out_of_range_ids = [b for b in block_ids if b < 0 or b >= total_blocks]
-        assert not out_of_range_ids, (
-            f"DISAGG_EXPORT req={request_id}: block_ids out of range {out_of_range_ids} "
-            f"(total_blocks={total_blocks}, block_count={block_count}, raw_count={raw_count})"
-        )
+        _, num_layers, _, block_size, heads, hidden = memory_buffer.shape
         # Gather the request's blocks in one op: (2, L, n, BS, H, HD) -> staging
         # (n, 2, L, BS, H, HD). contiguous() gives an owned buffer to hand off.
         block_ids_tensor = torch.tensor(block_ids, dtype=torch.int64, device=memory_buffer.device)
@@ -4228,9 +4217,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             return None
 
         block_count = int(payload["block_count"])
-        if block_count <= 0:
-            return None
-
         local_block_ids_tensor = self.kv_block_allocator.allocate_memory_blocks(
             block_count
         )
@@ -4275,18 +4261,16 @@ class DynamicInferenceContext(BaseInferenceContext):
     # --- one-sided (pull) hand-off: move KV by block reference, no copy -----
     def export_request_kv_ref(
         self, request_id: int, internal_idx: int
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """[pull] (prefill, one-sided) Capture a request's KV *by reference* -- block
         ids + hashes + Mamba slot -- with no copy. The decode peer READs these
         blocks straight from this rank's registered ``memory_buffer``, so the
         blocks must stay valid until read; after the request frees its slot they
         linger in the prefix cache, which is the (windowed) lifetime guarantee.
-        Returns ``None`` only for an empty prompt (nothing to hand off). Raises
-        ``NotImplementedError`` for the MLA latent cache (unsupported)."""
-        resolved = self._disagg_resolve_export_blocks(request_id, internal_idx)
-        if resolved is None:
-            return None
-        internal_idx, block_ids, block_hashes = resolved
+        Raises for the MLA latent cache and for an empty prompt (both unsupported)."""
+        internal_idx, block_ids, block_hashes = self._disagg_resolve_export_blocks(
+            request_id, internal_idx
+        )
         block_count = len(block_ids)
         _, num_layers, _, _, heads, hidden = self.memory_buffer.shape
         mamba_src_slot = -1
@@ -4336,7 +4320,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def disagg_export_request_kv(
         self, request_id: int, internal_idx: int
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """[shared] Capture a finished request's KV for the disagg hand-off, dispatching on
         this context's transport mode: by-reference (pull/NIXL, no copy) or a
         staging copy (push/NCCL). The caller stages the result until the
