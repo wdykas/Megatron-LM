@@ -697,7 +697,6 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             torch.distributed.broadcast_object_list(bcast, src=dp_src, group=dp_group)
         [dp_addr] = bcast
-        # MP (intra-instance) publisher address is always group-local.
         bcast = [mp_req_addr]
         torch.distributed.broadcast_object_list(bcast, src=mp_src, group=mp_group)
         [mp_req_addr] = bcast
