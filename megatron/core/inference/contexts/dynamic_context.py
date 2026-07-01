@@ -4022,7 +4022,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         if internal_idx is None:
             return None
         block_count = int(self.request_kv_block_counts[internal_idx].item())
-        cap = getattr(self, "disagg_prompt_block_count", {}).pop(request_id, None)
+        cap = self.disagg_prompt_block_count.pop(request_id, None)
         if cap is not None:
             block_count = min(block_count, cap)
         if block_count <= 0:
@@ -4405,7 +4405,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         this context's transport mode: by-reference (pull/NIXL, no copy) or a
         staging copy (push/NCCL). The caller stages the result until the
         coordinator's SEND_KV names the decode target."""
-        if getattr(self, "disagg_pull_mode", False):
+        if self.disagg_pull_mode:
             return self.export_request_kv_ref(request_id, internal_idx=internal_idx)
         return self.export_request_kv(request_id, internal_idx=internal_idx)
 
