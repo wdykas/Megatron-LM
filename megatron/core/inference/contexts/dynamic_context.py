@@ -1268,6 +1268,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         # request_id -> pinned KV block ids (prefill pull side); the pin holds the
         # blocks for the decode's one-sided READ until its RELEASE_KV ack.
         self.disagg_pinned: dict = {}
+        # Reset-safe Mamba end-state hold-ring (prefill pull side); allocated by
+        # register_pull_regions for hybrid pull, stays None otherwise.
+        self.disagg_mamba_hold_conv = None
+        self.disagg_mamba_hold_ssm = None
+        self.disagg_mamba_hold_n = 0
+        self.disagg_mamba_hold_count = 0
 
         # Allocate large non-graphed buffers.
         need_static_addr = (
@@ -3983,24 +3989,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     # --- Disaggregated KV export / import (prefill -> decode handoff) ---
 
-    def _resolve_internal_request_slot(self, request_id: int) -> Optional[int]:
-        """[shared] Reverse-lookup the engine-internal slot index for ``request_id``.
-
-        The context indexes block / mamba bookkeeping by an internal
-        slot counter (``total_request_count`` at the time the request
-        was added), not by the user-supplied ``request_id``. We keep the
-        mapping in ``self.request_ids[internal_idx] == user_request_id``.
-        """
-        upper = int(self.total_request_count)
-        if upper <= 0:
-            return None
-        # Search only the active portion to avoid matching stale -1 entries.
-        active = self.request_ids[:upper]
-        matches = (active == request_id).nonzero(as_tuple=False)
-        if matches.numel() == 0:
-            return None
-        return int(matches[0, 0].item())
-
     def _disagg_resolve_export_blocks(self, request_id, internal_idx):
         """[shared] Resolve a request to the KV blocks to export -- shared by
         :meth:`export_request_kv` / :meth:`export_request_kv_ref`. Resolves the
@@ -4015,10 +4003,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             raise NotImplementedError(
                 "disaggregated KV transfer does not support the MLA latent KV cache"
             )
-        if internal_idx is None:
-            internal_idx = self._resolve_internal_request_slot(request_id)
-        if internal_idx is None:
-            return None
+        # The disagg staging hook always passes the request's live slot (captured
+        # before update_requests frees it), so internal_idx is never None here.
+        assert internal_idx is not None, "disagg export requires the request's live slot"
         block_count = int(self.request_kv_block_counts[internal_idx].item())
         cap = self.disagg_prompt_block_count.pop(request_id, None)
         if cap is not None:
@@ -4027,7 +4014,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             return None
         block_ids = self.request_to_kv_block_ids[internal_idx, :block_count].tolist()
         if (
-            getattr(self.kv_block_allocator, "enable_prefix_caching", False)
+            self.kv_block_allocator.enable_prefix_caching
             and hasattr(self.kv_block_allocator, "block_hashes")
         ):
             block_hashes = self.kv_block_allocator.block_hashes[
@@ -4038,16 +4025,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         return internal_idx, block_ids, block_hashes
 
     def export_request_kv(
-        self, request_id: int, internal_idx: Optional[int] = None
+        self, request_id: int, internal_idx: int
     ) -> Optional[Dict[str, Any]]:
         """[push] Stage a request's KV (and Mamba state) for off-GPU transfer.
 
-        ``internal_idx`` overrides the request_id->slot reverse lookup -- the
-        caller passes the still-valid slot when exporting *before* the slot is
-        recycled (the disaggregation prefill hand-off stages here, since the
-        context frees the slot during the step before the engine's finish loop).
+        ``internal_idx`` is the request's live slot -- the staging hook captures
+        it *before* the slot is recycled (the context frees the slot during the
+        step, before the engine's finish loop runs).
 
-        Returns ``None`` when the request is unknown or has no KV blocks.
+        Returns ``None`` when the request has no prompt KV blocks.
         Raises ``NotImplementedError`` for the MLA latent cache (unsupported).
         Otherwise returns a dict with:
 
@@ -4112,6 +4098,40 @@ class DynamicInferenceContext(BaseInferenceContext):
             result["mamba_payload"] = mamba_payload
         return result
 
+    def _disagg_snapshot_block_slots(self, block_ids: list):
+        """[shared] Yield ``(block_id, snapshot_slot, block_hash)`` for each block
+        with a cached Mamba boundary snapshot and a registered hash. Empty for
+        non-hybrid / no-prefix-cache. Shared by the push (``_export_mamba_snapshots``)
+        and pull (``_export_snapshot_refs``) snapshot exporters."""
+        sa = self.mamba_slot_allocator
+        if sa is None or not block_ids:
+            return
+        block_to_slot = getattr(sa, "block_to_slot", None)
+        if block_to_slot is None or not hasattr(self.kv_block_allocator, "block_hashes"):
+            return
+        block_hashes = self.kv_block_allocator.block_hashes
+        for bid in block_ids:
+            slot = int(block_to_slot[bid].item())
+            if slot < 0:
+                continue
+            h = int(block_hashes[bid].item())
+            if h == -1:
+                continue
+            yield bid, slot, h
+
+    @staticmethod
+    def _mamba_state_descriptor(conv, ssm) -> Dict[str, Any]:
+        """[shared] Wire descriptor (shape/dtype + tensor) for a conv/ssm state
+        pair, so the decode side can rebuild matching tensors."""
+        return {
+            "conv_states_shape": list(conv.shape),
+            "ssm_states_shape": list(ssm.shape),
+            "conv_states_dtype": str(conv.dtype),
+            "ssm_states_dtype": str(ssm.dtype),
+            "conv_states_tensor": conv,
+            "ssm_states_tensor": ssm,
+        }
+
     def _export_mamba_state(
         self, internal_idx: int, block_ids: Optional[list] = None
     ) -> Optional[Dict[str, Any]]:
@@ -4133,35 +4153,19 @@ class DynamicInferenceContext(BaseInferenceContext):
         allocator has cached one or more block boundaries for the
         request's attention blocks.
         """
-        mamba_metadata = getattr(self, "mamba_metadata", None)
-        if mamba_metadata is None:
-            return None
-        slot_tensor = getattr(mamba_metadata, "request_to_mamba_state_idx", None)
-        if slot_tensor is None:
-            return None
-        slot_idx = int(slot_tensor[internal_idx].item())
+        slot_idx = int(self.mamba_metadata.request_to_mamba_state_idx[internal_idx].item())
         if slot_idx < 0:
-            return None
+            return None  # request has no Mamba slot yet
 
-        conv_states = getattr(self, "mamba_conv_states", None)
-        ssm_states = getattr(self, "mamba_ssm_states", None)
-        if conv_states is None or ssm_states is None:
-            return None
-
-        # Both buffers are shaped (num_mamba_layers, max_requests, *state_shape).
-        # Slice off this request's slot and clone so the staging tensor
-        # is self-contained for transport registration.
-        conv_slice = conv_states[:, slot_idx].contiguous().clone()
-        ssm_slice = ssm_states[:, slot_idx].contiguous().clone()
+        # Buffers are (num_mamba_layers, max_requests, *state_shape). Slice off
+        # this request's slot and clone so the staging tensor is self-contained
+        # for transport registration.
+        conv_slice = self.mamba_conv_states[:, slot_idx].contiguous().clone()
+        ssm_slice = self.mamba_ssm_states[:, slot_idx].contiguous().clone()
 
         result: Dict[str, Any] = {
-            "num_mamba_layers": int(conv_states.shape[0]),
-            "conv_states_shape": list(conv_slice.shape),
-            "ssm_states_shape": list(ssm_slice.shape),
-            "conv_states_dtype": str(conv_slice.dtype),
-            "ssm_states_dtype": str(ssm_slice.dtype),
-            "conv_states_tensor": conv_slice,
-            "ssm_states_tensor": ssm_slice,
+            "num_mamba_layers": int(self.mamba_conv_states.shape[0]),
+            **self._mamba_state_descriptor(conv_slice, ssm_slice),
         }
 
         snapshots = self._export_mamba_snapshots(block_ids or [])
@@ -4182,53 +4186,21 @@ class DynamicInferenceContext(BaseInferenceContext):
         without prefix caching) or when none of the request's blocks
         have a slot allocated.
         """
-        slot_allocator = self.mamba_slot_allocator
-        if slot_allocator is None or not block_ids:
+        pairs = list(self._disagg_snapshot_block_slots(block_ids))
+        if not pairs:
             return None
-
-        # Filter to blocks that actually have a Mamba snapshot.
-        block_to_slot = getattr(slot_allocator, "block_to_slot", None)
-        if block_to_slot is None:
-            return None
-        kv_allocator = getattr(self, "kv_block_allocator", None)
-        if kv_allocator is None or not hasattr(kv_allocator, "block_hashes"):
-            return None
-
-        snapshot_pairs = []  # list of (block_id, slot, hash)
-        for bid in block_ids:
-            slot = int(block_to_slot[bid].item())
-            if slot < 0:
-                continue
-            h = int(kv_allocator.block_hashes[bid].item())
-            if h == -1:
-                continue
-            snapshot_pairs.append((bid, slot, h))
-
-        if not snapshot_pairs:
-            return None
-
-        slot_indices = [s for _, s, _ in snapshot_pairs]
-        hashes = [h for _, _, h in snapshot_pairs]
+        slot_indices = [slot for _, slot, _ in pairs]
+        hashes = [h for _, _, h in pairs]
 
         slot_tensor = torch.tensor(slot_indices, dtype=torch.int64)
-        # Slot tensors live on GPU; the gather copies the right rows out.
-        conv = slot_allocator.conv_states[:, slot_tensor].contiguous().clone()
-        ssm = slot_allocator.ssm_states[:, slot_tensor].contiguous().clone()
+        # Slot tensors live on GPU; the gather copies the right rows out, then
+        # rearrange to (num_snapshots, num_mamba_layers, *state_shape) so decode
+        # can index by snapshot rather than by layer.
+        sa = self.mamba_slot_allocator
+        conv = sa.conv_states[:, slot_tensor].contiguous().clone().transpose(0, 1).contiguous()
+        ssm = sa.ssm_states[:, slot_tensor].contiguous().clone().transpose(0, 1).contiguous()
 
-        # Rearrange to (num_snapshots, num_mamba_layers, *state_shape) so
-        # decode can index by snapshot rather than by layer.
-        conv = conv.transpose(0, 1).contiguous()
-        ssm = ssm.transpose(0, 1).contiguous()
-
-        return {
-            "block_hashes": hashes,
-            "conv_states_shape": list(conv.shape),
-            "ssm_states_shape": list(ssm.shape),
-            "conv_states_dtype": str(conv.dtype),
-            "ssm_states_dtype": str(ssm.dtype),
-            "conv_states_tensor": conv,
-            "ssm_states_tensor": ssm,
-        }
+        return {"block_hashes": hashes, **self._mamba_state_descriptor(conv, ssm)}
 
     def import_request_kv(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """[push] Inject a staged KV (and optional Mamba) payload into this context.
@@ -4318,7 +4290,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     # --- one-sided (pull) hand-off: move KV by block reference, no copy -----
     def export_request_kv_ref(
-        self, request_id: int, internal_idx: Optional[int] = None
+        self, request_id: int, internal_idx: int
     ) -> Optional[Dict[str, Any]]:
         """[pull] (prefill, one-sided) Capture a request's KV *by reference* -- block
         ids + hashes + Mamba slot -- with no copy. The decode peer READs these
@@ -4336,9 +4308,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         layout = "std_attn_v1"
         mamba_src_slot = -1
         if self.is_hybrid_model:
-            mm = getattr(self, "mamba_metadata", None)
-            slot_tensor = getattr(mm, "request_to_mamba_state_idx", None) if mm else None
-            live_slot = int(slot_tensor[internal_idx].item()) if slot_tensor is not None else -1
+            live_slot = int(self.mamba_metadata.request_to_mamba_state_idx[internal_idx].item())
             if live_slot >= 0:
                 layout = "hybrid_v1"
                 # Copy the live Mamba end-state into the reset-safe hold-ring and
@@ -4347,24 +4317,17 @@ class DynamicInferenceContext(BaseInferenceContext):
                 # ring is disagg-owned and untouched, so the decode's READ stays
                 # correct without pinning. A ring slot is reused only after
                 # hold_n more publishes -- far beyond the decode's read lag.
-                hold_conv = getattr(self, "disagg_mamba_hold_conv", None)
-                if hold_conv is not None:
-                    n = self.disagg_mamba_hold_n
-                    ring = self.disagg_mamba_hold_count % n
-                    self.disagg_mamba_hold_count += 1
-                    self.disagg_mamba_hold_conv[:, ring] = self.mamba_conv_states[:, live_slot]
-                    self.disagg_mamba_hold_ssm[:, ring] = self.mamba_ssm_states[:, live_slot]
-                    mamba_src_slot = ring
-                else:
-                    # No hold-ring (e.g. decode-only context): publish the live
-                    # slot (windowed by-reference fallback).
-                    mamba_src_slot = live_slot
+                ring = self.disagg_mamba_hold_count % self.disagg_mamba_hold_n
+                self.disagg_mamba_hold_count += 1
+                self.disagg_mamba_hold_conv[:, ring] = self.mamba_conv_states[:, live_slot]
+                self.disagg_mamba_hold_ssm[:, ring] = self.mamba_ssm_states[:, live_slot]
+                mamba_src_slot = ring
         # Pin the KV blocks (ref-count) so they survive this request's release
         # into the prefix cache and cannot be reallocated/overwritten before the
         # decode's one-sided READ. Released on the RELEASE_KV ack
         # (disagg_release_pinned). Reset-safe: the per-step reset doesn't touch
         # block_ref_counts (only the epoch-level allocator reset does, when no
-        # hand-offs are outstanding). The coordinator's credit window bounds how
+        # hand-offs are outstanding). The coordinator's flow-control window bounds how
         # many such pins/ring slots can be outstanding -> a hard no-overwrite
         # guarantee. (Mamba uses the reset-safe ring above, not a pin.)
         self.kv_block_allocator.block_ref_counts[
@@ -4391,7 +4354,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         }
 
     def disagg_export_request_kv(
-        self, request_id: int, internal_idx: Optional[int] = None
+        self, request_id: int, internal_idx: int
     ) -> Optional[Dict[str, Any]]:
         """[shared] Capture a finished request's KV for the disagg hand-off, dispatching on
         this context's transport mode: by-reference (pull/NIXL, no copy) or a
@@ -4407,9 +4370,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         for a hetero (fragment) READ. conv hold: (num_mamba_layers, n_ring,
         conv_dim, d_conv); ssm hold: (num_mamba_layers, n_ring, nheads, headdim,
         d_state)."""
-        hc = getattr(self, "disagg_mamba_hold_conv", None)
-        hs = getattr(self, "disagg_mamba_hold_ssm", None)
-        if hc is None or hs is None:
+        hc = self.disagg_mamba_hold_conv
+        hs = self.disagg_mamba_hold_ssm
+        if hc is None:  # no hold-ring: non-hybrid or non-pull context
             return None
         return {
             "n_slots": int(hc.shape[1]),
@@ -4427,23 +4390,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         cached boundary snapshot and a valid hash. By reference (no copy): the
         decode READs these snapshot slots from this rank's registered snapshot
         buffers, which the KV pin keeps from being evicted until read."""
-        sa = self.mamba_slot_allocator
-        if sa is None or not block_ids:
-            return []
-        block_to_slot = getattr(sa, "block_to_slot", None)
-        kv = getattr(self, "kv_block_allocator", None)
-        if block_to_slot is None or kv is None or not hasattr(kv, "block_hashes"):
-            return []
-        refs = []
-        for bid in block_ids:
-            slot = int(block_to_slot[bid].item())
-            if slot < 0:
-                continue
-            h = int(kv.block_hashes[bid].item())
-            if h == -1:
-                continue
-            refs.append((h, slot))
-        return refs
+        return [(h, slot) for _, slot, h in self._disagg_snapshot_block_slots(block_ids)]
 
     def disagg_snapshot_pull_plan(self, snapshot_pairs: list) -> Optional[Dict[str, Any]]:
         """(decode, one-sided) Given the prefill's ``[(block_hash, src_slot), ...]``,
@@ -4455,10 +4402,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         :meth:`_import_mamba_snapshots`; the READ fills the slots, then
         :meth:`disagg_snapshot_commit` registers the hashes."""
         sa = self.mamba_slot_allocator
-        kv = getattr(self, "kv_block_allocator", None)
-        if sa is None or kv is None or not snapshot_pairs:
+        if sa is None or not snapshot_pairs:
             return None
-        hash_to_block = getattr(kv, "kv_hash_to_block_id", None)
+        hash_to_block = getattr(self.kv_block_allocator, "kv_hash_to_block_id", None)
         if not hash_to_block:
             return None
         target_blocks, hashes, src_slots = [], [], []
@@ -4516,7 +4462,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         :meth:`disagg_pull_commit` releases them. Empty when prefix caching is
         off or nothing matches."""
         empty = {"reused_block_ids": [], "match_len": 0}
-        if not getattr(self.kv_block_allocator, "enable_prefix_caching", False):
+        if not self.kv_block_allocator.enable_prefix_caching:
             return empty
         hashes = list(block_hashes or [])
         kv_hash_to_block = getattr(self.kv_block_allocator, "kv_hash_to_block_id", None)
@@ -4568,11 +4514,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             block_ids = []
         mamba_dst_slot = -1
         if want_mamba and self.is_hybrid_model:
-            mm = getattr(self, "mamba_metadata", None)
-            if mm is not None:
-                s = mm.allocate_slot()
-                if s is not None:
-                    mamba_dst_slot = int(s)
+            s = self.mamba_metadata.allocate_slot()
+            if s is not None:
+                mamba_dst_slot = int(s)
         return {"block_ids": block_ids, "mamba_dst_slot": mamba_dst_slot}
 
     def _disagg_register_and_release(self, block_ids: list, block_hashes: list) -> None:
@@ -4582,7 +4526,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         prefix-cache match grows from the cached ``ref_count==0`` state. Shared
         tail of :meth:`import_request_kv` (push) and :meth:`disagg_pull_commit`
         (pull)."""
-        if not getattr(self.kv_block_allocator, "enable_prefix_caching", False):
+        if not self.kv_block_allocator.enable_prefix_caching:
             return
         if len(block_hashes) == len(block_ids):
             valid = [(b, h) for b, h in zip(block_ids, block_hashes) if h is not None and h != -1]
@@ -4615,37 +4559,30 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def _import_mamba_state(self, payload: Dict[str, Any]) -> Optional[int]:
         """[push] Allocate a Mamba slot, write the end-state, and rehydrate
-        per-block snapshots so the decode worker's prefix cache works.
+        per-block snapshots so the decode worker's prefix cache works. Called only
+        for hybrid models (see import_request_kv).
 
-        Returns the allocated slot index, or ``None`` if the model is
-        not hybrid, the layout is incompatible, or no slot is free.
+        Returns the allocated slot index, or ``None`` if the payload's layout is
+        incompatible or no slot is free.
         """
-        mamba_metadata = getattr(self, "mamba_metadata", None)
-        if mamba_metadata is None:
-            return None
-
-        conv_local = getattr(self, "mamba_conv_states", None)
-        ssm_local = getattr(self, "mamba_ssm_states", None)
-        if conv_local is None or ssm_local is None:
-            return None
-
+        conv_local = self.mamba_conv_states
+        ssm_local = self.mamba_ssm_states
         conv_remote = payload["conv_states_tensor"]
         ssm_remote = payload["ssm_states_tensor"]
 
-        if conv_remote.dtype != conv_local.dtype:
-            return None
-        if ssm_remote.dtype != ssm_local.dtype:
+        # The remote tensor was sliced from the same per-slot layout
+        # (num_mamba_layers, *state_shape), so it must match dtype + shape apart
+        # from the leading slot dim. Reject an incompatible payload.
+        per_slot = lambda t: t.shape[:1] + t.shape[2:]
+        if (
+            conv_remote.dtype != conv_local.dtype
+            or ssm_remote.dtype != ssm_local.dtype
+            or conv_remote.shape != per_slot(conv_local)
+            or ssm_remote.shape != per_slot(ssm_local)
+        ):
             return None
 
-        # Local layout per slot is (num_mamba_layers, *state_shape); the
-        # remote tensor was sliced from the same shape, so it must match
-        # element-by-element apart from the leading "slot" dimension.
-        if conv_remote.shape != conv_local.shape[:1] + conv_local.shape[2:]:
-            return None
-        if ssm_remote.shape != ssm_local.shape[:1] + ssm_local.shape[2:]:
-            return None
-
-        slot_idx = mamba_metadata.allocate_slot()
+        slot_idx = self.mamba_metadata.allocate_slot()
         if slot_idx is None:
             return None
         slot_idx = int(slot_idx)
@@ -4682,10 +4619,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         slot_allocator = self.mamba_slot_allocator
         if slot_allocator is None:
             return
-        kv_allocator = getattr(self, "kv_block_allocator", None)
-        if kv_allocator is None:
-            return
-        hash_to_block = getattr(kv_allocator, "kv_hash_to_block_id", None)
+        hash_to_block = getattr(self.kv_block_allocator, "kv_hash_to_block_id", None)
         if not hash_to_block:
             return
 

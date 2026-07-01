@@ -27,15 +27,15 @@ Pull flow (5 headers -- the minimum for the one-sided path; SEND_KV is unused
 because the prefill publishes its KV up front and does nothing more)::
 
     REGISTER_ROLE  engine->coord   role + KV layout, flags is_pull=True so the
-                                   coordinator applies credit flow-control
+                                   coordinator applies flow control
     PREFILL_DONE   prefill->coord  finished + handoff payload (per-rank READ
                                    descriptors: block ids, buffer geometry)
     RECV_KV        coord->decode   relays the handoff; decode does the READ
-    KV_READ_DONE   decode->coord   READ drained -> free a credit, pin is
+    KV_READ_DONE   decode->coord   READ drained -> free an outstanding slot, pin is
                                    now safe to release
     RELEASE_KV     coord->prefill  unpin the request's KV blocks
 
-Credit flow-control (pull only): PREFILL_DONE consumes a credit per pull-prefill
+Flow control (pull only): PREFILL_DONE consumes an outstanding slot per pull-prefill
 instance; the decode's KV_READ_DONE returns it. This bounds how many hand-offs
 (and thus pinned blocks) can be outstanding at once.
 """
