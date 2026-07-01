@@ -3991,14 +3991,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         was added), not by the user-supplied ``request_id``. We keep the
         mapping in ``self.request_ids[internal_idx] == user_request_id``.
         """
-        request_ids_tensor = getattr(self, "request_ids", None)
-        if request_ids_tensor is None:
-            return None
-        upper = int(getattr(self, "total_request_count", 0) or 0)
+        upper = int(self.total_request_count)
         if upper <= 0:
             return None
         # Search only the active portion to avoid matching stale -1 entries.
-        active = request_ids_tensor[:upper]
+        active = self.request_ids[:upper]
         matches = (active == request_id).nonzero(as_tuple=False)
         if matches.numel() == 0:
             return None
