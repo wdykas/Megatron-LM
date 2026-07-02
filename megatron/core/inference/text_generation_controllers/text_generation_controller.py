@@ -1496,15 +1496,15 @@ class TextGenerationController:
         # collectives to avoid a hang.
         self._dummy_serial_mtp_forward()
 
-        # Clear the dummy step's attention/Mamba temporaries -- the same
-        # per-step cleanup a real step does (update_requests). A full
-        # context.reset() here would also wipe the prefix cache and any
-        # disaggregation hand-off state (staged exports, pinned KV), which
-        # must survive idle dummy steps -- an idle disagg prefill/decode runs
-        # this every loop iteration while its peer works.
-        context.reset_attention_state()
-        if context.total_request_count == 0:
-            context.reset_mamba_state()
+        # clear the context of any temporary state from the dummy forward.
+        # TODO(peter): this full reset also wipes the prefix cache (and zeroes
+        # disagg KV pins) on every idle loop iteration -- an idle disagg
+        # prefill/decode runs this constantly while its peer works, so cached
+        # blocks never survive an idle phase. context.reset() tolerates it
+        # (pins are cleared, late RELEASE_KV acks no-op, staged exports and
+        # prompt caps survive), but a scoped cleanup of just the dummy step's
+        # bookkeeping would let the prefix cache live across idleness.
+        context.reset()
 
     @torch.inference_mode()
     def _dummy_serial_mtp_forward(self):
