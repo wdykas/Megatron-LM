@@ -13,6 +13,7 @@ from typing import Any, List, Tuple
 
 import torch.distributed as dist
 
+from megatron.core.inference.config import PrefixCachingEvictionPolicy
 from megatron.core.inference.disaggregation.kv_reshard import KVShardLayout
 from megatron.core.inference.shards_spec import (
     InferenceShardSpec,
@@ -172,7 +173,7 @@ class DisaggCoordinatorSetup:
     """This rank's place in a coordinator-native disagg job."""
 
     role: str           # "prefill" / "decode"
-    replica_id: str     # "prefill" / "decode_s{shard}_dp{dp}"
+    replica_id: str     # "{role}_s{shard}_dp{dp}", e.g. "prefill_s0_dp0"
     engine: Any
     is_primary: bool    # global rank 0 -> owns the InferenceClient
     total_instances: int
@@ -201,6 +202,14 @@ def configure_prebuilt_disagg_engine(
     assert ctx.enable_prefix_caching, (
         "disaggregation requires prefix caching (enable_prefix_caching=True); "
         "the decode side admits handed-off KV via a prefix-cache hit."
+    )
+    # ref_zero eviction deregisters blocks the moment their ref count hits 0 --
+    # which is exactly what the import does before the request is scheduled, so
+    # the imported KV would be discarded before admission ever sees it.
+    assert ctx.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU, (
+        "disaggregation requires the LRU prefix-cache eviction policy "
+        "(--inference-dynamic-batching-prefix-caching-eviction-policy lru); "
+        f"got {ctx.prefix_caching_eviction_policy!r}."
     )
     assert not ctx.cache_mla_latent, (
         "disaggregation does not support the MLA latent KV cache "

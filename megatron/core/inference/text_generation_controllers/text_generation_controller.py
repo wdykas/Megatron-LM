@@ -1676,7 +1676,7 @@ class TextGenerationController:
         # The hand-off to decode happens later, when the coordinator's SEND_KV
         # names the target -- but update_requests (below) frees the slot first,
         # so we must capture it here and hold it in disagg_staged_kv.
-        if getattr(context, "disagg_stage_prefill_kv", False) and finished_idxs.numel() > 0:
+        if context.disagg_stage_prefill_kv and finished_idxs.numel() > 0:
             staged_kv = context.disagg_staged_kv
             # The context picks how to capture based on its transport mode: a
             # by-reference pin (pull/NIXL) or a staging copy (push/NCCL).

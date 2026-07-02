@@ -122,7 +122,6 @@ def test_pull_alloc_zero_count_full_prefix_hit():
     alloc = ctx.disagg_pull_alloc(0)
     assert alloc is not None
     assert alloc["block_ids"] == []
-    assert alloc["mamba_dst_slot"] == -1
 
 
 def test_unmatch_releases_transient_pin():

@@ -2,7 +2,7 @@
 
 # Disaggregated prefill→decode inference
 
-Disagregatted inference splits a request across two inference engines: one **prefills** the
+Disaggregated inference splits a request across two inference engines: one **prefills** the
 prompt (fills the KV cache) and another **decodes** (generates tokens). The KV
 cache computed by the prefill is handed off to the decode so it doesn't
 re-prefill. Only *control* flows through the shared coordinator; the KV *bytes*
@@ -14,7 +14,8 @@ It is transport-agnostic behind one flag, `backend.is_pull`:
 - **Pull** (one-sided, NIXL/RDMA): the decode *READs* the KV out of the
   prefill's registered buffer, no prefill-side action.
 
-If you want to run with no dependencies use the Push backend for best performance use the pull(Nixl) backend.
+To run with no extra dependencies, use the push (NCCL) backend; for best
+performance, use the pull (NIXL) backend.
 
 ## Control protocol (2-hop)
 
@@ -52,9 +53,10 @@ hand-off.
 
 - **`PREFILL_DONE`** (prefill → coord). A prefill finished a request and staged
   its KV; it reports this instead of replying to the client (the client is
-  waiting on decode's output). For pull it also carries the **handoff
-  descriptor** — the per-rank READ metadata (block ids + buffer geometry) — which
-  the coordinator relays without inspecting it. Triggers hop 2: the coordinator picks a decode.
+  waiting on decode's output). It also carries an opaque **handoff descriptor**
+  — for pull the per-rank READ metadata (block ids + buffer geometry), for push
+  the Mamba snapshot hashes (or nothing) — which the coordinator relays without
+  inspecting it. Triggers hop 2: the coordinator picks a decode.
 
 - **`SEND_KV`** (coord → prefill, **push only**). Tells the prefill to ship the
   staged KV to the chosen decode, resharded to the decode's layout. Skipped on
@@ -81,23 +83,31 @@ hand-off.
   the request's blocks into a staging tensor and ships them; pull hands off block
   *references* and the decode READs them in place, kept alive by prefix-cache
   retention + a ref-count pin (released on `RELEASE_KV`).
-- **Mamba end-state** (hybrid models): the live slot pool is LIFO-recycled and
-  reset mid-rollout, so pull can't expose it by reference. The prefill copies each
-  published end-state into a **reset-safe hold-ring** and hands off the ring index.
-- **Mamba snapshots** (block-boundary states, for prefix-cache reuse): the
-  snapshot pool isn't reset mid-rollout and the KV pin already protects it, so it
-  moves by reference (pull) / by copy (push) with no ring.
+- **Mamba snapshots** (hybrid models; block-boundary states): the hand-off's
+  only Mamba payload. Admission always re-runs at least the trailing prompt
+  tokens, and the recurrent state is only correct when restored at the block
+  boundary the re-run starts from — so the decode imports the boundary
+  snapshots into its `MambaSlotAllocator` and the native prefix-cache restore
+  path does the rest. The live end-state is never transferred (it would
+  double-process the re-run tokens). Snapshots move as whole per-slot entries,
+  so they ship only between identical Mamba shards; a hetero remap skips them
+  and the decode re-prefills past the last usable boundary. The snapshot pool
+  isn't reset mid-rollout and the KV pin protects a published request's
+  snapshots until they are read.
+
+Disaggregation requires the **LRU** prefix-cache eviction policy: the default
+`ref_zero` policy deregisters blocks the moment their ref count hits 0, which
+would discard the imported KV before the request is ever scheduled.
 
 ## Flow control
 
 | knob | where | bounds |
 |---|---|---|
-| `_disagg_max_outstanding` (32) | coordinator | outstanding hand-offs per **pull prefill** (≤ hold-ring depth) |
-| `mamba_hold_slots` (64) | prefill engine runtime | reset-safe Mamba hold-ring depth |
+| `_disagg_max_outstanding` (32) | coordinator | outstanding hand-offs per **pull prefill** (bounds pinned KV) |
 | `max_inflight` (8) | each engine runtime | KV transfers posted-but-not-reaped per step (step backpressure) |
 
-The flow-control window guarantees a pull prefill never recycles a hold-ring slot / KV
-pin the decode hasn't READ yet (hard no-overwrite guarantee).
+The flow-control window guarantees a pull prefill never recycles a KV pin the
+decode hasn't READ yet (hard no-overwrite guarantee).
 
 ## Module map
 

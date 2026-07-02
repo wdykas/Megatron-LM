@@ -120,5 +120,5 @@ def configure_disagg_engine(engine, inference_model, *, disagg_router="round_rob
     )
     return configure_prebuilt_disagg_engine(
         engine, pg, _specs(args), disagg_router=disagg_router,
-        kv_transport_backend=getattr(args, "disagg_kv_transport_backend", "nccl"),
+        kv_transport_backend=args.disagg_kv_transport_backend,
     )

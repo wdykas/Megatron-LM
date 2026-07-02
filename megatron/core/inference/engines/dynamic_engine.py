@@ -983,6 +983,10 @@ class DynamicInferenceEngine(AbstractEngine):
         request.add_event_fail()
         self.failed_request_ids.append(request_id)
 
+        # A failed disagg prefill request never reaches export, which is the
+        # only other consumer of its prompt-block-count entry.
+        self.context.disagg_prompt_block_count.pop(request_id, None)
+
         # Send the reply immediately, because it may never get a chance to be sent again.
         if self.use_coordinator and self.is_mp_coordinator:
             payload = msgpack.packb(
@@ -2366,13 +2370,12 @@ class DynamicInferenceEngine(AbstractEngine):
             elif header == Headers.RECV_KV:
                 # (decode) receive a request's KV, import it (registers the
                 # prefix-cache blocks), then admit it for generation. ``data[5]``
-                # (pull backends) carries the prefill's published READ descriptors;
-                # None for push backends.
-                handoff = data[5] if len(data) > 5 else None
-                self._disagg.recv_kv(data[1], data[2], data[3], data[4], handoff)
+                # carries the prefill's published hand-off: READ descriptors for
+                # pull backends, snapshot hashes (or None) for push.
+                self._disagg.recv_kv(data[1], data[2], data[3], data[4], data[5])
             elif header == Headers.RELEASE_KV:
-                # (prefill, one-sided) the decode finished its READ -- release the
-                # request's pinned KV blocks (Mamba used the reset-safe ring, no pin).
+                # (prefill, one-sided) the decode finished its READ -- release
+                # the request's pinned KV blocks.
                 self._disagg.release_pinned(data[1])
             elif header == Headers.SET_GENERATION_EPOCH:
                 new_generation_epoch = data[1]

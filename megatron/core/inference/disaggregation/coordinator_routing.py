@@ -40,6 +40,13 @@ class DisaggRouter(abc.ABC):
     def forget(self, request_id: int) -> None:
         """Drop per-request state once the reply has been routed home."""
 
+    def requests_involving(self, identity) -> List[int]:
+        """Request ids currently routed through ``identity`` (as prefill or
+        decode) -- what the coordinator must drop when the engine dies.
+        Default: none (a router that doesn't track this skips the dead-engine
+        sweep; the coordinator still stops routing to the engine)."""
+        return []
+
 
 class DisaggRouting(DisaggRouter):
     """Sequences a request prefill-engine -> (KV handoff) -> decode-engine.
@@ -57,9 +64,8 @@ class DisaggRouting(DisaggRouter):
         self.decode_engines: List = []
         self._prefill_rr = 0
         self._decode_rr = 0
-        # request_id -> (prefill_identity, decode_identity|None)
-        self._req_prefill: Dict[int, object] = {}
-        self._req_decode: Dict[int, object] = {}
+        self._req_prefill: Dict[int, object] = {}  # request_id -> prefill identity
+        self._req_decode: Dict[int, object] = {}   # request_id -> decode identity
 
     # --- registration ------------------------------------------------------
 
@@ -114,6 +120,12 @@ class DisaggRouting(DisaggRouter):
         """Drop per-request state once the reply has been routed to the client."""
         self._req_prefill.pop(request_id, None)
         self._req_decode.pop(request_id, None)
+
+    def requests_involving(self, identity) -> List[int]:
+        """Request ids routed through ``identity`` on either hop (snapshot)."""
+        rids = {rid for rid, ident in self._req_prefill.items() if ident == identity}
+        rids.update(rid for rid, ident in self._req_decode.items() if ident == identity)
+        return list(rids)
 
     def _pick_decode(self, request_id: int):
         # TODO: round-robin is not optimal -- it ignores decode-side load (free

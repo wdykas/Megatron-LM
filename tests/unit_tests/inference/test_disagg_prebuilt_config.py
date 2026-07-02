@@ -8,6 +8,8 @@ import os
 import pytest
 import torch
 
+from megatron.core.inference.config import PrefixCachingEvictionPolicy
+
 mp = torch.multiprocessing
 
 L, H = 4, 8  # global model dims (read off the fake engine's model_config)
@@ -28,6 +30,7 @@ class _FakeContext:
     memory_buffer.shape[1] (== global L here, since these specs are all pp=1)."""
 
     enable_prefix_caching = True
+    prefix_caching_eviction_policy = PrefixCachingEvictionPolicy.LRU
     cache_mla_latent = False
     is_hybrid_model = False
 

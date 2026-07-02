@@ -8,9 +8,8 @@ runs plan_mamba_reshard to a different destination (tp,pp), and asserts every
 destination rank ends up byte-identical to a direct shard of the global state.
 
 The plan/index-math sweep is device-agnostic and runs anywhere. A second test
-drives the full send/recv wiring over the real NCCL backend on GPUs (prefill
-TP2 -> decode TP1), so the transport helpers are exercised on hardware too.
-The residual gap is a real-model functional run with a hybrid checkpoint.
+covers the disagg snapshot pairing gate (identical shards only). The residual
+gap is a real-model functional run with a hybrid checkpoint.
 """
 
 import pytest
@@ -165,99 +164,24 @@ def test_layout_wire_roundtrip():
     assert rebuilt.headdim == HEADDIM and rebuilt.d_conv == DCONV
 
 
-# --------------------------------------------------------------------------
-# Full Mamba transport wiring over the real NCCL backend on GPUs.
-# Prefill TP2 {0,1} -> decode TP1 {2}: each prefill rank exports its conv/ssm
-# shard and sends the resharded sub-blocks; the decode rank receives, assembles,
-# and must match a direct shard of the global state. Exercises the actual
-# _send_mamba_resharded / _post_recv_mamba_resharded path (post-order matched,
-# no tags) on real hardware. Larger hetero combos are covered device-agnostically
-# by test_mamba_reshard_reconstructs_destination above.
-# --------------------------------------------------------------------------
-def _nccl_mamba_worker(rank, world, port, q):
-    import os
+def test_matching_mamba_peer_identical_shard_only():
+    """Snapshot sends pair identical Mamba shards (same tp_rank/layer range/
+    dims) and skip hetero remaps -- the whole-slot snapshot tensors are only
+    byte-compatible between identical shards."""
+    from megatron.core.inference.disaggregation.kv_transfer_push import matching_mamba_peer
 
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    import torch.distributed as dist
+    src = list(_layouts(2, 1).values())            # prefill TP2 -> ranks {0,1}
+    dst_same = list(_layouts(2, 1, base=2).values())   # decode TP2 -> ranks {2,3}
+    dst_tp1 = list(_layouts(1, 1, base=2).values())    # decode TP1 -> rank {2}
 
-    torch.cuda.set_device(rank)
-    dev = torch.device(f"cuda:{rank}")
-    dist.init_process_group("nccl", rank=rank, world_size=world)
-    try:
-        from megatron.core.inference.disaggregation.kv_transfer_push import (
-            DecodeRecv,
-            _build_mamba_recvs,
-            _send_mamba_resharded,
-        )
-        from megatron.core.inference.disaggregation.transfer_backends.nccl import (
-            NcclTransportBackend,
-        )
-
-        conv_g, ssm_g = _global_state()
-        src_lay = _layouts(2, 1)            # prefill TP2 -> ranks {0,1}
-        dst_lay = _layouts(1, 1, base=2)    # decode  TP1 -> rank  {2}
-        src_list, dst_list = list(src_lay.values()), list(dst_lay.values())
-        backend = NcclTransportBackend()
-        backend.init()
-        meta = {"has_mamba": True,
-                "mamba": {"conv_dtype": torch.float32, "ssm_dtype": torch.float32}}
-
-        if rank in src_lay:  # prefill
-            lay = src_lay[rank]
-            conv_l, ssm_l = (t.to(dev) for t in _shard(conv_g, ssm_g, lay))
-            sends, keep = [], []
-            _send_mamba_resharded(
-                {"conv_states_tensor": conv_l, "ssm_states_tensor": ssm_l},
-                lay, src_list, dst_list, sends, keep,
-            )
-            handle, _ = backend.batch(sends, [])
-            handle.wait()
-            q.put((rank, "prefill"))
-        else:                # decode
-            lay = dst_lay[rank]
-            recv = DecodeRecv(meta=meta, staging=None, pending=[], my_layout=None)
-            recvs = []
-            mamba_transfers = _build_mamba_recvs(
-                recv, meta, lay, src_list, dst_list, dev, recvs
-            )
-            handle, bufs = backend.batch([], recvs, device=dev)
-            handle.wait()
-            recv.mamba_pending = list(zip(mamba_transfers, bufs))
-            for t, sub in recv.mamba_pending:
-                if t.is_conv:
-                    recv.mamba_conv[t.dst_layer, t.dst_lo:t.dst_hi, :] = sub
-                else:
-                    recv.mamba_ssm[t.dst_layer, t.dst_lo:t.dst_hi, :, :] = sub
-            want_conv, want_ssm = (t.to(dev) for t in _shard(conv_g, ssm_g, lay))
-            ok = torch.equal(recv.mamba_conv, want_conv) and torch.equal(recv.mamba_ssm, want_ssm)
-            q.put((rank, ("decode", bool(ok))))
-        dist.barrier()  # rendezvous before teardown (rank 0 hosts the store)
-    except Exception:
-        import traceback
-
-        q.put((rank, ("ERROR", traceback.format_exc())))
-    finally:
-        if dist.is_initialized():
-            dist.destroy_process_group()
-
-
-@pytest.mark.skipif(
-    not (torch.cuda.is_available() and torch.cuda.device_count() >= 3),
-    reason="requires >=3 CUDA devices (prefill TP2 {0,1} + decode TP1 {2})",
-)
-def test_mamba_transport_wiring_roundtrip_nccl():
-    ctx = torch.multiprocessing.get_context("spawn")
-    q = ctx.Queue()
-    procs = [ctx.Process(target=_nccl_mamba_worker, args=(r, 3, 29611, q)) for r in range(3)]
-    for p in procs:
-        p.start()
-    out = {}
-    for _ in range(3):
-        rk, payload = q.get(timeout=180)
-        out[rk] = payload
-    for p in procs:
-        p.join(timeout=60)
-    errs = {r: v[1] for r, v in out.items() if isinstance(v, tuple) and v[0] == "ERROR"}
-    assert not errs, errs
-    assert out[2] == ("decode", True), out  # decode rank reconstructed the exact shard
+    # Identical shards pair one-to-one (rank i <-> base+i) and symmetrically.
+    for me, expect in zip(src, dst_same):
+        peer = matching_mamba_peer(me, dst_same)
+        assert peer is expect
+        assert matching_mamba_peer(peer, src) is me
+    # A hetero TP remap has no identical peer: snapshots are skipped.
+    for me in src:
+        assert matching_mamba_peer(me, dst_tp1) is None
+    # Empty / absent peer list (non-hybrid instance).
+    assert matching_mamba_peer(src[0], []) is None
+    assert matching_mamba_peer(src[0], None) is None

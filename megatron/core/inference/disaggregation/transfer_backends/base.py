@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 
@@ -14,15 +14,13 @@ import torch
 @dataclass
 class TransferHandle:
     """Handle for an in-flight non-blocking transfer; ``wait()`` blocks until it
-    completes and returns the received tensor (for receives)."""
+    completes. Received data lands in the buffers :meth:`KVTransportBackend.batch`
+    returned."""
 
-    wait_fn: object  # Callable[[], None]
-    tensor: Optional[torch.Tensor] = None
+    wait_fn: Callable[[], None]
 
-    def wait(self) -> Optional[torch.Tensor]:
-        if self.wait_fn is not None:
-            self.wait_fn()
-        return self.tensor
+    def wait(self) -> None:
+        self.wait_fn()
 
 
 @dataclass
@@ -55,7 +53,7 @@ class PullRegion:
             "num_outer": num_outer,
             "outer_stride_bytes": int(shape[self.index_axis]) * inner * elem,
             "inner_bytes": inner * elem,
-            "device_id": self.tensor.device.index or 0,
+            "device_id": self.tensor.device.index,
         }
 
 
@@ -68,25 +66,20 @@ class KVTransportBackend(abc.ABC):
       match by POST-ORDER, so both sides must enumerate them in the same order.
     * **One-sided** (RDMA: NIXL). Each rank registers its buffers once
       (:meth:`register_regions` / :meth:`export_regions_meta`); one rank then
-      moves entries with no peer action, either direction -- :meth:`begin_pull`
-      (remote READ) or :meth:`begin_push` (remote WRITE). No staging copy, no
-      per-request registration.
+      READs entries -- whole entries via :meth:`begin_pull` or raw byte
+      fragments via :meth:`begin_pull_raw` -- with no peer action. No staging
+      copy, no per-request registration.
 
     A backend implements one family and leaves the other raising
     ``NotImplementedError``; callers branch on :attr:`is_pull`.
     """
 
-    # True for one-sided (pull/push) backends, False for the two-sided batch.
+    # True for one-sided (pull) backends, False for the two-sided batch.
     is_pull: bool = False
 
     @abc.abstractmethod
-    def is_initialized(self) -> bool:
-        """Whether :meth:`init` has run."""
-
-    @abc.abstractmethod
-    def init(self, *, group: Optional[object] = None, **kwargs) -> None:
-        """One-shot, idempotent init. ``group`` scopes the collective
-        for backends that need it (NCCL); ignored otherwise."""
+    def init(self) -> None:
+        """One-shot, idempotent init."""
 
     # --- push family (two-sided) ------------------------------------------
     def batch(self, sends, recvs, *, device: Optional[torch.device] = None):
@@ -97,29 +90,29 @@ class KVTransportBackend(abc.ABC):
         ungrouped P2P ops to one peer race on NCCL (illegal access)."""
         raise NotImplementedError(f"{type(self).__name__} does not implement the push interface")
 
-    # --- one-sided family (RDMA, either direction) ------------------------
+    # --- one-sided family (RDMA) ------------------------------------------
     def register_regions(self, regions: dict) -> None:
-        """(one-sided) Register this rank's KV buffers once for remote READ/WRITE.
+        """(one-sided) Register this rank's KV buffers once for remote READ.
         ``regions`` maps a name to a :class:`PullRegion`."""
         raise NotImplementedError(f"{type(self).__name__} does not implement the one-sided interface")
 
     def export_regions_meta(self) -> dict:
-        """(one-sided) Metadata a remote peer needs to READ/WRITE this rank's
+        """(one-sided) Metadata a remote peer needs to READ this rank's
         regions (agent metadata + per-region layout). Exported once."""
         raise NotImplementedError(f"{type(self).__name__} does not implement the one-sided interface")
 
     def begin_pull(self, peer_meta: dict, transfers: list):
-        """(one-sided) Remote READ: copy entries from a peer's regions into this
-        rank's. ``transfers``: ``(region_name, peer_src_index, local_dst_index)``.
-        Returns a pollable handle."""
+        """(one-sided) Remote READ of whole entries from a peer's regions into
+        this rank's. ``transfers``: ``(region_name, peer_src_index,
+        local_dst_index)``. Returns a pollable handle."""
         raise NotImplementedError(f"{type(self).__name__} does not implement the one-sided interface")
 
-    def begin_push(self, peer_meta: dict, transfers: list):
-        """(one-sided) Remote WRITE: the mirror of :meth:`begin_pull`, copying
-        this rank's entries into a peer's. ``transfers``:
-        ``(region_name, local_src_index, peer_dst_index)``. Returns a handle."""
+    def begin_pull_raw(self, peer_meta: dict, region_name: str, descriptors: list):
+        """(one-sided) Remote READ of raw byte fragments from one peer region:
+        the hot path for resharded hand-offs. ``descriptors``:
+        ``(peer_offset_bytes, local_addr, num_bytes)``. Returns a pollable
+        handle."""
         raise NotImplementedError(f"{type(self).__name__} does not implement the one-sided interface")
-
 
 
 def construct_kv_transport_backend(name: str) -> KVTransportBackend:

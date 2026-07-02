@@ -50,19 +50,13 @@ class _FakeCtx:
     def export_request_kv(self, request_id):
         h0, h1 = self._layout.head_range()
         return {
-            "layout": "std_attn_v1",
-            "block_count": BC,
-            "block_size_tokens": BS,
-            "num_layers": L,
-            "num_heads_per_partition": h1 - h0,
-            "hidden_per_head": HD,
-            "block_hashes": [],
             "staging_tensor": self._g[:, :, :, :, h0:h1, :].clone(),
+            "mamba_snapshots": None,
         }
 
-    def import_request_kv(self, payload):
-        self.imported = payload["staging_tensor"]
-        return {"block_ids": list(range(payload["block_count"])), "ok": True}
+    def import_request_kv(self, staging, block_hashes, mamba_snapshots=None):
+        self.imported = staging
+        return {"block_ids": list(range(staging.shape[0])), "block_hashes": block_hashes}
 
 
 class _FakeEng:
@@ -111,14 +105,16 @@ def _worker(rank, world, port, q):
 
         if role == "prefill":
             h = H.send_request_kv_resharded(
-                eng, 7, layout, src_layouts, dst_layouts, backend=backend,
+                layout, src_layouts, dst_layouts, backend=backend,
+                payload=eng.context.export_request_kv(7),
+                my_mamba_layout=None, dst_mamba_layouts=[],
             )
-            if h is not None:
-                h.wait()
+            h.wait()
             q.put((f"prefill{rank}", "prefill"))
         else:
             recv = H.post_recv_request_kv_resharded(
                 eng, layout, src_layouts, dst_layouts, PROMPT, backend=backend,
+                handoff=None, my_mamba_layout=None, src_mamba_layouts=[],
             )
             res = recv.finish(eng) if recv is not None else None
             imported = eng.context.imported
