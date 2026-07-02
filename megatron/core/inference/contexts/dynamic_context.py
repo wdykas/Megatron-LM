@@ -2809,14 +2809,15 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Disagg observability: a request whose hand-off was imported should
         # admit via a prefix hit; zero matches means the imported KV was
-        # discarded before admission and the full prompt re-prefills.
+        # discarded before admission and the full prompt re-prefills. Requests
+        # with no complete prompt block have no hashes and can never hit --
+        # their hand-off degrading to re-prefill is expected, not an anomaly.
         if finished == 0 and req.request_id in self.disagg_imported_request_ids:
             self.disagg_imported_request_ids.discard(req.request_id)
-            if num_matched == 0:
+            if num_matched == 0 and req.precomputed_block_hashes:
                 logging.warning(
                     "disagg decode: imported KV for request %s yielded no prefix "
-                    "hit; re-prefilling the full prompt (prompts shorter than "
-                    "one KV block can never hit: partial blocks have no hash)",
+                    "hit; re-prefilling the full prompt",
                     req.request_id,
                 )
 
