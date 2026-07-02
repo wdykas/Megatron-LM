@@ -657,7 +657,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     "schedule_output_path": coordinator_schedule_output_path,
                     "hostname": hostname,
                     "disaggregated": disagg_enabled,
-                    "disagg_router": self._disagg.router_name,
+                    "disagg_router": self._disagg.router_name if disagg_enabled else None,
                 },
             )
             self.inference_coordinator_process.start()
