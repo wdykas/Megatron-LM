@@ -105,6 +105,8 @@ class DisaggRouting(DisaggRouter):
             raise RuntimeError("no decode engines registered")
         dec = self._pick_decode(request_id)
         self._req_decode[request_id] = dec
+        # None if this router never saw the submit (the coordinator guarantees
+        # submit-first; a standalone router tolerates it -- see route tests).
         prefill = self._req_prefill.get(request_id)
         return prefill, dec
 

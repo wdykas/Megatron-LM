@@ -39,10 +39,7 @@ from megatron.core.inference.headers import Headers
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.utils import get_pg_src_rank, nvtx_range_pop, nvtx_range_push
 
-try:
-    import msgpack
-except ImportError:
-    msgpack = None
+import msgpack
 
 
 def pull_only(method):
@@ -223,14 +220,14 @@ class DisaggEngineRuntime:
         one-sided pull). The runtime branches on ``backend.is_pull`` -- everything
         else is transport-agnostic.
 
-        One-sided backends register this rank's paged KV (+ Mamba) buffers once
-        here, so a peer can READ entries by block/slot index without any
-        per-request registration."""
+        Only push (two-sided) backends reach this lazy path. Pull backends are
+        built and their KV (+ Mamba) buffers registered eagerly in ``__init__``
+        (before the first prefill), so ``self.backend`` is already set for them
+        and a peer can READ entries by block/slot index without per-request
+        registration."""
         if self.backend is None:
             backend = construct_kv_transport_backend(self.kv_transport_backend)
             backend.init()
-            if backend.is_pull:
-                self.register_pull_regions(backend)
             self.backend = backend
         return self.backend
 
@@ -258,7 +255,7 @@ class DisaggEngineRuntime:
         """
         ctx = self.context
         regions = {"kv": PullRegion(ctx.memory_buffer, 2)}
-        if getattr(ctx, "is_hybrid_model", False):
+        if ctx.is_hybrid_model:
             # A hybrid context always allocates both (see _allocate_mamba_states).
             conv = ctx.mamba_conv_states
             ssm = ctx.mamba_ssm_states
@@ -339,12 +336,14 @@ class DisaggEngineRuntime:
         ref = self.context.disagg_staged_kv.pop(request_id, None)
         if not self.is_mp_coordinator:
             return None
+        # A finished prefill request always staged its KV before send_prefill_done;
+        # a missing ref on the coordinator is an invariant violation, and returning
+        # None here would emit PREFILL_DONE with no handoff. Fail loud.
         if ref is None:
-            logging.warning(
-                "disagg prefill: PREFILL_DONE publish for request %s has no staged "
-                "KV ref; skipping", request_id,
+            raise RuntimeError(
+                f"disagg prefill: PREFILL_DONE publish for request {request_id} "
+                "has no staged KV ref"
             )
-            return None
         request_meta = pull_request_meta(ref)
         return [{**static, **request_meta} for static in self.pull_static_metas]
 
@@ -399,15 +398,12 @@ class DisaggEngineRuntime:
         coordinator. Both paths yield an object with a ``finish(engine)`` that
         commits, so the rest is symmetric."""
         backend = self.get_backend()
-        # Backpressure: complete + admit the oldest in-flight receive once the
-        # window is full (collective: identical pending set across MP ranks).
+        # Backpressure: window full -> complete + admit the oldest in-flight
+        # receive (collective: identical pending set across MP ranks). One at a
+        # time, deterministic oldest-first; finish() blocks if that transfer
+        # hasn't landed yet, which is the unavoidable floor when saturated.
         while len(self.pending_recvs) >= self.max_inflight:
-            oldest = next(iter(self.pending_recvs))
-            rv, p, sp = self.pending_recvs.pop(oldest)
-            rv.finish(self.engine)
-            if backend.is_pull:
-                self.pending_acks.append(oldest)
-            self.engine.add_request(oldest, p, sampling_params=SamplingParams.deserialize(sp))
+            self._admit_recv(next(iter(self.pending_recvs)))
 
         if backend.is_pull:
             recv = post_pull_request_kv(
@@ -462,6 +458,26 @@ class DisaggEngineRuntime:
         )
         return [rid for rid, f in zip(pending, flags.tolist()) if f]
 
+    def _admit_recv(self, request_id):
+        """Finish one landed receive and admit its request: import the KV
+        (registers the prefix-cache blocks), queue the read-done ack (pull), and
+        add_request to continue generation. A failed import (``None``) still
+        admits the request -- it just re-prefills from the prompt."""
+        recv, prompt, sampling_params = self.pending_recvs.pop(request_id)
+        imported = recv.finish(self.engine)
+        if imported is None:
+            logging.warning(
+                "disagg decode: KV import failed for request %s; "
+                "re-prefilling from prompt instead of using handed-off KV",
+                request_id,
+            )
+        if self.is_pull:
+            # One-sided READ drained -> release the prefill's pin + outstanding slot.
+            self.pending_acks.append(request_id)
+        self.engine.add_request(
+            request_id, prompt, sampling_params=SamplingParams.deserialize(sampling_params)
+        )
+
     def complete_pending(self):
         """Reap KV transfers posted on a previous step.
 
@@ -478,26 +494,10 @@ class DisaggEngineRuntime:
         across ranks because that "done on all ranks" set is AND-reduced over the
         MP group -- if ranks admitted different requests the next forward step
         would diverge."""
-        is_pull = self.get_backend().is_pull
         for request_id in list(self.pending_sends):
             self.pending_sends.pop(request_id).wait()
-        for request_id in self.ready_recvs(is_pull):
-            recv, prompt, sampling_params = self.pending_recvs.pop(request_id)
-            imported = recv.finish(self.engine)
-            if imported is None:
-                # KV import failed (e.g. decode KV cache full): the request is
-                # still admitted but without the handed-off blocks, so it
-                # re-prefills from the prompt -- correct but slower. Surface it.
-                logging.warning(
-                    "disagg decode: KV import failed for request %s; "
-                    "re-prefilling from prompt instead of using handed-off KV",
-                    request_id,
-                )
-            if is_pull:
-                # One-sided READ drained -> release the prefill's pin + an outstanding slot.
-                self.pending_acks.append(request_id)
-            sp = SamplingParams.deserialize(sampling_params)
-            self.engine.add_request(request_id, prompt, sampling_params=sp)
+        for request_id in self.ready_recvs(self.is_pull):
+            self._admit_recv(request_id)
 
         # Flush read-done acks: the MP coordinator tells the coordinator each
         # pulled request has drained. Queue is identical across MP ranks

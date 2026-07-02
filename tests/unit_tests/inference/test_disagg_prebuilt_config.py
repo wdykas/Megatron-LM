@@ -28,6 +28,7 @@ class _FakeContext:
     memory_buffer.shape[1] (== global L here, since these specs are all pp=1)."""
 
     enable_prefix_caching = True
+    cache_mla_latent = False
     is_hybrid_model = False
 
     def __init__(self, local_layers):

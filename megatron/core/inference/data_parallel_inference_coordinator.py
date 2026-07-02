@@ -4,7 +4,6 @@ import errno
 import faulthandler
 import json
 import logging
-import os
 import signal
 import socket
 from collections import deque
@@ -198,7 +197,6 @@ class DataParallelInferenceCoordinator:
         # KV_READ_DONE. MUST stay <= the engine's hold-ring depth (64).
         # TODO(peter): test what values are good for this.
         self._disagg_max_outstanding = 32
-        # time.sleep(5)  # Give data parallel ranks time to spawn and connect.
         for _ in range(data_parallel_size):
             identity, _ = self.router_socket.recv_multipart()
             assert identity not in self.identities_of_data_parallel_ranks
@@ -315,9 +313,9 @@ class DataParallelInferenceCoordinator:
         to the prefill's hold-ring/pin window -- the hard no-overwrite guarantee."""
         self._req_meta[request_id] = (prompt, sampling_params)
         prefill_id = self._disagg.route_submit(request_id)
-        if not self._engine_is_pull.get(prefill_id, False):
-            # Push (or unknown) prefill: submit directly, no flow control
-            # (push has its own staging window and sends no read-done ack).
+        if not self._engine_is_pull[prefill_id]:
+            # Push prefill: submit directly, no flow control (push has its own
+            # staging window and sends no read-done ack).
             self._disagg_send(
                 prefill_id, Headers.SUBMIT_REQUEST, request_id, prompt, sampling_params
             )

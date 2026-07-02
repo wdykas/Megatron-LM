@@ -306,13 +306,12 @@ class _MegatronLLMBase:
         self._loop_manager: "Optional[_EventLoopManager]" = None
         self._coord_runtime: "Optional[_CoordinatorRuntime]" = None
         self._shutdown_called: bool = False
-        self._disagg_setup = None
 
         # Disaggregation: tag this engine as a prefill/decode shard from the
         # role-tagged layout. Must run before start_listening_to_data_parallel_coordinator.
         if inference_shards is not None:
             specs = normalize_shard_specs(inference_shards, dist.get_world_size())
-            self._disagg_setup = configure_prebuilt_disagg_engine(
+            configure_prebuilt_disagg_engine(
                 engine, engine.pg_collection, specs, disagg_router=disagg_router,
                 kv_transport_backend=kv_transport_backend,
             )

@@ -108,12 +108,12 @@ def _global_kv_dims(engine, pg) -> Tuple[int, int]:
     num_query_groups for GQA, else num_attention_heads.
     """
     cfg = engine.controller.model_config
-    num_heads = getattr(cfg, "num_query_groups", None) or cfg.num_attention_heads
-    mb = getattr(getattr(engine, "context", None), "memory_buffer", None)
+    num_heads = cfg.num_query_groups
     # A configured disagg engine always has an allocated memory_buffer.
+    mb = engine.context.memory_buffer
     assert mb is not None, (
         "disaggregation requires a dynamic KV context with an allocated "
-        "memory_buffer; got engine.context=%r" % getattr(engine, "context", None)
+        "memory_buffer; got engine.context=%r" % engine.context
     )
     # memory_buffer's layer dim is this PP stage's local attention-layer count.
     # Hybrid models split attention layers unevenly across PP stages, so gather
@@ -139,13 +139,11 @@ def _mamba_layout_dict(engine, pg):
     offset is the prefix sum of per-PP-stage local counts (contiguous in global
     layer order), via an all-gather over the PP group.
     """
-    ctx = getattr(engine, "context", None)
-    if ctx is None or not getattr(ctx, "is_hybrid_model", False):
+    ctx = engine.context
+    if not ctx.is_hybrid_model:
         return None
-    conv_shape = getattr(ctx, "mamba_conv_states_shape", None)
-    ssm_shape = getattr(ctx, "mamba_ssm_states_shape", None)
-    if conv_shape is None or ssm_shape is None:
-        return None
+    conv_shape = ctx.mamba_conv_states_shape
+    ssm_shape = ctx.mamba_ssm_states_shape
 
     nheads_local, headdim, d_state = (int(x) for x in ssm_shape)
     d_conv = int(conv_shape[1])
@@ -199,16 +197,15 @@ def configure_prebuilt_disagg_engine(
     # handed-off KV via a prefix-cache hit (import registers the block hashes).
     # Without it the imported blocks aren't matched and decode silently
     # re-prefills, wasting the hand-off.
-    ctx = getattr(engine, "context", None)
-    if ctx is not None:
-        assert getattr(ctx, "enable_prefix_caching", False), (
-            "disaggregation requires prefix caching (enable_prefix_caching=True); "
-            "the decode side admits handed-off KV via a prefix-cache hit."
-        )
-        assert not getattr(ctx, "cache_mla_latent", False), (
-            "disaggregation does not support the MLA latent KV cache "
-            "(cache_mla_latent=True)."
-        )
+    ctx = engine.context
+    assert ctx.enable_prefix_caching, (
+        "disaggregation requires prefix caching (enable_prefix_caching=True); "
+        "the decode side admits handed-off KV via a prefix-cache hit."
+    )
+    assert not ctx.cache_mla_latent, (
+        "disaggregation does not support the MLA latent KV cache "
+        "(cache_mla_latent=True)."
+    )
     rank = dist.get_rank()
 
     # Locate this rank's shard. Shard windows are contiguous (tp*pp*dp ranks

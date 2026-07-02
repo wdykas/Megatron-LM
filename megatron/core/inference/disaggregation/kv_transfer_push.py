@@ -33,7 +33,7 @@ def derive_decode_schema(engine: Any, prompt_token_ids) -> dict:
     prompt length) into a uniform KV layout."""
 
     ctx = engine.context
-    if getattr(ctx, "cache_mla_latent", False):
+    if ctx.cache_mla_latent:
         raise NotImplementedError(
             "disaggregated KV transfer does not support the MLA latent KV cache"
         )
@@ -59,7 +59,7 @@ def derive_decode_schema(engine: Any, prompt_token_ids) -> dict:
         "attn_dtype": mb.dtype,
         "has_mamba": False,
     }
-    if getattr(ctx, "is_hybrid_model", False):
+    if ctx.is_hybrid_model:
         conv = ctx.mamba_conv_states  # (num_mamba_layers, max_requests, *conv_state)
         ssm = ctx.mamba_ssm_states
         meta["has_mamba"] = True
