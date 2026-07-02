@@ -2576,17 +2576,20 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.reset_tensors()
         self.reset_metadata()
 
-        # Disaggregation invariant: the epoch-level reset zeroes block ref
-        # counts, so it must never run with hand-offs outstanding -- a pinned
-        # or staged request surviving here would release someone else's blocks
-        # later.
-        assert not self.disagg_pinned, (
-            f"context.reset() with {len(self.disagg_pinned)} disagg KV pins outstanding"
-        )
-        assert not self.disagg_staged_kv, (
-            f"context.reset() with {len(self.disagg_staged_kv)} disagg staged exports outstanding"
-        )
-        self.disagg_prompt_block_count.clear()
+        # Disaggregation: the reset wipes the allocator wholesale, so
+        # allocator-coupled hand-off state is meaningless afterward. Clear the
+        # pins (their late RELEASE_KV acks then land as no-ops in
+        # disagg_release_pinned) and the imported-request markers. Keep
+        # disagg_prompt_block_count and disagg_staged_kv: both are pure
+        # request-side state (a length cap and self-contained staging
+        # tensors/refs), consumed by requests that are still in flight across
+        # this reset -- e.g. the CUDA-graph warmup reset runs after SUBMITs
+        # have already recorded their caps.
+        if self.disagg_pinned:
+            logging.info(
+                "context.reset(): clearing %d disagg KV pins", len(self.disagg_pinned)
+            )
+        self.disagg_pinned.clear()
         self.disagg_imported_request_ids.clear()
 
         # Reset lifetime counters (not reset in reset_metadata, which is also
@@ -2812,7 +2815,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             if num_matched == 0:
                 logging.warning(
                     "disagg decode: imported KV for request %s yielded no prefix "
-                    "hit; re-prefilling the full prompt",
+                    "hit; re-prefilling the full prompt (prompts shorter than "
+                    "one KV block can never hit: partial blocks have no hash)",
                     req.request_id,
                 )
 
@@ -4306,10 +4310,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         """[pull] (prefill, one-sided) Release the KV blocks pinned for ``request_id`` by
         :meth:`export_request_kv_ref`, on the decode's read-done ack (RELEASE_KV).
         The coordinator sends at most one RELEASE_KV per hand-off (read-done and
-        drop are mutually exclusive), but a drop can fire before the prefill
-        finished -- i.e. before any pin exists -- so a missing entry is a legal
-        no-op, not an error. ``context.reset()`` asserts no pins are
-        outstanding, so a stale entry can't survive an epoch reset."""
+        drop are mutually exclusive), but a missing entry is a legal no-op, not
+        an error: a drop can fire before the prefill finished (no pin exists
+        yet), and an epoch-level ``context.reset()`` clears leftover pins, whose
+        late acks then land here after the allocator was wiped."""
         block_ids = self.disagg_pinned.pop(request_id, None)
         if block_ids is None:
             return
