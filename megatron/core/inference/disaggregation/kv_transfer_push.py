@@ -11,8 +11,9 @@ only the push receive path needs it.
 Hybrid (Mamba) models hand off block-boundary snapshots rather than the live
 end-state (see the kv_transfer_pull docstring for why). The snapshot count is
 not derivable from static config, so PREFILL_DONE carries the snapshot hashes
-and the decode sizes its receives from them. Snapshots move as whole per-slot
-tensors between identical Mamba shards; a hetero remap skips them.
+and the decode sizes its receives from them. Snapshots reshard across
+arbitrary TP/PP changes via plan_mamba_reshard, band by band, alongside the
+attention KV.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from typing import Any, List, Optional
 
 import torch
 
-from megatron.core.inference.disaggregation import kv_reshard, utils
+from megatron.core.inference.disaggregation import kv_reshard, mamba_reshard, utils
 from megatron.core.inference.disaggregation.transfer_backends.base import (
     KVTransportBackend,
     TransferHandle,
@@ -65,25 +66,14 @@ def derive_decode_schema(engine: Any, prompt_token_ids) -> dict:
     }
 
 
-def matching_mamba_peer(my_mamba, peer_mamba_layouts) -> Optional[Any]:
-    """Return the peer rank holding the identical Mamba shard (same TP split,
-    layer range, and structural dims), or None for a hetero remap.
-
-    Snapshots move as whole per-slot tensors, so they ship only between
-    identical shards; without a match the decode re-prefills past the last
-    usable boundary instead. The match is unique when it exists and symmetric,
-    so prefill and decode compute the same pairing.
-    """
-    for peer in peer_mamba_layouts or []:
-        if (
-            peer.tp_size == my_mamba.tp_size
-            and peer.tp_rank == my_mamba.tp_rank
-            and peer.layer_start == my_mamba.layer_start
-            and peer.num_layers == my_mamba.num_layers
-            and peer.dims == my_mamba.dims
-        ):
-            return peer
-    return None
+def snapshot_transfer_shape(t: "mamba_reshard.MambaReshardTransfer", n: int, dims) -> tuple:
+    """Shape of the buffer one snapshot reshard transfer moves: n snapshots of
+    one local layer's band slice. Conv slices the channel axis (trailing
+    d_conv); ssm slices the head axis (trailing headdim x d_state)."""
+    width = t.dst_hi - t.dst_lo
+    if t.is_conv:
+        return (n, width, dims.d_conv)
+    return (n, width, dims.headdim, dims.d_state)
 
 
 @dataclass
@@ -107,15 +97,15 @@ def send_request_kv_resharded(
     *,
     backend: KVTransportBackend,
     payload: dict,
-    my_mamba_layout,
+    src_mamba_layouts: list,
     dst_mamba_layouts: list,
 ) -> "PrefillHandoff":
     """Reshard this rank's pre-exported KV to the decode layout and ship it.
 
     `my_layout` is this rank's KVShardLayout; `src_layouts` / `dst_layouts`
-    are the full prefill / decode layout lists. Hybrid models also pass Mamba
-    layouts, which gate the snapshot send (identical shard only). `payload` is
-    the staging dict the context exported when the request was staged.
+    are the full prefill / decode KV layout lists, and the Mamba layout lists
+    drive the snapshot reshard for hybrid models. `payload` is the staging
+    dict the context exported when the request was staged.
     """
 
     attn = payload["staging_tensor"]  # [BC, 2, local_layers, BS, local_heads, HD]
@@ -135,13 +125,17 @@ def send_request_kv_resharded(
 
     snapshots = payload["mamba_snapshots"]
     if snapshots is not None:
-        peer = matching_mamba_peer(my_mamba_layout, dst_mamba_layouts)
-        if peer is not None:
-            # Snapshots go to the identical-shard peer after the attention
-            # sends; the recv side matches the post order.
-            for tensor in (snapshots["conv_states_tensor"], snapshots["ssm_states_tensor"]):
-                keep.append(tensor)
-                sends.append((tensor, peer.global_rank))
+        # Snapshot band slices follow the attention sends; the recv side
+        # enumerates the same plan, so the post orders match per peer.
+        conv = snapshots["conv_states_tensor"]  # (n, layers, conv_dim_local, d_conv)
+        ssm = snapshots["ssm_states_tensor"]  # (n, layers, nheads_local, headdim, d_state)
+        for t in mamba_reshard.plan_mamba_reshard(src_mamba_layouts, dst_mamba_layouts):
+            if t.src_rank != my_layout.global_rank:
+                continue
+            src = conv if t.is_conv else ssm
+            sub = src[:, t.src_layer, t.src_lo : t.src_hi].contiguous()
+            keep.append(sub)
+            sends.append((sub, t.dst_rank))
     handle, _ = backend.batch(sends, [])
     return PrefillHandoff(handles=[handle], keepalive=keep)
 
@@ -158,8 +152,10 @@ class DecodeRecv:
     my_layout: Any
     # Single coalesced handle for the whole request's batched receives.
     handle: Optional[TransferHandle] = None
-    # Mamba snapshots (hybrid, identical shard only): hashes + received tensors.
+    # Mamba snapshots (hybrid): hashes, per-band receives, and the staging
+    # tensors they assemble into.
     snapshot_hashes: List[int] = field(default_factory=list)
+    pending_snap: List[tuple] = field(default_factory=list)  # [(transfer, buf)]
     snapshot_conv: Optional[torch.Tensor] = None
     snapshot_ssm: Optional[torch.Tensor] = None
 
@@ -180,6 +176,9 @@ class DecodeRecv:
             dst.copy_(sub)
         mamba_snapshots = None
         if self.snapshot_hashes:
+            for t, buf in self.pending_snap:
+                dst = self.snapshot_conv if t.is_conv else self.snapshot_ssm
+                dst[:, t.dst_layer, t.dst_lo : t.dst_hi] = buf
             mamba_snapshots = {
                 "block_hashes": list(self.snapshot_hashes),
                 "conv_states_tensor": self.snapshot_conv,
@@ -205,13 +204,13 @@ def post_recv_request_kv_resharded(
     *,
     backend: KVTransportBackend,
     handoff: Optional[dict],
-    my_mamba_layout,
     src_mamba_layouts: list,
+    dst_mamba_layouts: list,
 ) -> "DecodeRecv":
     """Post the irecvs for every KV sub-block covering this rank's
-    (layer x head) rectangle, plus the Mamba snapshot tensors for hybrid
-    models (sized from the handoff's snapshot hashes; skipped for a hetero
-    Mamba shard), and return a DecodeRecv to complete later."""
+    (layer x head) rectangle, plus this rank's Mamba snapshot band slices for
+    hybrid models (sized from the handoff's snapshot hashes and the reshard
+    plan), and return a DecodeRecv to complete later."""
 
     meta = derive_decode_schema(engine, prompt_token_ids)
     bc = meta["block_count"]
@@ -243,23 +242,34 @@ def post_recv_request_kv_resharded(
 
     recv = DecodeRecv(meta=meta, staging=staging, pending=[], my_layout=my_layout)
     snapshot_hashes = list((handoff or {}).get("snapshot_hashes") or [])
+    snap_transfers: List[Any] = []
     if snapshot_hashes:
-        peer = matching_mamba_peer(my_mamba_layout, src_mamba_layouts)
-        if peer is not None:
-            # Per-snapshot entry shapes come from this rank's own snapshot pools
-            # (identical shard, so they equal the sender's staged shapes).
-            sa = engine.context.mamba_slot_allocator
-            n = len(snapshot_hashes)
-            conv_entry = sa.conv_states.shape[:1] + sa.conv_states.shape[2:]
-            ssm_entry = sa.ssm_states.shape[:1] + sa.ssm_states.shape[2:]
-            recvs.append(((n, *conv_entry), sa.conv_states.dtype, peer.global_rank))
-            recvs.append(((n, *ssm_entry), sa.ssm_states.dtype, peer.global_rank))
-            recv.snapshot_hashes = snapshot_hashes
+        sa = engine.context.mamba_slot_allocator
+        n = len(snapshot_hashes)
+        my_mamba = next(
+            m for m in dst_mamba_layouts if m.global_rank == my_layout.global_rank
+        )
+        # Band slices this rank receives, in plan order (mirrors the sender).
+        plan = mamba_reshard.plan_mamba_reshard(src_mamba_layouts, dst_mamba_layouts)
+        snap_transfers = [t for t in plan if t.dst_rank == my_layout.global_rank]
+        for t in snap_transfers:
+            dtype = sa.conv_states.dtype if t.is_conv else sa.ssm_states.dtype
+            recvs.append(
+                (snapshot_transfer_shape(t, n, my_mamba.dims), dtype, t.src_rank)
+            )
+        recv.snapshot_hashes = snapshot_hashes
+        recv.snapshot_conv = torch.empty(
+            (n, my_mamba.num_layers, *sa.conv_states.shape[2:]),
+            dtype=sa.conv_states.dtype, device=device,
+        )
+        recv.snapshot_ssm = torch.empty(
+            (n, my_mamba.num_layers, *sa.ssm_states.shape[2:]),
+            dtype=sa.ssm_states.dtype, device=device,
+        )
 
     handle, bufs = backend.batch([], recvs, device=device)
     recv.handle = handle
     n_attn = len(attn_transfers)
     recv.pending = list(zip(attn_transfers, bufs[:n_attn]))
-    if recv.snapshot_hashes:
-        recv.snapshot_conv, recv.snapshot_ssm = bufs[n_attn], bufs[n_attn + 1]
+    recv.pending_snap = list(zip(snap_transfers, bufs[n_attn:]))
     return recv

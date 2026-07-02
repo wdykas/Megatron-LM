@@ -30,7 +30,7 @@ from megatron.core.inference.disaggregation.kv_transfer_push import (
     post_recv_request_kv_resharded,
     send_request_kv_resharded,
 )
-from megatron.core.inference.disaggregation.mamba_layout import MambaShardLayout
+from megatron.core.inference.disaggregation.mamba_reshard import MambaShardLayout
 from megatron.core.inference.disaggregation.transfer_backends.base import (
     PullRegion,
     construct_kv_transport_backend,
@@ -150,9 +150,6 @@ class DisaggEngineRuntime:
         assert (
             self.my_layout is not None
         ), f"rank {rank} not found in its disagg instance layouts"
-        self.my_mamba_layout = next(
-            (m for m in self.instance_mamba_layouts if m.global_rank == rank), None
-        )
 
         # The prefill controller stages each finished request's KV into the
         # context while the slot is still valid; the engine's finish loop runs
@@ -318,7 +315,7 @@ class DisaggEngineRuntime:
             self.instance_kv_layouts,
             kv_layouts(dst_layout_dicts),
             backend=self.get_backend(), payload=staged,
-            my_mamba_layout=self.my_mamba_layout,
+            src_mamba_layouts=self.instance_mamba_layouts,
             dst_mamba_layouts=mamba_layouts(dst_layout_dicts),
         )
 
@@ -345,6 +342,8 @@ class DisaggEngineRuntime:
                 self.engine, self.get_backend(), handoff, self.my_layout,
                 src_layouts=kv_layouts(src_layout_dicts),
                 dst_layouts=self.instance_kv_layouts,
+                src_mamba_layouts=mamba_layouts(src_layout_dicts),
+                dst_mamba_layouts=self.instance_mamba_layouts,
             )
         else:
             recv = post_recv_request_kv_resharded(
@@ -353,8 +352,8 @@ class DisaggEngineRuntime:
                 self.instance_kv_layouts,
                 prompt, backend=self.get_backend(),
                 handoff=handoff,
-                my_mamba_layout=self.my_mamba_layout,
                 src_mamba_layouts=mamba_layouts(src_layout_dicts),
+                dst_mamba_layouts=self.instance_mamba_layouts,
             )
         if recv is None:
             # No KV received (pull: the decode KV cache was full); admit to

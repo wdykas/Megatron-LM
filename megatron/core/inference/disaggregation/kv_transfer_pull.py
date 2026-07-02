@@ -13,19 +13,20 @@ Hybrid (Mamba) models hand off block-boundary snapshots rather than the live
 end-state: admission always re-runs at least the trailing tokens of the
 prompt, and the recurrent Mamba state is only correct when restored at the
 block boundary the re-run starts from, which is what the prefix-cache restore
-path does with the imported snapshots. Snapshots move as whole per-slot
-entries, so they ship only between identical Mamba shards; a hetero remap
-skips them and the decode re-prefills past the last usable boundary.
+path does with the imported snapshots. Snapshots reshard across arbitrary
+TP/PP changes: each decode rank reads its band slices of every snapshot
+straight out of the prefill ranks' registered snapshot pools, driven by
+plan_mamba_reshard.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from typing import Any, List
 
 import torch
 
-from megatron.core.inference.disaggregation import kv_reshard, utils
+from megatron.core.inference.disaggregation import kv_reshard, mamba_reshard, utils
 
 
 def pull_static_meta(backend, my_layout, kv_dims):
@@ -76,27 +77,32 @@ class NixlPullRecv:
 
     finish() waits the read, then commits by registering the block hashes (the
     KV already landed in the allocated blocks). If the prefill published Mamba
-    snapshots, a second read pulls them after the KV commit. Only the KV
-    blocks are ref-count pinned on the prefill; the snapshot slots stay valid
-    for the second read because snapshot eviction is gated on that same
-    ref count.
+    snapshots, a second read pulls this rank's band slices of them after the
+    KV commit. Only the KV blocks are ref-count pinned on the prefill; the
+    snapshot slots stay valid for the second read because snapshot eviction is
+    gated on that same ref count.
 
     Attributes:
         handles: pollable transport handles for the in-flight reads.
         block_ids: destination KV block ids (reused prefix + newly pulled).
         block_hashes: per-block hashes to register on commit.
         backend: the one-sided transport, for the snapshot read.
-        peer_meta: the single source's region meta; None when snapshots are
-            skipped (multi-source or hetero Mamba shard).
-        snapshots: prefill's Mamba snapshot refs to pull, or empty.
+        snap_hashes: snapshot hashes to pull, in hand-off order.
+        snap_transfers: this rank's Mamba reshard transfers (band slices).
+        src_snap_slots: src_rank -> {hash: snapshot slot} on that rank.
+        src_region_meta: src_rank -> that rank's registered-region meta.
+        my_mamba: this rank's MambaShardLayout, or None for non-hybrid.
     """
 
     handles: List[Any]
     block_ids: List[int]
     block_hashes: List[int]
     backend: Any
-    peer_meta: Optional[dict] = None
-    snapshots: List = field(default_factory=list)
+    snap_hashes: List[int] = field(default_factory=list)
+    snap_transfers: List[Any] = field(default_factory=list)
+    src_snap_slots: dict = field(default_factory=dict)
+    src_region_meta: dict = field(default_factory=dict)
+    my_mamba: Any = None
 
     def poll(self) -> bool:
         """Return True if every in-flight read for this request has drained,
@@ -113,14 +119,20 @@ class NixlPullRecv:
             h.wait()
         with torch.inference_mode():
             result = engine.context.disagg_pull_commit(self.block_ids, self.block_hashes)
-            if self.snapshots:
+            if self.snap_hashes:
                 # Resolve hashes to the blocks the commit just registered,
-                # allocate snapshot slots, read the peer's snapshots into them,
-                # and register them for prefix-cache hits.
-                plan = engine.context.disagg_snapshot_pull_plan(self.snapshots)
-                if plan is not None:
-                    self.backend.begin_pull(self.peer_meta, plan["transfers"]).wait()
-                    engine.context.disagg_snapshot_commit(plan["block_ids"], plan["hashes"])
+                # allocate snapshot slots, read this rank's band slices of the
+                # peers' snapshots into them, and register them.
+                alloc = engine.context.disagg_snapshot_alloc(self.snap_hashes)
+                if alloc is not None:
+                    handles = _snapshot_fragment_pulls(
+                        engine.context, self.backend, self.my_mamba,
+                        self.snap_transfers, alloc,
+                        self.src_snap_slots, self.src_region_meta,
+                    )
+                    for h in handles:
+                        h.wait()
+                    engine.context.disagg_snapshot_commit(alloc["block_ids"], alloc["hashes"])
             return result
 
 
@@ -212,31 +224,67 @@ def _kv_fragment_descriptors(src_dims, dst_dims, src_block, dst_block,
     return descriptors
 
 
-def _snapshot_regions_match(backend, peer_meta: dict) -> bool:
-    """Return whether the peer's Mamba snapshot pools have the same per-entry
-    geometry as this rank's. Snapshots move as whole per-slot entries, so a
-    hetero shard cannot use them; the caller skips the snapshot read and the
-    decode re-prefills past the last usable boundary instead."""
-    local = backend.export_regions_meta()["regions"]
-    peer = peer_meta["regions"]
-    return all(
-        name in local and name in peer
-        and local[name]["num_outer"] == peer[name]["num_outer"]
-        and local[name]["inner_bytes"] == peer[name]["inner_bytes"]
-        for name in ("snap_conv", "snap_ssm")
-    )
+def _snapshot_fragment_pulls(
+    ctx, backend, my_mamba, transfers, alloc, src_snap_slots, src_region_meta
+):
+    """Issue the one-sided reads pulling this rank's band slices of each kept
+    snapshot out of the source ranks' registered snapshot pools.
+
+    For each reshard transfer and each kept snapshot, one byte fragment is
+    read: a conv band range is contiguous as (channels x d_conv), an ssm head
+    range as (heads x headdim x d_state), and the band tail sizes are global
+    dims, equal on both sides. Source offsets come from the source's region
+    layout (per-layer and per-slot strides in bytes); destination offsets come
+    from this rank's live pool tensors. Returns the transfer handles, one per
+    (source rank, region).
+    """
+    sa = ctx.mamba_slot_allocator
+    pools = {"snap_conv": sa.conv_states, "snap_ssm": sa.ssm_states}
+    tails = {
+        "snap_conv": my_mamba.dims.d_conv * sa.conv_states.element_size(),
+        "snap_ssm": (
+            my_mamba.dims.headdim * my_mamba.dims.d_state * sa.ssm_states.element_size()
+        ),
+    }
+    kept = list(zip(alloc["hashes"], alloc["slots"]))
+    triples_by: dict = {}  # (src_rank, region) -> [(local_off, remote_off, nbytes)]
+    for t in transfers:
+        region = "snap_conv" if t.is_conv else "snap_ssm"
+        pool, tail = pools[region], tails[region]
+        elem = pool.element_size()
+        layer_stride = pool.stride(0) * elem
+        slot_stride = pool.stride(1) * elem
+        src_meta = src_region_meta[t.src_rank]["regions"][region]
+        slot_of = src_snap_slots[t.src_rank]
+        nbytes = (t.dst_hi - t.dst_lo) * tail
+        triples = triples_by.setdefault((t.src_rank, region), [])
+        for h, dst_slot in kept:
+            triples.append(
+                (
+                    t.dst_layer * layer_stride + dst_slot * slot_stride + t.dst_lo * tail,
+                    t.src_layer * src_meta["outer_stride_bytes"]
+                    + int(slot_of[h]) * src_meta["inner_bytes"]
+                    + t.src_lo * tail,
+                    nbytes,
+                )
+            )
+    return [
+        backend.begin_pull_raw(src_region_meta[src_rank], region, triples)
+        for (src_rank, region), triples in triples_by.items()
+    ]
 
 
 def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
-                         src_layouts, dst_layouts):
+                         src_layouts, dst_layouts, src_mamba_layouts,
+                         dst_mamba_layouts):
     """Allocate destination blocks and issue the one-sided reads pulling the
     request's KV into them (decode side).
 
     Driven by kv_reshard.plan_kv_reshard: each decode rank reads its
     (layer x head) shard as byte fragments from the prefill ranks that hold
-    it. Mamba snapshots are carried only when a single prefill rank with an
-    identical Mamba shard holds this request's data; a multi-source or hetero
-    remap skips them.
+    it. Mamba snapshots reshard the same way via plan_mamba_reshard: this rank
+    reads its band slices of every usable snapshot from the source ranks'
+    registered pools (in finish(), after the KV commit resolves the hashes).
 
     Args:
         engine: the decode engine.
@@ -245,6 +293,8 @@ def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
             PREFILL_DONE, each {**pull_static_meta, **pull_request_meta}.
         my_layout: this decode rank's KVShardLayout.
         src_layouts / dst_layouts: full prefill / decode KV layout lists.
+        src_mamba_layouts / dst_mamba_layouts: full prefill / decode Mamba
+            layout lists (empty for non-hybrid models).
 
     Returns:
         A NixlPullRecv to complete later, or None if the decode KV cache is
@@ -267,7 +317,6 @@ def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
     src_layout_by_rank = {layout.global_rank: layout for layout in src_layouts}
     kv_plan = kv_reshard.plan_kv_reshard(src_layouts, dst_layouts)
     handles = []
-    source_handoffs: dict = {}  # src_rank -> handoff (the ranks this dst reads from)
     # Attention KV: per source rank, read its head/layer fragments of the
     # missing suffix. Full-head fragments coalesce to whole blocks.
     for transfer in utils.transfers_for_dst(kv_plan, my_layout.global_rank):
@@ -276,7 +325,6 @@ def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
         src_handoff = handoff_by_rank[transfer.src_rank]
         src_layout = src_layout_by_rank[transfer.src_rank]
         _check_pull_dims(src_handoff["kv_dims"], dst_dims)
-        source_handoffs[transfer.src_rank] = src_handoff
         src_layer_slice = transfer.src_layer_slice(src_layout)
         src_head_slice = transfer.src_head_slice(src_layout)
         dst_layer_slice = transfer.dst_layer_slice(my_layout)
@@ -291,19 +339,37 @@ def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
         if descriptors:
             handles.append(backend.begin_pull_raw(src_handoff["region_meta"], "kv", descriptors))
 
-    # Snapshots ship only when a single prefill rank with an identical Mamba
-    # shard holds this request's data, so the snapshot read in finish()
-    # resolves against one peer as whole entries.
-    peer_meta, snapshots = None, []
-    if len(source_handoffs) == 1:
-        single_source = next(iter(source_handoffs.values()))
-        if single_source["snapshots"] and _snapshot_regions_match(
-            backend, single_source["region_meta"]
-        ):
-            peer_meta = single_source["region_meta"]
-            snapshots = list(single_source["snapshots"])
+    # Mamba snapshots: a snapshot is usable only if every prefill rank
+    # published it (identical scheduling makes availability uniform; the
+    # intersection keeps every decode rank's choice consistent, which matters
+    # because divergent snapshot state would diverge the prefix skip across
+    # MP ranks at admission).
+    snap_hashes: list = []
+    snap_transfers: list = []
+    src_snap_slots: dict = {}
+    src_region_meta: dict = {}
+    my_mamba = None
+    if src_mamba_layouts and dst_mamba_layouts:
+        slot_maps = {
+            int(h["global_rank"]): {hash_: slot for hash_, slot in (h["snapshots"] or [])}
+            for h in rank_handoffs
+        }
+        base = rank_handoffs[0]["snapshots"] or []
+        usable = [hash_ for hash_, _ in base if all(hash_ in m for m in slot_maps.values())]
+        if usable:
+            my_mamba = next(
+                m for m in dst_mamba_layouts if m.global_rank == my_layout.global_rank
+            )
+            plan = mamba_reshard.plan_mamba_reshard(src_mamba_layouts, dst_mamba_layouts)
+            snap_transfers = [t for t in plan if t.dst_rank == my_layout.global_rank]
+            snap_hashes = usable
+            for t in snap_transfers:
+                src_snap_slots[t.src_rank] = slot_maps[t.src_rank]
+                src_region_meta[t.src_rank] = handoff_by_rank[t.src_rank]["region_meta"]
     return NixlPullRecv(
         handles=handles, block_ids=dst_block_ids,
         block_hashes=list(rank_handoffs[0]["block_hashes"]),
-        backend=backend, peer_meta=peer_meta, snapshots=snapshots,
+        backend=backend, snap_hashes=snap_hashes, snap_transfers=snap_transfers,
+        src_snap_slots=src_snap_slots, src_region_meta=src_region_meta,
+        my_mamba=my_mamba,
     )

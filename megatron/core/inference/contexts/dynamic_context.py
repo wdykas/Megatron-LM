@@ -4245,7 +4245,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         worker's prefix cache. Returns (keep_indices, target_block_ids).
         Best-effort: an unresolvable hash only costs a future prefix-cache
         sub-hit, so it is skipped, never raised. Shared by
-        disagg_snapshot_pull_plan and _import_mamba_snapshots."""
+        disagg_snapshot_alloc and _import_mamba_snapshots."""
         hash_to_block = self.kv_block_allocator.kv_hash_to_block_id
         keep_indices, target_blocks = [], []
         for i, h in enumerate(hashes):
@@ -4256,29 +4256,26 @@ class DynamicInferenceContext(BaseInferenceContext):
             target_blocks.append(int(local_bid))
         return keep_indices, target_blocks
 
-    def disagg_snapshot_pull_plan(self, snapshot_pairs: list) -> Optional[Dict[str, Any]]:
-        """Build the snapshot read plan for a pull (decode side). Given the
-        prefill's [(block_hash, src_slot), ...], resolve each hash to a local
-        attention block (registered by the KV commit), allocate a local
-        snapshot slot, and return {"transfers", "block_ids", "hashes"}, where
-        transfers are (region, src_slot, local_slot) for snap_conv and
-        snap_ssm. Returns None if there is nothing to pull. The read fills the
-        slots, then disagg_snapshot_commit registers the hashes."""
+    def disagg_snapshot_alloc(self, hashes: list) -> Optional[Dict[str, Any]]:
+        """Resolve hand-off snapshot hashes to local attention blocks
+        (registered by the KV commit) and allocate a local snapshot slot for
+        each (decode side). Returns {"keep_indices", "block_ids", "slots",
+        "hashes"}, where keep_indices index into `hashes`, or None if there is
+        nothing to pull. The caller reads the peer's snapshots into the slots,
+        then disagg_snapshot_commit registers the hashes."""
         sa = self.mamba_slot_allocator
-        if sa is None or not snapshot_pairs:
+        if sa is None or not hashes:
             return None
-        keep, target_blocks = self._disagg_resolve_snapshot_hashes(
-            [h for h, _ in snapshot_pairs]
-        )
+        keep, target_blocks = self._disagg_resolve_snapshot_hashes(list(hashes))
         if not target_blocks:
             return None
-        local_slots = sa.allocate_slots_batch(target_blocks)
-        transfers = []
-        for i, dst in zip(keep, local_slots):
-            transfers.append(("snap_conv", int(snapshot_pairs[i][1]), int(dst)))
-            transfers.append(("snap_ssm", int(snapshot_pairs[i][1]), int(dst)))
-        hashes = [snapshot_pairs[i][0] for i in keep]
-        return {"transfers": transfers, "block_ids": target_blocks, "hashes": hashes}
+        local_slots = [int(x) for x in sa.allocate_slots_batch(target_blocks)]
+        return {
+            "keep_indices": keep,
+            "block_ids": target_blocks,
+            "slots": local_slots,
+            "hashes": [hashes[i] for i in keep],
+        }
 
     def disagg_snapshot_commit(self, block_ids: list, hashes: list) -> None:
         """After the snapshot read has landed, register the hash->block

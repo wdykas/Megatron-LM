@@ -89,9 +89,9 @@ hand-off.
   boundary the re-run starts from — so the decode imports the boundary
   snapshots into its `MambaSlotAllocator` and the native prefix-cache restore
   path does the rest. The live end-state is never transferred (it would
-  double-process the re-run tokens). Snapshots move as whole per-slot entries,
-  so they ship only between identical Mamba shards; a hetero remap skips them
-  and the decode re-prefills past the last usable boundary. The snapshot pool
+  double-process the re-run tokens). Snapshots reshard across arbitrary TP/PP
+  changes via `plan_mamba_reshard`, band by band ([x|B|C] conv channels,
+  ssm heads), the Mamba analog of the attention KV reshard. The snapshot pool
   isn't reset mid-rollout and the KV pin protects a published request's
   snapshots until they are read.
 
@@ -120,7 +120,7 @@ decode has not read yet, so pinned blocks cannot be overwritten.
 | `kv_transfer_push.py` | push family (two-sided NCCL): resharded send / matched receive |
 | `kv_transfer_pull.py` | pull family (one-sided NIXL): register-once metadata + one-sided read |
 | `kv_reshard.py` | TP/PP/EP/ETP KV-shard layouts + the range-intersection reshard planner |
-| `mamba_layout.py` | per-rank Mamba shard identity (snapshot pairing) |
+| `mamba_reshard.py` | heterogeneous TP/PP reshard of Mamba snapshot state |
 | `transfer_backends/base.py` | `KVTransportBackend` interface + backend factory |
 | `transfer_backends/nccl.py` | two-sided push backend (`torch.distributed` P2P) |
 | `transfer_backends/nixl.py` | one-sided pull backend (NIXL RDMA) |
