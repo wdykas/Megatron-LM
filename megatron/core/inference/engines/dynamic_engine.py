@@ -33,6 +33,7 @@ from megatron.core.inference.contexts.dynamic_context import (
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
+from megatron.core.inference.disaggregation.engine_runtime import DisaggEngineRuntime
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
@@ -210,6 +211,9 @@ class DynamicInferenceEngine(AbstractEngine):
         EngineState.STOPPED,
     )
 
+    # Class-level default so test doubles that skip __init__ resolve as aggregated.
+    _disagg = None
+
     @deprecate_args(
         *DEPRECATED_ARGS,
         message="Argument `{name}` has been deprecated. Only pass `controller` and `context`",
@@ -298,6 +302,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Mark the inference engine as active. Cleared in `suspend()` and re-set in `resume()`.
         InferenceMode.set_active()
+
+        # Disaggregation runtime; None => normal aggregated engine.
+        self._disagg = None
 
         # Create cuda graphs.
         self.create_cuda_graphs()
@@ -520,6 +527,31 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.capture_stats = capture_stats
 
+    def set_disaggregation_config(
+        self,
+        *,
+        role,
+        instance_layouts,
+        identity,
+        spawn_coordinator,
+        disagg_router="round_robin",
+        kv_transport_backend="nccl",
+    ):
+        """Mark this engine as a disaggregated prefill/decode shard by
+        attaching a DisaggEngineRuntime, which holds all disagg state and the
+        2-hop KV hand-off. Call before
+        start_listening_to_data_parallel_coordinator. See DisaggEngineRuntime
+        for the argument semantics."""
+        self._disagg = DisaggEngineRuntime(
+            self,
+            role=role,
+            instance_layouts=instance_layouts,
+            identity=identity,
+            spawn_coordinator=spawn_coordinator,
+            disagg_router=disagg_router,
+            kv_transport_backend=kv_transport_backend,
+        )
+
     @internal_api
     async def start_listening_to_data_parallel_coordinator(
         self,
@@ -601,8 +633,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
         local_ip = hostname or socket.gethostname()
 
-        # Spawn a DP coordinator process and get the connection info.
-        if launch_inference_coordinator and self.is_dp_coordinator:
+        disagg_enabled = self._disagg is not None
+        # Disaggregated: ONE coordinator for the whole job, sized to the total
+        # prefill+decode instance count, spawned by the designated rank (the
+        # prefill instance's coordinator). Otherwise: one coordinator per DP
+        # group, spawned by each DP coordinator rank.
+        should_spawn = self._disagg.spawn_coordinator if disagg_enabled else self.is_dp_coordinator
+        if launch_inference_coordinator and should_spawn:
             spawn_context = multiprocessing.get_context('spawn')
             deterministic_mode = torch.are_deterministic_algorithms_enabled()
             dp_pipe, dp_process_pipe = spawn_context.Pipe()
@@ -612,7 +649,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 kwargs={
                     "pipe_connection": dp_process_pipe,
                     "ready_event": coordinator_ready_event,
-                    "data_parallel_size": get_pg_size(self.pg_collection.dp),
+                    # Disagg engines register dynamically (REGISTER_ROLE in the
+                    # coordinator loop, order-independent), so spawn with size 0
+                    # ; no blocking registration count in the coordinator init.
+                    "data_parallel_size": (
+                        0 if disagg_enabled else get_pg_size(self.pg_collection.dp)
+                    ),
                     "tokenizer": self.controller.tokenizer,
                     "max_requests": self.context.max_requests,
                     "inference_coordinator_port": inference_coordinator_port,
@@ -623,6 +665,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     "prefix_caching_routing_alpha": self.context.prefix_caching_routing_alpha,
                     "schedule_output_path": coordinator_schedule_output_path,
                     "hostname": hostname,
+                    "disaggregated": disagg_enabled,
+                    "disagg_router": self._disagg.router_name if disagg_enabled else None,
                 },
             )
             self.inference_coordinator_process.start()
@@ -652,15 +696,21 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             mp_req_addr = None
 
-        # Broadcast addresses to respective ranks.
+        # Broadcast the coordinator address. Disaggregated: the single
+        # coordinator is shared across shards, so broadcast over the whole
+        # disagg group from the spawner (global rank 0). Otherwise: within the
+        # DP group from its source rank.
         bcast = [dp_addr]
-        torch.distributed.broadcast_object_list(bcast, src=dp_src, group=dp_group)
+        if disagg_enabled:
+            torch.distributed.broadcast_object_list(bcast, src=0)
+        else:
+            torch.distributed.broadcast_object_list(bcast, src=dp_src, group=dp_group)
         [dp_addr] = bcast
         bcast = [mp_req_addr]
         torch.distributed.broadcast_object_list(bcast, src=mp_src, group=mp_group)
         [mp_req_addr] = bcast
 
-        identity = f'mp-coord-{dp_rank}'
+        identity = self._disagg.identity if disagg_enabled else f'mp-coord-{dp_rank}'
         if self.is_mp_coordinator:
             # 1. Create dealer sockets where tp_rank = 0 and pp_rank = 0
             #    These will receive requests from an InferenceCoordinator.
@@ -669,8 +719,11 @@ class DynamicInferenceEngine(AbstractEngine):
             self.socket_for_receiving_requests.setsockopt(zmq.IDENTITY, identity.encode('utf-8'))
             self.socket_for_receiving_requests.connect(dp_addr)
 
-            # send empty string. this is used to register with the coordinator.
-            self.socket_for_receiving_requests.send(b"")
+            # Register with the coordinator. Disaggregated: a REGISTER_ROLE message
+            # announcing role + KV layouts so it can 2-hop route + plan reshards.
+            # Otherwise: an empty-string ping (the coordinator just counts them).
+            registration = self._disagg.registration_message() if disagg_enabled else b""
+            self.socket_for_receiving_requests.send(registration)
 
             # 2. Create a publisher socket. This is used to publish or broadcast
             #    requests within the model parallel group
@@ -709,7 +762,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.zmq_context, process_group=None, hostname=hostname
             )
 
-        if launch_inference_coordinator and self.is_dp_coordinator:
+        if launch_inference_coordinator and should_spawn:
             await await_process_call(
                 coordinator_ready_event.wait, self.inference_coordinator_process
             )
@@ -938,6 +991,10 @@ class DynamicInferenceEngine(AbstractEngine):
         request.status = Status.FAILED
         request.add_event_fail()
         self.failed_request_ids.append(request_id)
+
+        # A failed disagg prefill request never reaches export, which is the
+        # only other consumer of its prompt-block-count entry.
+        self.context.disagg_prompt_block_count.pop(request_id, None)
 
         # Send the reply immediately, because it may never get a chance to be sent again.
         if self.use_coordinator and self.is_mp_coordinator:
@@ -2000,11 +2057,15 @@ class DynamicInferenceEngine(AbstractEngine):
         # Handle necessary ZMQ DP coordinator communication.
         # Failed request replies were already sent in _handle_failed_request,
         # so only send completed records here.
-        if self.use_coordinator and self.is_mp_coordinator:
+        if self.use_coordinator:
             records_to_send = [
                 r for r in finished_request_records if r.requests[-1].status != Status.FAILED
             ]
-            if records_to_send:
+            if records_to_send and self._disagg is not None and self._disagg.role == "prefill":
+                # Prefill-only: don't reply to the client; tell the coordinator
+                # each request finished prefill (KV staged) via PREFILL_DONE.
+                self._disagg.send_prefill_done(records_to_send)
+            elif records_to_send and self.is_mp_coordinator:
                 nvtx_range_push("coordinator_communication")
                 payload = msgpack.packb(
                     [Headers.ENGINE_REPLY.value, [r.merge().serialize() for r in records_to_send]],
@@ -2270,6 +2331,11 @@ class DynamicInferenceEngine(AbstractEngine):
             int: The number of messages that were received and processed in this batch.
         """
 
+        # Reap KV transfers posted on the previous step before admitting this
+        # step's batch (disaggregated only; collective across MP ranks).
+        if self._disagg is not None:
+            self._disagg.complete_pending()
+
         nvtx_range_push("drain_zmq_socket")
         all_messages = []
         if self.is_mp_coordinator:
@@ -2298,9 +2364,28 @@ class DynamicInferenceEngine(AbstractEngine):
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
                 sampling_params = SamplingParams.deserialize(sampling_params)
+                if self._disagg is not None and self._disagg.role == "prefill":
+                    # Prefill engine: cap this new request to prefill-only, so it
+                    # stops once the prompt KV is populated; that KV is the
+                    # hand-off payload; decode regenerates from the prompt.
+                    self._disagg.prepare_prefill_request(request_id, prompt, sampling_params)
                 nvtx_range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
                 nvtx_range_pop("add_request")
+            elif header == Headers.SEND_KV:
+                # (prefill) ship a staged request's KV to the chosen decode
+                # instance, resharded to its layout.
+                self._disagg.send_kv(data[1], data[2])
+            elif header == Headers.RECV_KV:
+                # Decode: receive a request's KV, import it (registers the
+                # prefix-cache blocks), then admit it for generation. data[5]
+                # carries the prefill's published hand-off: read descriptors
+                # for pull backends, snapshot hashes (or None) for push.
+                self._disagg.recv_kv(data[1], data[2], data[3], data[4], data[5])
+            elif header == Headers.RELEASE_KV:
+                # Prefill (pull): the decode finished its read; release
+                # the request's pinned KV blocks.
+                self._disagg.release_pinned(data[1])
             elif header == Headers.SET_GENERATION_EPOCH:
                 new_generation_epoch = data[1]
             else:

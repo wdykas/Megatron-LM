@@ -5,7 +5,7 @@ import math
 import operator
 import warnings
 from contextlib import nullcontext
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch  # type: ignore
 import torch.nn.functional as F  # type: ignore
@@ -1079,6 +1079,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # zero the whole buffer so their views start at 0 too, and so the
         # request staging slots start with a deterministic value.
         self._cpu_bookkeeping_buf.fill_(0)
+        # Records each step's async bookkeeping H2D; the next step waits on it
+        # before reusing this pinned buffer (see transfer_bookkeeping_to_gpu).
+        self._bookkeeping_h2d_event = None
 
         _off = 0
         # Per-token state (source-of-truth lives in the coalesced buffer since
@@ -1259,6 +1262,22 @@ class DynamicInferenceContext(BaseInferenceContext):
         # update_requests() (CPU phase), executed by transfer_bookkeeping_to_gpu().
         self._pending_mamba_zeros: list = []
         self._pending_mamba_restores: list = []
+        # Disaggregation state (inert defaults on aggregated engines; the
+        # DisaggEngineRuntime flips the flags at construction).
+        # prefill: stage each finished request's KV for the hand-off.
+        self.disagg_stage_prefill_kv: bool = False
+        # pull transport: stage by block reference instead of copying.
+        self.disagg_pull_mode: bool = False
+        # prefill pull: request_id -> KV blocks pinned for the decode's READ.
+        self.disagg_pinned: dict = {}
+        # prefill: request_id -> staged KV export awaiting SEND_KV/PREFILL_DONE.
+        self.disagg_staged_kv: dict = {}
+        # prefill: request_id -> prompt block count, recorded at SUBMIT (caps
+        # the export to the prompt-covering blocks; see prepare_prefill_request).
+        self.disagg_prompt_block_count: dict = {}
+        # decode: request_ids whose hand-off was imported; consumed at admission
+        # to detect (and warn on) imports that yielded no prefix hit.
+        self.disagg_imported_request_ids: set = set()
 
         # Allocate large non-graphed buffers.
         need_static_addr = (
@@ -2418,6 +2437,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         tensors immediately before the H2D (GPU reads them at `[:n_active]`
         while CPU bookkeeping keeps them at `[paused_count:total_count)`).
         """
+        # Wait for the previous step's async H2D before the CPU overwrites the
+        # shared pinned buffer; an in-flight copy would read mixed old and new
+        # bytes.
+        if self._bookkeeping_h2d_event is not None:
+            self._bookkeeping_h2d_event.synchronize()
+
         n_active = self.total_request_count - self.paused_request_count
         active_slice = slice(self.paused_request_count, self.total_request_count)
         padded_active = max(n_active, self.padded_active_request_count)
@@ -2464,6 +2489,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         if hasattr(self, '_pending_mamba_transfer') and self._pending_mamba_transfer is not None:
             self.mamba_metadata.load_from_cpu(self._pending_mamba_transfer)
             self._pending_mamba_transfer = None
+
+        # Record this step's enqueued H2D so the next step waits on it (above).
+        if self._bookkeeping_h2d_event is None:
+            self._bookkeeping_h2d_event = torch.cuda.Event()
+        self._bookkeeping_h2d_event.record()
 
     def reset_tensors(self) -> None:
         """Fill all bookkeeping tensors with sentinel values."""
@@ -2543,6 +2573,18 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         self.reset_tensors()
         self.reset_metadata()
+
+        # Disaggregation: the reset wipes the allocator, so allocator-coupled
+        # hand-off state is meaningless afterward. Clear the pins (late
+        # RELEASE_KV acks then land as no-ops) and the imported-request
+        # markers. Keep disagg_prompt_block_count and disagg_staged_kv: both
+        # are request-side state consumed by requests still in flight across
+        # this reset (the CUDA-graph warmup reset runs after SUBMITs have
+        # already recorded their caps).
+        if self.disagg_pinned:
+            logging.info("context.reset(): clearing %d disagg KV pins", len(self.disagg_pinned))
+        self.disagg_pinned.clear()
+        self.disagg_imported_request_ids.clear()
 
         # Reset lifetime counters (not reset in reset_metadata, which is also
         # called during suspend/resume where these must persist).
@@ -2758,6 +2800,19 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_blocks_from_pool = max(
             0, overall_required_blocks - already_allocated_blocks - num_matched
         )
+
+        # A request whose hand-off was imported should admit via a prefix hit;
+        # zero matches means the imported KV was discarded before admission and
+        # the full prompt re-prefills. Requests with no complete prompt block
+        # have no hashes and can never hit, so no warning for those.
+        if finished == 0 and req.request_id in self.disagg_imported_request_ids:
+            self.disagg_imported_request_ids.discard(req.request_id)
+            if num_matched == 0 and req.precomputed_block_hashes:
+                logging.warning(
+                    "disagg decode: imported KV for request %s yielded no prefix "
+                    "hit; re-prefilling the full prompt",
+                    req.request_id,
+                )
 
         return (
             matched_block_ids,
@@ -3012,7 +3067,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                 raise ContextOverflowError(req.request_id, "No Mamba slots available")
             self.mamba_metadata.request_to_mamba_state_idx[self.total_request_count] = mamba_idx
 
-            # Restore Mamba state from the block corresponding to prefix_skip_tokens
+            # Restore Mamba state from the block corresponding to prefix_skip_tokens.
+            # Disagg hand-offs also restore here: the KV import registered the
+            # imported boundary snapshots, and the recurrent state is only
+            # correct at a block boundary.
             restore_block_count = prefix_skip_tokens // self.block_size_tokens
             if restore_block_count > 0 and self.mamba_slot_allocator is not None:
                 restore_block_id = matched_block_ids[restore_block_count - 1]
@@ -3942,3 +4000,413 @@ class DynamicInferenceContext(BaseInferenceContext):
             'total_request_count': int(total_request_count),
             'max_requests': int(self.max_requests),
         }
+
+    # --- Disaggregated KV export / import (prefill -> decode handoff) ---
+
+    def _disagg_resolve_export_blocks(self, request_id, internal_idx):
+        """Shared head of export_request_kv / export_request_kv_ref: return
+        (internal_idx, block_ids, block_hashes) for the request.
+
+        Raises for the MLA latent cache and for an empty prompt (both
+        unsupported). block_ids is capped to the prompt-covering count,
+        ceil(prompt_len / block_size): a block-aligned prompt makes the
+        prefill allocate one extra block for its discarded token, which the
+        decode (deriving the count from the prompt) never expects."""
+        if self.cache_mla_latent:
+            raise NotImplementedError(
+                "disaggregated KV transfer does not support the MLA latent KV cache"
+            )
+        # The disagg staging hook always passes the request's live slot (captured
+        # before update_requests frees it), so internal_idx is never None here.
+        assert internal_idx is not None, "disagg export requires the request's live slot"
+        block_count = int(self.request_kv_block_counts[internal_idx].item())
+        # Always set by prepare_prefill_request on SUBMIT (TP-broadcast, so every
+        # MP rank saw it); caps the export to the prompt-covering blocks.
+        cap = self.disagg_prompt_block_count.pop(request_id)
+        block_count = min(block_count, cap)
+        if block_count <= 0:
+            raise ValueError("disaggregation does not support empty prompts")
+        block_ids = self.request_to_kv_block_ids[internal_idx, :block_count].tolist()
+        if self.kv_block_allocator.enable_prefix_caching:
+            block_hashes = self.kv_block_allocator.block_hashes[
+                torch.tensor(block_ids, dtype=torch.int64)
+            ].tolist()
+        else:
+            block_hashes = [-1] * block_count
+        return internal_idx, block_ids, block_hashes
+
+    def export_request_kv(self, request_id: int, internal_idx: int) -> Dict[str, Any]:
+        """Stage a request's KV (and Mamba boundary snapshots) for off-GPU
+        transfer (push path).
+
+        `internal_idx` is the request's live slot; the staging hook captures
+        it before the slot is recycled (the context frees the slot during the
+        step, before the engine's finish loop runs). Raises for the MLA latent
+        cache and for an empty prompt (both unsupported).
+
+        Returns a dict with:
+
+        * staging_tensor: the request's KV blocks, shape (num_blocks, 2,
+          num_layers, block_size_tokens, num_heads_per_partition,
+          hidden_per_head). The decode derives the matching schema from the
+          prompt.
+        * mamba_snapshots: block-boundary Mamba snapshots
+          (_export_mamba_snapshots), or None.
+        """
+        internal_idx, block_ids, _ = self._disagg_resolve_export_blocks(request_id, internal_idx)
+        memory_buffer = self.memory_buffer
+        # Gather the request's blocks in one op: (2, L, n, BS, H, HD) -> staging
+        # (n, 2, L, BS, H, HD). contiguous() gives an owned buffer to hand off.
+        block_ids_tensor = torch.tensor(block_ids, dtype=torch.int64, device=memory_buffer.device)
+        staging = memory_buffer[:, :, block_ids_tensor].permute(2, 0, 1, 3, 4, 5).contiguous()
+        return {
+            "staging_tensor": staging,
+            "mamba_snapshots": (
+                self._export_mamba_snapshots(block_ids) if self.is_hybrid_model else None
+            ),
+        }
+
+    def _disagg_snapshot_block_slots(self, block_ids: list):
+        """Yield (block_id, snapshot_slot, block_hash) for each block with a
+        cached Mamba boundary snapshot and a registered hash. Empty for
+        non-hybrid models and without prefix caching. Shared by the push
+        (_export_mamba_snapshots) and pull (_export_snapshot_refs) exporters."""
+        sa = self.mamba_slot_allocator
+        if sa is None or not block_ids:
+            return
+        # Gather slot + hash for all ids with one sync each (both tensors are
+        # CPU-resident; disagg requires prefix caching, so block_hashes exists).
+        ids = torch.as_tensor(block_ids, dtype=torch.int64)
+        slots = sa.block_to_slot[ids].tolist()
+        hashes = self.kv_block_allocator.block_hashes[ids].tolist()
+        for bid, slot, h in zip(block_ids, slots, hashes):
+            if slot < 0 or h == -1:
+                continue
+            yield bid, slot, h
+
+    def _export_mamba_snapshots(self, block_ids: list) -> Optional[Dict[str, Any]]:
+        """Collect per-block Mamba snapshots for the listed attention block
+        ids (push path).
+
+        The snapshots populate the decode worker's MambaSlotAllocator so
+        admission restores the recurrent state at the block boundary the
+        re-run starts from. They are the hand-off's only Mamba payload: the
+        live end-state is never transferred, since it is only correct when
+        zero tokens re-run, which admission never does.
+
+        Returns a dict with staged conv/ssm tensors of shape (num_snapshots,
+        num_mamba_layers, *state_shape) plus the matching block_hashes so the
+        decode side can look them up by hash, or None when there is no
+        MambaSlotAllocator or none of the request's blocks have a slot.
+        """
+        pairs = list(self._disagg_snapshot_block_slots(block_ids))
+        if not pairs:
+            return None
+        slot_indices = [slot for _, slot, _ in pairs]
+        hashes = [h for _, _, h in pairs]
+
+        slot_tensor = torch.tensor(slot_indices, dtype=torch.int64)
+        # Slot tensors live on GPU; the gather copies the right rows out, then
+        # rearrange to (num_snapshots, num_mamba_layers, *state_shape) so decode
+        # can index by snapshot rather than by layer.
+        sa = self.mamba_slot_allocator
+        conv = sa.conv_states[:, slot_tensor].contiguous().clone().transpose(0, 1).contiguous()
+        ssm = sa.ssm_states[:, slot_tensor].contiguous().clone().transpose(0, 1).contiguous()
+
+        return {"block_hashes": hashes, "conv_states_tensor": conv, "ssm_states_tensor": ssm}
+
+    def import_request_kv(
+        self, staging: Tensor, block_hashes: list, mamba_snapshots: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Inject a received KV staging tensor (and optional Mamba boundary
+        snapshots) into this context (push path).
+
+        `staging` is (num_blocks, 2, num_layers, block_size, heads, hidden),
+        already populated with the remote K/V data. A geometry or dtype
+        mismatch against this rank's memory_buffer is a prefill/decode config
+        bug and raises; a full KV cache is a runtime condition and returns
+        None (the caller re-prefills).
+
+        Returns {"block_ids", "block_hashes"}: the local blocks written,
+        registered under the hashes so admission prefix-hits them.
+        """
+        if self.cache_mla_latent:
+            raise NotImplementedError(
+                "disaggregated KV transfer does not support the MLA latent KV cache"
+            )
+
+        memory_buffer = self.memory_buffer
+        _, num_layers, total_blocks, block_size, heads, hidden = memory_buffer.shape
+        expected = (2, num_layers, block_size, heads, hidden)
+        if tuple(staging.shape[1:]) != expected or staging.dtype != memory_buffer.dtype:
+            raise ValueError(
+                f"disagg KV import layout mismatch: staging "
+                f"{tuple(staging.shape)}/{staging.dtype} vs local "
+                f"(n, {', '.join(map(str, expected))})/{memory_buffer.dtype}"
+            )
+
+        block_count = int(staging.shape[0])
+        local_block_ids_tensor = self.kv_block_allocator.allocate_memory_blocks(block_count)
+        if local_block_ids_tensor is None:
+            return None
+        local_block_ids = local_block_ids_tensor.tolist()
+
+        # Check every block id is in range before writing in place; an
+        # out-of-range id corrupts memory.
+        bad = [b for b in local_block_ids if b < 0 or b >= total_blocks]
+        assert not bad, f"DISAGG_IMPORT bad write: bad_ids={bad} total_blocks={total_blocks}"
+        # One batched scatter (mirrors the export's single gather).
+        ids_dev = torch.tensor(local_block_ids, dtype=torch.int64, device=memory_buffer.device)
+        memory_buffer[:, :, ids_dev] = staging.permute(1, 2, 0, 3, 4, 5)
+
+        # Register hashes + release the alloc-time pin (shared with the pull
+        # path's disagg_pull_commit; see _disagg_register_and_release).
+        block_hashes = list(block_hashes)
+        self._disagg_register_and_release(local_block_ids, block_hashes)
+
+        if mamba_snapshots is not None:
+            self._import_mamba_snapshots(mamba_snapshots)
+
+        return {"block_ids": local_block_ids, "block_hashes": block_hashes}
+
+    # --- one-sided (pull) hand-off: move KV by block reference, no copy -----
+    def export_request_kv_ref(self, request_id: int, internal_idx: int) -> Dict[str, Any]:
+        """Capture a request's KV by reference (block ids, hashes, snapshot
+        refs) with no copy, for the pull hand-off (prefill side). The decode
+        peer reads these blocks straight from this rank's registered
+        memory_buffer, so the blocks must stay valid until read; after the
+        request frees its slot they linger in the prefix cache. Raises for the
+        MLA latent cache and for an empty prompt (both unsupported)."""
+        internal_idx, block_ids, block_hashes = self._disagg_resolve_export_blocks(
+            request_id, internal_idx
+        )
+        # Pin the KV blocks (ref count) so they survive this request's release
+        # into the prefix cache and cannot be reallocated before the decode's
+        # one-sided read; released on the RELEASE_KV ack
+        # (disagg_release_pinned). The coordinator's flow-control window bounds
+        # how many pins can be outstanding. The pin also keeps the blocks'
+        # Mamba boundary snapshots from being evicted until the snapshot read.
+        self.kv_block_allocator.block_ref_counts[torch.tensor(block_ids, dtype=torch.int64)] += 1
+        self.disagg_pinned[request_id] = list(block_ids)
+        # Only the per-request fields; the static geometry (kv_dims/region meta)
+        # rides pull_static_meta, so pull_request_meta drops the rest.
+        return {
+            "block_count": len(block_ids),
+            "block_ids": block_ids,
+            "block_hashes": block_hashes,
+            "snapshots": self._export_snapshot_refs(block_ids),
+        }
+
+    def disagg_export_request_kv(self, request_id: int, internal_idx: int) -> Dict[str, Any]:
+        """Capture a finished request's KV for the disagg hand-off,
+        dispatching on this context's transport mode: by reference (pull) or a
+        staging copy (push). The caller stages the result until the
+        coordinator names the decode target."""
+        if self.disagg_pull_mode:
+            return self.export_request_kv_ref(request_id, internal_idx=internal_idx)
+        return self.export_request_kv(request_id, internal_idx=internal_idx)
+
+    def _export_snapshot_refs(self, block_ids: list) -> list:
+        """Per-block Mamba snapshot references for the request (pull side):
+        [(block_hash, snapshot_slot), ...] for blocks that have a cached
+        boundary snapshot and a valid hash. The decode reads these snapshot
+        slots from this rank's registered snapshot buffers, which the KV pin
+        keeps from being evicted until read."""
+        return [(h, slot) for _, slot, h in self._disagg_snapshot_block_slots(block_ids)]
+
+    def _disagg_resolve_snapshot_hashes(self, hashes: list):
+        """Map hand-off snapshot `hashes` to local attention blocks
+        (registered by the KV import), keeping only those resident in this
+        worker's prefix cache. Returns (keep_indices, target_block_ids).
+        Best-effort: an unresolvable hash only costs a future prefix-cache
+        sub-hit, so it is skipped, never raised. Shared by
+        disagg_snapshot_alloc and _import_mamba_snapshots."""
+        hash_to_block = self.kv_block_allocator.kv_hash_to_block_id
+        keep_indices, target_blocks = [], []
+        for i, h in enumerate(hashes):
+            local_bid = hash_to_block.get(h)
+            if local_bid is None:
+                continue
+            keep_indices.append(i)
+            target_blocks.append(int(local_bid))
+        return keep_indices, target_blocks
+
+    def disagg_snapshot_alloc(self, hashes: list) -> Optional[Dict[str, Any]]:
+        """Resolve hand-off snapshot hashes to local attention blocks
+        (registered by the KV commit) and allocate a local snapshot slot for
+        each (decode side). Returns {"keep_indices", "block_ids", "slots",
+        "hashes"}, where keep_indices index into `hashes`, or None if there is
+        nothing to pull. The caller reads the peer's snapshots into the slots,
+        then disagg_snapshot_commit registers the hashes."""
+        sa = self.mamba_slot_allocator
+        if sa is None or not hashes:
+            return None
+        keep, target_blocks = self._disagg_resolve_snapshot_hashes(list(hashes))
+        if not target_blocks:
+            return None
+        local_slots = [int(x) for x in sa.allocate_slots_batch(target_blocks)]
+        return {
+            "keep_indices": keep,
+            "block_ids": target_blocks,
+            "slots": local_slots,
+            "hashes": [hashes[i] for i in keep],
+        }
+
+    def disagg_snapshot_commit(self, block_ids: list, hashes: list) -> None:
+        """After the snapshot read has landed, register the hash->block
+        mapping in the slot allocator so prefix-cache sub-hits restore the
+        Mamba state at these boundaries."""
+        self.mamba_slot_allocator.register_block_hashes_batch(block_ids, hashes)
+
+    def disagg_release_pinned(self, request_id: int) -> None:
+        """Release the KV blocks pinned for `request_id` by
+        export_request_kv_ref, on the decode's read-done ack (RELEASE_KV).
+        The coordinator sends at most one RELEASE_KV per hand-off, but a
+        missing entry is a legal no-op: a drop can fire before the prefill
+        finished (no pin exists yet), and context.reset() clears leftover
+        pins, whose late acks then land here after the allocator was wiped."""
+        block_ids = self.disagg_pinned.pop(request_id, None)
+        if block_ids is None:
+            return
+        # Runs from the engine's coordinator-message loop, outside
+        # inference_mode, but the allocator's ref-count tensors are inference
+        # tensors; wrap the in-place release like other allocator mutations.
+        with torch.inference_mode():
+            self.kv_block_allocator.release_memory_blocks(
+                torch.tensor(block_ids, dtype=torch.int64)
+            )
+
+    def disagg_pull_match_prefix(self, block_hashes: list) -> Dict[str, Any]:
+        """Find the longest prefix of the prefill's published block_hashes
+        already resident in this rank's KV prefix cache, so the pull can skip
+        re-transferring those blocks. Returns {"reused_block_ids",
+        "match_len"}; transiently pins the reused blocks so they survive
+        eviction until disagg_pull_commit releases them. Empty when prefix
+        caching is off or nothing matches."""
+        empty = {"reused_block_ids": [], "match_len": 0}
+        if not self.kv_block_allocator.enable_prefix_caching:
+            return empty
+        hashes = list(block_hashes or [])
+        kv_hash_to_block = self.kv_block_allocator.kv_hash_to_block_id
+        if not hashes:
+            return empty
+        # Forward scan stops at the first unhashed (-1, the trailing partial
+        # block) or non-resident hash, yielding the longest resident prefix.
+        reused: list = []
+        for h in hashes:
+            if h is None or h == -1 or h not in kv_hash_to_block:
+                break
+            reused.append(int(kv_hash_to_block[h]))
+        if not reused:
+            return empty
+        self.kv_block_allocator.block_ref_counts[torch.tensor(reused, dtype=torch.int64)] += 1
+        return {"reused_block_ids": reused, "match_len": len(reused)}
+
+    def disagg_pull_unmatch(self, reused_block_ids: list) -> None:
+        """Release the transient pin taken by disagg_pull_match_prefix, on the
+        failure path where the suffix allocation fails and the pull is
+        abandoned."""
+        if reused_block_ids:
+            self.kv_block_allocator.release_memory_blocks(
+                torch.tensor(list(reused_block_ids), dtype=torch.int64)
+            )
+
+    def disagg_pull_alloc(self, block_count: int) -> Optional[Dict[str, Any]]:
+        """Allocate destination KV blocks for an incoming pull. Returns
+        {"block_ids"}, or None if the KV cache is full (the caller then admits
+        to re-prefill). block_count may be 0 (full prefix hit: nothing new to
+        pull). The caller reads the peer's data into these blocks, then calls
+        disagg_pull_commit."""
+        if block_count == 0:
+            return {"block_ids": []}
+        ids_t = self.kv_block_allocator.allocate_memory_blocks(block_count)
+        if ids_t is None:
+            return None
+        block_ids = ids_t.tolist()
+        total_blocks = self.memory_buffer.shape[2]
+        bad = [b for b in block_ids if b < 0 or b >= total_blocks]
+        assert (
+            not bad and len(block_ids) == block_count
+        ), f"DISAGG_PULL_ALLOC bad ids={bad} n={len(block_ids)} block_count={block_count}"
+        return {"block_ids": block_ids}
+
+    def _disagg_register_and_release(self, block_ids: list, block_hashes: list) -> None:
+        """Commit received or pulled KV blocks into the prefix cache: register
+        the valid (block, hash) pairs (dropping -1 sentinels) and release the
+        alloc-time ref_count=1 pin, so the prefix-cache match grows from the
+        cached ref_count==0 state. Shared tail of import_request_kv (push) and
+        disagg_pull_commit (pull)."""
+        if not self.kv_block_allocator.enable_prefix_caching:
+            return
+        # Hashes cover a leading prefix of the blocks: pull sends one per block
+        # (-1 for the trailing partial block); push derives them from the prompt,
+        # which hashes only complete blocks, so a partial trailing block has no
+        # hash at all. zip truncates to the hashed prefix; -1/None are dropped.
+        valid = [(b, h) for b, h in zip(block_ids, block_hashes) if h is not None and h != -1]
+        if valid:
+            self.kv_block_allocator.register_kv_block_hashes(
+                [b for b, _ in valid], [h for _, h in valid]
+            )
+        self.kv_block_allocator.release_memory_blocks(torch.tensor(block_ids, dtype=torch.int64))
+
+    def disagg_pull_commit(self, block_ids: list, block_hashes: list) -> Dict[str, Any]:
+        """After the read has landed the peer's KV into `block_ids`, register
+        the block hashes so the prefix-cache match treats them as populated,
+        and release the alloc-time pin. The tail of import_request_kv minus
+        the staging copy (the data arrived via the one-sided read)."""
+        block_hashes = list(block_hashes)
+        self._disagg_register_and_release(block_ids, block_hashes)
+        return {"block_ids": block_ids, "block_hashes": block_hashes}
+
+    def _import_mamba_snapshots(self, snapshots: Dict[str, Any]) -> None:
+        """Populate the local MambaSlotAllocator with snapshots the prefill
+        peer captured at attention block boundaries (push path). Admission
+        then restores the recurrent state at the boundary the re-run starts
+        from, via the prefix-cache restore path.
+
+        Each snapshot's hash is resolved to the local attention block the KV
+        import registered, a Mamba slot is allocated for it, the snapshotted
+        states are copied in, and the hash->block mapping is registered so the
+        restore path finds it on a sub-prefix hit. Snapshots are best-effort:
+        a missing or unresolvable snapshot only costs a shorter prefix skip at
+        admission, never a wrong result, so anything off is skipped rather
+        than raised.
+        """
+        slot_allocator = self.mamba_slot_allocator
+        if slot_allocator is None:
+            return
+
+        hashes = list(snapshots["block_hashes"])
+        if not hashes:
+            return
+        conv = snapshots["conv_states_tensor"]
+        ssm = snapshots["ssm_states_tensor"]
+        # Conv / SSM shapes are (num_snapshots, num_mamba_layers, *state_shape).
+        if conv.shape[0] != len(hashes) or ssm.shape[0] != len(hashes):
+            return
+
+        keep_indices, target_block_ids = self._disagg_resolve_snapshot_hashes(hashes)
+        if not target_block_ids:
+            return
+
+        slots = slot_allocator.allocate_slots_batch(target_block_ids)
+
+        # Bulk-copy snapshots → slot_allocator.{conv,ssm}_states.
+        # The slot allocator stores (num_mamba_layers, max_slots, *state_shape);
+        # our staged tensors are (num_snapshots, num_mamba_layers, *state_shape).
+        slot_tensor = torch.tensor(slots, dtype=torch.int64)
+        keep_tensor = torch.tensor(keep_indices, dtype=torch.int64)
+        # Move snapshots to the slot allocator's device.
+        device = slot_allocator.conv_states.device
+        conv_slice = conv.index_select(0, keep_tensor).to(device=device)
+        ssm_slice = ssm.index_select(0, keep_tensor).to(device=device)
+        slot_tensor_dev = slot_tensor.to(device=device)
+        # Transpose back to (num_mamba_layers, num_snapshots, *state_shape)
+        # for fancy-indexed assignment.
+        slot_allocator.conv_states[:, slot_tensor_dev] = conv_slice.transpose(0, 1)
+        slot_allocator.ssm_states[:, slot_tensor_dev] = ssm_slice.transpose(0, 1)
+
+        # Register hash → block_id so the slot allocator's lookups (and
+        # the engine's restoration probes) find these on sub-prefix hits.
+        registered_hashes = [hashes[i] for i in keep_indices]
+        slot_allocator.register_block_hashes_batch(target_block_ids, registered_hashes)

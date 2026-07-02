@@ -4,6 +4,7 @@ import logging
 from argparse import ArgumentParser
 from functools import partial
 from typing import Optional
+
 import torch
 
 from gpt_builders import gpt_builder
@@ -38,8 +39,16 @@ from model_provider import model_provider
 logger = logging.getLogger(__name__)
 
 
-def get_model_for_inference() -> MegatronModule:
-    """Initialize model and load checkpoint for inference."""
+def get_model_for_inference(pg_collection=None, config=None) -> MegatronModule:
+    """Initialize model and load checkpoint for inference.
+
+    Args:
+        pg_collection: Optional ``ProcessGroupCollection`` to build the model
+            against, instead of the global MPU layout. Used to instantiate a
+            replica at a parallelism that differs from the launched job (e.g.
+            a disaggregated prefill/decode mesh, or an RL rollout mesh).
+        config: Optional transformer config override matching ``pg_collection``.
+    """
 
     args = get_args()
 
@@ -58,8 +67,15 @@ def get_model_for_inference() -> MegatronModule:
     else:
         raise ValueError(f"Invalid model provider {args.model_provider}")
 
-    # Build model.
-    model = _get_model(partial(model_provider, model_builder), wrap_with_ddp=False)
+    # Build model. When a pg_collection is given, close over it in the
+    # provider (so the model's layers use that layout) and pass it to
+    # get_model (which uses it for pp pre/post-process placement).
+    model = _get_model(
+        partial(model_provider, model_builder, config=config, pg_collection=pg_collection),
+        wrap_with_ddp=False,
+        config=config,
+        pg_collection=pg_collection,
+    )
 
     # Load checkpoint.
     assert args.load is not None
