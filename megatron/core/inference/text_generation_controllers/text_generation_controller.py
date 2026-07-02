@@ -1496,14 +1496,7 @@ class TextGenerationController:
         # collectives to avoid a hang.
         self._dummy_serial_mtp_forward()
 
-        # clear the context of any temporary state from the dummy forward.
-        # TODO(peter): this full reset also wipes the prefix cache (and zeroes
-        # disagg KV pins) on every idle loop iteration -- an idle disagg
-        # prefill/decode runs this constantly while its peer works, so cached
-        # blocks never survive an idle phase. context.reset() tolerates it
-        # (pins are cleared, late RELEASE_KV acks no-op, staged exports and
-        # prompt caps survive), but a scoped cleanup of just the dummy step's
-        # bookkeeping would let the prefix cache live across idleness.
+        # clear the context of any temporary state from the dummy forward
         context.reset()
 
     @torch.inference_mode()
@@ -1679,14 +1672,12 @@ class TextGenerationController:
                 if valid:
                     finished_routing_block_ids[req_id] = valid
 
-        # Disaggregation (prefill engine): grab each finished request's KV now.
-        # The hand-off to decode happens later, when the coordinator's SEND_KV
-        # names the target -- but update_requests (below) frees the slot first,
-        # so we must capture it here and hold it in disagg_staged_kv.
+        # Disaggregation (prefill engine): capture each finished request's KV
+        # now. The hand-off to decode happens later, when the coordinator names
+        # the target, but update_requests below frees the slot first.
         if context.disagg_stage_prefill_kv and finished_idxs.numel() > 0:
             staged_kv = context.disagg_staged_kv
-            # The context picks how to capture based on its transport mode: a
-            # by-reference pin (pull/NIXL) or a staging copy (push/NCCL).
+            # The context captures by reference-pin (pull) or staging copy (push).
             for fidx in finished_idxs.tolist():
                 req_id = int(context.request_ids[fidx].item())
                 staged_kv[req_id] = context.disagg_export_request_kv(req_id, internal_idx=int(fidx))

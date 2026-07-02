@@ -16,13 +16,13 @@ class DisaggRouter(abc.ABC):
 
     Swap in a different policy (KV-/load-aware, or a Dynamo router) by
     implementing these five methods and registering the class under a name
-    (:func:`register_disagg_router`); the coordinator resolves it by name so the
-    choice survives the spawn boundary. Implementations hold no sockets and do
-    no I/O -- the coordinator owns the transport."""
+    (register_disagg_router); the coordinator resolves it by name so the
+    choice survives the spawn boundary. Implementations hold no sockets and
+    do no I/O; the coordinator owns the transport."""
 
     @abc.abstractmethod
     def register(self, identity, role: str) -> None:
-        """Record an engine + its role (``"prefill"``/``"decode"``)."""
+        """Record an engine and its role ("prefill"/"decode")."""
 
     @abc.abstractmethod
     def remove(self, identity) -> None:
@@ -34,29 +34,28 @@ class DisaggRouter(abc.ABC):
 
     @abc.abstractmethod
     def route_prefill_done(self, request_id: int) -> Tuple[object, object]:
-        """Hop 2: pick the decode engine; return ``(prefill_id, decode_id)``."""
+        """Hop 2: pick the decode engine; return (prefill_id, decode_id)."""
 
     @abc.abstractmethod
     def forget(self, request_id: int) -> None:
         """Drop per-request state once the reply has been routed home."""
 
     def requests_involving(self, identity) -> List[int]:
-        """Request ids currently routed through ``identity`` (as prefill or
-        decode) -- what the coordinator must drop when the engine dies.
-        Default: none (a router that doesn't track this skips the dead-engine
-        sweep; the coordinator still stops routing to the engine)."""
+        """Request ids currently routed through `identity` on either hop:
+        what the coordinator must drop when the engine dies. Default: none (a
+        router that does not track this skips the dead-engine sweep; the
+        coordinator still stops routing to the engine)."""
         return []
 
 
 class DisaggRouting(DisaggRouter):
-    """Sequences a request prefill-engine -> (KV handoff) -> decode-engine.
+    """Round-robin 2-hop router: prefill engine -> (KV handoff) -> decode
+    engine.
 
-    Engines are identified by their transport identity (bytes for ZMQ;
-    any hashable in tests). Holds no sockets and does no I/O -- it only decides
-    *which* engine each hop goes to and remembers the per-request pairing so the
-    final reply can be routed home. Selection is round-robin within each role
-    (deterministic given registration order); swap :meth:`_pick_decode` for a
-    prefix/load-aware policy later.
+    Engines are identified by their transport identity (bytes for ZMQ; any
+    hashable in tests). Decides which engine each hop goes to and remembers
+    the per-request pairing so the final reply can be routed home. Selection
+    is round-robin within each role, deterministic given registration order.
     """
 
     def __init__(self) -> None:
@@ -90,10 +89,7 @@ class DisaggRouting(DisaggRouter):
 
     def route_submit(self, request_id: int):
         """Hop 1: pick the prefill engine for a newly submitted request."""
-        # TODO: round-robin is not optimal -- it ignores per-engine load (queue
-        # depth / in-flight tokens) and prefix-cache locality. A better policy
-        # would pick the least-loaded prefill, or one that already holds a
-        # matching prompt prefix, instead of cycling blindly.
+        # TODO: load- and prefix-locality-aware selection instead of round-robin.
         if not self.prefill_engines:
             raise RuntimeError("no prefill engines registered")
         ident = self.prefill_engines[self._prefill_rr % len(self.prefill_engines)]
@@ -102,17 +98,17 @@ class DisaggRouting(DisaggRouter):
         return ident
 
     def route_prefill_done(self, request_id: int) -> Tuple[object, object]:
-        """Hop 2: a request finished prefill -- pick its decode engine.
+        """Hop 2: a request finished prefill; pick its decode engine.
 
-        Returns ``(prefill_identity, decode_identity)``: the coordinator sends
+        Returns (prefill_identity, decode_identity): the coordinator sends
         SEND_KV to the prefill engine and RECV_KV to the decode engine.
         """
         if not self.decode_engines:
             raise RuntimeError("no decode engines registered")
         dec = self._pick_decode(request_id)
         self._req_decode[request_id] = dec
-        # None if this router never saw the submit (the coordinator guarantees
-        # submit-first; a standalone router tolerates it -- see route tests).
+        # None if this router never saw the submit; the coordinator guarantees
+        # submit-first, but a standalone router tolerates it.
         prefill = self._req_prefill.get(request_id)
         return prefill, dec
 
@@ -122,17 +118,13 @@ class DisaggRouting(DisaggRouter):
         self._req_decode.pop(request_id, None)
 
     def requests_involving(self, identity) -> List[int]:
-        """Request ids routed through ``identity`` on either hop (snapshot)."""
+        """Request ids routed through `identity` on either hop (snapshot)."""
         rids = {rid for rid, ident in self._req_prefill.items() if ident == identity}
         rids.update(rid for rid, ident in self._req_decode.items() if ident == identity)
         return list(rids)
 
     def _pick_decode(self, request_id: int):
-        # TODO: round-robin is not optimal -- it ignores decode-side load (free
-        # KV blocks / running sequences) and the cost of the KV reshard from the
-        # request's prefill engine to the chosen decode. A better policy would
-        # prefer a decode with capacity and a layout that makes the handoff cheap
-        # (matching/co-located parallelism), rather than cycling blindly.
+        # TODO: load- and handoff-cost-aware selection instead of round-robin.
         dec = self.decode_engines[self._decode_rr % len(self.decode_engines)]
         self._decode_rr += 1
         return dec
@@ -145,12 +137,12 @@ _DISAGG_ROUTERS: Dict[str, Callable[[], DisaggRouter]] = {}
 
 
 def register_disagg_router(name: str, factory: Callable[[], DisaggRouter]) -> None:
-    """Register a :class:`DisaggRouter` factory under ``name`` (call at import)."""
+    """Register a DisaggRouter factory under `name` (call at import time)."""
     _DISAGG_ROUTERS[name] = factory
 
 
 def make_disagg_router(name: str = "round_robin") -> DisaggRouter:
-    """Instantiate the router registered under ``name``."""
+    """Instantiate the router registered under `name`."""
     try:
         return _DISAGG_ROUTERS[name]()
     except KeyError:

@@ -2,21 +2,20 @@
 
 """Prefill->decode KV transfer, pull family: one-sided (RDMA, NIXL) hand-off.
 
-The prefill registers its paged KV (+ Mamba snapshot) buffers ONCE and the
-decode rank READs the prefill's blocks straight into its own freshly-allocated
-blocks -- no staging copy, no per-request registration. The prefill publishes
-only references (block ids + snapshot refs + the static region meta); the
-coordinator relays them to the decode. Mirrors the reference NIXL backend. The
-two-sided (push) family lives in ``kv_transfer_push.py``.
+The prefill registers its paged KV (and Mamba snapshot) buffers once; the
+decode rank reads the prefill's blocks straight into its own freshly allocated
+blocks, with no staging copy and no per-request registration. The prefill
+publishes only references (block ids, snapshot refs, static region meta),
+which the coordinator relays to the decode. The two-sided (push) family lives
+in kv_transfer_push.py.
 
-Hybrid (Mamba) models hand off *block-boundary snapshots*, not the live
-end-state: admission always re-runs at least the trailing tokens of the prompt,
-and the recurrent Mamba state is only correct when restored at the block
-boundary the re-run starts from -- which is exactly what the native
-prefix-cache restore path does with the imported snapshots. Snapshots move as
-whole per-slot entries, so they ship only between identical Mamba shards; a
-hetero remap skips them and the decode re-prefills past the last usable
-boundary.
+Hybrid (Mamba) models hand off block-boundary snapshots rather than the live
+end-state: admission always re-runs at least the trailing tokens of the
+prompt, and the recurrent Mamba state is only correct when restored at the
+block boundary the re-run starts from, which is what the prefix-cache restore
+path does with the imported snapshots. Snapshots move as whole per-slot
+entries, so they ship only between identical Mamba shards; a hetero remap
+skips them and the decode re-prefills past the last usable boundary.
 """
 
 from __future__ import annotations
@@ -30,18 +29,17 @@ from megatron.core.inference.disaggregation import kv_reshard, utils
 
 
 def pull_static_meta(backend, my_layout, kv_dims):
-    """(prefill) This rank's request-invariant pull metadata. Built once and
-    merged with :func:`pull_request_meta` (``{**static, **request}``) per request,
-    so the per-request hand-off carries only block references, not this blob.
+    """Build this prefill rank's request-invariant pull metadata.
 
-    Pipeline: engine gathers it once at registration -> attached to PREFILL_DONE
-    -> consumed by the decode's ``post_pull_request_kv``.
+    Gathered once at registration and merged with pull_request_meta per
+    request, so the per-request hand-off carries only block references.
 
     Args:
-        backend: this rank's one-sided (NIXL) transport, regions already registered.
-        my_layout: this rank's ``KVShardLayout`` (gives the shard identity).
-        kv_dims: KV buffer geometry ``{num_layers, total_blocks, block_size, heads,
-            hidden, elem}``.
+        backend: this rank's one-sided (NIXL) transport, regions already
+            registered.
+        my_layout: this rank's KVShardLayout.
+        kv_dims: KV buffer geometry {num_layers, total_blocks, block_size,
+            heads, hidden, elem}.
     """
     return {
         "global_rank": int(my_layout.global_rank),
@@ -51,22 +49,18 @@ def pull_static_meta(backend, my_layout, kv_dims):
 
 
 def pull_request_meta(ref_payload):
-    """(prefill) A request's block-level references -- the per-request half of the
-    hand-off. Selects only the fields that vary per request, dropping the static
-    geometry in ``ref_payload`` (that goes in :func:`pull_static_meta` instead).
-    Replicated across the MP group (every rank schedules identically), so one
-    rank's copy is authoritative for all; merged onto each rank's
-    :func:`pull_static_meta` to form the hand-off.
+    """Build a request's block-level references, the per-request half of the
+    hand-off.
 
-    Pipeline: engine builds it per request in ``publish_kv`` -> attached to
-    PREFILL_DONE -> the decode's ``post_pull_request_kv`` READs these blocks
-    from the registered ``memory_buffer`` (no copy).
+    Keeps only the fields that vary per request; the static geometry goes in
+    pull_static_meta. Block ids are replicated across the MP group (every rank
+    schedules identically), so one rank's copy is authoritative for all.
 
     Args:
-        ref_payload: the dict returned by ``context.export_request_kv_ref(request_id)``.
+        ref_payload: the dict returned by context.export_request_kv_ref().
 
     Returns:
-        ``{block_ids, block_hashes, block_count, snapshots}``.
+        {block_ids, block_hashes, block_count, snapshots}.
     """
     return {
         "block_ids": ref_payload["block_ids"],
@@ -78,24 +72,22 @@ def pull_request_meta(ref_payload):
 
 @dataclass
 class NixlPullRecv:
-    """Decode side: an in-flight one-sided READ of a request's blocks.
-    :meth:`finish` waits the read, then commits -- registers the block hashes
-    (the KV already landed in the allocated blocks), mirroring
-    ``DecodeRecv.finish``. If the prefill published Mamba prefix-cache
-    ``snapshots``, a second READ pulls them after the KV commit.
+    """Decode side: an in-flight one-sided read of a request's blocks.
 
-    The only pin is the **KV block** ref-count pin (held on the prefill during
-    the hand-off); the prefill's snapshot slots stay valid for the second READ
-    only as a side effect of it, since snapshot eviction is gated on the KV
-    block ref-count being 0.
+    finish() waits the read, then commits by registering the block hashes (the
+    KV already landed in the allocated blocks). If the prefill published Mamba
+    snapshots, a second read pulls them after the KV commit. Only the KV
+    blocks are ref-count pinned on the prefill; the snapshot slots stay valid
+    for the second read because snapshot eviction is gated on that same
+    ref count.
 
     Attributes:
-        handles: pollable transport handles for the in-flight READ(s).
+        handles: pollable transport handles for the in-flight reads.
         block_ids: destination KV block ids (reused prefix + newly pulled).
         block_hashes: per-block hashes to register on commit.
-        backend: the one-sided transport (for the second, snapshot READ).
-        peer_meta: the single source's region meta (snapshot READ); None when
-            snapshots are skipped (multi-source or hetero Mamba shard).
+        backend: the one-sided transport, for the snapshot read.
+        peer_meta: the single source's region meta; None when snapshots are
+            skipped (multi-source or hetero Mamba shard).
         snapshots: prefill's Mamba snapshot refs to pull, or empty.
     """
 
@@ -107,30 +99,24 @@ class NixlPullRecv:
     snapshots: List = field(default_factory=list)
 
     def poll(self) -> bool:
-        """Non-blocking: ``True`` iff every in-flight READ for this request has
-        drained. Lets the engine admit completed pulls without blocking the loop
-        on a slower one (it just rechecks next step). Empty handles (e.g. a full
-        prefix hit) read as done."""
+        """Return True if every in-flight read for this request has drained,
+        without blocking. No handles (e.g. a full prefix hit) reads as done."""
         return all(h.poll() for h in self.handles)
 
     def finish(self, engine: Any) -> dict:
-        """Wait the READ(s), commit the KV (register hashes), and pull any Mamba
-        snapshots.
-
-        Args:
-            engine: the decode engine (uses ``engine.context`` to commit).
+        """Wait the reads, commit the KV, and pull any Mamba snapshots.
 
         Returns:
-            The import result dict from ``disagg_pull_commit``.
+            The import result dict from disagg_pull_commit.
         """
         for h in self.handles:
             h.wait()
         with torch.inference_mode():
             result = engine.context.disagg_pull_commit(self.block_ids, self.block_hashes)
             if self.snapshots:
-                # Resolve hashes -> local blocks (now registered by the commit),
-                # allocate snapshot slots, READ the peer's snapshots into them by
-                # reference, then register hash->block for prefix-cache sub-hits.
+                # Resolve hashes to the blocks the commit just registered,
+                # allocate snapshot slots, read the peer's snapshots into them,
+                # and register them for prefix-cache hits.
                 plan = engine.context.disagg_snapshot_pull_plan(self.snapshots)
                 if plan is not None:
                     self.backend.begin_pull(self.peer_meta, plan["transfers"]).wait()
@@ -139,16 +125,10 @@ class NixlPullRecv:
 
 
 def _ctx_kv_dims(ctx) -> dict:
-    """This rank's live KV ``memory_buffer`` geometry ``{num_layers,
-    total_blocks, block_size, heads, hidden, elem}``. On the decode it is the
-    *destination* (``dst_dims``) side of the byte-offset math in
-    :func:`_kv_fragment_descriptors`; on the prefill it is published as the
-    hand-off's ``kv_dims`` (:func:`pull_static_meta`) -- same schema, two
-    sources (local read here vs. relayed from the prefill).
-
-    Args:
-        ctx: a :class:`DynamicInferenceContext` (reads ``memory_buffer``).
-    """
+    """Return this rank's KV memory_buffer geometry: {num_layers,
+    total_blocks, block_size, heads, hidden, elem}. The decode uses it as the
+    destination side of the byte-offset math; the prefill publishes it as the
+    hand-off's kv_dims."""
     mb = ctx.memory_buffer
     return {
         "num_layers": int(mb.shape[1]),
@@ -161,11 +141,9 @@ def _ctx_kv_dims(ctx) -> dict:
 
 
 def _check_pull_dims(src_dims: dict, dst_dims: dict) -> None:
-    """Fail loud when the prefill and decode disagree on the geometry the raw
-    byte-offset math assumes is shared. Heads/layers/total_blocks legitimately
-    differ across TP/PP; block size, per-head width, and element size must not
-    -- a mismatch silently computes wrong remote offsets and commits corrupted
-    KV under registered hashes."""
+    """Raise if prefill and decode disagree on geometry the byte-offset math
+    assumes is shared. Heads, layers, and total_blocks may differ across
+    TP/PP; block size, per-head width, and element size must match."""
     for key in ("block_size", "hidden", "elem"):
         if src_dims[key] != dst_dims[key]:
             raise RuntimeError(
@@ -176,29 +154,28 @@ def _check_pull_dims(src_dims: dict, dst_dims: dict) -> None:
 
 def _kv_fragment_descriptors(src_dims, dst_dims, src_block, dst_block,
                              src_layer_slice, dst_layer_slice, src_head_slice, dst_head_slice):
-    """Byte ``(local_offset, remote_offset, nbytes)`` READ descriptors for one block's
-    head/layer fragment, coalesced to the contiguous minimum.
+    """Build (local_offset, remote_offset, nbytes) read descriptors for one
+    block's head/layer fragment, coalesced to the contiguous minimum.
 
-    In the row-major ``(2, num_layers, total_blocks, block_size, heads, hidden)``
-    buffer a head range is contiguous across tokens only when it spans *all*
-    heads. So when the fragment takes the full head dim on both sides (the
-    same-TP case), the whole ``(block_size, heads, hidden)`` block region is one
-    contiguous run per ``(kv, layer)`` -> one descriptor. A partial head range (a
-    TP remap) is contiguous only per ``(kv, layer, token)`` -> one descriptor
-    each. The full-head form reproduces exactly the whole-block stride math, so
-    the same-TP case moves blocks at the minimal descriptor count without a
-    separate code path. ``kv`` indexes the key (0) / value (1) cache.
+    In the row-major (2, num_layers, total_blocks, block_size, heads, hidden)
+    buffer, a head range is contiguous across tokens only when it spans all
+    heads. When the fragment takes the full head dim on both sides (same TP),
+    the whole (block_size, heads, hidden) region is one contiguous run per
+    (kv, layer): one descriptor. A partial head range (a TP remap) is
+    contiguous only per (kv, layer, token): one descriptor each. The full-head
+    form matches the whole-block stride math, so the same-TP case moves blocks
+    at the minimal descriptor count without a separate code path.
 
     Args:
-        src_dims: source (prefill) KV geometry, from the hand-off's ``kv_dims``.
-        dst_dims: destination (decode) KV geometry, from :func:`_ctx_kv_dims`.
+        src_dims: source (prefill) KV geometry, from the hand-off's kv_dims.
+        dst_dims: destination (decode) KV geometry, from _ctx_kv_dims().
         src_block: source physical block id.
         dst_block: destination physical block id.
-        src_layer_slice / dst_layer_slice: layer range on each side (a ``slice``).
-        src_head_slice / dst_head_slice: head range on each side (a ``slice``).
+        src_layer_slice / dst_layer_slice: layer range on each side.
+        src_head_slice / dst_head_slice: head range on each side.
 
     Returns:
-        A list of ``(local_offset, remote_offset, nbytes)`` byte descriptors.
+        A list of (local_offset, remote_offset, nbytes) byte descriptors.
     """
     hidden = dst_dims["hidden"]
     elem = dst_dims["elem"]
@@ -236,10 +213,10 @@ def _kv_fragment_descriptors(src_dims, dst_dims, src_block, dst_block,
 
 
 def _snapshot_regions_match(backend, peer_meta: dict) -> bool:
-    """Whether the peer's Mamba snapshot pools have the same per-entry geometry
-    as this rank's (identical Mamba shard). Snapshots move as whole per-slot
-    entries, so a hetero shard can't use them -- the caller skips the snapshot
-    READ and the decode re-prefills past the last usable boundary instead."""
+    """Return whether the peer's Mamba snapshot pools have the same per-entry
+    geometry as this rank's. Snapshots move as whole per-slot entries, so a
+    hetero shard cannot use them; the caller skips the snapshot read and the
+    decode re-prefills past the last usable boundary instead."""
     local = backend.export_regions_meta()["regions"]
     peer = peer_meta["regions"]
     return all(
@@ -252,39 +229,32 @@ def _snapshot_regions_match(backend, peer_meta: dict) -> bool:
 
 def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
                          src_layouts, dst_layouts):
-    """(decode, one-sided) Allocate destination blocks and issue the one-sided
-    READ(s) pulling the request's KV into them. Returns a :class:`NixlPullRecv`,
-    or ``None`` if the decode KV cache is full.
+    """Allocate destination blocks and issue the one-sided reads pulling the
+    request's KV into them (decode side).
 
-    One path, driven by ``kv_reshard.plan_kv_reshard``: each decode rank reads its
-    ``(layer x head)`` shard as byte fragments from the prefill ranks that hold
-    it. ``_kv_fragment_descriptors`` coalesces a full-head fragment to one
-    descriptor per ``(kv, layer)``, so the same-TP case moves whole blocks at the
-    minimal descriptor count while a TP remap splits per token -- no separate fast
-    path. Mamba prefix-cache snapshots are carried only when a single prefill
-    rank with an identical Mamba shard holds this request's data (so the second,
-    snapshot READ resolves against one peer as whole entries); a multi-source or
-    hetero remap skips them.
+    Driven by kv_reshard.plan_kv_reshard: each decode rank reads its
+    (layer x head) shard as byte fragments from the prefill ranks that hold
+    it. Mamba snapshots are carried only when a single prefill rank with an
+    identical Mamba shard holds this request's data; a multi-source or hetero
+    remap skips them.
 
     Args:
-        engine: the decode engine (uses ``engine.context`` to alloc/match blocks).
+        engine: the decode engine.
         backend: this rank's one-sided (NIXL) transport.
-        rank_handoffs: the per-prefill-rank hand-offs relayed from PREFILL_DONE
-            (each ``{**pull_static_meta, **pull_request_meta}``).
-        my_layout: this decode rank's :class:`KVShardLayout`.
-        src_layouts / dst_layouts: full prefill / decode KV layout lists (drive
-            the reshard plan).
+        rank_handoffs: the per-prefill-rank hand-offs relayed from
+            PREFILL_DONE, each {**pull_static_meta, **pull_request_meta}.
+        my_layout: this decode rank's KVShardLayout.
+        src_layouts / dst_layouts: full prefill / decode KV layout lists.
 
     Returns:
-        A :class:`NixlPullRecv` to complete later, or ``None`` if the decode KV
-        cache is full.
+        A NixlPullRecv to complete later, or None if the decode KV cache is
+        full.
     """
     if not rank_handoffs:
         raise RuntimeError("disagg pull: RECV_KV carried an empty hand-off list")
     block_count = int(rank_handoffs[0]["block_count"])
-    # Partial transfer: reuse the longest block prefix the decode already has
-    # cached (hashes are TP-independent) and pull only blocks
-    # [match_len, block_count). dst block table = reused (in order) + new.
+    # Reuse the longest block prefix the decode already has cached (hashes are
+    # TP-independent) and pull only blocks [match_len, block_count).
     match = engine.context.disagg_pull_match_prefix(rank_handoffs[0]["block_hashes"])
     reused, match_len = match["reused_block_ids"], match["match_len"]
     alloc = engine.context.disagg_pull_alloc(block_count - match_len)
@@ -298,12 +268,11 @@ def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
     kv_plan = kv_reshard.plan_kv_reshard(src_layouts, dst_layouts)
     handles = []
     source_handoffs: dict = {}  # src_rank -> handoff (the ranks this dst reads from)
-    # Attention KV: per source rank, READ its head/layer fragments of the missing
-    # suffix [match_len, block_count). Full-head fragments coalesce to whole blocks.
+    # Attention KV: per source rank, read its head/layer fragments of the
+    # missing suffix. Full-head fragments coalesce to whole blocks.
     for transfer in utils.transfers_for_dst(kv_plan, my_layout.global_rank):
-        # Every source rank in the plan published static meta (gathered over the
-        # whole MP group), so a miss is a protocol violation -- and skipping it
-        # would commit never-filled blocks under registered hashes.
+        # Every source rank in the plan published static meta, so a miss is a
+        # protocol violation; skipping it would commit never-filled blocks.
         src_handoff = handoff_by_rank[transfer.src_rank]
         src_layout = src_layout_by_rank[transfer.src_rank]
         _check_pull_dims(src_handoff["kv_dims"], dst_dims)
@@ -322,8 +291,8 @@ def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
         if descriptors:
             handles.append(backend.begin_pull_raw(src_handoff["region_meta"], "kv", descriptors))
 
-    # Snapshots: only when a single prefill rank with an identical Mamba shard
-    # holds this request's data, so the second snapshot READ in finish()
+    # Snapshots ship only when a single prefill rank with an identical Mamba
+    # shard holds this request's data, so the snapshot read in finish()
     # resolves against one peer as whole entries.
     peer_meta, snapshots = None, []
     if len(source_handoffs) == 1:

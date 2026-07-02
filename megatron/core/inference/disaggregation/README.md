@@ -11,7 +11,7 @@ move engine→engine via a transport backend.
 It is transport-agnostic behind one flag, `backend.is_pull`:
 
 - **Push** (two-sided, NCCL): the prefill *sends* the KV to the decode.
-- **Pull** (one-sided, NIXL/RDMA): the decode *READs* the KV out of the
+- **Pull** (one-sided, NIXL/RDMA): the decode *reads* the KV out of the
   prefill's registered buffer, no prefill-side action.
 
 To run with no extra dependencies, use the push (NCCL) backend; for best
@@ -28,15 +28,15 @@ along on `PREFILL_DONE`, never on what it contains.
 ```
 Push (NCCL), 4 headers:                 Pull (NIXL), 5 headers:
   REGISTER_ROLE  engine→coord            REGISTER_ROLE  engine→coord (is_pull=True)
-  PREFILL_DONE   prefill→coord            PREFILL_DONE   prefill→coord (+ READ descriptors)
-  SEND_KV        coord→prefill (ship)     RECV_KV        coord→decode  (relays descriptors; decode READs)
-  RECV_KV        coord→decode  (recv)     KV_READ_DONE   decode→coord  (READ drained → free an outstanding slot)
+  PREFILL_DONE   prefill→coord            PREFILL_DONE   prefill→coord (+ read descriptors)
+  SEND_KV        coord→prefill (ship)     RECV_KV        coord→decode  (relays descriptors; decode reads)
+  RECV_KV        coord→decode  (recv)     KV_READ_DONE   decode→coord  (read drained → free an outstanding slot)
                                           RELEASE_KV     coord→prefill (unpin blocks)
 ```
 
 Pull skips `SEND_KV` (the prefill published its KV up front and does nothing
 more) and adds the `KV_READ_DONE`→`RELEASE_KV` pair, which is the outstanding/lifetime
-bookkeeping the one-sided READ needs. See the module docstring in `__init__.py`.
+bookkeeping the one-sided read needs. See the module docstring in `__init__.py`.
 
 ### What each header does
 
@@ -54,7 +54,7 @@ hand-off.
 - **`PREFILL_DONE`** (prefill → coord). A prefill finished a request and staged
   its KV; it reports this instead of replying to the client (the client is
   waiting on decode's output). It also carries an opaque **handoff descriptor**
-  — for pull the per-rank READ metadata (block ids + buffer geometry), for push
+  — for pull the per-rank read metadata (block ids + buffer geometry), for push
   the Mamba snapshot hashes (or nothing) — which the coordinator relays without
   inspecting it. Triggers hop 2: the coordinator picks a decode.
 
@@ -65,9 +65,9 @@ hand-off.
 - **`RECV_KV`** (coord → decode). Tells the decode a request is inbound: carries
   the source KV layouts, the prompt + sampling params (the decode never saw the
   original request), and — on pull — the relayed handoff descriptor. The decode
-  receives/READs the KV, admits the request via a prefix-cache hit, and generates.
+  receives or reads the KV, admits the request via a prefix-cache hit, and generates.
 
-- **`KV_READ_DONE`** (decode → coord, **pull only**). The one-sided READ has
+- **`KV_READ_DONE`** (decode → coord, **pull only**). The one-sided read has
   drained (only the decode knows this — RDMA gives no completion to the other
   side). Lets the coordinator free the prefill's outstanding-hand-off slot (and
   admit the next queued request) and know the pinned blocks are safe to release.
@@ -81,7 +81,7 @@ hand-off.
 
 - **Attention KV**: registered once per engine (register-once arena). Push copies
   the request's blocks into a staging tensor and ships them; pull hands off block
-  *references* and the decode READs them in place, kept alive by prefix-cache
+  *references* and the decode reads them in place, kept alive by prefix-cache
   retention + a ref-count pin (released on `RELEASE_KV`).
 - **Mamba snapshots** (hybrid models; block-boundary states): the hand-off's
   only Mamba payload. Admission always re-runs at least the trailing prompt
@@ -107,7 +107,7 @@ would discard the imported KV before the request is ever scheduled.
 | `max_inflight` (8) | each engine runtime | KV transfers posted-but-not-reaped per step (step backpressure) |
 
 The flow-control window guarantees a pull prefill never recycles a KV pin the
-decode hasn't READ yet (hard no-overwrite guarantee).
+decode has not read yet, so pinned blocks cannot be overwritten.
 
 ## Module map
 
@@ -118,9 +118,9 @@ decode hasn't READ yet (hard no-overwrite guarantee).
 | `coordinator_routing.py` | pure 2-hop routing state used by the coordinator |
 | `engine_runtime.py` | `DisaggEngineRuntime`: all per-engine disagg state + the 2-hop hand-off |
 | `kv_transfer_push.py` | push family (two-sided NCCL): resharded send / matched receive |
-| `kv_transfer_pull.py` | pull family (one-sided NIXL): register-once metadata + one-sided READ |
+| `kv_transfer_pull.py` | pull family (one-sided NIXL): register-once metadata + one-sided read |
 | `kv_reshard.py` | TP/PP/EP/ETP KV-shard layouts + the range-intersection reshard planner |
-| `mamba_reshard.py` | heterogeneous TP/PP reshard of Mamba conv/ssm state |
+| `mamba_layout.py` | per-rank Mamba shard identity (snapshot pairing) |
 | `transfer_backends/base.py` | `KVTransportBackend` interface + backend factory |
 | `transfer_backends/nccl.py` | two-sided push backend (`torch.distributed` P2P) |
 | `transfer_backends/nixl.py` | one-sided pull backend (NIXL RDMA) |

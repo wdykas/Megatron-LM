@@ -1,12 +1,11 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""NIXL (one-sided RDMA) pull-based KV transfer backend for disaggregated
-inference, following the reference NIXL backend.
+"""NIXL (one-sided RDMA) pull-based KV transfer backend.
 
-Each rank registers its paged KV (and Mamba) buffers once; the decode rank then
-READs specific entries straight from the prefill's buffer by index, with no
-staging copy or per-request registration. ``nixl`` is imported lazily; selected
-via ``--disagg-kv-transport-backend nixl``.
+Each rank registers its paged KV (and Mamba) buffers once; the decode rank
+then reads entries straight out of the prefill's buffers by index, with no
+staging copy or per-request registration. ``nixl`` is imported lazily;
+selected via ``--disagg-kv-transport-backend nixl``.
 """
 
 from __future__ import annotations
@@ -24,11 +23,10 @@ from megatron.core.inference.disaggregation.transfer_backends.base import (
 
 logger = logging.getLogger(__name__)
 
-# Required UCX env for GPU KV transfer (we only inspect, never set):
-#   * UCX_TLS must include a CUDA transport; ``UCX_TLS=tcp`` (host-only)
-#     segfaults on the first GPU hand-off.
-#   * UCX_MEMTYPE_CACHE=n so UCX re-queries pointer types instead of
-#     misclassifying CUDA pointers as host memory.
+# UCX env required for GPU KV transfer (inspected, never set):
+# UCX_TLS must include a CUDA transport (host-only UCX segfaults on the first
+# GPU hand-off), and UCX_MEMTYPE_CACHE=n so UCX re-queries pointer types
+# instead of misclassifying CUDA pointers as host memory.
 _UCX_RECOMMENDED = {
     "UCX_TLS": "cuda_ipc,cuda_copy,tcp,sm,self",
     "UCX_MEMTYPE_CACHE": "n",
@@ -38,14 +36,14 @@ _POLL_INTERVAL_S = 0.0005
 
 
 def _check_ucx_env() -> None:
-    """Fail loud on a UCX environment known to crash GPU KV transfer; warn on
-    a merely suboptimal one."""
+    """Raise on a UCX environment known to crash GPU KV transfer; warn on a
+    merely suboptimal one."""
     tls = os.environ.get("UCX_TLS")
     if tls is not None and "cuda" not in tls.lower():
         raise RuntimeError(
-            f"NIXL KV transport: UCX_TLS={tls!r} has no CUDA transport; GPU "
-            f"hand-offs crash under host-only UCX. Set "
-            f"UCX_TLS={_UCX_RECOMMENDED['UCX_TLS']} (or unset it) before launch."
+            f"NIXL KV transport: UCX_TLS={tls!r} has no CUDA transport, which "
+            f"crashes GPU hand-offs. Set UCX_TLS={_UCX_RECOMMENDED['UCX_TLS']} "
+            f"(or unset it) before launch."
         )
     cache = os.environ.get("UCX_MEMTYPE_CACHE")
     if cache is None or cache.lower() not in ("n", "no"):
@@ -79,8 +77,8 @@ class NixlPullHandle:
         return self._done
 
     def _release(self) -> None:
-        # Free the agent-side transfer handle (and its descriptor lists) as soon
-        # as the transfer settles; otherwise they accumulate per request.
+        # Free the agent-side transfer handle as soon as the transfer settles;
+        # otherwise handles accumulate per request.
         self._agent.release_xfer_handle(self._xfer)
         self._xfer = None
 
@@ -91,9 +89,11 @@ class NixlPullHandle:
 
 class NixlTransportBackend(KVTransportBackend):
     """Per-rank NIXL agent owning one registration over the paged KV buffers.
-    One-sided: register once, then READ entries by index (:meth:`begin_pull`)
-    or raw byte fragments (:meth:`begin_pull_raw`). The two-sided send/recv
-    interface is left unimplemented."""
+
+    One-sided: register once, then read entries by index (`begin_pull`) or raw
+    byte fragments (`begin_pull_raw`). The two-sided push interface is left
+    unimplemented.
+    """
 
     is_pull = True
 
@@ -119,10 +119,9 @@ class NixlTransportBackend(KVTransportBackend):
         self._agent = nixl_agent(self._agent_name, nixl_agent_config(backends=["UCX"]))
         self._init = True
 
-    # --- one-sided family: register once, READ entries --------------------
     def register_regions(self, regions: Dict[str, PullRegion]) -> None:
-        """Register each region's buffer with the agent once (for the backend's
-        lifetime) and export the agent metadata, so peers load it exactly once."""
+        """Register each region's buffer with the agent, once for the
+        backend's lifetime, and export the agent metadata."""
         assert self._init, "NixlTransportBackend.init() not called"
         assert not self._regions, "register_regions called more than once"
         for name, region in regions.items():
@@ -130,9 +129,7 @@ class NixlTransportBackend(KVTransportBackend):
             self._regions[name] = region
             # Layouts are immutable after registration; compute once.
             self._layouts[name] = region.layout()
-        self._agent_meta_b64 = base64.b64encode(
-            self._agent.get_agent_metadata()
-        ).decode("ascii")
+        self._agent_meta_b64 = base64.b64encode(self._agent.get_agent_metadata()).decode("ascii")
 
     def export_regions_meta(self) -> dict:
         assert self._regions, "register_regions() not called"
@@ -143,17 +140,20 @@ class NixlTransportBackend(KVTransportBackend):
         }
 
     def begin_pull(self, peer_meta: dict, transfers: list) -> NixlPullHandle:
-        """Remote READ peer->local. ``transfers``: ``(region, peer_src, local_dst)``."""
+        """Read whole entries from a peer. `transfers` is a list of
+        (region_name, peer_src_index, local_dst_index)."""
         return self._begin(
             peer_meta,
             [(region, local_dst, peer_src) for region, peer_src, local_dst in transfers],
         )
 
     def begin_pull_raw(self, peer_meta: dict, region_name: str, triples: list) -> NixlPullHandle:
-        """Remote READ of arbitrary byte sub-ranges of one region -- for hetero-TP
-        fragment reads (head/layer sub-ranges, not whole entries). ``triples``:
-        ``(local_byte_off, remote_byte_off, nbytes)`` relative to each side's
-        region base; all batched into one transfer."""
+        """Read byte sub-ranges of one region, for hetero-TP fragment reads.
+
+        `triples` is a list of (local_byte_off, remote_byte_off, nbytes),
+        offsets relative to each side's region base; all batched into one
+        transfer.
+        """
         assert self._init, "NixlTransportBackend.init() not called"
         if not triples:
             return NixlPullHandle(self._agent, None)
@@ -169,9 +169,9 @@ class NixlTransportBackend(KVTransportBackend):
         return NixlPullHandle(self._agent, xfer)
 
     def _begin(self, peer_meta: dict, items: list) -> NixlPullHandle:
-        """Issue one remote READ batching every ``(region, local_index,
-        remote_index)`` in ``items``. Identity layout only -- peer and local
-        region must share num_outer / inner_bytes."""
+        """Issue one remote read batching every (region, local_index,
+        remote_index) in `items`. Peer and local region must share
+        num_outer / inner_bytes."""
         assert self._init, "NixlTransportBackend.init() not called"
         if not items:
             return NixlPullHandle(self._agent, None)
@@ -191,12 +191,18 @@ class NixlTransportBackend(KVTransportBackend):
             inner = ld["inner_bytes"]
             for o in range(ld["num_outer"]):
                 local_tuples.append(
-                    (ld["base_addr"] + o * ld["outer_stride_bytes"] + local_idx * inner,
-                     inner, ld["device_id"])
+                    (
+                        ld["base_addr"] + o * ld["outer_stride_bytes"] + local_idx * inner,
+                        inner,
+                        ld["device_id"],
+                    )
                 )
                 remote_tuples.append(
-                    (pr["base_addr"] + o * pr["outer_stride_bytes"] + remote_idx * inner,
-                     inner, pr["device_id"])
+                    (
+                        pr["base_addr"] + o * pr["outer_stride_bytes"] + remote_idx * inner,
+                        inner,
+                        pr["device_id"],
+                    )
                 )
         local_descs = self._agent.get_xfer_descs(local_tuples, mem_type="VRAM")
         remote_descs = self._agent.get_xfer_descs(remote_tuples, mem_type="VRAM")
@@ -205,15 +211,13 @@ class NixlTransportBackend(KVTransportBackend):
         return NixlPullHandle(self._agent, xfer)
 
     def _ensure_peer(self, peer_meta: dict) -> str:
-        # Load the peer's metadata exactly once. Registrations are stable, so a
-        # given peer always advertises the same regions; loadRemoteMD rejects
+        # Load each peer's metadata exactly once: registrations are stable, so
+        # a peer always advertises the same regions, and loadRemoteMD rejects
         # re-loading an already-known agent (NIXL_ERR_NOT_ALLOWED).
         name = peer_meta["agent_name"]
         cached = self._known_peers.get(name)
         if cached is not None:
             return cached
-        peer_id = self._agent.add_remote_agent(
-            base64.b64decode(peer_meta["agent_metadata_b64"])
-        )
+        peer_id = self._agent.add_remote_agent(base64.b64decode(peer_meta["agent_metadata_b64"]))
         self._known_peers[name] = peer_id
         return peer_id

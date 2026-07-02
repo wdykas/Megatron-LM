@@ -118,7 +118,7 @@ def configure_disagg_engine(engine, inference_model, *, disagg_router="round_rob
         inference_model[0] if isinstance(inference_model, (list, tuple)) else inference_model,
         "pg_collection",
     )
-    return configure_prebuilt_disagg_engine(
+    configure_prebuilt_disagg_engine(
         engine, pg, _specs(args), disagg_router=disagg_router,
         kv_transport_backend=args.disagg_kv_transport_backend,
     )

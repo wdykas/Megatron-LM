@@ -2,16 +2,16 @@
 
 """Prefill->decode KV transfer, push family: two-sided (NCCL) hand-off.
 
-Both ranks post matched send/recv ops (the coordinator triggers both sides): the
-prefill gathers its KV into a staging tensor, ships it, and the decode scatters
-the received sub-blocks into its paged cache. The one-sided (pull) family lives
-in ``kv_transfer_pull.py``; the header-free schema (:func:`derive_decode_schema`)
-lives here because only the push receive path needs it.
+Both ranks post matched send/recv ops (the coordinator triggers both sides).
+The prefill gathers its KV into a staging tensor and ships it; the decode
+scatters the received sub-blocks into its paged cache. The one-sided (pull)
+family lives in kv_transfer_pull.py; derive_decode_schema lives here because
+only the push receive path needs it.
 
-Hybrid (Mamba) models hand off *block-boundary snapshots*, not the live
-end-state (see the ``kv_transfer_pull`` docstring for why). The snapshot count
-isn't derivable header-free, so PREFILL_DONE carries the snapshot hashes and
-the decode sizes its receives from them. Snapshots move as whole per-slot
+Hybrid (Mamba) models hand off block-boundary snapshots rather than the live
+end-state (see the kv_transfer_pull docstring for why). The snapshot count is
+not derivable from static config, so PREFILL_DONE carries the snapshot hashes
+and the decode sizes its receives from them. Snapshots move as whole per-slot
 tensors between identical Mamba shards; a hetero remap skips them.
 """
 
@@ -31,12 +31,11 @@ from megatron.core.inference.inference_request import compute_block_hashes_batch
 
 
 def derive_decode_schema(engine: Any, prompt_token_ids) -> dict:
-    """Reconstruct the KV schema (shapes/dtypes, block count) on the decode side
-    with no control message -- computed locally from the engine's static config +
-    the prompt tokens, so only KV tensors cross the wire. Raises
-    ``NotImplementedError`` for the MLA latent cache (unsupported). Assumes the
-    whole prompt is handed off (``block_count`` follows from the prompt length)
-    into a uniform KV layout."""
+    """Reconstruct the KV schema (shapes/dtypes, block count) on the decode
+    side from the engine's static config and the prompt tokens, so only KV
+    tensors cross the wire. Assumes the whole prompt is handed off into a
+    uniform KV layout. Raises NotImplementedError for the MLA latent cache
+    (unsupported)."""
 
     ctx = engine.context
     if ctx.cache_mla_latent:
@@ -67,13 +66,14 @@ def derive_decode_schema(engine: Any, prompt_token_ids) -> dict:
 
 
 def matching_mamba_peer(my_mamba, peer_mamba_layouts) -> Optional[Any]:
-    """The peer instance's rank holding the *identical* Mamba shard (same TP
-    split, layer range, and structural dims), or ``None`` for a hetero remap.
+    """Return the peer rank holding the identical Mamba shard (same TP split,
+    layer range, and structural dims), or None for a hetero remap.
+
     Snapshots move as whole per-slot tensors, so they ship only between
     identical shards; without a match the decode re-prefills past the last
-    usable boundary instead. Unique when it exists (one rank per
-    ``(tp_rank, layer_start)`` in an instance), and symmetric -- prefill and
-    decode compute the same pairing from the same layout lists."""
+    usable boundary instead. The match is unique when it exists and symmetric,
+    so prefill and decode compute the same pairing.
+    """
     for peer in peer_mamba_layouts or []:
         if (
             peer.tp_size == my_mamba.tp_size
@@ -88,8 +88,8 @@ def matching_mamba_peer(my_mamba, peer_mamba_layouts) -> Optional[Any]:
 
 @dataclass
 class PrefillHandoff:
-    """Prefill-side bookkeeping held until the transfer drains: keeps the staged
-    tensors alive until :meth:`wait` completes."""
+    """Prefill-side bookkeeping that keeps the staged tensors alive until
+    wait() completes."""
 
     handles: List[TransferHandle]
     keepalive: List[torch.Tensor] = field(default_factory=list)
@@ -110,22 +110,20 @@ def send_request_kv_resharded(
     my_mamba_layout,
     dst_mamba_layouts: list,
 ) -> "PrefillHandoff":
-    """Hetero-layout prefill send: reshard this rank's pre-exported KV to the
-    decode layout and ship it. ``my_layout`` is this rank's
-    :class:`KVShardLayout`; ``src_layouts`` / ``dst_layouts`` are the full
-    prefill / decode layout lists. Hybrid models also pass Mamba layouts, which
-    gate the snapshot send (identical shard only). ``payload`` is the staging
-    dict the context exported when the request was staged."""
+    """Reshard this rank's pre-exported KV to the decode layout and ship it.
+
+    `my_layout` is this rank's KVShardLayout; `src_layouts` / `dst_layouts`
+    are the full prefill / decode layout lists. Hybrid models also pass Mamba
+    layouts, which gate the snapshot send (identical shard only). `payload` is
+    the staging dict the context exported when the request was staged.
+    """
 
     attn = payload["staging_tensor"]  # [BC, 2, local_layers, BS, local_heads, HD]
     plan = kv_reshard.plan_kv_reshard(src_layouts, dst_layouts)
     mine = utils.transfers_for_src(plan, my_layout.global_rank)
-    # Collect every sub-block this request ships (attention, then Mamba
-    # snapshots) and issue them as ONE coalesced batch. Posting dozens of
-    # separate isends for a single request races on NCCL (un-grouped concurrent
-    # P2P -> illegal memory access); batching wraps them in one ncclGroup so the
-    # request's transfer is atomic. ``keep`` holds the staged slices alive until
-    # the batch drains.
+    # All of the request's sends (attention sub-blocks, then Mamba snapshots)
+    # go out as one coalesced batch; `keep` holds the staged slices alive
+    # until it drains.
     sends: List[tuple] = []  # (tensor, dst)
     keep: List[torch.Tensor] = []
     for t in mine:
@@ -139,8 +137,8 @@ def send_request_kv_resharded(
     if snapshots is not None:
         peer = matching_mamba_peer(my_mamba_layout, dst_mamba_layouts)
         if peer is not None:
-            # Whole-tensor snapshot send to the identical-shard peer, posted
-            # after the attention sends (the recv side matches the post-order).
+            # Snapshots go to the identical-shard peer after the attention
+            # sends; the recv side matches the post order.
             for tensor in (snapshots["conv_states_tensor"], snapshots["ssm_states_tensor"]):
                 keep.append(tensor)
                 sends.append((tensor, peer.global_rank))
@@ -150,9 +148,9 @@ def send_request_kv_resharded(
 
 @dataclass
 class DecodeRecv:
-    """In-flight decode receive: the irecv handle + staging buffer it fills.
-    :meth:`finish` waits the transfer, assembles the local KV tensor, and imports
-    it -- letting the caller defer completion so it overlaps an engine step."""
+    """In-flight decode receive: the irecv handle and the staging buffer it
+    fills. finish() waits the transfer, assembles the local KV tensor, and
+    imports it, so the caller can overlap completion with an engine step."""
 
     meta: dict
     staging: torch.Tensor
@@ -187,10 +185,9 @@ class DecodeRecv:
                 "conv_states_tensor": self.snapshot_conv,
                 "ssm_states_tensor": self.snapshot_ssm,
             }
-        # import_request_kv writes the received KV into the cache + block
-        # bookkeeping (inference tensors), but runs from the engine's message
-        # loop (schedule_requests), outside the inference_mode the model step
-        # uses -- re-enter it so the in-place writes are permitted.
+        # import_request_kv writes into inference tensors but runs from the
+        # engine's message loop, outside the model step's inference_mode;
+        # re-enter it so the in-place writes are permitted.
         with torch.inference_mode():
             return engine.context.import_request_kv(
                 self.staging,
@@ -211,11 +208,10 @@ def post_recv_request_kv_resharded(
     my_mamba_layout,
     src_mamba_layouts: list,
 ) -> "DecodeRecv":
-    """Hetero-layout decode receive (non-blocking): post the irecv for every KV
-    sub-block covering this rank's (layer x head) rectangle, plus the Mamba
-    snapshot tensors for hybrid models (sized from the ``handoff``'s snapshot
-    hashes; skipped for a hetero Mamba shard), and return a :class:`DecodeRecv`
-    to complete later."""
+    """Post the irecvs for every KV sub-block covering this rank's
+    (layer x head) rectangle, plus the Mamba snapshot tensors for hybrid
+    models (sized from the handoff's snapshot hashes; skipped for a hetero
+    Mamba shard), and return a DecodeRecv to complete later."""
 
     meta = derive_decode_schema(engine, prompt_token_ids)
     bc = meta["block_count"]
@@ -235,10 +231,8 @@ def post_recv_request_kv_resharded(
         device=device,
     )
 
-    # Collect every sub-block this request receives (attention, then Mamba
-    # snapshots) and post them as ONE coalesced batch -- mirrors the send side's
-    # single batch so the request's transfer is atomic and ordered (un-grouped
-    # concurrent irecvs race on NCCL -> illegal memory access).
+    # Mirror the send side's single coalesced batch: attention sub-blocks,
+    # then Mamba snapshots.
     plan = kv_reshard.plan_kv_reshard(src_layouts, dst_layouts)
     attn_transfers = utils.transfers_for_dst(plan, my_layout.global_rank)
     recvs: List[tuple] = []  # (shape, dtype, src)

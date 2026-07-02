@@ -1,14 +1,14 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 """Configure a prefill/decode shard engine for the shared DP inference
-coordinator (role + KV layouts + identity); called by ``MegatronAsyncLLM`` when
-given ``inference_shards``. Also holds the shared shard helpers (KV-shard layout
+coordinator (role, KV layouts, identity); called by MegatronAsyncLLM when
+given inference_shards. Also holds the shared shard helpers (KV-shard layout
 from process groups, role-layout validation, global KV dims)."""
 
 from __future__ import annotations
 
 import functools
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from typing import Any, List, Tuple
 
 import torch.distributed as dist
@@ -27,7 +27,7 @@ DECODE = "decode"
 
 
 def layout_from_pg_collection(pg, num_layers: int, num_heads: int) -> KVShardLayout:
-    """Build a :class:`KVShardLayout` from a shard's ``ProcessGroupCollection``.
+    """Build a KVShardLayout from a shard's ProcessGroupCollection.
 
     Reads attention TP/PP (which shard the KV) and EP/ETP (KV-replica
     dimensions, used only for source dedup) from the collection's groups.
@@ -47,13 +47,11 @@ def layout_from_pg_collection(pg, num_layers: int, num_heads: int) -> KVShardLay
     )
 
 
-def _validate_disagg_specs(specs: List[InferenceShardSpec]) -> int:
-    """Check the role layout; return the number of decode instances.
+def _validate_disagg_specs(specs: List[InferenceShardSpec]) -> None:
+    """Check the role layout.
 
-    Any number of prefill and decode instances is allowed (each instance --
-    a shard's dp replica -- is an independent routing target). The coordinator
-    round-robins submits across prefill instances and remembers, per request,
-    which prefill held its KV, so the decode side pulls from the right source.
+    Any number of prefill and decode instances is allowed; each instance (a
+    shard's dp replica) is an independent routing target.
     """
     prefill = [s for s in specs if s.role == PREFILL]
     decode = [s for s in specs if s.role == DECODE]
@@ -65,24 +63,20 @@ def _validate_disagg_specs(specs: List[InferenceShardSpec]) -> int:
     assert prefill and decode, (
         "disaggregation needs at least one prefill shard and one decode shard."
     )
-    return sum(s.dp for s in decode)
 
 
 @functools.lru_cache(maxsize=None)
 def disagg_refit_pools(inference_shards, world_size: int, rank: int = None) -> Tuple[int, int]:
-    """Map an ``--inference-shards`` spec to ``(num_dst_pools, dst_pool_index)``
-    for :func:`~megatron.core.resharding.refit.swap_model_weights`.
+    """Map an --inference-shards spec to (num_dst_pools, dst_pool_index) for
+    swap_model_weights.
 
-    Memoized: the result is a pure function of the (process-constant) spec,
-    world size, and this rank, so callers can invoke it once per rollout without
-    re-parsing the spec each time.
-
-    Disaggregated serving refits the source (training) model into each shard's
-    inference model -- disjoint rank windows, possibly at different parallelism
-    -- so the refit runs one collective pass per shard. This returns the pool
-    count and the window containing ``rank``. Returns ``(1, 0)`` (the
-    single-destination default) when the spec is absent or not disaggregated, so
-    callers can pass the result unconditionally."""
+    Disaggregated serving refits the training model into each shard's
+    inference model (disjoint rank windows, possibly at different
+    parallelism), so the refit runs one collective pass per shard. This
+    returns the pool count and the window containing `rank`. Returns (1, 0)
+    when the spec is absent or not disaggregated, so callers can pass the
+    result unconditionally. Memoized: the result is a pure function of the
+    process-constant spec, world size, and rank."""
     if rank is None:
         rank = dist.get_rank()
     if not (inference_shards and spec_declares_disaggregation(inference_shards)):
@@ -97,16 +91,13 @@ def disagg_refit_pools(inference_shards, world_size: int, rank: int = None) -> T
 
 
 def _global_kv_dims(engine, pg) -> Tuple[int, int]:
-    """Global (num_layers, KV-head count) for the *attention* KV cache.
+    """Global (num_layers, KV-head count) for the attention KV cache.
 
-    num_layers is the number of attention layers in the KV cache -- NOT
-    ``cfg.num_layers``: a hybrid Mamba-attention model's ``cfg.num_layers``
-    counts Mamba layers too, but only attention layers have a KV cache, so
-    using the total would make the reshard plan span layers the cache doesn't
-    have (mismatched transfers -> NCCL abort on the hand-off). Read the local
-    attention-layer count off the context's ``memory_buffer`` (shape
-    ``(2, local_layers, ...)``) and scale to global by the PP size. KV heads =
-    num_query_groups for GQA, else num_attention_heads.
+    num_layers counts attention layers only, not cfg.num_layers: a hybrid
+    model's cfg.num_layers includes Mamba layers, which have no KV cache, and
+    a reshard plan spanning them would build mismatched transfers. The local
+    attention-layer count is read off the context's memory_buffer and summed
+    over PP stages. KV heads = num_query_groups (GQA).
     """
     cfg = engine.controller.model_config
     num_heads = cfg.num_query_groups
@@ -129,16 +120,14 @@ def _global_kv_dims(engine, pg) -> Tuple[int, int]:
 
 
 def _mamba_layout_dict(engine, pg):
-    """This rank's Mamba shard layout dict (or ``None`` for non-hybrid models).
+    """This rank's Mamba shard layout dict, or None for non-hybrid models.
 
-    Structural dims (the ``dims`` sub-dict, a serialized :class:`MambaStateDims`)
-    come straight from the model config -- notably ``ngroups`` is
-    ``config.mamba_num_groups``, the same source MambaMixer reads, rather than
-    reverse-derived from the conv channel width (which would silently break if
-    the conv packing ever changed). nheads/headdim/d_state/d_conv are read off
-    the allocated conv/ssm shapes, which are unambiguous. The global Mamba-layer
-    offset is the prefix sum of per-PP-stage local counts (contiguous in global
-    layer order), via an all-gather over the PP group.
+    Structural dims (the dims sub-dict, a serialized MambaStateDims) come from
+    the model config: ngroups is config.mamba_num_groups, the same source
+    MambaMixer reads, rather than reverse-derived from the conv channel width.
+    nheads/headdim/d_state/d_conv are read off the allocated conv/ssm shapes.
+    The global Mamba-layer offset is the prefix sum of per-PP-stage local
+    counts, gathered over the PP group.
     """
     ctx = engine.context
     if not ctx.is_hybrid_model:
@@ -168,44 +157,28 @@ def _mamba_layout_dict(engine, pg):
     )
 
 
-@dataclass
-class DisaggCoordinatorSetup:
-    """This rank's place in a coordinator-native disagg job."""
-
-    role: str           # "prefill" / "decode"
-    replica_id: str     # "{role}_s{shard}_dp{dp}", e.g. "prefill_s0_dp0"
-    engine: Any
-    is_primary: bool    # global rank 0 -> owns the InferenceClient
-    total_instances: int
-
-
 def configure_prebuilt_disagg_engine(
     engine: Any, pg: Any, specs: List[InferenceShardSpec], disagg_router: str = "round_robin",
     kv_transport_backend: str = "nccl",
-) -> DisaggCoordinatorSetup:
+) -> None:
     """Configure an already-built engine for the shared coordinator.
 
-    The caller built the model + engine against this rank's shard ``pg``
-    outside (mirroring ``MegatronLLM(model=...)``); this only derives the disagg
-    config and sets it on the engine. The per-rank KV layout is read from the
-    live ``pg`` and the full per-instance layout is gathered over the instance's
-    MP group (tp x pp), so it is correct for any tp/dp/pp rank ordering (no
-    contiguity assumption).
+    The caller built the model + engine against this rank's shard `pg`; this
+    only derives the disagg config and sets it on the engine. The per-rank KV
+    layout is read from the live `pg` and the full per-instance layout is
+    gathered over the instance's MP group (tp x pp), so it is correct for any
+    tp/dp/pp rank ordering.
     """
-    total_instances = sum(s.dp for s in specs)
-    _validate_disagg_specs(specs)  # role-layout checks
-    # Disaggregation requires prefix caching: the decode side admits the
-    # handed-off KV via a prefix-cache hit (import registers the block hashes).
-    # Without it the imported blocks aren't matched and decode silently
-    # re-prefills, wasting the hand-off.
+    _validate_disagg_specs(specs)
+    # The decode side admits handed-off KV via a prefix-cache hit (the import
+    # registers the block hashes), so prefix caching is required.
     ctx = engine.context
     assert ctx.enable_prefix_caching, (
         "disaggregation requires prefix caching (enable_prefix_caching=True); "
         "the decode side admits handed-off KV via a prefix-cache hit."
     )
-    # ref_zero eviction deregisters blocks the moment their ref count hits 0 --
-    # which is exactly what the import does before the request is scheduled, so
-    # the imported KV would be discarded before admission ever sees it.
+    # ref_zero eviction deregisters blocks the moment their ref count hits 0,
+    # which would discard the imported KV before admission sees it.
     assert ctx.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU, (
         "disaggregation requires the LRU prefix-cache eviction policy "
         "(--inference-dynamic-batching-prefix-caching-eviction-policy lru); "
@@ -233,8 +206,8 @@ def configure_prebuilt_disagg_engine(
     num_layers, num_heads = _global_kv_dims(engine, pg)
     dp_rank = get_pg_rank(pg.dp)
     my_layout = asdict(layout_from_pg_collection(pg, num_layers, num_heads))
-    # Hybrid models: attach this rank's Mamba shard layout so conv/ssm state can
-    # be resharded alongside the attention KV.
+    # Hybrid models: attach this rank's Mamba shard layout so snapshots can be
+    # paired alongside the attention KV.
     mamba = _mamba_layout_dict(engine, pg)
     if mamba is not None:
         my_layout["mamba"] = mamba
@@ -242,20 +215,15 @@ def configure_prebuilt_disagg_engine(
     layouts = [None] * get_pg_size(pg.mp)
     dist.all_gather_object(layouts, my_layout, group=pg.mp)
 
-    # Unique per instance (shard index + dp replica) so each prefill/decode
-    # replica gets a distinct ZMQ identity + layout key -- this is what lets the
-    # coordinator address multiple prefill replicas, not just one.
+    # Unique per instance (shard index + dp replica), so each prefill/decode
+    # replica gets a distinct ZMQ identity and layout key; this is what lets
+    # the coordinator address multiple replicas of a role.
     replica_id = f"{role}_s{my_index}_dp{dp_rank}"
     engine.set_disaggregation_config(
         role=role,
         instance_layouts=layouts,
         identity=replica_id,
-        world_group=None,  # default world group for the cross-shard addr broadcast
         spawn_coordinator=(rank == 0),
         disagg_router=disagg_router,
         kv_transport_backend=kv_transport_backend,
-    )
-    return DisaggCoordinatorSetup(
-        role=role, replica_id=replica_id, engine=engine,
-        is_primary=(rank == 0), total_instances=total_instances,
     )

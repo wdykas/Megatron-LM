@@ -529,17 +529,17 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def set_disaggregation_config(
         self, *, role, instance_layouts, identity,
-        world_group, spawn_coordinator, disagg_router="round_robin",
+        spawn_coordinator, disagg_router="round_robin",
         kv_transport_backend="nccl",
     ):
-        """Mark this engine as a disaggregated prefill/decode shard by attaching
-        a :class:`DisaggEngineRuntime`, which holds all disagg state + the 2-hop
-        KV hand-off. Call before
-        :meth:`start_listening_to_data_parallel_coordinator`. See
-        ``DisaggEngineRuntime`` for the argument semantics."""
+        """Mark this engine as a disaggregated prefill/decode shard by
+        attaching a DisaggEngineRuntime, which holds all disagg state and the
+        2-hop KV hand-off. Call before
+        start_listening_to_data_parallel_coordinator. See DisaggEngineRuntime
+        for the argument semantics."""
         self._disagg = DisaggEngineRuntime(
             self, role=role, instance_layouts=instance_layouts, identity=identity,
-            world_group=world_group, spawn_coordinator=spawn_coordinator,
+            spawn_coordinator=spawn_coordinator,
             disagg_router=disagg_router, kv_transport_backend=kv_transport_backend,
         )
 
@@ -642,7 +642,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     "ready_event": coordinator_ready_event,
                     # Disagg engines register dynamically (REGISTER_ROLE in the
                     # coordinator loop, order-independent), so spawn with size 0
-                    # -- no blocking registration count in the coordinator init.
+                    #; no blocking registration count in the coordinator init.
                     "data_parallel_size": (
                         0 if disagg_enabled else get_pg_size(self.pg_collection.dp)
                     ),
@@ -693,7 +693,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # DP group from its source rank.
         bcast = [dp_addr]
         if disagg_enabled:
-            torch.distributed.broadcast_object_list(bcast, src=0, group=self._disagg.world_group)
+            torch.distributed.broadcast_object_list(bcast, src=0)
         else:
             torch.distributed.broadcast_object_list(bcast, src=dp_src, group=dp_group)
         [dp_addr] = bcast
@@ -2357,7 +2357,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 if self._disagg is not None and self._disagg.role == "prefill":
                     # Prefill engine: cap this new request to prefill-only, so it
-                    # stops once the prompt KV is populated -- that KV is the
+                    # stops once the prompt KV is populated; that KV is the
                     # hand-off payload; decode regenerates from the prompt.
                     self._disagg.prepare_prefill_request(request_id, prompt, sampling_params)
                 nvtx_range_push("add_request")
@@ -2368,13 +2368,13 @@ class DynamicInferenceEngine(AbstractEngine):
                 # instance, resharded to its layout.
                 self._disagg.send_kv(data[1], data[2])
             elif header == Headers.RECV_KV:
-                # (decode) receive a request's KV, import it (registers the
-                # prefix-cache blocks), then admit it for generation. ``data[5]``
-                # carries the prefill's published hand-off: READ descriptors for
-                # pull backends, snapshot hashes (or None) for push.
+                # Decode: receive a request's KV, import it (registers the
+                # prefix-cache blocks), then admit it for generation. data[5]
+                # carries the prefill's published hand-off: read descriptors
+                # for pull backends, snapshot hashes (or None) for push.
                 self._disagg.recv_kv(data[1], data[2], data[3], data[4], data[5])
             elif header == Headers.RELEASE_KV:
-                # (prefill, one-sided) the decode finished its READ -- release
+                # Prefill (pull): the decode finished its read; release
                 # the request's pinned KV blocks.
                 self._disagg.release_pinned(data[1])
             elif header == Headers.SET_GENERATION_EPOCH:

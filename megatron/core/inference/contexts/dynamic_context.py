@@ -2438,10 +2438,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         while CPU bookkeeping keeps them at `[paused_count:total_count)`).
         """
         # Wait for the previous step's async H2D before the CPU overwrites the
-        # shared pinned buffer, or the in-flight copy tears (reads mixed old/new
-        # bytes). Surfaced under disagg prefill's fast churn (num_tokens=1, active
-        # batch changes every step) as an out-of-range Mamba batch index and a
-        # conv-kernel illegal access.
+        # shared pinned buffer; an in-flight copy would read mixed old and new
+        # bytes.
         if self._bookkeeping_h2d_event is not None:
             self._bookkeeping_h2d_event.synchronize()
 
@@ -2576,15 +2574,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.reset_tensors()
         self.reset_metadata()
 
-        # Disaggregation: the reset wipes the allocator wholesale, so
-        # allocator-coupled hand-off state is meaningless afterward. Clear the
-        # pins (their late RELEASE_KV acks then land as no-ops in
-        # disagg_release_pinned) and the imported-request markers. Keep
-        # disagg_prompt_block_count and disagg_staged_kv: both are pure
-        # request-side state (a length cap and self-contained staging
-        # tensors/refs), consumed by requests that are still in flight across
-        # this reset -- e.g. the CUDA-graph warmup reset runs after SUBMITs
-        # have already recorded their caps.
+        # Disaggregation: the reset wipes the allocator, so allocator-coupled
+        # hand-off state is meaningless afterward. Clear the pins (late
+        # RELEASE_KV acks then land as no-ops) and the imported-request
+        # markers. Keep disagg_prompt_block_count and disagg_staged_kv: both
+        # are request-side state consumed by requests still in flight across
+        # this reset (the CUDA-graph warmup reset runs after SUBMITs have
+        # already recorded their caps).
         if self.disagg_pinned:
             logging.info(
                 "context.reset(): clearing %d disagg KV pins", len(self.disagg_pinned)
@@ -2807,11 +2803,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             0, overall_required_blocks - already_allocated_blocks - num_matched
         )
 
-        # Disagg observability: a request whose hand-off was imported should
-        # admit via a prefix hit; zero matches means the imported KV was
-        # discarded before admission and the full prompt re-prefills. Requests
-        # with no complete prompt block have no hashes and can never hit --
-        # their hand-off degrading to re-prefill is expected, not an anomaly.
+        # A request whose hand-off was imported should admit via a prefix hit;
+        # zero matches means the imported KV was discarded before admission and
+        # the full prompt re-prefills. Requests with no complete prompt block
+        # have no hashes and can never hit, so no warning for those.
         if finished == 0 and req.request_id in self.disagg_imported_request_ids:
             self.disagg_imported_request_ids.discard(req.request_id)
             if num_matched == 0 and req.precomputed_block_hashes:
@@ -3071,18 +3066,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Allocate a slot for Mamba states
             mamba_idx = self.mamba_metadata.allocate_slot()
             if mamba_idx is None:
-                raise ContextOverflowError(
-                    req.request_id, "No Mamba slots available"
-                )
-            self.mamba_metadata.request_to_mamba_state_idx[
-                self.total_request_count
-            ] = mamba_idx
+                raise ContextOverflowError(req.request_id, "No Mamba slots available")
+            self.mamba_metadata.request_to_mamba_state_idx[self.total_request_count] = mamba_idx
 
             # Restore Mamba state from the block corresponding to prefix_skip_tokens.
-            # Disagg hand-offs also land here: the imported boundary snapshots
-            # registered by the KV import make this the restore source (the
-            # recurrent state is only correct at a block boundary, so there is
-            # no end-state fast path).
+            # Disagg hand-offs also restore here: the KV import registered the
+            # imported boundary snapshots, and the recurrent state is only
+            # correct at a block boundary.
             restore_block_count = prefix_skip_tokens // self.block_size_tokens
             if restore_block_count > 0 and self.mamba_slot_allocator is not None:
                 restore_block_id = matched_block_ids[restore_block_count - 1]
@@ -4016,16 +4006,14 @@ class DynamicInferenceContext(BaseInferenceContext):
     # --- Disaggregated KV export / import (prefill -> decode handoff) ---
 
     def _disagg_resolve_export_blocks(self, request_id, internal_idx):
-        """[shared] Shared head of export_request_kv / export_request_kv_ref:
-        returns ``(internal_idx, block_ids, block_hashes)`` for the request.
+        """Shared head of export_request_kv / export_request_kv_ref: return
+        (internal_idx, block_ids, block_hashes) for the request.
 
-        Raises for the MLA latent cache and for an empty prompt (disaggregation
-        doesn't support prompt-less requests).
-
-        ``block_ids`` is capped to the prompt-covering count
-        (``ceil(prompt_len/block_size)``): a block-aligned prompt makes the
+        Raises for the MLA latent cache and for an empty prompt (both
+        unsupported). block_ids is capped to the prompt-covering count,
+        ceil(prompt_len / block_size): a block-aligned prompt makes the
         prefill allocate one extra block for its discarded token, which the
-        decode -- computing the count header-free -- never expects."""
+        decode (deriving the count from the prompt) never expects."""
         if self.cache_mla_latent:
             raise NotImplementedError(
                 "disaggregated KV transfer does not support the MLA latent KV cache"
@@ -4052,22 +4040,22 @@ class DynamicInferenceContext(BaseInferenceContext):
     def export_request_kv(
         self, request_id: int, internal_idx: int
     ) -> Dict[str, Any]:
-        """[push] Stage a request's KV (and Mamba boundary snapshots) for
-        off-GPU transfer.
+        """Stage a request's KV (and Mamba boundary snapshots) for off-GPU
+        transfer (push path).
 
-        ``internal_idx`` is the request's live slot -- the staging hook captures
-        it *before* the slot is recycled (the context frees the slot during the
-        step, before the engine's finish loop runs).
+        `internal_idx` is the request's live slot; the staging hook captures
+        it before the slot is recycled (the context frees the slot during the
+        step, before the engine's finish loop runs). Raises for the MLA latent
+        cache and for an empty prompt (both unsupported).
 
-        Raises for the MLA latent cache and for an empty prompt (both unsupported).
         Returns a dict with:
 
-        * ``staging_tensor`` — KV blocks for the request, shape
-          ``(num_blocks, 2, num_layers, block_size_tokens,
-          num_heads_per_partition, hidden_per_head)``. The decode derives the
-          matching schema header-free from the prompt.
-        * ``mamba_snapshots`` — block-boundary Mamba snapshots
-          (:meth:`_export_mamba_snapshots`), or ``None``.
+        * staging_tensor: the request's KV blocks, shape (num_blocks, 2,
+          num_layers, block_size_tokens, num_heads_per_partition,
+          hidden_per_head). The decode derives the matching schema from the
+          prompt.
+        * mamba_snapshots: block-boundary Mamba snapshots
+          (_export_mamba_snapshots), or None.
         """
         internal_idx, block_ids, _ = self._disagg_resolve_export_blocks(
             request_id, internal_idx
@@ -4085,10 +4073,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         }
 
     def _disagg_snapshot_block_slots(self, block_ids: list):
-        """[shared] Yield ``(block_id, snapshot_slot, block_hash)`` for each block
-        with a cached Mamba boundary snapshot and a registered hash. Empty for
-        non-hybrid / no-prefix-cache. Shared by the push (``_export_mamba_snapshots``)
-        and pull (``_export_snapshot_refs``) snapshot exporters."""
+        """Yield (block_id, snapshot_slot, block_hash) for each block with a
+        cached Mamba boundary snapshot and a registered hash. Empty for
+        non-hybrid models and without prefix caching. Shared by the push
+        (_export_mamba_snapshots) and pull (_export_snapshot_refs) exporters."""
         sa = self.mamba_slot_allocator
         if sa is None or not block_ids:
             return
@@ -4103,23 +4091,19 @@ class DynamicInferenceContext(BaseInferenceContext):
             yield bid, slot, h
 
     def _export_mamba_snapshots(self, block_ids: list) -> Optional[Dict[str, Any]]:
-        """[push] Collect per-block Mamba snapshots for the listed attention block IDs.
+        """Collect per-block Mamba snapshots for the listed attention block
+        ids (push path).
 
-        The snapshots populate the decode worker's :class:`MambaSlotAllocator`
-        so admission restores the recurrent state at the block boundary the
-        re-run starts from -- the hand-off's only Mamba payload (the live
-        end-state is never transferred; it is only correct when zero tokens
-        re-run, which admission never does).
+        The snapshots populate the decode worker's MambaSlotAllocator so
+        admission restores the recurrent state at the block boundary the
+        re-run starts from. They are the hand-off's only Mamba payload: the
+        live end-state is never transferred, since it is only correct when
+        zero tokens re-run, which admission never does.
 
-        Returns a dict carrying staged ``conv`` / ``ssm`` tensors of
-        shape ``(num_snapshots, num_mamba_layers, *state_shape)`` plus
-        the matching ``block_hashes`` so the decode side can look them
-        up by hash in its own attention allocator.
-
-        Returns ``None`` when the model has no
-        :class:`MambaSlotAllocator` (e.g. pure attention or hybrid
-        without prefix caching) or when none of the request's blocks
-        have a slot allocated.
+        Returns a dict with staged conv/ssm tensors of shape (num_snapshots,
+        num_mamba_layers, *state_shape) plus the matching block_hashes so the
+        decode side can look them up by hash, or None when there is no
+        MambaSlotAllocator or none of the request's blocks have a slot.
         """
         pairs = list(self._disagg_snapshot_block_slots(block_ids))
         if not pairs:
@@ -4147,16 +4131,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         block_hashes: list,
         mamba_snapshots: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
-        """[push] Inject a received KV staging tensor (and optional Mamba
-        boundary snapshots) into this context.
+        """Inject a received KV staging tensor (and optional Mamba boundary
+        snapshots) into this context (push path).
 
-        ``staging`` is ``(num_blocks, 2, num_layers, block_size, heads,
-        hidden)``, already populated with the remote K/V data. A geometry or
-        dtype mismatch against this rank's ``memory_buffer`` is a prefill/decode
-        config bug and raises; a full KV cache is a runtime condition and
-        returns ``None`` (the caller re-prefills).
+        `staging` is (num_blocks, 2, num_layers, block_size, heads, hidden),
+        already populated with the remote K/V data. A geometry or dtype
+        mismatch against this rank's memory_buffer is a prefill/decode config
+        bug and raises; a full KV cache is a runtime condition and returns
+        None (the caller re-prefills).
 
-        Returns ``{"block_ids", "block_hashes"}`` -- the local blocks written,
+        Returns {"block_ids", "block_hashes"}: the local blocks written,
         registered under the hashes so admission prefix-hits them.
         """
         if self.cache_mla_latent:
@@ -4182,7 +4166,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             return None
         local_block_ids = local_block_ids_tensor.tolist()
 
-        # Check every block id is in range before writing in place -- an
+        # Check every block id is in range before writing in place; an
         # out-of-range id corrupts memory.
         bad = [b for b in local_block_ids if b < 0 or b >= total_blocks]
         assert not bad, (
@@ -4208,24 +4192,21 @@ class DynamicInferenceContext(BaseInferenceContext):
     def export_request_kv_ref(
         self, request_id: int, internal_idx: int
     ) -> Dict[str, Any]:
-        """[pull] (prefill, one-sided) Capture a request's KV *by reference* -- block
-        ids + hashes + Mamba slot -- with no copy. The decode peer READs these
-        blocks straight from this rank's registered ``memory_buffer``, so the
-        blocks must stay valid until read; after the request frees its slot they
-        linger in the prefix cache, which is the (windowed) lifetime guarantee.
-        Raises for the MLA latent cache and for an empty prompt (both unsupported)."""
+        """Capture a request's KV by reference (block ids, hashes, snapshot
+        refs) with no copy, for the pull hand-off (prefill side). The decode
+        peer reads these blocks straight from this rank's registered
+        memory_buffer, so the blocks must stay valid until read; after the
+        request frees its slot they linger in the prefix cache. Raises for the
+        MLA latent cache and for an empty prompt (both unsupported)."""
         internal_idx, block_ids, block_hashes = self._disagg_resolve_export_blocks(
             request_id, internal_idx
         )
-        # Pin the KV blocks (ref-count) so they survive this request's release
-        # into the prefix cache and cannot be reallocated/overwritten before the
-        # decode's one-sided READ. Released on the RELEASE_KV ack
-        # (disagg_release_pinned). Reset-safe: the per-step reset doesn't touch
-        # block_ref_counts (only the epoch-level allocator reset does, when no
-        # hand-offs are outstanding). The coordinator's flow-control window
-        # bounds how many such pins can be outstanding -> a hard no-overwrite
-        # guarantee. The pin also keeps the blocks' Mamba boundary snapshots
-        # from being evicted until the decode's snapshot READ.
+        # Pin the KV blocks (ref count) so they survive this request's release
+        # into the prefix cache and cannot be reallocated before the decode's
+        # one-sided read; released on the RELEASE_KV ack
+        # (disagg_release_pinned). The coordinator's flow-control window bounds
+        # how many pins can be outstanding. The pin also keeps the blocks'
+        # Mamba boundary snapshots from being evicted until the snapshot read.
         self.kv_block_allocator.block_ref_counts[
             torch.tensor(block_ids, dtype=torch.int64)
         ] += 1
@@ -4242,30 +4223,29 @@ class DynamicInferenceContext(BaseInferenceContext):
     def disagg_export_request_kv(
         self, request_id: int, internal_idx: int
     ) -> Dict[str, Any]:
-        """[shared] Capture a finished request's KV for the disagg hand-off, dispatching on
-        this context's transport mode: by-reference (pull/NIXL, no copy) or a
-        staging copy (push/NCCL). The caller stages the result until the
-        coordinator's SEND_KV names the decode target."""
+        """Capture a finished request's KV for the disagg hand-off,
+        dispatching on this context's transport mode: by reference (pull) or a
+        staging copy (push). The caller stages the result until the
+        coordinator names the decode target."""
         if self.disagg_pull_mode:
             return self.export_request_kv_ref(request_id, internal_idx=internal_idx)
         return self.export_request_kv(request_id, internal_idx=internal_idx)
 
     def _export_snapshot_refs(self, block_ids: list) -> list:
-        """[pull] (prefill, one-sided) Per-block Mamba snapshot references for the
-        request: ``[(block_hash, snapshot_slot), ...]`` for blocks that have a
-        cached boundary snapshot and a valid hash. By reference (no copy): the
-        decode READs these snapshot slots from this rank's registered snapshot
-        buffers, which the KV pin keeps from being evicted until read."""
+        """Per-block Mamba snapshot references for the request (pull side):
+        [(block_hash, snapshot_slot), ...] for blocks that have a cached
+        boundary snapshot and a valid hash. The decode reads these snapshot
+        slots from this rank's registered snapshot buffers, which the KV pin
+        keeps from being evicted until read."""
         return [(h, slot) for _, slot, h in self._disagg_snapshot_block_slots(block_ids)]
 
     def _disagg_resolve_snapshot_hashes(self, hashes: list):
-        """[shared] Map hand-off snapshot ``hashes`` to local attention blocks
+        """Map hand-off snapshot `hashes` to local attention blocks
         (registered by the KV import), keeping only those resident in this
-        worker's prefix cache. Returns ``(keep_indices, target_block_ids)``.
-        Best-effort by design: an unresolvable hash only costs a future
-        prefix-cache sub-hit, so it is skipped, never raised. Shared resolve
-        head of :meth:`disagg_snapshot_pull_plan` and
-        :meth:`_import_mamba_snapshots`."""
+        worker's prefix cache. Returns (keep_indices, target_block_ids).
+        Best-effort: an unresolvable hash only costs a future prefix-cache
+        sub-hit, so it is skipped, never raised. Shared by
+        disagg_snapshot_pull_plan and _import_mamba_snapshots."""
         hash_to_block = self.kv_block_allocator.kv_hash_to_block_id
         keep_indices, target_blocks = [], []
         for i, h in enumerate(hashes):
@@ -4277,14 +4257,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         return keep_indices, target_blocks
 
     def disagg_snapshot_pull_plan(self, snapshot_pairs: list) -> Optional[Dict[str, Any]]:
-        """[pull] (decode, one-sided) Given the prefill's ``[(block_hash, src_slot), ...]``,
-        resolve each hash to a local attention block (registered by the KV commit),
-        allocate a local snapshot slot, and return the READ plan
-        ``{"transfers", "block_ids", "hashes"}`` -- transfers are
-        ``(region, src_slot, local_slot)`` for snap_conv + snap_ssm. Returns
-        ``None`` if there is nothing to pull. Mirrors the resolve+allocate half of
-        :meth:`_import_mamba_snapshots`; the READ fills the slots, then
-        :meth:`disagg_snapshot_commit` registers the hashes."""
+        """Build the snapshot read plan for a pull (decode side). Given the
+        prefill's [(block_hash, src_slot), ...], resolve each hash to a local
+        attention block (registered by the KV commit), allocate a local
+        snapshot slot, and return {"transfers", "block_ids", "hashes"}, where
+        transfers are (region, src_slot, local_slot) for snap_conv and
+        snap_ssm. Returns None if there is nothing to pull. The read fills the
+        slots, then disagg_snapshot_commit registers the hashes."""
         sa = self.mamba_slot_allocator
         if sa is None or not snapshot_pairs:
             return None
@@ -4302,38 +4281,36 @@ class DynamicInferenceContext(BaseInferenceContext):
         return {"transfers": transfers, "block_ids": target_blocks, "hashes": hashes}
 
     def disagg_snapshot_commit(self, block_ids: list, hashes: list) -> None:
-        """[pull] (decode, one-sided) After the snapshot READ has landed, register the
-        hash->block mapping in the slot allocator so prefix-cache sub-hits restore
-        the Mamba state at these boundaries."""
+        """After the snapshot read has landed, register the hash->block
+        mapping in the slot allocator so prefix-cache sub-hits restore the
+        Mamba state at these boundaries."""
         self.mamba_slot_allocator.register_block_hashes_batch(block_ids, hashes)
 
     def disagg_release_pinned(self, request_id: int) -> None:
-        """[pull] (prefill, one-sided) Release the KV blocks pinned for ``request_id`` by
-        :meth:`export_request_kv_ref`, on the decode's read-done ack (RELEASE_KV).
-        The coordinator sends at most one RELEASE_KV per hand-off (read-done and
-        drop are mutually exclusive), but a missing entry is a legal no-op, not
-        an error: a drop can fire before the prefill finished (no pin exists
-        yet), and an epoch-level ``context.reset()`` clears leftover pins, whose
-        late acks then land here after the allocator was wiped."""
+        """Release the KV blocks pinned for `request_id` by
+        export_request_kv_ref, on the decode's read-done ack (RELEASE_KV).
+        The coordinator sends at most one RELEASE_KV per hand-off, but a
+        missing entry is a legal no-op: a drop can fire before the prefill
+        finished (no pin exists yet), and context.reset() clears leftover
+        pins, whose late acks then land here after the allocator was wiped."""
         block_ids = self.disagg_pinned.pop(request_id, None)
         if block_ids is None:
             return
-        # Runs from the engine's coordinator-message loop, outside inference_mode,
-        # but the allocator's ref-count tensors are inference tensors -- wrap the
-        # inplace release like the other allocator mutations do.
+        # Runs from the engine's coordinator-message loop, outside
+        # inference_mode, but the allocator's ref-count tensors are inference
+        # tensors; wrap the in-place release like other allocator mutations.
         with torch.inference_mode():
             self.kv_block_allocator.release_memory_blocks(
                 torch.tensor(block_ids, dtype=torch.int64)
             )
 
     def disagg_pull_match_prefix(self, block_hashes: list) -> Dict[str, Any]:
-        """[pull] (decode, one-sided) Longest prefix of the prefill's published
-        ``block_hashes`` already resident in this rank's KV prefix cache, so the
-        pull can skip re-transferring those blocks. Returns
-        ``{"reused_block_ids", "match_len"}``; transiently pins the reused blocks
-        (``ref_count += 1``) so they survive eviction until the matching
-        :meth:`disagg_pull_commit` releases them. Empty when prefix caching is
-        off or nothing matches."""
+        """Find the longest prefix of the prefill's published block_hashes
+        already resident in this rank's KV prefix cache, so the pull can skip
+        re-transferring those blocks. Returns {"reused_block_ids",
+        "match_len"}; transiently pins the reused blocks so they survive
+        eviction until disagg_pull_commit releases them. Empty when prefix
+        caching is off or nothing matches."""
         empty = {"reused_block_ids": [], "match_len": 0}
         if not self.kv_block_allocator.enable_prefix_caching:
             return empty
@@ -4356,20 +4333,20 @@ class DynamicInferenceContext(BaseInferenceContext):
         return {"reused_block_ids": reused, "match_len": len(reused)}
 
     def disagg_pull_unmatch(self, reused_block_ids: list) -> None:
-        """[pull] (decode, one-sided) Release the transient pin taken by
-        :meth:`disagg_pull_match_prefix` -- used on the failure path when the
-        suffix allocation fails and the pull is abandoned."""
+        """Release the transient pin taken by disagg_pull_match_prefix, on the
+        failure path where the suffix allocation fails and the pull is
+        abandoned."""
         if reused_block_ids:
             self.kv_block_allocator.release_memory_blocks(
                 torch.tensor(list(reused_block_ids), dtype=torch.int64)
             )
 
     def disagg_pull_alloc(self, block_count: int) -> Optional[Dict[str, Any]]:
-        """[pull] (decode, one-sided) Allocate destination KV blocks for an
-        incoming pull. Returns ``{"block_ids"}``, or ``None`` if the KV cache is
-        full (so the caller defers the pull). ``block_count`` may be 0 (full
-        prefix hit: nothing new to pull). The caller READs the peer's data into
-        these, then calls :meth:`disagg_pull_commit`."""
+        """Allocate destination KV blocks for an incoming pull. Returns
+        {"block_ids"}, or None if the KV cache is full (the caller then admits
+        to re-prefill). block_count may be 0 (full prefix hit: nothing new to
+        pull). The caller reads the peer's data into these blocks, then calls
+        disagg_pull_commit."""
         if block_count == 0:
             return {"block_ids": []}
         ids_t = self.kv_block_allocator.allocate_memory_blocks(block_count)
@@ -4384,12 +4361,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         return {"block_ids": block_ids}
 
     def _disagg_register_and_release(self, block_ids: list, block_hashes: list) -> None:
-        """[shared] Commit received/pulled KV blocks into the prefix cache: register the
-        valid (block, hash) pairs (dropping -1 sentinels the registry can't hold)
-        and release the alloc-time ``ref_count=1`` pin, so the engine's
-        prefix-cache match grows from the cached ``ref_count==0`` state. Shared
-        tail of :meth:`import_request_kv` (push) and :meth:`disagg_pull_commit`
-        (pull)."""
+        """Commit received or pulled KV blocks into the prefix cache: register
+        the valid (block, hash) pairs (dropping -1 sentinels) and release the
+        alloc-time ref_count=1 pin, so the prefix-cache match grows from the
+        cached ref_count==0 state. Shared tail of import_request_kv (push) and
+        disagg_pull_commit (pull)."""
         if not self.kv_block_allocator.enable_prefix_caching:
             return
         # Hashes cover a leading prefix of the blocks: pull sends one per block
@@ -4406,40 +4382,27 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
     def disagg_pull_commit(self, block_ids: list, block_hashes: list) -> Dict[str, Any]:
-        """[pull] (decode, one-sided) After the READ has landed the peer's KV into
-        ``block_ids``, register the block hashes so the prefix-cache match
-        treats them as populated and balance the allocator ref-count (we
-        allocated with ref_count=1; the matched-block path expects to grow from
-        the cached ref_count==0 state). Mirrors the tail of
-        :meth:`import_request_kv` minus the staging copy (the data arrived via
-        the one-sided READ)."""
+        """After the read has landed the peer's KV into `block_ids`, register
+        the block hashes so the prefix-cache match treats them as populated,
+        and release the alloc-time pin. The tail of import_request_kv minus
+        the staging copy (the data arrived via the one-sided read)."""
         block_hashes = list(block_hashes)
         self._disagg_register_and_release(block_ids, block_hashes)
         return {"block_ids": block_ids, "block_hashes": block_hashes}
 
     def _import_mamba_snapshots(self, snapshots: Dict[str, Any]) -> None:
-        """[push] Populate the local :class:`MambaSlotAllocator` with snapshots
-        the prefill peer captured at attention block boundaries -- the hand-off's
-        only Mamba payload. Admission then restores the recurrent state at the
-        boundary the re-run starts from, via the native prefix-cache restore
-        path.
+        """Populate the local MambaSlotAllocator with snapshots the prefill
+        peer captured at attention block boundaries (push path). Admission
+        then restores the recurrent state at the boundary the re-run starts
+        from, via the prefix-cache restore path.
 
-        For each ``(block_hash, conv_state, ssm_state)`` triple we:
-
-        1. Resolve the local attention ``block_id`` via
-           ``kv_block_allocator.kv_hash_to_block_id`` — the matching
-           prefix-cache entry from the attention import.
-        2. Reserve a Mamba slot for it via
-           ``slot_allocator.allocate_slots_batch`` (or reuse an
-           existing slot when the block already had one).
-        3. Copy the snapshotted states into that slot.
-        4. Register the hash → block_id mapping in the slot allocator
-           so the engine's restoration path finds it on a sub-prefix
-           hit.
-
-        Snapshots are best-effort: a missing or unresolvable snapshot only
-        costs a shorter prefix skip at admission, never a wrong result -- so
-        anything off is skipped rather than raised.
+        Each snapshot's hash is resolved to the local attention block the KV
+        import registered, a Mamba slot is allocated for it, the snapshotted
+        states are copied in, and the hash->block mapping is registered so the
+        restore path finds it on a sub-prefix hit. Snapshots are best-effort:
+        a missing or unresolvable snapshot only costs a shorter prefix skip at
+        admission, never a wrong result, so anything off is skipped rather
+        than raised.
         """
         slot_allocator = self.mamba_slot_allocator
         if slot_allocator is None:

@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""``torch.distributed`` point-to-point (NCCL) KV transfer backend."""
+"""torch.distributed point-to-point (NCCL) KV transfer backend."""
 
 from __future__ import annotations
 
@@ -16,9 +16,9 @@ from megatron.core.inference.disaggregation.transfer_backends.base import (
 
 
 class NcclTransportBackend(KVTransportBackend):
-    """``torch.distributed`` point-to-point transport via ``isend``/``irecv`` over
-    the NCCL backend (default process group). The receive side allocates the
-    destination buffer; send tensors must be contiguous."""
+    """Point-to-point transport via isend/irecv over the default (NCCL)
+    process group. The receive side allocates the destination buffers; send
+    tensors must be contiguous."""
 
     def init(self) -> None:
         if not dist.is_available() or not dist.is_initialized():
@@ -29,11 +29,12 @@ class NcclTransportBackend(KVTransportBackend):
 
     def batch(self, sends, recvs, *, device: Optional[torch.device] = None):
         """Issue one request's point-to-point ops as a single coalesced NCCL
-        group (``batch_isend_irecv`` -> one ``ncclGroupStart/End``), returning
-        ``(handle, recv_buffers)``. Grouping is required for correctness: dozens
-        of concurrent ungrouped P2P ops to one peer can corrupt memory. ``sends``:
-        ``(tensor, dst)``; ``recvs``: ``(shape, dtype, src)`` with buffers
-        allocated here and returned in order.
+        group and return (handle, recv_buffers).
+
+        `sends` is a list of (tensor, dst); `recvs` is a list of
+        (shape, dtype, src), whose buffers are allocated here and returned in
+        order. Grouping via batch_isend_irecv is required: concurrent
+        ungrouped P2P ops to the same peer can corrupt memory.
         """
         ops = []
         for tensor, dst in sends:
