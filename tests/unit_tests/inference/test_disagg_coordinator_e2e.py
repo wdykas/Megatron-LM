@@ -38,8 +38,19 @@ PORT = 46733
 
 
 def _layout(global_rank):
-    return dict(num_layers=L, num_heads=H, tp_size=1, tp_rank=0, pp_size=1, pp_rank=0,
-                global_rank=global_rank, ep_size=1, ep_rank=0, etp_size=1, etp_rank=0)
+    return dict(
+        num_layers=L,
+        num_heads=H,
+        tp_size=1,
+        tp_rank=0,
+        pp_size=1,
+        pp_rank=0,
+        global_rank=global_rank,
+        ep_size=1,
+        ep_rank=0,
+        etp_size=1,
+        etp_rank=0,
+    )
 
 
 class _FakeKVContext(DummyContext):
@@ -61,8 +72,12 @@ class _FakeKVContext(DummyContext):
 
     def export_request_kv(self, request_id):
         return {
-            "layout": "std_attn_v1", "block_count": BC, "block_size_tokens": BS,
-            "num_layers": L, "num_heads_per_partition": H, "hidden_per_head": HD,
+            "layout": "std_attn_v1",
+            "block_count": BC,
+            "block_size_tokens": BS,
+            "num_layers": L,
+            "num_heads_per_partition": H,
+            "hidden_per_head": HD,
             "block_hashes": [],
             "staging_tensor": torch.full((BC, 2, L, BS, H, HD), 1.0, device=self._dev),
         }
@@ -84,8 +99,12 @@ class DisaggDummyEngine(DummyEngine):
     async def async_step(self, *, verbose=False):
         from collections import deque as _dq
 
-        result = {"active_request_ids": [], "finished_request_records": [],
-                  "step_time": 0.01, "cuda_graph_request_count": 1}
+        result = {
+            "active_request_ids": [],
+            "finished_request_records": [],
+            "step_time": 0.01,
+            "cuda_graph_request_count": 1,
+        }
         # activate queued
         while self.waiting_request_ids:
             rid = self.waiting_request_ids.popleft()
@@ -175,8 +194,7 @@ async def _run_disagg_e2e():
             client = InferenceClient(dp_addr)
             client.start()
             fut = client.add_request(
-                prompt=[1, 2, 3, 4],
-                sampling_params=SamplingParams(num_tokens_to_generate=2),
+                prompt=[1, 2, 3, 4], sampling_params=SamplingParams(num_tokens_to_generate=2)
             )
             result = await asyncio.wait_for(fut, timeout=30.0)
             assert result["status"] == Status.COMPLETED.name, result

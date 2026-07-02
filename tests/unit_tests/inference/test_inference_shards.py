@@ -13,8 +13,7 @@ from megatron.core.inference.shards_spec import (
 
 
 def test_shard_spec_objects_match_string_parsing():
-    objs = [InferenceShardSpec(tp=2, role="prefill"),
-            InferenceShardSpec(tp=1, dp=2, role="decode")]
+    objs = [InferenceShardSpec(tp=2, role="prefill"), InferenceShardSpec(tp=1, dp=2, role="decode")]
     assert normalize_shard_specs(objs, 4) == parse_inference_shards_spec(
         "tp=2,role=prefill+tp=1,dp=2,role=decode", 4
     )
@@ -35,7 +34,14 @@ def test_parse_defaults_and_dp_and_role():
     assert specs[0] == InferenceShardSpec(tp=2, role="prefill")
     assert specs[1] == InferenceShardSpec(tp=1, dp=2, role="decode")
     # dict form (serialization / external consumers) carries the resolved keys.
-    assert specs[0].to_dict() == {"tp": 2, "pp": 1, "ep": 1, "dp": 1, "expt_tp": 2, "role": "prefill"}
+    assert specs[0].to_dict() == {
+        "tp": 2,
+        "pp": 1,
+        "ep": 1,
+        "dp": 1,
+        "expt_tp": 2,
+        "role": "prefill",
+    }
 
 
 def test_parse_partitions_world_with_dp():
@@ -61,7 +67,9 @@ def test_plus_and_semicolon_separators_equivalent():
 def test_cp_accepted_only_when_one():
     # cp is a recognized key (clear error, not "unknown key") but must be 1:
     # inference shards don't context-parallelize.
-    assert parse_inference_shards_spec("tp=2,cp=1", world_size=2) == [InferenceShardSpec(tp=2, cp=1)]
+    assert parse_inference_shards_spec("tp=2,cp=1", world_size=2) == [
+        InferenceShardSpec(tp=2, cp=1)
+    ]
     with pytest.raises(ValueError):
         InferenceShardSpec(tp=1, cp=2)
     with pytest.raises(ValueError):
@@ -75,16 +83,18 @@ def test_validate_specs_allows_multi_prefill_rejects_untagged_and_no_decode():
     from megatron.core.inference.disaggregation.coordinator_setup import _validate_disagg_specs
 
     # Multiple prefill and decode instances are allowed (dp>1 = a pool).
-    _validate_disagg_specs(parse_inference_shards_spec(
-        "tp=1,dp=2,role=prefill+tp=1,role=decode", world_size=3))
-    _validate_disagg_specs(parse_inference_shards_spec(
-        "tp=2,role=prefill+tp=1,dp=2,role=decode+tp=2,role=decode", world_size=6))
+    _validate_disagg_specs(
+        parse_inference_shards_spec("tp=1,dp=2,role=prefill+tp=1,role=decode", world_size=3)
+    )
+    _validate_disagg_specs(
+        parse_inference_shards_spec(
+            "tp=2,role=prefill+tp=1,dp=2,role=decode+tp=2,role=decode", world_size=6
+        )
+    )
     with pytest.raises(AssertionError):  # an untagged shard
-        _validate_disagg_specs(parse_inference_shards_spec(
-            "tp=1,role=prefill+tp=1", world_size=2))
+        _validate_disagg_specs(parse_inference_shards_spec("tp=1,role=prefill+tp=1", world_size=2))
     with pytest.raises(AssertionError):  # no decode
-        _validate_disagg_specs(parse_inference_shards_spec(
-            "tp=1,role=prefill", world_size=1))
+        _validate_disagg_specs(parse_inference_shards_spec("tp=1,role=prefill", world_size=1))
 
 
 # --------------------------------------------------------------------------
@@ -120,6 +130,6 @@ def test_layout_from_pg_collection(monkeypatch):
     assert (lay.ep_size, lay.ep_rank) == (2, 1)
     assert (lay.etp_size, lay.etp_rank) == (1, 0)
     assert lay.global_rank == 5
-    assert lay.head_range() == (4, 8)      # attention TP4 -> heads [4,8)
-    assert lay.layer_range() == (0, 4)     # PP2 rank0 -> layers [0,4)
-    assert lay.kv_shard_key() == (1, 0)    # EP/ETP are replica dims
+    assert lay.head_range() == (4, 8)  # attention TP4 -> heads [4,8)
+    assert lay.layer_range() == (0, 4)  # PP2 rank0 -> layers [0,4)
+    assert lay.kv_shard_key() == (1, 0)  # EP/ETP are replica dims

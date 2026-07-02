@@ -528,8 +528,13 @@ class DynamicInferenceEngine(AbstractEngine):
         self.capture_stats = capture_stats
 
     def set_disaggregation_config(
-        self, *, role, instance_layouts, identity,
-        spawn_coordinator, disagg_router="round_robin",
+        self,
+        *,
+        role,
+        instance_layouts,
+        identity,
+        spawn_coordinator,
+        disagg_router="round_robin",
         kv_transport_backend="nccl",
     ):
         """Mark this engine as a disaggregated prefill/decode shard by
@@ -538,9 +543,13 @@ class DynamicInferenceEngine(AbstractEngine):
         start_listening_to_data_parallel_coordinator. See DisaggEngineRuntime
         for the argument semantics."""
         self._disagg = DisaggEngineRuntime(
-            self, role=role, instance_layouts=instance_layouts, identity=identity,
+            self,
+            role=role,
+            instance_layouts=instance_layouts,
+            identity=identity,
             spawn_coordinator=spawn_coordinator,
-            disagg_router=disagg_router, kv_transport_backend=kv_transport_backend,
+            disagg_router=disagg_router,
+            kv_transport_backend=kv_transport_backend,
         )
 
     @internal_api
@@ -642,7 +651,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     "ready_event": coordinator_ready_event,
                     # Disagg engines register dynamically (REGISTER_ROLE in the
                     # coordinator loop, order-independent), so spawn with size 0
-                    #; no blocking registration count in the coordinator init.
+                    # ; no blocking registration count in the coordinator init.
                     "data_parallel_size": (
                         0 if disagg_enabled else get_pg_size(self.pg_collection.dp)
                     ),

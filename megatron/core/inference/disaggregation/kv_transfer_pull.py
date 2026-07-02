@@ -126,9 +126,13 @@ class NixlPullRecv:
                 alloc = engine.context.disagg_snapshot_alloc(self.snap_hashes)
                 if alloc is not None:
                     handles = _snapshot_fragment_pulls(
-                        engine.context, self.backend, self.my_mamba,
-                        self.snap_transfers, alloc,
-                        self.src_snap_slots, self.src_region_meta,
+                        engine.context,
+                        self.backend,
+                        self.my_mamba,
+                        self.snap_transfers,
+                        alloc,
+                        self.src_snap_slots,
+                        self.src_region_meta,
                     )
                     for h in handles:
                         h.wait()
@@ -164,8 +168,16 @@ def _check_pull_dims(src_dims: dict, dst_dims: dict) -> None:
             )
 
 
-def _kv_fragment_descriptors(src_dims, dst_dims, src_block, dst_block,
-                             src_layer_slice, dst_layer_slice, src_head_slice, dst_head_slice):
+def _kv_fragment_descriptors(
+    src_dims,
+    dst_dims,
+    src_block,
+    dst_block,
+    src_layer_slice,
+    dst_layer_slice,
+    src_head_slice,
+    dst_head_slice,
+):
     """Build (local_offset, remote_offset, nbytes) read descriptors for one
     block's head/layer fragment, coalesced to the contiguous minimum.
 
@@ -192,16 +204,24 @@ def _kv_fragment_descriptors(src_dims, dst_dims, src_block, dst_block,
     hidden = dst_dims["hidden"]
     elem = dst_dims["elem"]
     src_num_layers, src_total_blocks, src_block_size, src_heads = (
-        src_dims["num_layers"], src_dims["total_blocks"], src_dims["block_size"], src_dims["heads"]
+        src_dims["num_layers"],
+        src_dims["total_blocks"],
+        src_dims["block_size"],
+        src_dims["heads"],
     )
     dst_num_layers, dst_total_blocks, dst_block_size, dst_heads = (
-        dst_dims["num_layers"], dst_dims["total_blocks"], dst_dims["block_size"], dst_dims["heads"]
+        dst_dims["num_layers"],
+        dst_dims["total_blocks"],
+        dst_dims["block_size"],
+        dst_dims["heads"],
     )
     src_layer_ids = range(src_layer_slice.start, src_layer_slice.stop)
     dst_layer_ids = range(dst_layer_slice.start, dst_layer_slice.stop)
     full_head_span = (
-        src_head_slice.start == 0 and src_head_slice.stop == src_heads
-        and dst_head_slice.start == 0 and dst_head_slice.stop == dst_heads
+        src_head_slice.start == 0
+        and src_head_slice.stop == src_heads
+        and dst_head_slice.start == 0
+        and dst_head_slice.stop == dst_heads
         and src_heads == dst_heads
     )
     descriptors = []
@@ -209,17 +229,59 @@ def _kv_fragment_descriptors(src_dims, dst_dims, src_block, dst_block,
         nbytes = src_block_size * src_heads * hidden * elem
         for kv in (0, 1):
             for src_layer, dst_layer in zip(src_layer_ids, dst_layer_ids):
-                src_offset = (((kv * src_num_layers + src_layer) * src_total_blocks + src_block) * src_block_size) * src_heads * hidden * elem
-                dst_offset = (((kv * dst_num_layers + dst_layer) * dst_total_blocks + dst_block) * dst_block_size) * dst_heads * hidden * elem
-                descriptors.append((dst_offset, src_offset, nbytes))  # (local=dst, remote=src, nbytes)
+                src_offset = (
+                    (
+                        ((kv * src_num_layers + src_layer) * src_total_blocks + src_block)
+                        * src_block_size
+                    )
+                    * src_heads
+                    * hidden
+                    * elem
+                )
+                dst_offset = (
+                    (
+                        ((kv * dst_num_layers + dst_layer) * dst_total_blocks + dst_block)
+                        * dst_block_size
+                    )
+                    * dst_heads
+                    * hidden
+                    * elem
+                )
+                descriptors.append(
+                    (dst_offset, src_offset, nbytes)
+                )  # (local=dst, remote=src, nbytes)
         return descriptors
     head_count = src_head_slice.stop - src_head_slice.start
     nbytes = head_count * hidden * elem
     for kv in (0, 1):
         for src_layer, dst_layer in zip(src_layer_ids, dst_layer_ids):
             for token in range(src_block_size):
-                src_offset = ((((kv * src_num_layers + src_layer) * src_total_blocks + src_block) * src_block_size + token) * src_heads + src_head_slice.start) * hidden * elem
-                dst_offset = ((((kv * dst_num_layers + dst_layer) * dst_total_blocks + dst_block) * dst_block_size + token) * dst_heads + dst_head_slice.start) * hidden * elem
+                src_offset = (
+                    (
+                        (
+                            ((kv * src_num_layers + src_layer) * src_total_blocks + src_block)
+                            * src_block_size
+                            + token
+                        )
+                        * src_heads
+                        + src_head_slice.start
+                    )
+                    * hidden
+                    * elem
+                )
+                dst_offset = (
+                    (
+                        (
+                            ((kv * dst_num_layers + dst_layer) * dst_total_blocks + dst_block)
+                            * dst_block_size
+                            + token
+                        )
+                        * dst_heads
+                        + dst_head_slice.start
+                    )
+                    * hidden
+                    * elem
+                )
                 descriptors.append((dst_offset, src_offset, nbytes))
     return descriptors
 
@@ -242,9 +304,7 @@ def _snapshot_fragment_pulls(
     pools = {"snap_conv": sa.conv_states, "snap_ssm": sa.ssm_states}
     tails = {
         "snap_conv": my_mamba.dims.d_conv * sa.conv_states.element_size(),
-        "snap_ssm": (
-            my_mamba.dims.headdim * my_mamba.dims.d_state * sa.ssm_states.element_size()
-        ),
+        "snap_ssm": (my_mamba.dims.headdim * my_mamba.dims.d_state * sa.ssm_states.element_size()),
     }
     kept = list(zip(alloc["hashes"], alloc["slots"]))
     triples_by: dict = {}  # (src_rank, region) -> [(local_off, remote_off, nbytes)]
@@ -274,9 +334,16 @@ def _snapshot_fragment_pulls(
     ]
 
 
-def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
-                         src_layouts, dst_layouts, src_mamba_layouts,
-                         dst_mamba_layouts):
+def post_pull_request_kv(
+    engine,
+    backend,
+    rank_handoffs,
+    my_layout,
+    src_layouts,
+    dst_layouts,
+    src_mamba_layouts,
+    dst_mamba_layouts,
+):
     """Allocate destination blocks and issue the one-sided reads pulling the
     request's KV into them (decode side).
 
@@ -332,9 +399,14 @@ def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
         descriptors = []
         for block_idx in range(match_len, block_count):
             descriptors += _kv_fragment_descriptors(
-                src_handoff["kv_dims"], dst_dims,
-                int(src_handoff["block_ids"][block_idx]), int(dst_block_ids[block_idx]),
-                src_layer_slice, dst_layer_slice, src_head_slice, dst_head_slice,
+                src_handoff["kv_dims"],
+                dst_dims,
+                int(src_handoff["block_ids"][block_idx]),
+                int(dst_block_ids[block_idx]),
+                src_layer_slice,
+                dst_layer_slice,
+                src_head_slice,
+                dst_head_slice,
             )
         if descriptors:
             handles.append(backend.begin_pull_raw(src_handoff["region_meta"], "kv", descriptors))
@@ -357,9 +429,7 @@ def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
         base = rank_handoffs[0]["snapshots"] or []
         usable = [hash_ for hash_, _ in base if all(hash_ in m for m in slot_maps.values())]
         if usable:
-            my_mamba = next(
-                m for m in dst_mamba_layouts if m.global_rank == my_layout.global_rank
-            )
+            my_mamba = next(m for m in dst_mamba_layouts if m.global_rank == my_layout.global_rank)
             plan = mamba_reshard.plan_mamba_reshard(src_mamba_layouts, dst_mamba_layouts)
             snap_transfers = [t for t in plan if t.dst_rank == my_layout.global_rank]
             snap_hashes = usable
@@ -367,9 +437,13 @@ def post_pull_request_kv(engine, backend, rank_handoffs, my_layout,
                 src_snap_slots[t.src_rank] = slot_maps[t.src_rank]
                 src_region_meta[t.src_rank] = handoff_by_rank[t.src_rank]["region_meta"]
     return NixlPullRecv(
-        handles=handles, block_ids=dst_block_ids,
+        handles=handles,
+        block_ids=dst_block_ids,
         block_hashes=list(rank_handoffs[0]["block_hashes"]),
-        backend=backend, snap_hashes=snap_hashes, snap_transfers=snap_transfers,
-        src_snap_slots=src_snap_slots, src_region_meta=src_region_meta,
+        backend=backend,
+        snap_hashes=snap_hashes,
+        snap_transfers=snap_transfers,
+        src_snap_slots=src_snap_slots,
+        src_region_meta=src_region_meta,
         my_mamba=my_mamba,
     )

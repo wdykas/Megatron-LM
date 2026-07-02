@@ -43,6 +43,7 @@ from megatron.core.utils import get_pg_src_rank, nvtx_range_pop, nvtx_range_push
 def pull_only(method):
     """Assert at call time that the method only runs on a pull (one-sided)
     backend."""
+
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
         assert self.is_pull, (
@@ -57,6 +58,7 @@ def pull_only(method):
 def push_only(method):
     """Assert at call time that the method only runs on a push (two-sided)
     backend."""
+
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
         assert not self.is_pull, (
@@ -104,21 +106,28 @@ class DisaggEngineRuntime:
     """
 
     def __init__(
-        self, engine, *, role, instance_layouts, identity,
-        spawn_coordinator, disagg_router="round_robin", kv_transport_backend="nccl",
+        self,
+        engine,
+        *,
+        role,
+        instance_layouts,
+        identity,
+        spawn_coordinator,
+        disagg_router="round_robin",
+        kv_transport_backend="nccl",
     ):
         """Args:
-            engine: the owning DynamicInferenceEngine.
-            role: "prefill" or "decode".
-            instance_layouts: KV-shard layout dicts for every rank of this
-                instance (so the coordinator can build reshard plans).
-            identity: unique ZMQ identity for this instance's MP-coordinator
-                (must differ across shards/instances).
-            spawn_coordinator: whether this rank spawns the single coordinator.
-            disagg_router: name of the routing policy the coordinator resolves
-                (registered via register_disagg_router; default round-robin).
-            kv_transport_backend: KV transport, "nccl" (two-sided push) or
-                "nixl" (one-sided pull).
+        engine: the owning DynamicInferenceEngine.
+        role: "prefill" or "decode".
+        instance_layouts: KV-shard layout dicts for every rank of this
+            instance (so the coordinator can build reshard plans).
+        identity: unique ZMQ identity for this instance's MP-coordinator
+            (must differ across shards/instances).
+        spawn_coordinator: whether this rank spawns the single coordinator.
+        disagg_router: name of the routing policy the coordinator resolves
+            (registered via register_disagg_router; default round-robin).
+        kv_transport_backend: KV transport, "nccl" (two-sided push) or
+            "nixl" (one-sided pull).
         """
         assert role in ("prefill", "decode")
         self.engine = engine
@@ -144,12 +153,8 @@ class DisaggEngineRuntime:
         rank = dist.get_rank()
         self.instance_kv_layouts = kv_layouts(instance_layouts)
         self.instance_mamba_layouts = mamba_layouts(instance_layouts)
-        self.my_layout = next(
-            (l for l in self.instance_kv_layouts if l.global_rank == rank), None
-        )
-        assert (
-            self.my_layout is not None
-        ), f"rank {rank} not found in its disagg instance layouts"
+        self.my_layout = next((l for l in self.instance_kv_layouts if l.global_rank == rank), None)
+        assert self.my_layout is not None, f"rank {rank} not found in its disagg instance layouts"
 
         # The prefill controller stages each finished request's KV into the
         # context while the slot is still valid; the engine's finish loop runs
@@ -170,18 +175,22 @@ class DisaggEngineRuntime:
     # start_listening after this runtime is constructed) -----------------
     @property
     def context(self):
+        """The engine's DynamicInferenceContext."""
         return self.engine.context
 
     @property
     def pg_collection(self):
+        """The engine's process-group collection."""
         return self.engine.pg_collection
 
     @property
     def is_mp_coordinator(self):
+        """Whether this rank is the instance's MP coordinator."""
         return self.engine.is_mp_coordinator
 
     @property
     def socket_for_receiving_requests(self):
+        """The MP coordinator's ZMQ socket toward the shared coordinator."""
         return self.engine.socket_for_receiving_requests
 
     # --- backend + one-sided registration --------------------------------
@@ -230,13 +239,10 @@ class DisaggEngineRuntime:
         coordinator caches the per-rank list and synthesizes each request's
         hand-off locally, so PREFILL_DONE carries no per-request gather.
         Collective across the MP group; all ranks must call it in lockstep."""
-        static = pull_static_meta(
-            self.get_backend(), self.my_layout, _ctx_kv_dims(self.context)
-        )
+        static = pull_static_meta(self.get_backend(), self.my_layout, _ctx_kv_dims(self.context))
         mp_group = self.pg_collection.mp
         gathered = (
-            [None] * torch.distributed.get_world_size(mp_group)
-            if self.is_mp_coordinator else None
+            [None] * torch.distributed.get_world_size(mp_group) if self.is_mp_coordinator else None
         )
         torch.distributed.gather_object(
             static, gathered, dst=get_pg_src_rank(mp_group), group=mp_group
@@ -307,14 +313,13 @@ class DisaggEngineRuntime:
         # recv.
         staged = self.context.disagg_staged_kv.pop(request_id, None)
         if staged is None:
-            raise RuntimeError(
-                f"disagg prefill: SEND_KV for request {request_id} has no staged KV"
-            )
+            raise RuntimeError(f"disagg prefill: SEND_KV for request {request_id} has no staged KV")
         self.pending_sends[request_id] = send_request_kv_resharded(
             self.my_layout,
             self.instance_kv_layouts,
             kv_layouts(dst_layout_dicts),
-            backend=self.get_backend(), payload=staged,
+            backend=self.get_backend(),
+            payload=staged,
             src_mamba_layouts=self.instance_mamba_layouts,
             dst_mamba_layouts=mamba_layouts(dst_layout_dicts),
         )
@@ -339,7 +344,10 @@ class DisaggEngineRuntime:
 
         if self.is_pull:
             recv = post_pull_request_kv(
-                self.engine, self.get_backend(), handoff, self.my_layout,
+                self.engine,
+                self.get_backend(),
+                handoff,
+                self.my_layout,
                 src_layouts=kv_layouts(src_layout_dicts),
                 dst_layouts=self.instance_kv_layouts,
                 src_mamba_layouts=mamba_layouts(src_layout_dicts),
@@ -347,10 +355,12 @@ class DisaggEngineRuntime:
             )
         else:
             recv = post_recv_request_kv_resharded(
-                self.engine, self.my_layout,
+                self.engine,
+                self.my_layout,
                 kv_layouts(src_layout_dicts),
                 self.instance_kv_layouts,
-                prompt, backend=self.get_backend(),
+                prompt,
+                backend=self.get_backend(),
                 handoff=handoff,
                 src_mamba_layouts=mamba_layouts(src_layout_dicts),
                 dst_mamba_layouts=self.instance_mamba_layouts,
@@ -381,7 +391,8 @@ class DisaggEngineRuntime:
         local = [self.pending_recvs[rid][0].poll() for rid in pending]
         flags = torch.tensor(
             [1 if d else 0 for d in local],
-            dtype=torch.int32, device=self.context.memory_buffer.device,
+            dtype=torch.int32,
+            device=self.context.memory_buffer.device,
         )
         # MIN over the MP group == logical AND: admit only where all ranks agree.
         torch.distributed.all_reduce(
@@ -488,9 +499,7 @@ class DisaggEngineRuntime:
                 parts = [Headers.PREFILL_DONE.value, rid]
                 if handoff is not None:
                     parts.append(handoff)
-                self.socket_for_receiving_requests.send(
-                    msgpack.packb(parts, use_bin_type=True)
-                )
+                self.socket_for_receiving_requests.send(msgpack.packb(parts, use_bin_type=True))
         nvtx_range_pop("coordinator_communication")
 
     @pull_only

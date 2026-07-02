@@ -9,8 +9,14 @@ from megatron.core.inference.disaggregation.kv_transfer_pull import _kv_fragment
 
 
 def _kv_dims(L, TB, BS, H, HD, elem=2):
-    return {"num_layers": L, "total_blocks": TB, "block_size": BS,
-            "heads": H, "hidden": HD, "elem": elem}
+    return {
+        "num_layers": L,
+        "total_blocks": TB,
+        "block_size": BS,
+        "heads": H,
+        "hidden": HD,
+        "elem": elem,
+    }
 
 
 def test_full_head_fragment_coalesces_to_whole_block_descriptors():
@@ -21,8 +27,7 @@ def test_full_head_fragment_coalesces_to_whole_block_descriptors():
     dims = _kv_dims(L, TB, BS, H, HD, elem)
     src_block, dst_block = 7, 2
     descriptors = _kv_fragment_descriptors(
-        dims, dims, src_block, dst_block,
-        range(0, L), range(0, L), range(0, H), range(0, H),
+        dims, dims, src_block, dst_block, range(0, L), range(0, L), range(0, H), range(0, H)
     )
     assert len(descriptors) == 2 * L  # 2 (k) * L, NOT 2*L*BS
     inner = BS * H * HD * elem
@@ -40,7 +45,7 @@ def test_partial_head_fragment_splits_per_token():
     dims = _kv_dims(L, TB, BS, H, HD, elem)
     # Pull heads [0:4) of an 8-head buffer -> partial -> per-token split.
     descriptors = _kv_fragment_descriptors(
-        dims, dims, 7, 2, range(0, L), range(0, L), range(0, 4), range(0, 4),
+        dims, dims, 7, 2, range(0, L), range(0, L), range(0, 4), range(0, 4)
     )
     assert len(descriptors) == 2 * L * BS
     assert all(nb == 4 * HD * elem for _, _, nb in descriptors)

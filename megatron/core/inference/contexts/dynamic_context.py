@@ -2582,9 +2582,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # this reset (the CUDA-graph warmup reset runs after SUBMITs have
         # already recorded their caps).
         if self.disagg_pinned:
-            logging.info(
-                "context.reset(): clearing %d disagg KV pins", len(self.disagg_pinned)
-            )
+            logging.info("context.reset(): clearing %d disagg KV pins", len(self.disagg_pinned))
         self.disagg_pinned.clear()
         self.disagg_imported_request_ids.clear()
 
@@ -4037,9 +4035,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             block_hashes = [-1] * block_count
         return internal_idx, block_ids, block_hashes
 
-    def export_request_kv(
-        self, request_id: int, internal_idx: int
-    ) -> Dict[str, Any]:
+    def export_request_kv(self, request_id: int, internal_idx: int) -> Dict[str, Any]:
         """Stage a request's KV (and Mamba boundary snapshots) for off-GPU
         transfer (push path).
 
@@ -4057,9 +4053,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         * mamba_snapshots: block-boundary Mamba snapshots
           (_export_mamba_snapshots), or None.
         """
-        internal_idx, block_ids, _ = self._disagg_resolve_export_blocks(
-            request_id, internal_idx
-        )
+        internal_idx, block_ids, _ = self._disagg_resolve_export_blocks(request_id, internal_idx)
         memory_buffer = self.memory_buffer
         # Gather the request's blocks in one op: (2, L, n, BS, H, HD) -> staging
         # (n, 2, L, BS, H, HD). contiguous() gives an owned buffer to hand off.
@@ -4119,17 +4113,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         conv = sa.conv_states[:, slot_tensor].contiguous().clone().transpose(0, 1).contiguous()
         ssm = sa.ssm_states[:, slot_tensor].contiguous().clone().transpose(0, 1).contiguous()
 
-        return {
-            "block_hashes": hashes,
-            "conv_states_tensor": conv,
-            "ssm_states_tensor": ssm,
-        }
+        return {"block_hashes": hashes, "conv_states_tensor": conv, "ssm_states_tensor": ssm}
 
     def import_request_kv(
-        self,
-        staging: Tensor,
-        block_hashes: list,
-        mamba_snapshots: Optional[Dict[str, Any]] = None,
+        self, staging: Tensor, block_hashes: list, mamba_snapshots: Optional[Dict[str, Any]] = None
     ) -> Optional[Dict[str, Any]]:
         """Inject a received KV staging tensor (and optional Mamba boundary
         snapshots) into this context (push path).
@@ -4159,9 +4146,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
 
         block_count = int(staging.shape[0])
-        local_block_ids_tensor = self.kv_block_allocator.allocate_memory_blocks(
-            block_count
-        )
+        local_block_ids_tensor = self.kv_block_allocator.allocate_memory_blocks(block_count)
         if local_block_ids_tensor is None:
             return None
         local_block_ids = local_block_ids_tensor.tolist()
@@ -4169,13 +4154,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Check every block id is in range before writing in place; an
         # out-of-range id corrupts memory.
         bad = [b for b in local_block_ids if b < 0 or b >= total_blocks]
-        assert not bad, (
-            f"DISAGG_IMPORT bad write: bad_ids={bad} total_blocks={total_blocks}"
-        )
+        assert not bad, f"DISAGG_IMPORT bad write: bad_ids={bad} total_blocks={total_blocks}"
         # One batched scatter (mirrors the export's single gather).
-        ids_dev = torch.tensor(
-            local_block_ids, dtype=torch.int64, device=memory_buffer.device
-        )
+        ids_dev = torch.tensor(local_block_ids, dtype=torch.int64, device=memory_buffer.device)
         memory_buffer[:, :, ids_dev] = staging.permute(1, 2, 0, 3, 4, 5)
 
         # Register hashes + release the alloc-time pin (shared with the pull
@@ -4189,9 +4170,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         return {"block_ids": local_block_ids, "block_hashes": block_hashes}
 
     # --- one-sided (pull) hand-off: move KV by block reference, no copy -----
-    def export_request_kv_ref(
-        self, request_id: int, internal_idx: int
-    ) -> Dict[str, Any]:
+    def export_request_kv_ref(self, request_id: int, internal_idx: int) -> Dict[str, Any]:
         """Capture a request's KV by reference (block ids, hashes, snapshot
         refs) with no copy, for the pull hand-off (prefill side). The decode
         peer reads these blocks straight from this rank's registered
@@ -4207,9 +4186,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # (disagg_release_pinned). The coordinator's flow-control window bounds
         # how many pins can be outstanding. The pin also keeps the blocks'
         # Mamba boundary snapshots from being evicted until the snapshot read.
-        self.kv_block_allocator.block_ref_counts[
-            torch.tensor(block_ids, dtype=torch.int64)
-        ] += 1
+        self.kv_block_allocator.block_ref_counts[torch.tensor(block_ids, dtype=torch.int64)] += 1
         self.disagg_pinned[request_id] = list(block_ids)
         # Only the per-request fields; the static geometry (kv_dims/region meta)
         # rides pull_static_meta, so pull_request_meta drops the rest.
@@ -4220,9 +4197,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             "snapshots": self._export_snapshot_refs(block_ids),
         }
 
-    def disagg_export_request_kv(
-        self, request_id: int, internal_idx: int
-    ) -> Dict[str, Any]:
+    def disagg_export_request_kv(self, request_id: int, internal_idx: int) -> Dict[str, Any]:
         """Capture a finished request's KV for the disagg hand-off,
         dispatching on this context's transport mode: by reference (pull) or a
         staging copy (push). The caller stages the result until the
@@ -4324,9 +4299,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             reused.append(int(kv_hash_to_block[h]))
         if not reused:
             return empty
-        self.kv_block_allocator.block_ref_counts[
-            torch.tensor(reused, dtype=torch.int64)
-        ] += 1
+        self.kv_block_allocator.block_ref_counts[torch.tensor(reused, dtype=torch.int64)] += 1
         return {"reused_block_ids": reused, "match_len": len(reused)}
 
     def disagg_pull_unmatch(self, reused_block_ids: list) -> None:
@@ -4352,9 +4325,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         block_ids = ids_t.tolist()
         total_blocks = self.memory_buffer.shape[2]
         bad = [b for b in block_ids if b < 0 or b >= total_blocks]
-        assert not bad and len(block_ids) == block_count, (
-            f"DISAGG_PULL_ALLOC bad ids={bad} n={len(block_ids)} block_count={block_count}"
-        )
+        assert (
+            not bad and len(block_ids) == block_count
+        ), f"DISAGG_PULL_ALLOC bad ids={bad} n={len(block_ids)} block_count={block_count}"
         return {"block_ids": block_ids}
 
     def _disagg_register_and_release(self, block_ids: list, block_hashes: list) -> None:
@@ -4374,9 +4347,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.kv_block_allocator.register_kv_block_hashes(
                 [b for b, _ in valid], [h for _, h in valid]
             )
-        self.kv_block_allocator.release_memory_blocks(
-            torch.tensor(block_ids, dtype=torch.int64)
-        )
+        self.kv_block_allocator.release_memory_blocks(torch.tensor(block_ids, dtype=torch.int64))
 
     def disagg_pull_commit(self, block_ids: list, block_hashes: list) -> Dict[str, Any]:
         """After the read has landed the peer's KV into `block_ids`, register
@@ -4438,6 +4409,4 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Register hash → block_id so the slot allocator's lookups (and
         # the engine's restoration probes) find these on sub-prefix hits.
         registered_hashes = [hashes[i] for i in keep_indices]
-        slot_allocator.register_block_hashes_batch(
-            target_block_ids, registered_hashes
-        )
+        slot_allocator.register_block_hashes_batch(target_block_ids, registered_hashes)

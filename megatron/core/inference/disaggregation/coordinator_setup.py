@@ -60,9 +60,9 @@ def _validate_disagg_specs(specs: List[InferenceShardSpec]) -> None:
         f"every shard must declare role=prefill or role=decode for "
         f"disaggregation; {len(untagged)} shard(s) had none: {untagged}"
     )
-    assert prefill and decode, (
-        "disaggregation needs at least one prefill shard and one decode shard."
-    )
+    assert (
+        prefill and decode
+    ), "disaggregation needs at least one prefill shard and one decode shard."
 
 
 @functools.lru_cache(maxsize=None)
@@ -148,17 +148,26 @@ def _mamba_layout_dict(engine, pg):
     layer_start = sum(counts[:pp_rank])
 
     return dict(
-        global_rank=dist.get_rank(), tp_size=tp, tp_rank=tp_rank,
-        layer_start=layer_start, num_layers=num_local,
+        global_rank=dist.get_rank(),
+        tp_size=tp,
+        tp_rank=tp_rank,
+        layer_start=layer_start,
+        num_layers=num_local,
         dims=dict(
-            nheads=nheads_local * tp, headdim=headdim, d_state=d_state,
-            ngroups=engine.controller.model_config.mamba_num_groups, d_conv=d_conv,
+            nheads=nheads_local * tp,
+            headdim=headdim,
+            d_state=d_state,
+            ngroups=engine.controller.model_config.mamba_num_groups,
+            d_conv=d_conv,
         ),
     )
 
 
 def configure_prebuilt_disagg_engine(
-    engine: Any, pg: Any, specs: List[InferenceShardSpec], disagg_router: str = "round_robin",
+    engine: Any,
+    pg: Any,
+    specs: List[InferenceShardSpec],
+    disagg_router: str = "round_robin",
     kv_transport_backend: str = "nccl",
 ) -> None:
     """Configure an already-built engine for the shared coordinator.
@@ -185,8 +194,7 @@ def configure_prebuilt_disagg_engine(
         f"got {ctx.prefix_caching_eviction_policy!r}."
     )
     assert not ctx.cache_mla_latent, (
-        "disaggregation does not support the MLA latent KV cache "
-        "(cache_mla_latent=True)."
+        "disaggregation does not support the MLA latent KV cache " "(cache_mla_latent=True)."
     )
     rank = dist.get_rank()
 

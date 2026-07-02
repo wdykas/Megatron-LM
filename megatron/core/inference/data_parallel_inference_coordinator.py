@@ -189,10 +189,12 @@ class DataParallelInferenceCoordinator:
         # outstanding (submitted but not yet read-done) so its pinned KV cannot
         # grow without bound before the decode reads it. Push prefills are not
         # throttled (they copy to a staging tensor and send no ack).
-        self._engine_is_pull: dict = {}        # engine identity -> bool
-        self._disagg_prefill_of: dict = {}     # request_id -> prefill identity (for RELEASE/outstanding)
-        self._disagg_outstanding: dict = {}    # prefill identity -> outstanding hand-off count
-        self._disagg_submit_queue: dict = {}   # prefill identity -> deque of (rid, prompt, sp)
+        self._engine_is_pull: dict = {}  # engine identity -> bool
+        self._disagg_prefill_of: dict = (
+            {}
+        )  # request_id -> prefill identity (for RELEASE/outstanding)
+        self._disagg_outstanding: dict = {}  # prefill identity -> outstanding hand-off count
+        self._disagg_submit_queue: dict = {}  # prefill identity -> deque of (rid, prompt, sp)
         # Max outstanding hand-offs per pull prefill; released by the decode's
         # KV_READ_DONE. TODO: tune.
         self._disagg_max_outstanding = 32
@@ -297,9 +299,7 @@ class DataParallelInferenceCoordinator:
             # slot releases would otherwise resubmit queued requests to the
             # engine being removed.
             for rid, _, _ in self._disagg_submit_queue.pop(identity, ()):
-                self._drop_disagg_request(
-                    rid, f"queued on removed prefill engine {identity!r}"
-                )
+                self._drop_disagg_request(rid, f"queued on removed prefill engine {identity!r}")
             # Drop in-flight requests before popping the outstanding counter:
             # their cleanup decrements it.
             for rid in self._disagg.requests_involving(identity):
@@ -358,9 +358,7 @@ class DataParallelInferenceCoordinator:
         count it against the flow-control window until read-done."""
         self._disagg_prefill_of[request_id] = prefill_id
         self._disagg_outstanding[prefill_id] = self._disagg_outstanding.get(prefill_id, 0) + 1
-        self._disagg_send(
-            prefill_id, Headers.SUBMIT_REQUEST, request_id, prompt, sampling_params
-        )
+        self._disagg_send(prefill_id, Headers.SUBMIT_REQUEST, request_id, prompt, sampling_params)
 
     def _disagg_release_outstanding(self, request_id):
         """Release the outstanding slot a request held on its prefill instance
@@ -424,7 +422,9 @@ class DataParallelInferenceCoordinator:
         if meta is None:
             # Stale/duplicate PREFILL_DONE (request already completed or dropped).
             # No client is waiting; just log.
-            logging.warning("Coordinator: PREFILL_DONE for unknown request %s; ignoring", request_id)
+            logging.warning(
+                "Coordinator: PREFILL_DONE for unknown request %s; ignoring", request_id
+            )
             return
         try:
             prefill_id, decode_id = self._disagg.route_prefill_done(request_id)
@@ -437,13 +437,10 @@ class DataParallelInferenceCoordinator:
         src_layouts = self._engine_layouts.get(prefill_id)
         dst_layouts = self._engine_layouts[decode_id]
         if src_layouts is None:
-            self._drop_disagg_request(
-                request_id, f"prefill {prefill_id!r} removed before hand-off"
-            )
+            self._drop_disagg_request(request_id, f"prefill {prefill_id!r} removed before hand-off")
             return
         if not self._disagg_send(
-            decode_id, Headers.RECV_KV, request_id, src_layouts, prompt, sampling_params,
-            handoff,
+            decode_id, Headers.RECV_KV, request_id, src_layouts, prompt, sampling_params, handoff
         ):
             # _remove_engine's sweep already dropped this request (and released
             # the prefill's pin); emitting SEND_KV now would block the prefill

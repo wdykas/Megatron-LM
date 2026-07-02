@@ -312,7 +312,10 @@ class _MegatronLLMBase:
         if inference_shards is not None:
             specs = normalize_shard_specs(inference_shards, dist.get_world_size())
             configure_prebuilt_disagg_engine(
-                engine, engine.pg_collection, specs, disagg_router=disagg_router,
+                engine,
+                engine.pg_collection,
+                specs,
+                disagg_router=disagg_router,
                 kv_transport_backend=kv_transport_backend,
             )
 

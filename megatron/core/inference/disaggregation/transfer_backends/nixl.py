@@ -27,10 +27,7 @@ logger = logging.getLogger(__name__)
 # UCX_TLS must include a CUDA transport (host-only UCX segfaults on the first
 # GPU hand-off), and UCX_MEMTYPE_CACHE=n so UCX re-queries pointer types
 # instead of misclassifying CUDA pointers as host memory.
-_UCX_RECOMMENDED = {
-    "UCX_TLS": "cuda_ipc,cuda_copy,tcp,sm,self",
-    "UCX_MEMTYPE_CACHE": "n",
-}
+_UCX_RECOMMENDED = {"UCX_TLS": "cuda_ipc,cuda_copy,tcp,sm,self", "UCX_MEMTYPE_CACHE": "n"}
 
 _POLL_INTERVAL_S = 0.0005
 
@@ -65,6 +62,7 @@ class NixlPullHandle:
         self._done = xfer is None
 
     def poll(self) -> bool:
+        """Return True if the transfer has settled, without blocking."""
         if self._done:
             return True
         st = self._agent.check_xfer_state(self._xfer)
@@ -83,6 +81,7 @@ class NixlPullHandle:
         self._xfer = None
 
     def wait(self) -> None:
+        """Block until the transfer completes."""
         while not self.poll():
             time.sleep(_POLL_INTERVAL_S)
 
@@ -143,8 +142,7 @@ class NixlTransportBackend(KVTransportBackend):
         """Read whole entries from a peer. `transfers` is a list of
         (region_name, peer_src_index, local_dst_index)."""
         return self._begin(
-            peer_meta,
-            [(region, local_dst, peer_src) for region, peer_src, local_dst in transfers],
+            peer_meta, [(region, local_dst, peer_src) for region, peer_src, local_dst in transfers]
         )
 
     def begin_pull_raw(self, peer_meta: dict, region_name: str, triples: list) -> NixlPullHandle:

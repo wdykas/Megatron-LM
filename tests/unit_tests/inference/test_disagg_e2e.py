@@ -22,8 +22,8 @@ import torch
 
 mp = torch.multiprocessing
 
-L, H, BC, BS, HD = 4, 8, 2, 4, 6           # global model + block dims
-PROMPT = list(range(BC * BS))               # block_count = BC
+L, H, BC, BS, HD = 4, 8, 2, 4, 6  # global model + block dims
+PROMPT = list(range(BC * BS))  # block_count = BC
 # Hybrid variant: global Mamba dims + one snapshot per block.
 NHEADS, HEADDIM, DSTATE, NGROUPS, DCONV, ML = 8, 4, 2, 2, 3, 4
 D_INNER = NHEADS * HEADDIM
@@ -48,9 +48,12 @@ def _global_snapshots():
     conv = torch.arange(n * ML * CONV_DIM * DCONV, dtype=torch.float32).reshape(
         n, ML, CONV_DIM, DCONV
     )
-    ssm = torch.arange(n * ML * NHEADS * HEADDIM * DSTATE, dtype=torch.float32).reshape(
-        n, ML, NHEADS, HEADDIM, DSTATE
-    ) + 100_000.0
+    ssm = (
+        torch.arange(n * ML * NHEADS * HEADDIM * DSTATE, dtype=torch.float32).reshape(
+            n, ML, NHEADS, HEADDIM, DSTATE
+        )
+        + 100_000.0
+    )
     return conv, ssm
 
 
@@ -62,12 +65,12 @@ def _shard_snapshots(conv_g, ssm_g, mlay):
     di_l = D_INNER // tp
     g_l = (NGROUPS // tp) * DSTATE
     gsz = NGROUPS * DSTATE
-    x = conv_g[:, s:e, 0:D_INNER][:, :, r * di_l:(r + 1) * di_l]
-    b = conv_g[:, s:e, D_INNER:D_INNER + gsz][:, :, r * g_l:(r + 1) * g_l]
-    c = conv_g[:, s:e, D_INNER + gsz:D_INNER + 2 * gsz][:, :, r * g_l:(r + 1) * g_l]
+    x = conv_g[:, s:e, 0:D_INNER][:, :, r * di_l : (r + 1) * di_l]
+    b = conv_g[:, s:e, D_INNER : D_INNER + gsz][:, :, r * g_l : (r + 1) * g_l]
+    c = conv_g[:, s:e, D_INNER + gsz : D_INNER + 2 * gsz][:, :, r * g_l : (r + 1) * g_l]
     conv_l = torch.cat([x, b, c], dim=2).contiguous()
     nh_l = NHEADS // tp
-    ssm_l = ssm_g[:, s:e, r * nh_l:(r + 1) * nh_l].contiguous()
+    ssm_l = ssm_g[:, s:e, r * nh_l : (r + 1) * nh_l].contiguous()
     return conv_l, ssm_l
 
 
@@ -192,17 +195,28 @@ def _worker(rank, world, port, q, hybrid=False):
 
         if role == "prefill":
             h = H.send_request_kv_resharded(
-                layout, src_layouts, dst_layouts, backend=backend,
+                layout,
+                src_layouts,
+                dst_layouts,
+                backend=backend,
                 payload=eng.context.export_request_kv(7),
-                src_mamba_layouts=src_mamba, dst_mamba_layouts=dst_mamba,
+                src_mamba_layouts=src_mamba,
+                dst_mamba_layouts=dst_mamba,
             )
             h.wait()
             q.put((f"prefill{rank}", "prefill"))
         else:
             handoff = {"snapshot_hashes": list(SNAP_HASHES)} if hybrid else None
             recv = H.post_recv_request_kv_resharded(
-                eng, layout, src_layouts, dst_layouts, PROMPT, backend=backend,
-                handoff=handoff, src_mamba_layouts=src_mamba, dst_mamba_layouts=dst_mamba,
+                eng,
+                layout,
+                src_layouts,
+                dst_layouts,
+                PROMPT,
+                backend=backend,
+                handoff=handoff,
+                src_mamba_layouts=src_mamba,
+                dst_mamba_layouts=dst_mamba,
             )
             res = recv.finish(eng) if recv is not None else None
             imported = eng.context.imported

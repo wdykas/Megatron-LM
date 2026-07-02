@@ -85,6 +85,7 @@ class PrefillHandoff:
     keepalive: List[torch.Tensor] = field(default_factory=list)
 
     def wait(self) -> None:
+        """Wait every handle, then drop the keepalive references."""
         for h in self.handles:
             h.wait()
         self.keepalive.clear()
@@ -169,8 +170,9 @@ class DecodeRecv:
                 :, :, t.dst_layer_slice(self.my_layout), :, t.dst_head_slice(self.my_layout), :
             ]
             assert dst.shape == sub.shape, (
-                f"DISAGG_RECV attn shape mismatch: dst={tuple(dst.shape)} recv={tuple(sub.shape)} "
-                f"transfer=({t.global_layer_lo}:{t.global_layer_hi},{t.global_head_lo}:{t.global_head_hi}) "
+                f"DISAGG_RECV attn shape mismatch: dst={tuple(dst.shape)} "
+                f"recv={tuple(sub.shape)} transfer=({t.global_layer_lo}:"
+                f"{t.global_layer_hi},{t.global_head_lo}:{t.global_head_hi}) "
                 f"src={t.src_rank} dst_rank={t.dst_rank}"
             )
             dst.copy_(sub)
@@ -189,9 +191,7 @@ class DecodeRecv:
         # re-enter it so the in-place writes are permitted.
         with torch.inference_mode():
             return engine.context.import_request_kv(
-                self.staging,
-                list(self.meta["block_hashes"]),
-                mamba_snapshots=mamba_snapshots,
+                self.staging, list(self.meta["block_hashes"]), mamba_snapshots=mamba_snapshots
             )
 
 
@@ -246,25 +246,23 @@ def post_recv_request_kv_resharded(
     if snapshot_hashes:
         sa = engine.context.mamba_slot_allocator
         n = len(snapshot_hashes)
-        my_mamba = next(
-            m for m in dst_mamba_layouts if m.global_rank == my_layout.global_rank
-        )
+        my_mamba = next(m for m in dst_mamba_layouts if m.global_rank == my_layout.global_rank)
         # Band slices this rank receives, in plan order (mirrors the sender).
         plan = mamba_reshard.plan_mamba_reshard(src_mamba_layouts, dst_mamba_layouts)
         snap_transfers = [t for t in plan if t.dst_rank == my_layout.global_rank]
         for t in snap_transfers:
             dtype = sa.conv_states.dtype if t.is_conv else sa.ssm_states.dtype
-            recvs.append(
-                (snapshot_transfer_shape(t, n, my_mamba.dims), dtype, t.src_rank)
-            )
+            recvs.append((snapshot_transfer_shape(t, n, my_mamba.dims), dtype, t.src_rank))
         recv.snapshot_hashes = snapshot_hashes
         recv.snapshot_conv = torch.empty(
             (n, my_mamba.num_layers, *sa.conv_states.shape[2:]),
-            dtype=sa.conv_states.dtype, device=device,
+            dtype=sa.conv_states.dtype,
+            device=device,
         )
         recv.snapshot_ssm = torch.empty(
             (n, my_mamba.num_layers, *sa.ssm_states.shape[2:]),
-            dtype=sa.ssm_states.dtype, device=device,
+            dtype=sa.ssm_states.dtype,
+            device=device,
         )
 
     handle, bufs = backend.batch([], recvs, device=device)

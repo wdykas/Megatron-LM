@@ -64,7 +64,7 @@ class DisaggRouting(DisaggRouter):
         self._prefill_rr = 0
         self._decode_rr = 0
         self._req_prefill: Dict[int, object] = {}  # request_id -> prefill identity
-        self._req_decode: Dict[int, object] = {}   # request_id -> decode identity
+        self._req_decode: Dict[int, object] = {}  # request_id -> decode identity
 
     # --- registration ------------------------------------------------------
 

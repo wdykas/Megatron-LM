@@ -45,8 +45,12 @@ def _layouts(tp, pp, base=0):
         for r in range(tp):
             rank = base + p * tp + r
             out[rank] = MambaShardLayout(
-                global_rank=rank, tp_size=tp, tp_rank=r,
-                layer_start=p * per, num_layers=per, dims=_dims(),
+                global_rank=rank,
+                tp_size=tp,
+                tp_rank=r,
+                layer_start=p * per,
+                num_layers=per,
+                dims=_dims(),
             )
     return out
 
@@ -74,12 +78,12 @@ def _shard(conv_g, ssm_g, lay: MambaShardLayout):
     r, tp = lay.tp_rank, lay.tp_size
     di_l = D_INNER // tp
     g_l = (NGROUPS // tp) * DSTATE
-    x = conv_g[:, s:e, 0:D_INNER][:, :, r * di_l:(r + 1) * di_l]
-    b = conv_g[:, s:e, D_INNER:D_INNER + G][:, :, r * g_l:(r + 1) * g_l]
-    c = conv_g[:, s:e, D_INNER + G:D_INNER + 2 * G][:, :, r * g_l:(r + 1) * g_l]
+    x = conv_g[:, s:e, 0:D_INNER][:, :, r * di_l : (r + 1) * di_l]
+    b = conv_g[:, s:e, D_INNER : D_INNER + G][:, :, r * g_l : (r + 1) * g_l]
+    c = conv_g[:, s:e, D_INNER + G : D_INNER + 2 * G][:, :, r * g_l : (r + 1) * g_l]
     conv_l = torch.cat([x, b, c], dim=2).contiguous()
     nh_l = NHEADS // tp
-    ssm_l = ssm_g[:, s:e, r * nh_l:(r + 1) * nh_l].contiguous()
+    ssm_l = ssm_g[:, s:e, r * nh_l : (r + 1) * nh_l].contiguous()
     return conv_l, ssm_l
 
 
@@ -115,8 +119,8 @@ def test_push_snapshot_reshard_reconstructs_destination(src, dst):
     for t in plan:
         src_conv, src_ssm = src_t[t.src_rank]
         dst_conv, dst_ssm = dst_t[t.dst_rank]
-        sub = (src_conv if t.is_conv else src_ssm)[:, t.src_layer, t.src_lo:t.src_hi]
-        (dst_conv if t.is_conv else dst_ssm)[:, t.dst_layer, t.dst_lo:t.dst_hi] = sub
+        sub = (src_conv if t.is_conv else src_ssm)[:, t.src_layer, t.src_lo : t.src_hi]
+        (dst_conv if t.is_conv else dst_ssm)[:, t.dst_layer, t.dst_lo : t.dst_hi] = sub
 
     for rk, lay in dst_lay.items():
         want_conv, want_ssm = _shard(conv_g, ssm_g, lay)
@@ -142,7 +146,7 @@ class _FakeByteBackend:
         src = self._src_pools[peer_meta["agent_name"]][region].flatten().view(torch.uint8)
         dst = self._dst_pools[region].flatten().view(torch.uint8)
         for lo, ro, nb in triples:
-            dst[lo:lo + nb] = src[ro:ro + nb]
+            dst[lo : lo + nb] = src[ro : ro + nb]
         return self._Done()
 
 
@@ -161,10 +165,7 @@ def _pool_meta(tensor):
     """The region layout the real backend exports for a (layers, slots,
     *state) pool: per-layer and per-slot strides in bytes."""
     elem = tensor.element_size()
-    return {
-        "outer_stride_bytes": tensor.stride(0) * elem,
-        "inner_bytes": tensor.stride(1) * elem,
-    }
+    return {"outer_stride_bytes": tensor.stride(0) * elem, "inner_bytes": tensor.stride(1) * elem}
 
 
 @pytest.mark.parametrize("src,dst", PARALLELISM_SWEEP)
@@ -191,10 +192,7 @@ def test_pull_snapshot_fragments_reconstruct_destination(src, dst):
         src_pools[name] = {"snap_conv": conv_pool, "snap_ssm": ssm_pool}
         src_region_meta[rk] = {
             "agent_name": name,
-            "regions": {
-                "snap_conv": _pool_meta(conv_pool),
-                "snap_ssm": _pool_meta(ssm_pool),
-            },
+            "regions": {"snap_conv": _pool_meta(conv_pool), "snap_ssm": _pool_meta(ssm_pool)},
         }
         src_snap_slots[rk] = dict(src_slot_of)
 
@@ -229,6 +227,7 @@ def test_mamba_dedupes_replica_sources():
     """Two source ranks holding the same Mamba shard (same tp_rank +
     layer_start, e.g. EP/DP replicas) are deduped: the shard is sourced from
     exactly one of them (smallest global_rank)."""
+
     def _lay(gr):
         return MambaShardLayout(
             global_rank=gr, tp_size=1, tp_rank=0, layer_start=0, num_layers=M, dims=_dims()
@@ -243,10 +242,12 @@ def test_mamba_rejects_indivisible_groups():
     up front."""
     with pytest.raises(ValueError):
         MambaShardLayout(
-            global_rank=0, tp_size=4, tp_rank=0, layer_start=0, num_layers=1,
-            dims=MambaStateDims(
-                nheads=8, headdim=HEADDIM, d_state=DSTATE, ngroups=2, d_conv=DCONV
-            ),
+            global_rank=0,
+            tp_size=4,
+            tp_rank=0,
+            layer_start=0,
+            num_layers=1,
+            dims=MambaStateDims(nheads=8, headdim=HEADDIM, d_state=DSTATE, ngroups=2, d_conv=DCONV),
         )
 
 

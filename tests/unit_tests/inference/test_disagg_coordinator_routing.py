@@ -61,7 +61,7 @@ def test_registration_partitions_by_role():
     r = DisaggRouting()
     r.register("p0", "prefill")
     r.register("d0", "decode")
-    r.register("p0", "prefill")             # idempotent
+    r.register("p0", "prefill")  # idempotent
     assert r.prefill_engines == ["p0"] and r.decode_engines == ["d0"]
     with pytest.raises(ValueError):
         r.register("x", "both")
@@ -90,7 +90,7 @@ def test_submit_round_robins_across_multiple_prefill():
 def test_forget_clears_request_state():
     r = _routing()
     r.route_submit(7)
-    assert r.route_prefill_done(7)[0] == "p0"   # the prefill that ran it
+    assert r.route_prefill_done(7)[0] == "p0"  # the prefill that ran it
     r.forget(7)
     # forget dropped the pairing -- the prefill is no longer remembered
     assert r.route_prefill_done(7)[0] is None
@@ -110,4 +110,4 @@ def test_route_without_engines_raises():
     r.register("p0", "prefill")
     r.route_submit(0)
     with pytest.raises(RuntimeError):
-        r.route_prefill_done(0)              # no decode engine
+        r.route_prefill_done(0)  # no decode engine

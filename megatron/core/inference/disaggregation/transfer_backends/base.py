@@ -22,6 +22,7 @@ class TransferHandle:
     wait_fn: Callable[[], None]
 
     def wait(self) -> None:
+        """Block until the transfer completes."""
         self.wait_fn()
 
 
