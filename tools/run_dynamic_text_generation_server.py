@@ -64,6 +64,13 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
              "typically negative — calibrate with KV_COMPACTION_DEBUG=1 "
              "(trained Nano: -3.0).",
     )
+    parser.add_argument(
+        "--kv-compaction-prefetch-margin", type=float, default=None,
+        help="Speculative prefetch threshold (<= retrieval margin): when the "
+             "trigger margin crosses this but not the firing threshold, the "
+             "best span's CPU->GPU copy starts on a side stream so a later "
+             "firing splices a staged span with no PCIe stall.",
+    )
     return parser
 
 
@@ -139,6 +146,7 @@ if __name__ == "__main__":
                 n_compress=args.kv_compaction_n_compress,
                 archive=args.kv_compaction_archive,
                 retrieval_margin=args.kv_compaction_retrieval_margin,
+                prefetch_margin=args.kv_compaction_prefetch_margin,
             )
             print(f"[kv-compaction] live compaction enabled: "
                   f"{args.kv_compaction_strategy} @ {args.kv_compaction_budget_ratio}")

@@ -73,6 +73,7 @@ class LiveKVCompactor:
         n_compress: int = 64,
         archive: bool = False,
         retrieval_margin: float | None = None,
+        prefetch_margin: float | None = None,
         max_retrievals_per_request: int = 4,
     ) -> None:
         if strategy not in _LIVE_STRATEGIES:
@@ -101,9 +102,11 @@ class LiveKVCompactor:
         # graphs at all); enforced at the first missed capture.
         self.archive_enabled = archive
         self.retrieval_margin = retrieval_margin
+        self.prefetch_margin = prefetch_margin
         self.max_retrievals_per_request = max_retrievals_per_request
         self._archive = None
         self._retrieval_counts: dict[int, int] = {}
+        self._prefetch_stream: torch.cuda.Stream | None = None
         if archive:
             if strategy == "belief_still":
                 raise ValueError(
@@ -121,8 +124,16 @@ class LiveKVCompactor:
                     "KV_COMPACTION_DEBUG=1, read the per-step margins, and set "
                     "the threshold between need-steps and idle steps "
                     "(trained Nano: −3.0).")
+            if prefetch_margin is not None and prefetch_margin > retrieval_margin:
+                raise ValueError(
+                    f"prefetch_margin ({prefetch_margin}) must be <= "
+                    f"retrieval_margin ({retrieval_margin}): prefetch is the "
+                    "more permissive threshold — it starts the CPU->GPU copy "
+                    "early so the firing threshold splices a staged span.")
             from .archive import KVArchive
             self._archive = KVArchive()
+            if prefetch_margin is not None:
+                self._prefetch_stream = torch.cuda.Stream()
 
         # Pruning keeps each retained key's cached (post-embedding) value while the
         # engine renumbers positions to the compacted slots. With RoPE the retained
@@ -257,8 +268,12 @@ class LiveKVCompactor:
                 logger.info("[kv-retrieval] request id=%d: margin %.3f (threshold %.3f, "
                             "best span %d)", rid, margin, self.retrieval_margin, span_idx)
             if margin <= self.retrieval_margin:
+                if self.prefetch_margin is not None and margin > self.prefetch_margin:
+                    # Speculative: stage the likely span on the side stream so a
+                    # later firing splices it without a synchronous PCIe copy.
+                    self._archive.prefetch(rid, span_idx, self._prefetch_stream)
                 continue
-            ak, av = self._archive.take(rid, span_idx)
+            ak, av = self._archive.take(rid, span_idx)   # staged GPU or pinned CPU
             self._hook.append_kv_to_request(b_local, ak.cuda(), av.cuda())
             self._repoint_pending_token(
                 b_local, b_global, int(ctx.request_kv_length_offsets[b_global]))
@@ -266,8 +281,9 @@ class LiveKVCompactor:
             self._retrieval_counts[rid] = self._retrieval_counts.get(rid, 0) + 1
             logger.info(
                 "[kv-retrieval] request id=%d: restored %d tokens (margin %.3f, "
-                "%d spans left)", rid, ak.shape[1], margin,
-                len(self._archive._spans.get(rid, [])))
+                "%d spans left, %s)", rid, ak.shape[1], margin,
+                len(self._archive._spans.get(rid, [])),
+                "prefetched" if ak.is_cuda else "sync copy")
         self._archive.drop_all_except(live_ids)
         for rid in [r for r in self._retrieval_counts if r not in live_ids]:
             del self._retrieval_counts[rid]

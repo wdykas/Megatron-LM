@@ -141,6 +141,14 @@ have no evicted spans to archive). Verified end-to-end on Nano: a needle that
 `streaming_llm @ 0.4` alone loses (model confabulates) is recovered exactly
 once the trigger restores its span mid-generation.
 
+Speculative prefetch (`--kv-compaction-prefetch-margin`, optional, must be ≤
+the firing margin): when the margin crosses this lower threshold, the best
+span's CPU→GPU copy starts on a side stream while decode continues; a later
+firing splices the staged copy with no synchronous PCIe stall (`take` logs
+`prefetched` vs `sync copy`). Only helps when the margin dwells in the
+prefetch band before firing — a fire on the first decode step is always a
+sync copy.
+
 ### Serving flags (`tools/run_dynamic_text_generation_server.py`)
 
 ```
@@ -152,7 +160,8 @@ once the trigger restores its span mid-generation.
 --kv-compaction-n-compress 64           # belief_still synthetic slots
 --decode-only-cuda-graphs               # required for snapkv
 --kv-compaction-archive                 # CPU archive + retrieval (Track D)
---kv-compaction-retrieval-margin -3.0   # trigger threshold, REQUIRED w/ archive
+--kv-compaction-retrieval-margin -3.2   # trigger threshold, REQUIRED w/ archive
+--kv-compaction-prefetch-margin -5.0    # optional speculative staging threshold
                                         # (with archive: --cuda-graph-impl none)
 ```
 

@@ -130,3 +130,34 @@ class TestKVArchive:
         arch = KVArchive()
         assert arch.score(9, [torch.zeros(2, 8, device="cuda")],
                           torch.zeros(2, 4, 1, 8, device="cuda")) is None
+
+    def test_prefetch_then_take_returns_staged_gpu(self):
+        k, v = self._kv()
+        arch = KVArchive(max_span=4)
+        arch.store_evicted(5, k, v, list(range(0, 24, 2)))
+        want_k = arch._spans[5][1].keys.clone()
+        stream = torch.cuda.Stream()
+        arch.prefetch(5, 1, stream)
+        arch.prefetch(5, 1, stream)                      # idempotent re-stage
+        tk, tv = arch.take(5, 1)
+        assert tk.is_cuda and tv.is_cuda
+        assert arch.prefetch_hits == 1
+        assert torch.equal(tk.cpu(), want_k)
+        assert arch._staged_key is None                   # staging consumed
+
+    def test_take_other_span_invalidates_staging(self):
+        k, v = self._kv()
+        arch = KVArchive(max_span=4)
+        arch.store_evicted(5, k, v, list(range(0, 24, 2)))
+        arch.prefetch(5, 2, torch.cuda.Stream())
+        tk, _ = arch.take(5, 0)                           # indices shift
+        assert not tk.is_cuda and arch.prefetch_hits == 0
+        assert arch._staged_key is None                   # stale staging cleared
+
+    def test_gc_clears_staging(self):
+        k, v = self._kv()
+        arch = KVArchive(max_span=4)
+        arch.store_evicted(5, k, v, [0, 1])
+        arch.prefetch(5, 0, torch.cuda.Stream())
+        arch.drop_all_except(set())
+        assert arch.empty and arch._staged_key is None

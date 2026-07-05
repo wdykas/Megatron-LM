@@ -41,6 +41,12 @@ class KVArchive:
         self.max_span = max_span
         self._spans: dict[int, list[_Span]] = {}
         self.retrievals = 0
+        # Speculative prefetch staging: at most one span in flight, identified
+        # by (request_id, span_idx) — span indices shift on take, so staging is
+        # invalidated whenever the request's span list changes.
+        self._staged_key: tuple[int, int] | None = None
+        self._staged: tuple[torch.Tensor, torch.Tensor, torch.cuda.Event] | None = None
+        self.prefetch_hits = 0
 
     # ------------------------------------------------------------------
     # Store (called at prune time)
@@ -126,14 +132,49 @@ class KVArchive:
             span_total += neg_l
         return margin / L, int(span_total.argmax())
 
+    def prefetch(self, request_id: int, span_idx: int, stream: torch.cuda.Stream) -> None:
+        """Start the CPU→GPU copy of one span on a side stream (speculative).
+
+        Called when the trigger margin crosses the *prefetch* threshold but not
+        yet the firing threshold: the pinned-memory transfer overlaps subsequent
+        decode steps, so a later `take` of the same span costs no PCIe stall.
+        At most one span is staged; re-prefetching the staged span is a no-op.
+        """
+        key = (int(request_id), span_idx)
+        if self._staged_key == key:
+            return
+        span = self._spans[int(request_id)][span_idx]
+        with torch.cuda.stream(stream):
+            gk = span.keys.to("cuda", non_blocking=True)
+            gv = span.values.to("cuda", non_blocking=True)
+        event = torch.cuda.Event()
+        event.record(stream)
+        self._staged_key = key
+        self._staged = (gk, gv, event)
+
     def take(self, request_id: int, span_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Remove and return one span's (keys, values), each (L, T, H, D) CPU."""
+        """Remove and return one span's (keys, values), each (L, T, H, D).
+
+        Returns the staged GPU copy when this span was prefetched (waiting on
+        the copy event, which has typically long completed); otherwise the
+        pinned CPU tensors. Any staging for this request is invalidated —
+        span indices shift when an entry is popped.
+        """
         entries = self._spans[int(request_id)]
         span = entries.pop(span_idx)
         if not entries:
             del self._spans[int(request_id)]
         self.retrievals += 1
-        return span.keys, span.values
+        staged = None
+        if self._staged_key == (int(request_id), span_idx):
+            gk, gv, event = self._staged
+            torch.cuda.current_stream().wait_event(event)
+            staged = (gk, gv)
+            self.prefetch_hits += 1
+        if self._staged_key is not None and self._staged_key[0] == int(request_id):
+            self._staged_key = None
+            self._staged = None
+        return staged if staged is not None else (span.keys, span.values)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -149,8 +190,14 @@ class KVArchive:
     def drop(self, request_id: int) -> None:
         """Free a finished request's archive (CPU tensors + GPU centroids)."""
         self._spans.pop(int(request_id), None)
+        if self._staged_key is not None and self._staged_key[0] == int(request_id):
+            self._staged_key = None
+            self._staged = None
 
     def drop_all_except(self, live_ids: set[int]) -> None:
         """Garbage-collect entries whose requests are no longer live."""
         for rid in [r for r in self._spans if r not in live_ids]:
             del self._spans[rid]
+        if self._staged_key is not None and self._staged_key[0] not in live_ids:
+            self._staged_key = None
+            self._staged = None
