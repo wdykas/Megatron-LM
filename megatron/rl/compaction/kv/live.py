@@ -38,7 +38,7 @@ from .megatron_hook import MegatronInferenceHook
 
 logger = logging.getLogger(__name__)
 
-_LIVE_STRATEGIES = ("snapkv", "streaming_llm")
+_LIVE_STRATEGIES = ("snapkv", "streaming_llm", "belief_still")
 
 
 class LiveKVCompactor:
@@ -69,6 +69,8 @@ class LiveKVCompactor:
         pool_kernel: int = 7,
         n_sink: int = 4,
         min_tokens: int = 128,
+        compactor_checkpoint: str | None = None,
+        n_compress: int = 64,
     ) -> None:
         if strategy not in _LIVE_STRATEGIES:
             # Route through the factory for the canonical error (h2o explains
@@ -87,6 +89,9 @@ class LiveKVCompactor:
         self.pool_kernel = pool_kernel
         self.n_sink = n_sink
         self.min_tokens = min_tokens
+        self.compactor_checkpoint = compactor_checkpoint
+        self.n_compress = n_compress
+        self._updater = None   # lazy: belief_still builds/loads on first request
 
         # Pruning keeps each retained key's cached (post-embedding) value while the
         # engine renumbers positions to the compacted slots. With RoPE the retained
@@ -209,6 +214,12 @@ class LiveKVCompactor:
             S = k.shape[1]
             if S < self.min_tokens:
                 continue
+            if self.strategy == "belief_still":
+                if self.n_compress >= S:
+                    continue
+                self._compact_with_updater(b_local, b_global, k, v)
+                continue
+
             budget = max(1, int(S * self.budget_ratio))
             if budget >= S:
                 continue
@@ -239,6 +250,66 @@ class LiveKVCompactor:
             )
         self._prefill_locals = []
         self._cu_q = None
+
+    def _compact_with_updater(self, b_local: int, b_global: int,
+                              k: torch.Tensor, v: torch.Tensor) -> None:
+        """belief_still: replace the request's prompt KV with the learned
+        compactor's C synthetic tokens (Perceiver/gated-updater initial_compress),
+        injected via apply_belief_memory_for_request. k/v: (L, S, H, D) TP-local."""
+        ctx = self._ctx
+        L, S, H, D = k.shape
+        if self._updater is None:
+            self._init_updater(n_attn_layers=L, d_kv=H * D)
+        keys_pl = [k[li].reshape(1, S, H * D).to(torch.bfloat16) for li in range(L)]
+        vals_pl = [v[li].reshape(1, S, H * D).to(torch.bfloat16) for li in range(L)]
+        with torch.no_grad():
+            memory = self._updater.initial_compress(keys_pl, vals_pl)
+        C = memory.keys.shape[2]
+        self._hook.apply_belief_memory_for_request(b_local, memory)
+        self._repoint_pending_token(b_local, b_global, C)
+        ctx.request_output_lengths[b_global] -= S - C
+        self.compacted_requests += 1
+        self.tokens_evicted += S - C
+        logger.info(
+            "[kv-compaction] request b_local=%d: %d -> %d synthetic tokens (belief_still)",
+            b_local, S, C,
+        )
+
+    def _init_updater(self, n_attn_layers: int, d_kv: int) -> None:
+        """Build (or load) the learned compactor, replicated on every rank.
+
+        With a checkpoint: collective dist_checkpointing load (all TP ranks call
+        this together — compaction runs in lockstep on every rank). Without one:
+        RANDOM INIT, useful only for plumbing smoke tests — generation quality
+        will be garbage, and we log a loud warning.
+        """
+        from megatron.rl.compaction.learned import (
+            BeliefUpdater, GatedRecurrentUpdater, GatedUpdaterConfig, PerceiverCompactor,
+        )
+        from megatron.rl.compaction.learned.training.parallel import (
+            build_compactor_pg_collection,
+        )
+        pgc = build_compactor_pg_collection()
+        if self.compactor_checkpoint:
+            from megatron.rl.compaction.learned import load_checkpoint
+            model, _meta = load_checkpoint(
+                self.compactor_checkpoint, map_location="cuda",
+                params_dtype=torch.bfloat16, pg_collection=pgc,
+            )
+            model = model.to(torch.bfloat16).eval()
+            self._updater = (BeliefUpdater(model)
+                             if isinstance(model, PerceiverCompactor) else model)
+            logger.info("[kv-compaction] belief_still checkpoint loaded: %s",
+                        self.compactor_checkpoint)
+        else:
+            logger.warning(
+                "[kv-compaction] belief_still WITHOUT a checkpoint: RANDOM-INIT "
+                "compactor — plumbing smoke only, generation will be degraded.")
+            cfg = GatedUpdaterConfig(n_compress=self.n_compress, n_heads=8,
+                                     d_kv=d_kv, n_attn_layers=n_attn_layers)
+            self._updater = GatedRecurrentUpdater(
+                cfg, params_dtype=torch.bfloat16, pg_collection=pgc,
+            ).cuda().to(torch.bfloat16).eval()
 
     def _debug_dump(self) -> None:
         ctx = self._ctx

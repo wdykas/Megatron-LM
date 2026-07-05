@@ -42,6 +42,14 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
         "--kv-compaction-min-tokens", type=int, default=128,
         help="Skip live compaction for prompts shorter than this.",
     )
+    parser.add_argument(
+        "--kv-compaction-compactor-checkpoint", type=str, default=None,
+        help="Trained compactor checkpoint for --kv-compaction-strategy belief_still.",
+    )
+    parser.add_argument(
+        "--kv-compaction-n-compress", type=int, default=64,
+        help="Synthetic memory slots for belief_still.",
+    )
     return parser
 
 
@@ -113,6 +121,8 @@ if __name__ == "__main__":
                 budget_ratio=args.kv_compaction_budget_ratio,
                 obs_window=args.kv_compaction_obs_window,
                 min_tokens=args.kv_compaction_min_tokens,
+                compactor_checkpoint=args.kv_compaction_compactor_checkpoint,
+                n_compress=args.kv_compaction_n_compress,
             )
             print(f"[kv-compaction] live compaction enabled: "
                   f"{args.kv_compaction_strategy} @ {args.kv_compaction_budget_ratio}")
