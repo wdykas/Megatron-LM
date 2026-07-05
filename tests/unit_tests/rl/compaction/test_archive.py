@@ -111,8 +111,9 @@ class TestKVArchive:
         arch = KVArchive(max_span=4)
         arch.store_evicted(3, k, v, list(range(0, 24, 2)))
         n = len(arch._spans[3])
-        tk, tv = arch.take(3, 0)
+        tk, tv, tpos = arch.take(3, 0)
         assert tk.shape == tv.shape and tk.shape[1] <= 4
+        assert len(tpos) == tk.shape[1]
         assert len(arch._spans[3]) == n - 1
         assert arch.retrievals == 1
 
@@ -139,7 +140,7 @@ class TestKVArchive:
         stream = torch.cuda.Stream()
         arch.prefetch(5, 1, stream)
         arch.prefetch(5, 1, stream)                      # idempotent re-stage
-        tk, tv = arch.take(5, 1)
+        tk, tv, _ = arch.take(5, 1)
         assert tk.is_cuda and tv.is_cuda
         assert arch.prefetch_hits == 1
         assert torch.equal(tk.cpu(), want_k)
@@ -150,7 +151,7 @@ class TestKVArchive:
         arch = KVArchive(max_span=4)
         arch.store_evicted(5, k, v, list(range(0, 24, 2)))
         arch.prefetch(5, 2, torch.cuda.Stream())
-        tk, _ = arch.take(5, 0)                           # indices shift
+        tk, _, _ = arch.take(5, 0)                        # indices shift
         assert not tk.is_cuda and arch.prefetch_hits == 0
         assert arch._staged_key is None                   # stale staging cleared
 

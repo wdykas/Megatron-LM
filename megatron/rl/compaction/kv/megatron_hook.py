@@ -338,6 +338,40 @@ class MegatronInferenceHook:
         ctx.request_last_kv_block_id[b_global] = block_ids[n_total_blocks - 1]
         ctx.request_kv_length_offsets[b_global] = new_len
 
+    def overwrite_keys_for_request(self, b_local: int, keys: torch.Tensor) -> None:
+        """Rewrite one active request's cached KEYS in place; values untouched.
+
+        The RoPE-renumber primitive: after a prune moves retained K/V to
+        compacted slots, the delta-rotated keys (see ``rope.py``) are written
+        back over them. ``keys``: (n_layers, S, H, D) where S must equal the
+        request's current KV length.
+        """
+        got = self._context_kv()
+        if got is None:
+            raise RuntimeError(
+                "overwrite_keys_for_request: no live KV cache (engine not "
+                "allocated or no active requests)."
+            )
+        ctx, buf, n_active = got
+        if b_local >= n_active:
+            raise RuntimeError(
+                f"overwrite_keys_for_request: b_local={b_local} >= n_active={n_active}"
+            )
+        b_global = ctx.paused_request_count + b_local
+        BS = ctx.block_size_tokens
+        n_blocks = int(ctx.request_kv_block_counts[b_global].item())
+        last_offset = int(ctx.request_last_kv_block_offset[b_global].item())
+        seq_len = (n_blocks - 1) * BS + last_offset
+        if keys.shape[1] != seq_len:
+            raise RuntimeError(
+                f"overwrite_keys_for_request: got {keys.shape[1]} keys for a "
+                f"request with KV length {seq_len}."
+            )
+        block_ids = ctx.request_to_kv_block_ids[b_global, :n_blocks].to(buf.device)
+        keys = keys.to(device=buf.device, dtype=buf.dtype)
+        for pos in range(seq_len):
+            buf[0, :, block_ids[pos // BS], pos % BS] = keys[:, pos]
+
     def get_kv_for_request(
         self, b_local: int
     ) -> tuple[torch.Tensor, torch.Tensor]:

@@ -71,6 +71,15 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
              "best span's CPU->GPU copy starts on a side stream so a later "
              "firing splices a staged span with no PCIe stall.",
     )
+    parser.add_argument(
+        "--kv-compaction-rope-mode", type=str, default=None,
+        choices=["logical", "renumber"],
+        help="Required for RoPE models. 'logical': keep original positions of "
+             "record (stored rotations stay exact; decode queries get their "
+             "original sequence positions) — the exact/measurement setting. "
+             "'renumber': contiguous cache positions with key re-rotation "
+             "(StreamingLLM semantics, positions bounded by cache size).",
+    )
     return parser
 
 
@@ -147,6 +156,7 @@ if __name__ == "__main__":
                 archive=args.kv_compaction_archive,
                 retrieval_margin=args.kv_compaction_retrieval_margin,
                 prefetch_margin=args.kv_compaction_prefetch_margin,
+                rope_mode=args.kv_compaction_rope_mode,
             )
             print(f"[kv-compaction] live compaction enabled: "
                   f"{args.kv_compaction_strategy} @ {args.kv_compaction_budget_ratio}")

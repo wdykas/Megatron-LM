@@ -152,13 +152,17 @@ class KVArchive:
         self._staged_key = key
         self._staged = (gk, gv, event)
 
-    def take(self, request_id: int, span_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Remove and return one span's (keys, values), each (L, T, H, D).
+    def take(
+        self, request_id: int, span_idx: int
+    ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+        """Remove and return one span's (keys, values, original_positions).
 
-        Returns the staged GPU copy when this span was prefetched (waiting on
-        the copy event, which has typically long completed); otherwise the
-        pinned CPU tensors. Any staging for this request is invalidated —
-        span indices shift when an entry is popped.
+        keys/values are (L, T, H, D) — the staged GPU copy when this span was
+        prefetched (waiting on the copy event, which has typically long
+        completed), otherwise the pinned CPU tensors. Original positions let a
+        RoPE-renumber caller re-rotate the keys to their new cache positions.
+        Any staging for this request is invalidated — span indices shift when
+        an entry is popped.
         """
         entries = self._spans[int(request_id)]
         span = entries.pop(span_idx)
@@ -174,7 +178,8 @@ class KVArchive:
         if self._staged_key is not None and self._staged_key[0] == int(request_id):
             self._staged_key = None
             self._staged = None
-        return staged if staged is not None else (span.keys, span.values)
+        k, v = staged if staged is not None else (span.keys, span.values)
+        return k, v, span.positions
 
     # ------------------------------------------------------------------
     # Lifecycle

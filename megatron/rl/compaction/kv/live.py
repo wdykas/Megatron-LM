@@ -75,6 +75,7 @@ class LiveKVCompactor:
         retrieval_margin: float | None = None,
         prefetch_margin: float | None = None,
         max_retrievals_per_request: int = 4,
+        rope_mode: str | None = None,
     ) -> None:
         if strategy not in _LIVE_STRATEGIES:
             # Route through the factory for the canonical error (h2o explains
@@ -135,19 +136,61 @@ class LiveKVCompactor:
             if prefetch_margin is not None:
                 self._prefetch_stream = torch.cuda.Stream()
 
-        # Pruning keeps each retained key's cached (post-embedding) value while the
-        # engine renumbers positions to the compacted slots. With RoPE the retained
-        # keys would carry stale rotations relative to the new positions — that
-        # re-rotation is not implemented, so only position-embedding-free attention
-        # (e.g. Nemotron Nano's hybrid, where Mamba carries position) is supported.
-        model = engine.controller.inference_wrapped_model.model
+        # Position embeddings. Cached keys are stored POST-rotation, so pruning
+        # (which renumbers cache slots) is only transparent when attention has no
+        # positional encoding (e.g. Nemotron Nano's hybrid — Mamba carries
+        # position). RoPE models must pick one of two supported conventions:
+        #   'logical'  — positions of record never change: stored rotations stay
+        #                exact and begin_step patches each decode token's
+        #                token_to_pos_ids to its ORIGINAL sequence position
+        #                (rotary reads that tensor; cache write slots come from
+        #                the separate token_to_* fields). Exact geometry; archive
+        #                splice-back needs no rotation. The full-cache
+        #                counterfactual semantics.
+        #   'renumber' — StreamingLLM semantics: cache positions are contiguous
+        #                0..C-1; retained keys are delta-rotated to their new
+        #                positions (rope.py) and restored archive spans to the
+        #                cache tail. Positions stay bounded by cache size
+        #                (beyond-training-window generation), at the cost of
+        #                collapsing the gaps evicted content occupied.
+        from megatron.rl.compaction.learned.capture.kv_capture import _unwrap_model
+        model = _unwrap_model(engine.controller.inference_wrapped_model.model)
         pos_emb = getattr(model, "position_embedding_type", "none")
-        if pos_emb not in ("none", None):
+        self.rope_mode = rope_mode
+        self._inv_freq: torch.Tensor | None = None
+        self._rope_interleaved = False
+        self._logical_pos: dict[int, int] = {}
+        if pos_emb in ("none", None):
+            if rope_mode is not None:
+                raise ValueError(
+                    f"rope_mode={rope_mode!r} given but the model has no positional "
+                    "embedding (position_embedding_type none) — remove the flag.")
+        elif pos_emb == "rope":
+            if rope_mode not in ("logical", "renumber"):
+                raise NotImplementedError(
+                    "LiveKVCompactor on a RoPE model requires an explicit "
+                    "rope_mode: 'logical' (keep original positions — exact, the "
+                    "measurement setting) or 'renumber' (contiguous cache "
+                    f"positions + key re-rotation, StreamingLLM semantics); got "
+                    f"{rope_mode!r}.")
+            if strategy == "belief_still":
+                raise NotImplementedError(
+                    "belief_still under RoPE is unsupported: synthetic KV has no "
+                    "position convention yet (the compactor must be trained to "
+                    "emit keys pre-rotated for assigned slots).")
+            if rope_mode == "renumber":
+                rotary = getattr(model, "rotary_pos_emb", None)
+                if rotary is None or not hasattr(rotary, "inv_freq"):
+                    raise RuntimeError(
+                        "rope_mode='renumber': model has no rotary_pos_emb.inv_freq "
+                        "to re-rotate keys with.")
+                self._inv_freq = rotary.inv_freq
+                self._rope_interleaved = bool(
+                    getattr(rotary, "rotary_interleaved", False))
+        else:
             raise NotImplementedError(
-                f"LiveKVCompactor: model uses position_embedding_type={pos_emb!r}; "
-                "pruning would leave retained keys with stale rotary phases. "
-                "Re-rotation of cached keys is not implemented yet."
-            )
+                f"LiveKVCompactor: position_embedding_type={pos_emb!r} is not "
+                "supported (only 'none' and 'rope').")
 
         self._ctx = engine.context
         self._hook = MegatronInferenceHook(self._ctx)
@@ -216,6 +259,8 @@ class LiveKVCompactor:
             self._q_per_layer = [None] * len(self._q_per_layer)  # type: ignore[list-item]
         if os.environ.get("KV_COMPACTION_DEBUG"):
             self._debug_dump()
+        if self.rope_mode == "logical" and self._logical_pos:
+            self._patch_logical_positions()
         if is_decode_only:
             return
         ctx = self._ctx
@@ -233,6 +278,40 @@ class LiveKVCompactor:
         if self.strategy == "snapkv" and not self._capturing:
             self._capturing = True
             self._q_per_layer = [None] * len(self._q_per_layer)  # type: ignore[list-item]
+
+    def _patch_logical_positions(self) -> None:
+        """rope_mode='logical': give this step's decode tokens their ORIGINAL
+        sequence positions before the forward runs.
+
+        The engine derives ``token_to_pos_ids`` (which rotary indexes directly)
+        from ``request_kv_length_offsets`` — the compacted cache length. For a
+        pruned request that under-rotates every future query relative to its
+        history. The stored keys keep their original rotations, so patching the
+        query position to the request's logical (uncompacted) position restores
+        exact relative geometry. Cache write slots are unaffected: they come
+        from ``token_to_local_position_within_kv_block``/``token_to_block_idx``,
+        which the previous step's bookkeeping computed before this patch.
+        """
+        ctx = self._ctx
+        n_active = ctx.total_request_count - ctx.paused_request_count
+        if n_active <= 0:
+            return
+        active = slice(ctx.paused_request_count, ctx.total_request_count)
+        qlens = ctx.request_query_lengths[active].to(torch.long)
+        starts = torch.cat([qlens.new_zeros(1), qlens.cumsum(0)])
+        in_prefill = ctx.request_in_prefill_status_tensor[active]
+        live_ids = set()
+        for b_local in range(n_active):
+            b_global = ctx.paused_request_count + b_local
+            rid = int(ctx.request_ids[b_global].item())
+            live_ids.add(rid)
+            pos = self._logical_pos.get(rid)
+            if pos is None or bool(in_prefill[b_local] == 1):
+                continue
+            ctx.token_to_pos_ids[int(starts[b_local].item())] = pos
+            self._logical_pos[rid] = pos + 1
+        for rid in [r for r in self._logical_pos if r not in live_ids]:
+            del self._logical_pos[rid]
 
     def retrieve_for_decoding_requests(self) -> None:
         """Negative-cache retrieval: restore archived spans the decode queries ask for.
@@ -273,8 +352,17 @@ class LiveKVCompactor:
                     # later firing splices it without a synchronous PCIe copy.
                     self._archive.prefetch(rid, span_idx, self._prefetch_stream)
                 continue
-            ak, av = self._archive.take(rid, span_idx)   # staged GPU or pinned CPU
-            self._hook.append_kv_to_request(b_local, ak.cuda(), av.cuda())
+            ak, av, apos = self._archive.take(rid, span_idx)  # staged GPU or pinned CPU
+            was_staged = ak.is_cuda
+            ak, av = ak.cuda(), av.cuda()
+            if self.rope_mode == "renumber":
+                from .rope import delta_rotate_keys
+                start = int(ctx.request_kv_length_offsets[b_global].item())
+                old_pos = torch.tensor(apos, device=ak.device, dtype=torch.long)
+                new_pos = torch.arange(start, start + ak.shape[1], device=ak.device)
+                ak = delta_rotate_keys(
+                    ak, old_pos, new_pos, self._inv_freq, self._rope_interleaved)
+            self._hook.append_kv_to_request(b_local, ak, av)
             self._repoint_pending_token(
                 b_local, b_global, int(ctx.request_kv_length_offsets[b_global]))
             ctx.request_output_lengths[b_global] += ak.shape[1]
@@ -283,7 +371,7 @@ class LiveKVCompactor:
                 "[kv-retrieval] request id=%d: restored %d tokens (margin %.3f, "
                 "%d spans left, %s)", rid, ak.shape[1], margin,
                 len(self._archive._spans.get(rid, [])),
-                "prefetched" if ak.is_cuda else "sync copy")
+                "prefetched" if was_staged else "sync copy")
         self._archive.drop_all_except(live_ids)
         for rid in [r for r in self._retrieval_counts if r not in live_ids]:
             del self._retrieval_counts[rid]
@@ -345,7 +433,21 @@ class LiveKVCompactor:
             if self._archive is not None:
                 rid = int(ctx.request_ids[b_global].item())
                 self._archive.store_evicted(rid, k, v, positions)
+            rotated_keys = None
+            if self.rope_mode == "renumber":
+                from .rope import delta_rotate_keys
+                old_pos = torch.tensor(positions, device=k.device, dtype=torch.long)
+                new_pos = torch.arange(len(positions), device=k.device)
+                rotated_keys = delta_rotate_keys(
+                    k[:, positions], old_pos, new_pos,
+                    self._inv_freq, self._rope_interleaved)
             self._hook.apply_mask_for_request(b_local, positions)
+            if rotated_keys is not None:
+                self._hook.overwrite_keys_for_request(b_local, rotated_keys)
+            if self.rope_mode == "logical":
+                # The pending decode token's original position is S (prompt
+                # length); begin_step patches it in before the next forward.
+                self._logical_pos[int(ctx.request_ids[b_global].item())] = S
             self._repoint_pending_token(b_local, b_global, len(positions))
             # Termination compares current length against request_output_lengths
             # (prompt + num_tokens_to_generate, absolute) — shift it down by the

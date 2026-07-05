@@ -102,9 +102,25 @@ it (details in the module docstrings):
   heads** → live eviction is token-level; scores aggregate over layers/KV-heads.
 - Prefill must run **eagerly** for SnapKV's Q capture → launch with
   `--decode-only-cuda-graphs`.
-- Only position-embedding-free attention is supported live (Nemotron Nano's
-  hybrid: `--position-embedding-type none`); RoPE models hard-fail (retained
-  keys would carry stale rotations).
+- Positional encodings: on position-embedding-free models (Nemotron Nano's
+  hybrid, `--position-embedding-type none`) pruning is transparent — the cache
+  is a set, and slot order carries no meaning. RoPE models must choose a
+  `--kv-compaction-rope-mode` (hard-fail otherwise):
+  - **`logical`** — positions of record never change. Stored keys keep their
+    original (exact) rotations; every step the compactor patches the decode
+    tokens' `token_to_pos_ids` (which rotary indexes directly) back to their
+    original sequence positions, while cache write slots keep coming from the
+    separate `token_to_*` bookkeeping fields. Exact relative geometry — the
+    full-cache counterfactual — and archive splice-back needs no rotation.
+  - **`renumber`** — StreamingLLM semantics: cache positions are contiguous
+    `0..C-1`. Retained keys are delta-rotated to their new positions
+    (`rope.py`: RoPE planes compose additively, so a key moves from position m
+    to m' by one rotation of m'−m using the model's own
+    `rotary_pos_emb.inv_freq`); restored archive spans delta-rotate to the
+    cache tail. Positions stay bounded by cache size (beyond-training-window
+    generation) at the cost of collapsing the gaps evicted content occupied.
+  belief_still stays unsupported under RoPE (synthetic KV has no position
+  convention yet).
 - `megatron_hook.py` maintains every piece of engine bookkeeping a prune
   touches; note the offset field is the **count of tokens in the last block**
   (engine post-update semantics), and a count on a block boundary is
@@ -162,6 +178,7 @@ sync copy.
 --kv-compaction-archive                 # CPU archive + retrieval (Track D)
 --kv-compaction-retrieval-margin -3.2   # trigger threshold, REQUIRED w/ archive
 --kv-compaction-prefetch-margin -5.0    # optional speculative staging threshold
+--kv-compaction-rope-mode logical       # RoPE models: logical | renumber
                                         # (with archive: --cuda-graph-impl none)
 ```
 
