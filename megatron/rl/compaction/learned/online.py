@@ -100,6 +100,7 @@ def init_compactor_from_kv(runtime_state: Any, args, n_attn_layers: int, d_kv: i
             dynamics=getattr(args, "rl_compaction_compactor_dynamics", 0.0),
             future_kv_reconstruction=getattr(args, "rl_compaction_compactor_future_kv_reconstruction", 0.0),
             future_horizon_kl=getattr(args, "rl_compaction_compactor_future_horizon_kl", 0.0),
+            future_latent=getattr(args, "rl_compaction_compactor_future_latent", 0.0),
         ),
         vd_cfg=ValueDirectedConfig(
             advantage_clip=getattr(args, "rl_compaction_compactor_advantage_clip", 5.0),
@@ -114,6 +115,12 @@ def init_compactor_from_kv(runtime_state: Any, args, n_attn_layers: int, d_kv: i
     # A loss weight that is silently inert online (term enabled but its
     # precondition off, so it contributes zero gradient) is a misconfiguration.
     _w = trainer_cfg.loss_weights
+    if _w.future_latent > 0.0 and not getattr(args, "rl_compaction_trajectory_dir", None):
+        raise ValueError(
+            "--rl-compaction-compactor-future-latent needs probes with teacher_hidden "
+            "(the full-KV forward's final hidden states), which only the offline "
+            "pipeline captures (capture/student_forward.teacher_outputs). Remove the "
+            "flag online, or train offline from saved trajectories.")
     if _w.future_horizon_kl > 0.0 and (trainer_cfg.future_horizon_gamma >= 1.0 or _use_teacher_kl):
         raise ValueError(
             "future-horizon-KL > 0 is inert online: it needs gamma < 1.0 and per-probe "
@@ -373,7 +380,7 @@ def maybe_train_compactor(runtime_state: Any, args=None, optimizer=None) -> None
                 "teacher-KL mode is active but compactor_student_model is None — "
                 "build_compactor_trajectories must run before maybe_train_compactor."
             )
-        from megatron.rl.compaction.learned.capture.student_forward import student_logits as _sf
+        from megatron.rl.compaction.learned.capture.student_forward import student_outputs as _sf
         _m = _still_model  # capture for closure
         _student_fn = lambda q, kv: _sf(_m, q, kv)
 

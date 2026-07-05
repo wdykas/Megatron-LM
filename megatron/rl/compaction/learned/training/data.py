@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, NamedTuple
 
 import torch
 from torch.utils.data import Dataset
@@ -18,8 +18,21 @@ from torch.utils.data import Dataset
 # Per-layer compact KV cache: n_layers × (K (B, C, d), V (B, C, d))
 CompactKV = list[tuple[torch.Tensor, torch.Tensor]]
 
-# Frozen model forward: (query_tokens, compact_kv) → logits (B, S_q, vocab)
-StudentFn = Callable[[torch.Tensor, CompactKV], torch.Tensor]
+
+class StudentOutput(NamedTuple):
+    """One frozen-model forward over probe tokens with compact KV injected.
+
+    logits: (B, S_q, vocab) — differentiable w.r.t. the compact KV.
+    hidden: (B, S_q, d_model) — final decoder output (post final norm), the
+        target space of the NextLat future-latent loss (C5).
+    """
+
+    logits: torch.Tensor
+    hidden: torch.Tensor
+
+
+# Frozen model forward: (query_tokens, compact_kv) → StudentOutput
+StudentFn = Callable[[torch.Tensor, CompactKV], "StudentOutput"]
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +60,7 @@ class TrainingProbe:
 
     query_tokens:      torch.Tensor              # (B, S_q)
     teacher_logits:    torch.Tensor | None = None  # (B, S_q, vocab) — None disables teacher KL
+    teacher_hidden:    torch.Tensor | None = None  # (B, S_q, d_model) full-KV final hidden — None disables future_latent
     answer_tokens:     torch.Tensor | None = None
     is_exact_retrieval: bool = False
     advantage:         float | None = None

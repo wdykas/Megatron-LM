@@ -105,6 +105,41 @@ class TestSufficiencyKlRealModel:
         }
         Utils.destroy_model_parallel()
 
+    def test_student_and_teacher_outputs_capture_hidden(self, model_and_data):
+        """C5 plumbing through the real model: hidden capture + gradient flow."""
+        from megatron.rl.compaction.learned.capture.student_forward import (
+            student_outputs, teacher_outputs,
+        )
+        from megatron.rl.compaction.learned.training.losses import future_latent_loss
+        d = model_and_data
+        B, SQ = d["query_tokens"].shape
+        H = 128  # hidden_size of the fixture model
+
+        teach = teacher_outputs(d["model"], d["query_tokens"])
+        assert teach.logits.shape[:2] == (B, SQ)
+        assert teach.hidden.shape == (B, SQ, H)
+        assert torch.isfinite(teach.hidden.float()).all()
+
+        compact_kv = [(k.clone().requires_grad_(True), v.clone().requires_grad_(True))
+                      for k, v in d["prefix_kv"]]
+        stud = student_outputs(d["model"], d["query_tokens"], compact_kv)
+        assert stud.hidden.shape == (B, SQ, H)
+
+        loss = future_latent_loss(stud.hidden, teach.hidden)
+        assert torch.isfinite(loss)
+        loss.backward()
+        # Gradient must reach the compact KV through the hidden states.
+        assert compact_kv[0][0].grad is not None
+        assert compact_kv[0][0].grad.abs().sum() > 0
+
+    def test_future_latent_loss_shape_guard(self):
+        from megatron.rl.compaction.learned.training.losses import future_latent_loss
+        a = torch.randn(1, 4, 8, device="cuda")
+        with pytest.raises(ValueError, match="hidden shape mismatch"):
+            future_latent_loss(a, torch.randn(1, 5, 8, device="cuda"))
+        # identical hidden -> zero loss
+        assert future_latent_loss(a, a.clone()).item() == 0.0
+
     def test_shape_and_finite(self, model_and_data):
         d = model_and_data
         kl = sufficiency_kl(d["model"], d["query_tokens"], d["prefix_kv"], d["teacher_logits"])

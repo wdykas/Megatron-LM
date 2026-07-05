@@ -63,19 +63,28 @@ def _make_trajectory(n_chunks=4, add_probe_at=2):
 
 
 
-def _student_fn(query_tokens: torch.Tensor, compact_kv: CompactKV) -> torch.Tensor:
+def _student_fn(query_tokens: torch.Tensor, compact_kv: CompactKV) -> "StudentOutput":
     """Detached student_fn — useful for testing non-training paths."""
     B_, S_q, *_ = query_tokens.shape
-    return torch.randn(B_, S_q, V)
+    return _as_student_output(torch.randn(B_, S_q, V), compact_kv)
 
 
-def _student_fn_with_grad(query_tokens: torch.Tensor, compact_kv: CompactKV) -> torch.Tensor:
+def _student_fn_with_grad(query_tokens: torch.Tensor, compact_kv: CompactKV) -> "StudentOutput":
     """Differentiable student_fn: uses compact_kv so loss has grad wrt updater params."""
     B_, S_q = query_tokens.shape[:2]
     # Sum kv tensors linearly so the logits depend on compact_kv
     kv_signal = sum(k.mean() + v.mean() for k, v in compact_kv)
     base = torch.zeros(B_, S_q, V)
-    return base + kv_signal  # (B, S_q, V) — differentiable w.r.t. compact_kv
+    return _as_student_output(base + kv_signal, compact_kv)
+
+def _as_student_output(logits, compact_kv):
+    """Wrap dummy logits into the StudentFn contract with a differentiable hidden."""
+    from megatron.rl.compaction.learned.training.data import StudentOutput
+    B, S_q = logits.shape[:2]
+    k0 = compact_kv[0][0]
+    hidden = k0.mean(dim=1, keepdim=True).expand(B, S_q, k0.shape[-1])
+    return StudentOutput(logits=logits, hidden=hidden)
+
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +102,8 @@ class TestTypes:
     def test_student_fn_callable(self):
         fn: StudentFn = _student_fn
         out = fn(torch.randint(0, V, (B, 8)), [(torch.zeros(B, C, D), torch.zeros(B, C, D))])
-        assert out.shape == (B, 8, V)
+        assert out.logits.shape == (B, 8, V)
+        assert out.hidden.shape == (B, 8, D)
 
     def test_types_importable_from_still_package(self):
         from megatron.rl.compaction import learned

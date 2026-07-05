@@ -36,6 +36,7 @@ chunks):
 | `dynamics` (NextLat) | roll the updater forward and match the next memory (head-free latent dynamics) |
 | `future_kv_reconstruction` (NextLat) | old memory must answer queries from the *future* chunk (belief sufficiency) |
 | `future_horizon_kl` (NextLat, offline-only) | position-weighted teacher KL, γ<1 upweights later positions |
+| `future_latent` (NextLat C5, offline-only) | SmoothL1 between compact-KV and full-KV **final hidden states** over probe tokens — the strongest NextLat form (direct future hidden-state matching) |
 | `consistency` / `merged_chunk_prob` | sequential belief must match one-pass compression of merged chunks (path independence) |
 
 Value-directed weighting (`training/value_directed.py`): scales each probe's
@@ -82,6 +83,7 @@ sequence together — the NCCL-deadlock guard).
 --rl-compaction-compactor-use-future-accuracy-weight
 --rl-compaction-compactor-future-horizon-kl 0.3      # offline pipeline only
 --rl-compaction-compactor-future-horizon-gamma 0.8   # γ<1 required with the above
+--rl-compaction-compactor-future-latent 0.5          # C5, offline pipeline only
 # value-directed weighting
 --rl-compaction-compactor-advantage-clip 5.0
 --rl-compaction-compactor-advantage-min-weight 0.1
@@ -108,6 +110,10 @@ LLM + advantage-weighted recon), vd_joint (LLM trains too), still_online
 - `kv_capture.capture_kv_from_forward(model, tokens, position_ids)` — per-layer
   TP-local K/V from a collective forward (hooks on `core_attention`; raises on
   every failure mode).
-- `student_forward.student_logits(model, response_tokens, compact_kv)` — the
+- `student_forward.student_outputs(model, response_tokens, compact_kv)` — the
   differentiable frozen-model forward with each attention layer's context
-  replaced by compact KV; gradients flow only into the compactor.
+  replaced by compact KV; returns `StudentOutput(logits, hidden)` (hidden =
+  final decoder output, the future-latent target space); gradients flow only
+  into the compactor. `teacher_outputs(model, tokens)` is the capture side:
+  the same forward with the REAL context, no grad — store the results on
+  `TrainingProbe.teacher_logits` / `teacher_hidden`.

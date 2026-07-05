@@ -22,6 +22,7 @@ class TestPathConsistencyLoss:
         return BeliefUpdater(compactor)
 
     def _student_fn(self, query_tokens, compact_kv):
+        from megatron.rl.compaction.learned.training.data import StudentOutput
         B, S_q = query_tokens.shape
         V = 32
         # Produce logits that depend on compact_kv so grad flows
@@ -29,7 +30,9 @@ class TestPathConsistencyLoss:
         flat = k0.reshape(B, -1)
         need = S_q * V
         reps = (need + flat.shape[1] - 1) // flat.shape[1]
-        return flat.repeat(1, reps)[:, :need].reshape(B, S_q, V)
+        logits = flat.repeat(1, reps)[:, :need].reshape(B, S_q, V)
+        hidden = k0.mean(dim=1, keepdim=True).expand(B, S_q, k0.shape[-1])
+        return StudentOutput(logits=logits, hidden=hidden)
 
     def test_loss_is_scalar(self):
         updater = self._make_updater()

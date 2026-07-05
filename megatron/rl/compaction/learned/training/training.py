@@ -50,7 +50,7 @@ def train_compactor_trajectory(
     from megatron.rl.compaction.learned.training.losses import (
         predictive_coding_loss, consistency_loss,
         kv_reconstruction_loss, future_kv_reconstruction_loss,
-        dynamics_prediction_loss, future_horizon_kl_loss,
+        dynamics_prediction_loss, future_horizon_kl_loss, future_latent_loss,
     )
     from megatron.rl.compaction.learned.training.value_directed import _probe_weight
     from megatron.rl.compaction.learned.training.data import TrainingProbe
@@ -89,6 +89,7 @@ def train_compactor_trajectory(
     future_kv_recon_vals: list = []
     dynamics_vals: list = []
     future_horizon_kl_vals: list = []
+    future_latent_vals: list = []
     merged_consist_vals: list = []
     _per_chunk_accumulators = {
         "kv_reconstruction": kv_recon_vals,
@@ -99,6 +100,7 @@ def train_compactor_trajectory(
         "future_kv_reconstruction": future_kv_recon_vals,
         "dynamics": dynamics_vals,
         "future_horizon_kl": future_horizon_kl_vals,
+        "future_latent": future_latent_vals,
         "merged_consistency": merged_consist_vals,
     }
 
@@ -225,8 +227,8 @@ def train_compactor_trajectory(
             for probe in trajectory.probes_at(chunk_idx):
                 if cfg.use_teacher_kl:
                     # True STILL paper objective: CE(model(response | compact_kv), response_tokens).
-                    # student_fn returns (B, S, vocab) logits; shift to get next-token prediction.
-                    _logits = student_fn(probe.query_tokens, compact_kv)  # (B, S, V)
+                    # student_fn returns StudentOutput; shift logits for next-token prediction.
+                    _logits = student_fn(probe.query_tokens, compact_kv).logits  # (B, S, V)
                     _B, _S, _V = _logits.shape
                     if _S > 1:
                         _labels = probe.query_tokens[:, 1:].to(_logits.device).reshape(-1)
@@ -243,7 +245,8 @@ def train_compactor_trajectory(
                     still_ce_vals.append(_ce.item())
                     all_probe_terms.append(None)
                 else:
-                    _student_logits = student_fn(probe.query_tokens, compact_kv)
+                    _student_out = student_fn(probe.query_tokens, compact_kv)
+                    _student_logits = _student_out.logits
                     terms = _compute_probe_terms(cfg, probe, _student_logits)
                     probe_total = terms.total
                     if probe.advantage is not None and cfg.vd_cfg is not None:
@@ -263,6 +266,15 @@ def train_compactor_trajectory(
                         )
                         chunk_loss = chunk_loss + cfg.loss_weights.future_horizon_kl * fh_l
                         future_horizon_kl_vals.append(fh_l.item())
+                    # C5 future-latent: match the full-KV forward's final hidden states.
+                    if (cfg.loss_weights.future_latent > 0.0
+                            and probe.teacher_hidden is not None):
+                        fl_l = future_latent_loss(
+                            _student_out.hidden,
+                            probe.teacher_hidden.to(_student_out.hidden.device),
+                        )
+                        chunk_loss = chunk_loss + cfg.loss_weights.future_latent * fl_l
+                        future_latent_vals.append(fl_l.item())
 
         # Merged-chunk consistency (path-independence of compression)
         if (cfg.merged_chunk_prob > 0.0
@@ -366,7 +378,7 @@ class SinglePassCompactorTrainer:
         probe_terms = []
         if student_fn is not None and probes:
             for probe in probes:
-                student_logits = student_fn(probe.query_tokens, compact_kv)
+                student_logits = student_fn(probe.query_tokens, compact_kv).logits
                 terms = _compute_probe_terms(cfg, probe, student_logits)
                 probe_terms.append(terms)
         else:
@@ -400,7 +412,7 @@ class SinglePassCompactorTrainer:
             compact_kv = [(ck_list[l], cv_list[l]) for l in range(len(ck_list))]
             probe_terms = []
             for probe in probes:
-                student_logits = student_fn(probe.query_tokens, compact_kv)
+                student_logits = student_fn(probe.query_tokens, compact_kv).logits
                 terms = _compute_probe_terms(cfg, probe, student_logits)
                 probe_terms.append(terms)
         return _average_compactor_terms(probe_terms)
@@ -525,7 +537,7 @@ def still_train_step(
 
     if student_fn is not None and probes:
         for probe in probes:
-            student_logits = student_fn(probe.query_tokens, compact_kv)
+            student_logits = student_fn(probe.query_tokens, compact_kv).logits
             terms = _compute_probe_terms(cfg, probe, student_logits)
             terms_list.append(terms)
     else:

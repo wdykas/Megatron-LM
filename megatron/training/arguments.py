@@ -2359,6 +2359,10 @@ def _add_rl_args(parser):
     group.add_argument('--rl-compaction-compactor-train', action='store_true', default=False,
                        help='Train a GatedRecurrentUpdater online during RL rollouts using '
                             'collected KV trajectories weighted by rollout advantages.')
+    group.add_argument('--rl-compaction-compactor-future-latent', type=float, default=0.0,
+                       help='C5 NextLat weight: SmoothL1 between compact-KV and full-KV '
+                            'final hidden states over probe tokens. Needs teacher_hidden '
+                            'on probes (offline pipeline).')
     group.add_argument('--rl-compaction-compactor-lr', type=float, default=3e-4,
                        help='Learning rate for online STILL compactor training.')
     group.add_argument('--rl-compaction-compactor-checkpoint-dir', type=str, default=None,

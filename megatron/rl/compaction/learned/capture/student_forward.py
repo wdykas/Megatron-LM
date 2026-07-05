@@ -6,7 +6,7 @@ Runs the Megatron GPT model on response tokens where each attention layer
 attends to compact_kv (from the compactor) instead of the full KV cache.
 
 Gradient flows:
-    loss → student_logits → attention(Q, compact_k, compact_v) → compact_kv → compactor
+    loss → student_outputs → attention(Q, compact_k, compact_v) → compact_kv → compactor
 
 Model weights are temporarily frozen so backward only touches the compactor.
 
@@ -94,12 +94,50 @@ def _inject_compact_kv(model, compact_kv_list: List[Tuple[torch.Tensor, torch.Te
             h.remove()
 
 
-def student_logits(
+@contextmanager
+def _capture_final_hidden(gpt, sink: list):
+    """Capture the decoder's final hidden state (post final norm) into sink.
+
+    ``gpt.decoder`` (TransformerBlock) returns the normed hidden states that
+    feed the output layer — the target space of the NextLat future-latent
+    loss. Output is (S, B, d_model); the caller transposes to batch-first.
+    """
+    def _hook(module, args, output):
+        sink.append(output[0] if isinstance(output, tuple) else output)
+
+    h = gpt.decoder.register_forward_hook(_hook)
+    try:
+        yield
+    finally:
+        h.remove()
+
+
+def _forward_outputs(gpt, response_token_ids: torch.Tensor):
+    """One forward returning (logits, final hidden), both batch-first."""
+    from megatron.rl.compaction.learned.training.data import StudentOutput
+
+    hidden_sink: list = []
+    with _capture_final_hidden(gpt, hidden_sink):
+        output = gpt(
+            input_ids=response_token_ids,
+            position_ids=None,
+            attention_mask=None,
+        )
+    # GPTModel returns (logits, ...) or just logits depending on version.
+    logits = output[0] if isinstance(output, (tuple, list)) else output
+    if len(hidden_sink) != 1:
+        raise RuntimeError(
+            f"final-hidden capture fired {len(hidden_sink)} times (expected 1).")
+    hidden = hidden_sink[0].transpose(0, 1)          # (S, B, d) -> (B, S, d)
+    return StudentOutput(logits=logits, hidden=hidden)
+
+
+def student_outputs(
     model,
     response_token_ids: torch.Tensor,
     compact_kv_list: List[Tuple[torch.Tensor, torch.Tensor]],
-) -> torch.Tensor:
-    """Compute student logits with compact KV as context.
+):
+    """Student forward with compact KV as context → StudentOutput.
 
     Runs model(response_token_ids) with each attention layer's K, V replaced
     by the corresponding compact_kv.  Gradients flow through compact_kv to the
@@ -112,7 +150,8 @@ def student_logits(
             each (B, C, d_kv) with requires_grad=True.
 
     Returns:
-        logits: (B, S_resp, vocab_size) — differentiable w.r.t. compact_kv.
+        StudentOutput(logits (B, S_resp, vocab), hidden (B, S_resp, d_model)),
+        both differentiable w.r.t. compact_kv.
     """
     gpt = _unwrap_model(model)
 
@@ -123,15 +162,20 @@ def student_logits(
 
     try:
         with _inject_compact_kv(model, compact_kv_list):
-            output = gpt(
-                input_ids=response_token_ids,
-                position_ids=None,
-                attention_mask=None,
-            )
+            return _forward_outputs(gpt, response_token_ids)
     finally:
         for p in frozen:
             p.requires_grad_(True)
 
-    # GPTModel returns (logits, ...) or just logits depending on version.
-    logits = output[0] if isinstance(output, (tuple, list)) else output
-    return logits  # (B, S_resp, vocab_size)
+
+@torch.no_grad()
+def teacher_outputs(model, response_token_ids: torch.Tensor):
+    """Full-KV teacher forward → StudentOutput (logits + final hidden).
+
+    The capture side of the future-latent loss: run the frozen model with its
+    REAL context (no injection) over the probe tokens and record the final
+    hidden states the compact cache must reproduce. Store the results on
+    ``TrainingProbe.teacher_logits`` / ``teacher_hidden``.
+    """
+    gpt = _unwrap_model(model)
+    return _forward_outputs(gpt, response_token_ids)

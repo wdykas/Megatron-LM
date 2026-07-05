@@ -7,7 +7,7 @@ The core measurement of the compaction research plan: per query position,
     D_KL( pi(. | full context)  ||  pi(. | compacted context) )
 
 computed through the REAL Megatron model — the teacher distribution comes from
-a full-context forward and the student from ``student_logits`` (the same
+a full-context forward and the student from ``student_outputs`` (the same
 compact-KV injection used for compactor training). Low KL at a position means
 the compacted cache is a sufficient statistic for that prediction; a spike
 localizes exactly where compression lost something the policy needed.
@@ -24,7 +24,7 @@ from typing import List, Tuple
 import torch
 import torch.nn.functional as F
 
-from megatron.rl.compaction.learned.capture.student_forward import student_logits
+from megatron.rl.compaction.learned.capture.student_forward import student_outputs
 
 
 def kl_from_logits(teacher_logits: torch.Tensor, student_logits_: torch.Tensor) -> torch.Tensor:
@@ -56,5 +56,5 @@ def sufficiency_kl(
     Returns (B, S_q) fp32 KL per position. Mean it for a scalar sufficiency
     score; argmax it to localize the worst-hit positions.
     """
-    student = student_logits(model, query_tokens, compact_kv)
+    student = student_outputs(model, query_tokens, compact_kv).logits
     return kl_from_logits(teacher_logits, student)

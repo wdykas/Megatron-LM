@@ -52,7 +52,17 @@ def _dummy_student_fn(query_tokens, compact_kv):
     flat = k0.reshape(B_q, -1)
     need = S_q * V
     reps = (need + flat.shape[1] - 1) // flat.shape[1]
-    return flat.repeat(1, reps)[:, :need].reshape(B_q, S_q, V)
+    logits = flat.repeat(1, reps)[:, :need].reshape(B_q, S_q, V)
+    return _as_student_output(logits, compact_kv)
+
+def _as_student_output(logits, compact_kv):
+    """Wrap dummy logits into the StudentFn contract with a differentiable hidden."""
+    from megatron.rl.compaction.learned.training.data import StudentOutput
+    B, S_q = logits.shape[:2]
+    k0 = compact_kv[0][0]
+    hidden = k0.mean(dim=1, keepdim=True).expand(B, S_q, k0.shape[-1])
+    return StudentOutput(logits=logits, hidden=hidden)
+
 
 
 def _trajectory(n_chunks=4, probe_chunk=2, advantage=None):

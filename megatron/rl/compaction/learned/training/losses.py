@@ -68,6 +68,7 @@ class CompactorLossWeights:
     future_kv_reconstruction:  float = 0.0
     dynamics:                  float = 0.0
     future_horizon_kl:         float = 0.0
+    future_latent:             float = 0.0   # C5: match full-KV future hidden states
 
     def as_dict(self) -> dict[str, float]:
         return {
@@ -321,14 +322,14 @@ def path_consistency_loss(
     mem_a  = updater.initial_compress(chunk_a_keys, chunk_a_values)
     mem_ab = updater(mem_a, chunk_b_keys, chunk_b_values)
     kv_seq: CompactKV = list(zip(mem_ab.keys_list(), mem_ab.values_list()))
-    logits_seq = student_fn(query_tokens, kv_seq)
+    logits_seq = student_fn(query_tokens, kv_seq).logits
 
     # --- Path C: compress cat(A, B) in one shot ----------------------------
     combined_keys   = [torch.cat([a, b], dim=1) for a, b in zip(chunk_a_keys,   chunk_b_keys)]
     combined_values = [torch.cat([a, b], dim=1) for a, b in zip(chunk_a_values, chunk_b_values)]
     mem_combined = updater.initial_compress(combined_keys, combined_values)
     kv_comb: CompactKV = list(zip(mem_combined.keys_list(), mem_combined.values_list()))
-    logits_comb = student_fn(query_tokens, kv_comb)
+    logits_comb = student_fn(query_tokens, kv_comb).logits
 
     # KL(combined || sequential): train sequential path to match combined reference
     return teacher_kl_loss(logits_comb.detach(), logits_seq, temperature=temperature)
@@ -458,6 +459,26 @@ def future_horizon_kl_loss(full_logits, compact_logits, temperature=1.0, gamma=0
         kl_per_token = (kl_per_token * weights.unsqueeze(0)).sum(-1).unsqueeze(-1)
         return kl_per_token.mean() * T * T
     return kl_per_token.mean() * T * T
+
+
+def future_latent_loss(
+    student_hidden: torch.Tensor,     # (B, S_q, d_model) — from the compact-KV forward
+    teacher_hidden: torch.Tensor,     # (B, S_q, d_model) — from the full-KV forward
+) -> torch.Tensor:
+    """C5 NextLat: direct future hidden-state matching (SmoothL1).
+
+    The strongest NextLat form: instead of matching the next belief memory
+    (dynamics) or answering future queries from old memory (future-KV recon),
+    require the compact cache to induce the SAME final hidden states the full
+    cache induces when the model processes future tokens. Matches the design
+    note's L_future_latent; teacher hidden is captured once per probe by
+    ``teacher_outputs`` and stored on ``TrainingProbe.teacher_hidden``.
+    """
+    if student_hidden.shape != teacher_hidden.shape:
+        raise ValueError(
+            f"hidden shape mismatch: student {tuple(student_hidden.shape)} vs "
+            f"teacher {tuple(teacher_hidden.shape)}")
+    return F.smooth_l1_loss(student_hidden.float(), teacher_hidden.detach().float())
 
 
 def predictive_coding_loss(

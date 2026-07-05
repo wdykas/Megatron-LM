@@ -90,6 +90,69 @@ def _make_belief_memory(n_layers=N_LAYERS, B=B, C=C, d=D, *, seed=0):
 
 
 # ---------------------------------------------------------------------------
+# TestFutureLatentLoss (C5)
+# ---------------------------------------------------------------------------
+
+class TestFutureLatentLoss(unittest.TestCase):
+    """C5: the trajectory trainer consumes probe.teacher_hidden."""
+
+    def _student_fn(self, query_tokens, compact_kv):
+        from megatron.rl.compaction.learned.training.data import StudentOutput
+        B_, S_q = query_tokens.shape
+        k0 = compact_kv[0][0]                             # (B, C, D)
+        flat = k0.reshape(B_, -1)
+        need = S_q * VOCAB
+        reps = (need + flat.shape[1] - 1) // flat.shape[1]
+        logits = flat.repeat(1, reps)[:, :need].reshape(B_, S_q, VOCAB)
+        hidden = k0.mean(dim=1, keepdim=True).expand(B_, S_q, D)
+        return StudentOutput(logits=logits, hidden=hidden)
+
+    def _traj_with_hidden_probe(self):
+        chunks = [(_make_kv_list(seed=c)[0], _make_kv_list(seed=c)[1]) for c in range(2)]
+        probe = TrainingProbe(
+            query_tokens=torch.randint(0, VOCAB, (B, 4)),
+            teacher_logits=_make_logits(seq=4, seed=7),
+            teacher_hidden=torch.randn(B, 4, D),
+        )
+        return Trajectory(chunks=chunks, probes_by_chunk={1: [probe]}, rollout_return=0.0)
+
+    def test_reported_and_trains(self):
+        updater = GatedRecurrentUpdater(_make_gru_cfg())
+        opt = torch.optim.SGD(updater.parameters(), lr=1e-2)
+        cfg = CompactorTrainerConfig(
+            loss_weights=CompactorLossWeights(
+                teacher_kl=1.0, future_kl=0.0, consistency=0.0, retrieval=0.0,
+                predictive=0.0, future_latent=0.5,
+            ),
+        )
+        log = train_compactor_trajectory(
+            updater, opt, self._traj_with_hidden_probe(),
+            student_fn=self._student_fn, cfg=cfg)
+        self.assertIn("future_latent", log)
+        # The trainer aggregates each stat list to its mean.
+        self.assertTrue(torch.isfinite(torch.tensor(log["future_latent"])))
+        self.assertGreater(log["future_latent"], 0.0)
+
+    def test_absent_without_teacher_hidden(self):
+        updater = GatedRecurrentUpdater(_make_gru_cfg())
+        opt = torch.optim.SGD(updater.parameters(), lr=1e-2)
+        traj = self._traj_with_hidden_probe()
+        for probes in traj.probes_by_chunk.values():
+            for pr in probes:
+                pr.teacher_hidden = None
+        cfg = CompactorTrainerConfig(
+            loss_weights=CompactorLossWeights(
+                teacher_kl=1.0, future_kl=0.0, consistency=0.0, retrieval=0.0,
+                predictive=0.0, future_latent=0.5,
+            ),
+        )
+        log = train_compactor_trajectory(updater, opt, traj,
+                                         student_fn=self._student_fn, cfg=cfg)
+        # Empty stat lists are dropped from the log — the term never fired.
+        self.assertNotIn("future_latent", log)
+
+
+# ---------------------------------------------------------------------------
 # TestFutureKvReconstructionLoss
 # ---------------------------------------------------------------------------
 
