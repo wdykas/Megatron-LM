@@ -173,7 +173,16 @@ sync copy.
 --rl-compaction-kv-budget-ratio 0.5
 --rl-compaction-n-compress 64
 --rl-compaction-compactor-checkpoint …
+--rl-compaction-split-fraction 0.5      # A1 split-group: P(rollout compacts)
 ```
+
+With a split fraction, each rollout draws its compaction arm Bernoulli(p) —
+the control arm decodes over the full cache — and the arm is recorded on the
+rollout. Advantages are then normalized within-arm and training logs emit
+`kv_compact_reward_gap`, the per-prompt compact-vs-full reward difference.
+The same per-request switch is exposed over HTTP: pass `"kv_compact": false`
+in a /completions or /chat/completions body to exempt that request — A/B
+compaction against one server without restarting.
 
 Debugging: `KV_COMPACTION_DEBUG=1` makes the live compactor dump per-step
 request bookkeeping (`[kv-dbg]` lines) — diff a compacted trace against a
