@@ -431,7 +431,7 @@ class TestRLUtils:
 
         rollouts = [r1, r2, r3]
 
-        trajs, genmask, inference_logprobs = rl_utils.prepare_trajectories(
+        trajs, genmask, inference_logprobs, kv_stalenesses = rl_utils.prepare_trajectories(
             rollouts,
             tokenizer,
             seq_length,
@@ -537,6 +537,49 @@ class TestRLUtils:
         num_turns = [[2, 1], [1, 3]]
         assert rl_utils.calculate_grpo_advantages(rewards, num_turns) == \
             rl_utils.calculate_grpo_advantages(rewards, num_turns, kv_compact_arms=None)
+
+    def test_staleness_bias_stats_split(self):
+        """A2: the inference/train prob gap is attributed by kv staleness."""
+        from types import SimpleNamespace
+        old_lp = torch.full((1, 6), -1.0)
+        inf_lp = old_lp.clone()
+        inf_lp[0, 3:] = -2.0                              # stale tokens diverge
+        staleness = torch.tensor([[0, 0, 0, 1, 1, 2]], dtype=torch.float32)
+        mask = torch.ones(1, 6, dtype=torch.bool)
+        gs = SimpleNamespace(mean_inf_train_prob_abs_diff_stale=None,
+                             mean_inf_train_prob_abs_diff_clean=None,
+                             kv_stale_token_frac=None)
+        rl_utils.update_staleness_bias_stats(old_lp, inf_lp, mask, staleness, gs)
+        assert gs.kv_stale_token_frac == 0.5
+        assert gs.mean_inf_train_prob_abs_diff_clean == 0.0
+        expected = abs(torch.tensor(-1.0).exp() - torch.tensor(-2.0).exp()).item()
+        assert abs(gs.mean_inf_train_prob_abs_diff_stale - expected) < 1e-6
+
+    def test_staleness_bias_stats_shape_guard(self):
+        from types import SimpleNamespace
+        gs = SimpleNamespace(mean_inf_train_prob_abs_diff_stale=None,
+                             mean_inf_train_prob_abs_diff_clean=None,
+                             kv_stale_token_frac=None)
+        rl_utils.update_staleness_bias_stats(
+            torch.zeros(1, 6), torch.zeros(1, 6),
+            torch.ones(1, 5, dtype=torch.bool), torch.zeros(1, 6), gs)
+        assert gs.kv_stale_token_frac is None             # silently skipped
+
+    def test_align_generated_series_matches_logprob_alignment(self):
+        """The shared alignment core places series at the same positions the
+        inference-logprob alignment uses."""
+        B, S = 2, 10
+        gen_masks = torch.zeros(B, S, dtype=torch.bool)
+        gen_masks[0, 4:9] = True                          # 5 generated tokens
+        gen_masks[1, 6:10] = True                         # 4 generated tokens
+        series = [torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0]),
+                  torch.tensor([7.0, 8.0, 9.0, 10.0])]
+        template = torch.zeros(B, S - 1)
+        aligned, mask = rl_utils._align_generated_series(series, template, gen_masks)
+        assert aligned[0, 3:8].tolist() == [1.0, 2.0, 3.0, 4.0, 5.0]
+        assert aligned[1, 5:9].tolist() == [7.0, 8.0, 9.0, 10.0]
+        # Mask marks exactly the generation region (shifted for logprobs).
+        assert mask[0].int().sum() == 5 and mask[1].int().sum() == 4
 
     def test_pad_list_of_nones(self):
         with pytest.raises(ValueError) as e_info:

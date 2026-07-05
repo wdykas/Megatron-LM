@@ -291,6 +291,11 @@ class RolloutStats:
     num_evictions: list[list[int]]
     # A1 split-group: per-rollout compaction arm, grouped (None = split off).
     kv_compact_arms: None | list[list[bool | None]] = None
+    # A2 compaction-bias attribution: inference-vs-train prob gap split by
+    # per-token kv_cache_staleness (stale = generated after a compaction).
+    mean_inf_train_prob_abs_diff_stale: None | float = None
+    mean_inf_train_prob_abs_diff_clean: None | float = None
+    kv_stale_token_frac: None | float = None
 
 
 # Runtime state container for RL-specific data that shouldn't be checkpointed
@@ -379,6 +384,72 @@ def update_inference_logprobs_group_stats(
         group_stats.mean_inf_prob = inf_probs.mean().item()
 
 
+def update_staleness_bias_stats(
+    old_logprobs: torch.Tensor,
+    inference_logprobs: torch.Tensor,
+    mask: torch.Tensor,
+    staleness: torch.Tensor,
+    group_stats: Any,
+) -> None:
+    """A2: attribute the inference-vs-train probability gap to KV compaction.
+
+    Tokens with kv_cache_staleness > 0 were generated AFTER their request's
+    cache was compacted — their behaviour logprobs came from the compacted
+    cache while training recomputes over the full sequence. Splitting the
+    |pi_inf - pi_old| gap by staleness measures the compaction-attributable
+    bias directly; the correction itself is the existing truncated importance
+    sampling (--rl-inference-logprobs-is-correction), which covers stale
+    tokens like any other inference/train mismatch.
+    """
+    if (mask.shape != old_logprobs.shape
+            or staleness.shape != old_logprobs.shape
+            or inference_logprobs.shape != old_logprobs.shape):
+        # Stats-only path: mirror compute_packed_inference_logprobs_stats,
+        # which also skips quietly on a shape mismatch.
+        return
+    if not mask.any():
+        return
+    abs_diff = (old_logprobs.exp() - inference_logprobs.exp()).abs()
+    stale = mask & (staleness > 0)
+    clean = mask & (staleness == 0)
+    group_stats.kv_stale_token_frac = (stale.sum() / mask.sum()).item()
+    if stale.any():
+        group_stats.mean_inf_train_prob_abs_diff_stale = abs_diff[stale].mean().item()
+    if clean.any():
+        group_stats.mean_inf_train_prob_abs_diff_clean = abs_diff[clean].mean().item()
+
+
+def _align_generated_series(
+    series: List[torch.Tensor],
+    template: torch.Tensor,
+    generation_masks: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Align per-generated-token series to logprob positions (shared core of
+    ``align_unpacked_inference_logprobs``; also used for kv_cache_staleness).
+
+    Returns (aligned series, generation mask truncated to logprob shape).
+    """
+    gen_masks_for_alignment = generation_masks
+    first_gen_tok = gen_masks_for_alignment.int().argmax(dim=1) - 1
+    aligned = template.clone()
+    for i, values in enumerate(series):
+        first_gen_idx = first_gen_tok[i]
+        end_idx = min(first_gen_idx + len(values), aligned.shape[1])
+        actual_len = end_idx - first_gen_idx
+        if actual_len > 0:
+            aligned[i, first_gen_idx:end_idx] = values[:actual_len].to(aligned.dtype)
+    if template.shape[1] + 1 < gen_masks_for_alignment.shape[1]:
+        gen_masks_for_alignment = gen_masks_for_alignment[:, : template.shape[1] + 1]
+    truncated_mask = gen_masks_for_alignment[:, 1:].bool()
+    if truncated_mask.shape != template.shape:
+        if truncated_mask.shape[1] > template.shape[1]:
+            truncated_mask = truncated_mask[:, : template.shape[1]]
+        else:
+            pad_size = template.shape[1] - truncated_mask.shape[1]
+            truncated_mask = torch.nn.functional.pad(truncated_mask, (0, pad_size), value=False)
+    return aligned, truncated_mask
+
+
 def align_unpacked_inference_logprobs(
     inference_logprobs: List[torch.Tensor],
     old_logprobs_for_data: torch.Tensor,
@@ -396,38 +467,11 @@ def align_unpacked_inference_logprobs(
     Returns:
         Aligned inference logprobs tensor
     """
-    # Get first occurrence of a generation token
-    # In get_logprobs() we chop off the first token -> the generation mask is shifted by one
-    gen_masks_for_alignment = generation_masks
-    first_gen_tok = gen_masks_for_alignment.int().argmax(dim=1) - 1
-
-    # Align inference logprobs with old_logprobs
-    # Note: We use old_logprobs_for_data as template since it has correct shape
-    padded_inference_logprobs = old_logprobs_for_data.clone()
-
-    # We need to align old_logprobs and inference logprobs as the latter are only for generations
-    for i, inf_logprobs in enumerate(inference_logprobs):
-        first_gen_idx = first_gen_tok[i]
-        # We subtract -1 here because we append eod token on the train side, and we do not
-        # get it from the inference. For the eod token, we reuse old_logprobs value.
-        end_idx = min(first_gen_idx + len(inf_logprobs), padded_inference_logprobs.shape[1])
-        actual_len = end_idx - first_gen_idx
-        if actual_len > 0:
-            padded_inference_logprobs[i, first_gen_idx:end_idx] = inf_logprobs[:actual_len]
-
-    # Create truncated mask for statistics
-    if old_logprobs_for_data.shape[1] + 1 < gen_masks_for_alignment.shape[1]:
-        gen_masks_for_alignment = gen_masks_for_alignment[:, : old_logprobs_for_data.shape[1] + 1]
-
-    truncated_mask = gen_masks_for_alignment[:, 1:].bool()
-
-    # Final safety check
-    if truncated_mask.shape != old_logprobs_for_data.shape:
-        if truncated_mask.shape[1] > old_logprobs_for_data.shape[1]:
-            truncated_mask = truncated_mask[:, : old_logprobs_for_data.shape[1]]
-        elif truncated_mask.shape[1] < old_logprobs_for_data.shape[1]:
-            pad_size = old_logprobs_for_data.shape[1] - truncated_mask.shape[1]
-            truncated_mask = torch.nn.functional.pad(truncated_mask, (0, pad_size), value=False)
+    # Positions without an inference value reuse old_logprobs (ratio 1); the
+    # eod token appended on the train side is one such position.
+    padded_inference_logprobs, truncated_mask = _align_generated_series(
+        inference_logprobs, old_logprobs_for_data, generation_masks
+    )
 
     # Sanity check: Two probability values cannot be more than 1.0 apart
     abs_diffs = (old_logprobs_for_data.exp() - padded_inference_logprobs.exp()).abs()[truncated_mask]
@@ -1095,6 +1139,10 @@ def maybe_log_training_metrics(
         'min_inf_prob': group_stats.min_inf_prob,
         'max_inf_prob': group_stats.max_inf_prob,
         'mean_inf_prob': group_stats.mean_inf_prob,
+        # A2: compaction-attributable inference/train mismatch.
+        'mean_inf_train_prob_abs_diff_stale': group_stats.mean_inf_train_prob_abs_diff_stale,
+        'mean_inf_train_prob_abs_diff_clean': group_stats.mean_inf_train_prob_abs_diff_clean,
+        'kv_stale_token_frac': group_stats.kv_stale_token_frac,
     }
 
     # A1 split-group counterfactual: per-prompt compact-vs-full reward gap,
@@ -1207,6 +1255,7 @@ def prepare_trajectories(
     trajs = []
     generation_masks = []
     inference_logprobs = []
+    kv_stalenesses = []
     for rollout in rollouts:
         # traj, gen mask and logprobs are lists now.
         # each list entry is a turn, single-turn environments just have a single-element list.
@@ -1240,6 +1289,12 @@ def prepare_trajectories(
                 inference_logprobs.append(inf_logprobs_tensor)
             else:
                 inference_logprobs.append(None)
+            # Per-token KV staleness rides the same alignment as the logprobs
+            # (A2: attribute inference/train mismatch to compaction).
+            turn_staleness = rollout.kv_cache_staleness[turn_idx]
+            kv_stalenesses.append(
+                torch.tensor(turn_staleness, dtype=torch.float32)
+                if turn_staleness is not None else None)
 
         env_id_counts[rollout.env_id] += 1
 
@@ -1280,7 +1335,7 @@ def prepare_trajectories(
     # We should avoid the tokenizer pad token being the same as the eod token for proper loss masking,
     # But now the deepseek tokenizer has the pad token set to eod, we need to handle this.
     # assert (tokenizer.pad != tokenizer.eod), "Pad and eod should be different"
-    return trajs, generation_masks, inference_logprobs
+    return trajs, generation_masks, inference_logprobs, kv_stalenesses
 
 
 def logprobs_forward_step(data_iterator, model, is_correction, packing_context=None):
@@ -1440,7 +1495,7 @@ def prepare_data_for_update(
             # Sequence packing and reporting needs it global but non-packing wants it local.
 
         with nvtx_range("prepare_trajectories"):
-            trajs, generation_masks, inference_logprobs = prepare_trajectories(
+            trajs, generation_masks, inference_logprobs, kv_stalenesses = prepare_trajectories(
                 rollouts, tokenizer, args.seq_length, sequence_packing, args.rl_skip_bos_token
             )
 
@@ -1569,6 +1624,20 @@ def prepare_data_for_update(
                         packed_loss_mask=packing_context.packed_loss_mask,
                         group_stats=group_stats,
                     )
+                    if all(st is not None for st in kv_stalenesses):
+                        packed_staleness = pack_inference_logprobs(
+                            inference_logprobs=kv_stalenesses,
+                            packing_info=packing_context.packing_info,
+                            generation_masks=packing_context.original_generation_masks,
+                            bin_size=args.seq_length,
+                        )
+                        update_staleness_bias_stats(
+                            old_logprobs=old_logprobs.cpu(),
+                            inference_logprobs=packed_inference_logprobs.cpu(),
+                            mask=packing_context.packed_loss_mask.cpu()[:, 1:].bool(),
+                            staleness=packed_staleness.cpu(),
+                            group_stats=group_stats,
+                        )
 
                     # Store packed inference logprobs in packing context
                     packing_context.packed_inference_logprobs = packed_inference_logprobs.cuda()
@@ -1599,6 +1668,18 @@ def prepare_data_for_update(
                         generation_masks=generation_masks,
                         group_stats=group_stats,
                     )
+                    if all(st is not None for st in kv_stalenesses):
+                        aligned_staleness, stale_mask = _align_generated_series(
+                            kv_stalenesses, torch.zeros_like(old_logprobs),
+                            generation_masks,
+                        )
+                        update_staleness_bias_stats(
+                            old_logprobs=old_logprobs,
+                            inference_logprobs=inference_logprobs,
+                            mask=stale_mask,
+                            staleness=aligned_staleness,
+                            group_stats=group_stats,
+                        )
                     # We run the above to fill in the inference/train side mismatch stats.
                     # We do the above for logging purposes.
                     # Nullify logprobs if not used in IS correction,
