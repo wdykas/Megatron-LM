@@ -60,8 +60,11 @@ def _make_context(
     # Fill with recognisable values: buf[kv, layer, block, pos, h, d] = layer * 1000 + pos_in_seq
     buf = torch.zeros(2, n_layers, total_blocks, BS, H, D)
 
-    n_blocks = math.ceil(seq_len / BS)
-    last_offset = (seq_len - 1) % BS
+    last_offset = seq_len % BS
+    n_data_blocks = math.ceil(seq_len / BS)
+    # Engine post-update semantics: offset = COUNT of tokens in the last block;
+    # a full last block is represented as an extra EMPTY current block + offset 0.
+    n_blocks = n_data_blocks + (1 if last_offset == 0 else 0)
 
     # Fill the blocks used by the one request
     block_ids_for_req = list(range(n_blocks))
@@ -71,6 +74,7 @@ def _make_context(
         for layer in range(n_layers):
             for kv in range(2):
                 buf[kv, layer, block_ids_for_req[blk], pos] = float(t + 1)
+    del blk, pos
 
     allocator = _FakeBlockAllocator(total_blocks)
     # Pre-use the blocks taken by the request so allocator doesn't reassign them
@@ -220,8 +224,8 @@ class TestApplyMask:
         hook = MegatronInferenceHook(ctx)
         mask = self._make_mask(list(range(8)), 8)
         hook.apply_mask(mask)
-        assert ctx.request_kv_block_counts[0].item() == 2
-        assert ctx.request_last_kv_block_offset[0].item() == 3
+        assert ctx.request_kv_block_counts[0].item() == 3   # 2 data + 1 empty current
+        assert ctx.request_last_kv_block_offset[0].item() == 0
 
     def test_reduces_block_count(self):
         ctx = _make_context(seq_len=8, block_size=4)
@@ -230,7 +234,7 @@ class TestApplyMask:
         mask = self._make_mask([0, 1, 2], 8)
         hook.apply_mask(mask)
         assert ctx.request_kv_block_counts[0].item() == 1
-        assert ctx.request_last_kv_block_offset[0].item() == 2
+        assert ctx.request_last_kv_block_offset[0].item() == 3
 
     def test_frees_excess_blocks(self):
         ctx = _make_context(seq_len=8, block_size=4)
@@ -306,7 +310,7 @@ class TestApplyMask:
         mask = self._make_mask([6], 8)
         hook.apply_mask(mask)
         assert ctx.request_kv_block_counts[0].item() == 1
-        assert ctx.request_last_kv_block_offset[0].item() == 0
+        assert ctx.request_last_kv_block_offset[0].item() == 1
 
 
 # ---------------------------------------------------------------------------
@@ -326,9 +330,9 @@ class TestApplyBeliefMemory:
         memory = self._make_memory(n_layers=2, B=1, C=C, d_model=4)
         hook.apply_belief_memory(memory)
 
-        # Should now have ceil(3/4)=1 block with last_offset=2
+        # 3 tokens -> 1 block holding 3 tokens (offset = count)
         assert ctx.request_kv_block_counts[0].item() == 1
-        assert ctx.request_last_kv_block_offset[0].item() == 2
+        assert ctx.request_last_kv_block_offset[0].item() == 3
 
     def test_values_written_correctly(self):
         ctx = _make_context(n_layers=1, n_heads=1, d_head=2, block_size=4, seq_len=8)
@@ -389,7 +393,7 @@ class TestApplyBeliefMemory:
         memory = self._make_memory(n_layers=1, B=1, C=C, d_model=4)
         hook.apply_belief_memory(memory)
         assert ctx.request_kv_block_counts[0].item() == 3
-        assert ctx.request_last_kv_block_offset[0].item() == 0  # (9-1)%4=0
+        assert ctx.request_last_kv_block_offset[0].item() == 1  # 9 % 4 = 1 token in last block
 
     def test_for_request_injects_single(self):
         # paused=1 so request 0 is paused and request 1 is the single active one.
@@ -399,7 +403,7 @@ class TestApplyBeliefMemory:
         memory = self._make_memory(n_layers=2, B=1, C=C, d_model=4)
         hook.apply_belief_memory_for_request(0, memory)
         assert ctx.request_kv_block_counts[1].item() == 1
-        assert ctx.request_last_kv_block_offset[1].item() == 2
+        assert ctx.request_last_kv_block_offset[1].item() == 3
 
     def test_for_request_raises_out_of_range(self):
         ctx = _make_context(seq_len=4)
@@ -434,7 +438,7 @@ class TestPerRequestPrimitives:
         hook.apply_mask_for_request(0, [0, 2, 5])
         # 3 retained → 1 block; verify every engine-side field the decode step reads.
         assert ctx.request_kv_block_counts[0].item() == 1
-        assert ctx.request_last_kv_block_offset[0].item() == 2      # (3-1) % 4
+        assert ctx.request_last_kv_block_offset[0].item() == 3      # count in last block
         assert ctx.request_kv_length_offsets[0].item() == 3          # next pos id / write slot
         assert ctx.request_last_kv_block_id[0].item() == ctx.request_to_kv_block_ids[0, 0].item()
         # Values compacted contiguously (positions 0,2,5 had values 1,3,6).
@@ -446,6 +450,19 @@ class TestPerRequestPrimitives:
         hook = MegatronInferenceHook(ctx)
         with pytest.raises(RuntimeError, match="empty"):
             hook.apply_mask_for_request(0, [])
+
+    def test_prune_to_block_multiple_keeps_empty_current_block(self):
+        """Retained count on a block boundary = full data blocks + empty current
+        block with offset 0 (the engine's own representation of that state)."""
+        ctx = _make_context(n_layers=1, n_heads=1, d_head=1, block_size=4, seq_len=7)
+        hook = MegatronInferenceHook(ctx)
+        hook.apply_mask_for_request(0, [0, 1, 2, 3])
+        assert ctx.request_kv_block_counts[0].item() == 2      # 1 data + 1 empty current
+        assert ctx.request_last_kv_block_offset[0].item() == 0
+        assert ctx.request_kv_length_offsets[0].item() == 4
+        assert ctx.request_last_kv_block_id[0].item() == ctx.request_to_kv_block_ids[0, 1].item()
+        k, _ = hook.get_kv_for_request(0)
+        assert k.shape[1] == 4
 
     def test_batch_apply_mask_matches_per_request(self):
         retained = [1, 3, 5, 7]

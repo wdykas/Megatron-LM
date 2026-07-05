@@ -152,7 +152,7 @@ class MegatronInferenceHook:
         BS = ctx.block_size_tokens
         n_blocks = int(ctx.request_kv_block_counts[b_global].item())
         last_offset = int(ctx.request_last_kv_block_offset[b_global].item())
-        seq_len = (n_blocks - 1) * BS + last_offset + 1
+        seq_len = (n_blocks - 1) * BS + last_offset
         if seq_len <= 0:
             return []
 
@@ -233,11 +233,22 @@ class MegatronInferenceHook:
 
         n_retained = len(retained)
         retained_idx = torch.tensor(retained, dtype=torch.long, device=buf.device)
-        n_new_blocks = math.ceil(n_retained / BS)
-        new_last_offset = (n_retained - 1) % BS
+        # Offset semantics (matches the engine's post-update state): the COUNT of
+        # tokens in the last block. A retained count on a block boundary is
+        # represented the way the engine represents it — data blocks full, plus a
+        # trailing EMPTY current block with offset 0.
+        n_data_blocks = math.ceil(n_retained / BS)
+        new_last_offset = n_retained % BS
+        n_new_blocks = n_data_blocks + (1 if new_last_offset == 0 else 0)
 
         n_blocks = int(ctx.request_kv_block_counts[b_global].item())
         block_ids = ctx.request_to_kv_block_ids[b_global, :n_blocks].to(buf.device)
+
+        if n_new_blocks > n_blocks:
+            raise RuntimeError(
+                f"_prune_request: need {n_new_blocks} blocks for {n_retained} retained "
+                f"tokens but the request only has {n_blocks} — prune cannot grow a request."
+            )
 
         # Gather all blocks → flatten → select retained → (n_layers, n_retained, H, D)
         k_flat = buf[0, :, block_ids].reshape(n_layers, n_blocks * BS, H, D)
@@ -245,8 +256,8 @@ class MegatronInferenceHook:
         k_ret = k_flat[:, retained_idx]
         v_ret = v_flat[:, retained_idx]
 
-        # Write retained tokens back into the first n_new_blocks blocks.
-        for bi in range(n_new_blocks):
+        # Write retained tokens back into the first data blocks.
+        for bi in range(n_data_blocks):
             start = bi * BS
             end = min(start + BS, n_retained)
             chunk_len = end - start
@@ -295,7 +306,7 @@ class MegatronInferenceHook:
 
         n_blocks = int(ctx.request_kv_block_counts[b_global].item())
         last_offset = int(ctx.request_last_kv_block_offset[b_global].item())
-        seq_len = (n_blocks - 1) * BS + last_offset + 1
+        seq_len = (n_blocks - 1) * BS + last_offset
         block_ids = ctx.request_to_kv_block_ids[b_global, :n_blocks].to(buf.device)
 
         k = buf[0, :, block_ids].reshape(n_layers, n_blocks * BS, H, D)[:, :seq_len]
@@ -333,7 +344,7 @@ class MegatronInferenceHook:
 
         # seq_len[b] = (block_counts[b] - 1) * block_size + last_offsets[b] + 1
         BS = ctx.block_size_tokens
-        seq_lens = (block_counts - 1) * BS + last_offsets + 1   # (B,)
+        seq_lens = (block_counts - 1) * BS + last_offsets   # (B,)
         max_seq = int(seq_lens.max().item())
         B = n_active
 
@@ -399,7 +410,9 @@ class MegatronInferenceHook:
         n_layers = ctx.num_attention_layers
         H, D = buf.shape[-2], buf.shape[-1]
         C = keys.shape[1]
-        n_new_blocks = math.ceil(C / BS)
+        n_data_blocks = math.ceil(C / BS)
+        new_last_offset = C % BS
+        n_new_blocks = n_data_blocks + (1 if new_last_offset == 0 else 0)
 
         n_old_blocks = int(ctx.request_kv_block_counts[b_global].item())
         old_block_ids = ctx.request_to_kv_block_ids[b_global, :n_old_blocks].to(buf.device)
@@ -418,7 +431,7 @@ class MegatronInferenceHook:
         for layer in range(n_layers):
             k_compact = keys[layer].to(buf.device).reshape(C, H, D)
             v_compact = values[layer].to(buf.device).reshape(C, H, D)
-            for bi in range(n_new_blocks):
+            for bi in range(n_data_blocks):
                 start = bi * BS
                 end = min(start + BS, C)
                 chunk = end - start
@@ -427,7 +440,7 @@ class MegatronInferenceHook:
 
         ctx.request_to_kv_block_ids[b_global, :n_new_blocks] = new_block_ids
         ctx.request_kv_block_counts[b_global] = n_new_blocks
-        ctx.request_last_kv_block_offset[b_global] = (C - 1) % BS
+        ctx.request_last_kv_block_offset[b_global] = new_last_offset
         ctx.request_last_kv_block_id[b_global] = new_block_ids[-1]
         ctx.request_kv_length_offsets[b_global] = C
 

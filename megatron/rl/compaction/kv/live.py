@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from typing import Any
 
 import torch
@@ -164,6 +165,8 @@ class LiveKVCompactor:
         self._prefill_locals: list[int] = []
         self._cu_q: torch.Tensor | None = None
         self._capturing = False
+        if os.environ.get("KV_COMPACTION_DEBUG"):
+            self._debug_dump()
         if is_decode_only:
             return
         ctx = self._ctx
@@ -196,7 +199,6 @@ class LiveKVCompactor:
         self._capturing = False
         cu_q = self._cu_q
         ctx = self._ctx
-        BS = ctx.block_size_tokens
         chunked_global = ctx.get_index_of_chunked_prefill_request(safe=True)
 
         for b_local in self._prefill_locals:
@@ -208,12 +210,7 @@ class LiveKVCompactor:
             if S < self.min_tokens:
                 continue
             budget = max(1, int(S * self.budget_ratio))
-            # The pending decode token must land INSIDE the last retained block
-            # (a retained count on a block boundary would need a fresh block that
-            # update_requests already decided not to allocate).
-            if budget % BS == 0:
-                budget -= 1
-            if budget >= S or budget < 1:
+            if budget >= S:
                 continue
 
             if self.strategy == "snapkv":
@@ -240,14 +237,24 @@ class LiveKVCompactor:
                 "[kv-compaction] request b_local=%d: %d -> %d tokens (%s, ratio %.2f)",
                 b_local, S, len(positions), self.strategy, self.budget_ratio,
             )
-        if self.compacted_requests:
-            # The prune's gather/scatter kernels run on the default stream, but the
-            # next decode step may replay a CUDA graph on its own stream. Without a
-            # barrier the replay races the in-flight cache surgery (observed as
-            # cudaErrorIllegalAddress; disappears under CUDA_LAUNCH_BLOCKING=1).
-            torch.cuda.synchronize()
         self._prefill_locals = []
         self._cu_q = None
+
+    def _debug_dump(self) -> None:
+        ctx = self._ctx
+        if ctx.total_request_count <= ctx.paused_request_count and ctx.paused_request_count == 0:
+            return
+        b = ctx.paused_request_count  # first active (or first paused if none active)
+        logger.info(
+            "[kv-dbg] step=%s paused=%d total=%d | kvlen=%d qlen=%d blocks=%d "
+            "lastblk=%d off=%d outlen=%d | t2pos=%d t2blk=%d t2loc=%d",
+            ctx.step_count, ctx.paused_request_count, ctx.total_request_count,
+            int(ctx.request_kv_length_offsets[b]), int(ctx.request_query_lengths[b]),
+            int(ctx.request_kv_block_counts[b]), int(ctx.request_last_kv_block_id[b]),
+            int(ctx.request_last_kv_block_offset[b]), int(ctx.request_output_lengths[b]),
+            int(ctx.token_to_pos_ids[0]), int(ctx.token_to_block_idx[0]),
+            int(ctx.token_to_local_position_within_kv_block[0]),
+        )
 
     def _repoint_pending_token(self, b_local: int, b_global: int, C: int) -> None:
         """Fix the precomputed placement of the request's pending decode token.
