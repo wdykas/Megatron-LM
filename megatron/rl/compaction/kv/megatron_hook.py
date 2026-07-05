@@ -191,51 +191,116 @@ class MegatronInferenceHook:
         ctx, buf, n_active = got
 
         retained = sorted(mask.retained_positions)
-        n_retained = len(retained)
-        if n_retained == 0:
+        if len(retained) == 0:
             raise RuntimeError("apply_mask: retained_positions is empty; nothing to keep.")
 
+        for b_local in range(n_active):
+            b_global = ctx.paused_request_count + b_local
+            self._prune_request(ctx, buf, b_global, retained)
+
+    def apply_mask_for_request(self, b_local: int, retained_positions: list[int]) -> None:
+        """Prune ONE active request's paged KV to ``retained_positions``.
+
+        Per-request variant of apply_mask — the seam used by live post-prefill
+        compaction, where every request gets its own retained set. Positions are
+        token-level: the paged cache shares one block table across all layers
+        and heads, so a dropped position is dropped everywhere.
+        """
+        got = self._context_kv()
+        if got is None:
+            raise RuntimeError(
+                "apply_mask_for_request: no live KV cache (engine not allocated "
+                "or no active requests)."
+            )
+        ctx, buf, n_active = got
+        if b_local >= n_active:
+            raise RuntimeError(
+                f"apply_mask_for_request: b_local={b_local} >= n_active={n_active}"
+            )
+        retained = sorted(retained_positions)
+        if len(retained) == 0:
+            raise RuntimeError("apply_mask_for_request: retained_positions is empty.")
+        self._prune_request(ctx, buf, ctx.paused_request_count + b_local, retained)
+
+    @staticmethod
+    def _prune_request(ctx: Any, buf: torch.Tensor, b_global: int, retained: list[int]) -> None:
+        """Gather ``retained`` token slots of one request and write them back
+        contiguously from block 0 slot 0; release the freed blocks and update
+        the request's block-table metadata in place."""
         BS = ctx.block_size_tokens
         n_layers = ctx.num_attention_layers
+        H, D = buf.shape[-2], buf.shape[-1]
 
+        n_retained = len(retained)
         retained_idx = torch.tensor(retained, dtype=torch.long, device=buf.device)
         n_new_blocks = math.ceil(n_retained / BS)
         new_last_offset = (n_retained - 1) % BS
 
-        for b_local in range(n_active):
-            b_global = ctx.paused_request_count + b_local
-            n_blocks = int(ctx.request_kv_block_counts[b_global].item())
-            block_ids = ctx.request_to_kv_block_ids[b_global, :n_blocks].to(buf.device)
+        n_blocks = int(ctx.request_kv_block_counts[b_global].item())
+        block_ids = ctx.request_to_kv_block_ids[b_global, :n_blocks].to(buf.device)
 
-            # Gather all blocks → (n_layers, n_blocks, BS, H, D)
-            k_all = buf[0, :, block_ids]
-            v_all = buf[1, :, block_ids]
+        # Gather all blocks → flatten → select retained → (n_layers, n_retained, H, D)
+        k_flat = buf[0, :, block_ids].reshape(n_layers, n_blocks * BS, H, D)
+        v_flat = buf[1, :, block_ids].reshape(n_layers, n_blocks * BS, H, D)
+        k_ret = k_flat[:, retained_idx]
+        v_ret = v_flat[:, retained_idx]
 
-            H, D = buf.shape[-2], buf.shape[-1]
-            # Flatten blocks → (n_layers, n_blocks*BS, H, D)
-            k_flat = k_all.reshape(n_layers, n_blocks * BS, H, D)
-            v_flat = v_all.reshape(n_layers, n_blocks * BS, H, D)
+        # Write retained tokens back into the first n_new_blocks blocks.
+        for bi in range(n_new_blocks):
+            start = bi * BS
+            end = min(start + BS, n_retained)
+            chunk_len = end - start
+            buf[0, :, block_ids[bi], :chunk_len] = k_ret[:, start:end]
+            buf[1, :, block_ids[bi], :chunk_len] = v_ret[:, start:end]
 
-            # Gather retained positions → (n_layers, n_retained, H, D)
-            k_ret = k_flat[:, retained_idx]
-            v_ret = v_flat[:, retained_idx]
+        # Free excess blocks.
+        if n_new_blocks < n_blocks:
+            excess = block_ids[n_new_blocks:].clone()
+            ctx.block_allocator.release_memory_blocks(excess)
+            ctx.request_to_kv_block_ids[b_global, n_new_blocks:n_blocks] = -1
 
-            # Write retained tokens back into first n_new_blocks blocks
-            for bi in range(n_new_blocks):
-                start = bi * BS
-                end = min(start + BS, n_retained)
-                chunk_len = end - start
-                buf[0, :, block_ids[bi], :chunk_len] = k_ret[:, start:end]
-                buf[1, :, block_ids[bi], :chunk_len] = v_ret[:, start:end]
+        # Keep ALL of the engine's per-request bookkeeping consistent with the
+        # pruned cache: the next decode token's position id AND its write slot
+        # both derive from request_kv_length_offsets (token_to_pos_ids =
+        # kv_length_offsets), and the block-boundary logic reads
+        # request_last_kv_block_id/offset.
+        ctx.request_kv_block_counts[b_global] = n_new_blocks
+        ctx.request_last_kv_block_offset[b_global] = new_last_offset
+        ctx.request_last_kv_block_id[b_global] = block_ids[n_new_blocks - 1]
+        ctx.request_kv_length_offsets[b_global] = n_retained
 
-            # Free excess blocks
-            if n_new_blocks < n_blocks:
-                excess = block_ids[n_new_blocks:].clone()
-                ctx.block_allocator.release_memory_blocks(excess)
-                ctx.request_to_kv_block_ids[b_global, n_new_blocks:n_blocks] = -1
+    def get_kv_for_request(
+        self, b_local: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return one active request's KV as (K, V), each (n_layers, S, H, D).
 
-            ctx.request_kv_block_counts[b_global] = n_new_blocks
-            ctx.request_last_kv_block_offset[b_global] = new_last_offset
+        Unpadded and head-explicit — the read primitive for live per-request
+        scoring (S = the request's current KV length).
+        """
+        got = self._context_kv()
+        if got is None:
+            raise RuntimeError(
+                "get_kv_for_request: no live KV cache (engine not allocated "
+                "or no active requests)."
+            )
+        ctx, buf, n_active = got
+        if b_local >= n_active:
+            raise RuntimeError(
+                f"get_kv_for_request: b_local={b_local} >= n_active={n_active}"
+            )
+        b_global = ctx.paused_request_count + b_local
+        BS = ctx.block_size_tokens
+        n_layers = ctx.num_attention_layers
+        H, D = buf.shape[-2], buf.shape[-1]
+
+        n_blocks = int(ctx.request_kv_block_counts[b_global].item())
+        last_offset = int(ctx.request_last_kv_block_offset[b_global].item())
+        seq_len = (n_blocks - 1) * BS + last_offset + 1
+        block_ids = ctx.request_to_kv_block_ids[b_global, :n_blocks].to(buf.device)
+
+        k = buf[0, :, block_ids].reshape(n_layers, n_blocks * BS, H, D)[:, :seq_len]
+        v = buf[1, :, block_ids].reshape(n_layers, n_blocks * BS, H, D)[:, :seq_len]
+        return k, v
 
     def get_kv_matrices(
         self,
@@ -363,6 +428,8 @@ class MegatronInferenceHook:
         ctx.request_to_kv_block_ids[b_global, :n_new_blocks] = new_block_ids
         ctx.request_kv_block_counts[b_global] = n_new_blocks
         ctx.request_last_kv_block_offset[b_global] = (C - 1) % BS
+        ctx.request_last_kv_block_id[b_global] = new_block_ids[-1]
+        ctx.request_kv_length_offsets[b_global] = C
 
     def apply_belief_memory(self, memory: Any) -> None:
         """Inject compact BeliefMemory into the live KV cache for every request.

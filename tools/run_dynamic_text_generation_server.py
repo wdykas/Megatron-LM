@@ -25,6 +25,23 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--parsers", type=str, nargs="+", default=[], help="Parsers to use for parsing the response"
     )
+    parser.add_argument(
+        "--kv-compaction-strategy", type=str, default=None,
+        help="Live post-prefill KV compaction strategy (snapkv, streaming_llm). "
+             "Requires --decode-only-cuda-graphs so prefill forwards run eagerly.",
+    )
+    parser.add_argument(
+        "--kv-compaction-budget-ratio", type=float, default=0.5,
+        help="Fraction of prompt tokens to keep when --kv-compaction-strategy is set.",
+    )
+    parser.add_argument(
+        "--kv-compaction-obs-window", type=int, default=32,
+        help="SnapKV observation window (last W prompt queries score the rest).",
+    )
+    parser.add_argument(
+        "--kv-compaction-min-tokens", type=int, default=128,
+        help="Skip live compaction for prompts shorter than this.",
+    )
     return parser
 
 
@@ -82,6 +99,23 @@ if __name__ == "__main__":
         args.return_log_probs = True
 
         engine = get_dynamic_inference_engine()
+
+        if args.kv_compaction_strategy is not None:
+            from megatron.rl.compaction.kv.live import LiveKVCompactor
+            if not args.decode_only_cuda_graphs and args.kv_compaction_strategy == "snapkv":
+                raise ValueError(
+                    "--kv-compaction-strategy snapkv needs eager prefill forwards for "
+                    "observation-window Q capture: relaunch with --decode-only-cuda-graphs."
+                )
+            engine.kv_compactor = LiveKVCompactor(
+                engine,
+                strategy=args.kv_compaction_strategy,
+                budget_ratio=args.kv_compaction_budget_ratio,
+                obs_window=args.kv_compaction_obs_window,
+                min_tokens=args.kv_compaction_min_tokens,
+            )
+            print(f"[kv-compaction] live compaction enabled: "
+                  f"{args.kv_compaction_strategy} @ {args.kv_compaction_budget_ratio}")
 
         try:
             asyncio.run(

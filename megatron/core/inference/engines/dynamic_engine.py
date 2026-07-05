@@ -282,6 +282,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Timing and logging variables.
         self.rank = torch.distributed.get_rank()
+        # Optional live KV compactor (megatron.rl.compaction.kv.live); set by
+        # the serving tool when --kv-compaction-strategy is passed.
+        self.kv_compactor = None
+
         self.step_start_event = torch.cuda.Event(enable_timing=True)
         self.step_end_event = torch.cuda.Event(enable_timing=True)
         self.capture_stats = None
@@ -1525,6 +1529,13 @@ class DynamicInferenceEngine(AbstractEngine):
         # TODO @TDE: Account for this line when overlapping forward and bookkeep.
         self.is_decode_only = is_decode_only
 
+        # Live KV compaction (megatron.rl.compaction.kv.live.LiveKVCompactor),
+        # attached by the serving tool. Arms observation-window Q capture before
+        # prefill forwards and prunes each just-prefilled request's paged KV to
+        # budget right after; both calls are no-ops on decode-only steps.
+        if self.kv_compactor is not None:
+            self.kv_compactor.begin_step(is_decode_only)
+
         self.step_start_event.record()
         result = await self.controller.async_generate_output_tokens_dynamic_batch()
         self.step_end_event.record()
@@ -1775,6 +1786,13 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         last_step_data = await self.async_forward()
         ret = await self.async_bookkeep(*last_step_data)
+        # Live KV compaction runs AFTER bookkeeping: post_process_requests reads
+        # this step's counters, so the paged cache may only be mutated once the
+        # step is fully settled. begin_step (in async_forward) snapshotted which
+        # requests prefilled; the pruned state takes effect from the next step's
+        # initialize_attention_state. No-op on decode-only steps.
+        if self.kv_compactor is not None:
+            self.kv_compactor.compact_prefilled_requests(self.is_decode_only)
         # Keep for compatibility with current test suite.
         return ret
 

@@ -41,6 +41,8 @@ from megatron.rl.compaction.learned.training.value_directed import (
     attach_grpo_advantages,
 )
 
+from megatron.rl.compaction.learned.probes import kl_from_logits, sufficiency_kl
+
 __all__ = [
     "PerceiverConfig", "PerceiverCompactor",
     "BeliefMemory", "BeliefUpdater",
@@ -58,4 +60,5 @@ __all__ = [
     "load_optimizer_state",
     "advantage_weighted_kl_loss",
     "ValueDirectedConfig", "attach_grpo_advantages",
+    "kl_from_logits", "sufficiency_kl",
 ]

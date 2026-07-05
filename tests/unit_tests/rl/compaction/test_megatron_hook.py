@@ -85,6 +85,12 @@ def _make_context(
     request_last_kv_block_offset = torch.zeros(1 + paused, dtype=torch.int32)
     request_last_kv_block_offset[paused] = last_offset
 
+    request_last_kv_block_id = torch.full((1 + paused,), -1, dtype=torch.int32)
+    request_last_kv_block_id[paused] = block_ids_for_req[-1]
+
+    request_kv_length_offsets = torch.zeros(1 + paused, dtype=torch.int32)
+    request_kv_length_offsets[paused] = seq_len
+
     ctx = type("FakeCtx", (), {})()
     ctx.memory_buffer = buf
     ctx.cache_mla_latent = False
@@ -97,6 +103,8 @@ def _make_context(
     ctx.request_to_kv_block_ids = request_to_kv_block_ids
     ctx.request_kv_block_counts = request_kv_block_counts
     ctx.request_last_kv_block_offset = request_last_kv_block_offset
+    ctx.request_last_kv_block_id = request_last_kv_block_id
+    ctx.request_kv_length_offsets = request_kv_length_offsets
     ctx.block_allocator = allocator
     return ctx
 
@@ -399,6 +407,58 @@ class TestApplyBeliefMemory:
         memory = self._make_memory(n_layers=1, B=1, C=3, d_model=4)
         with pytest.raises(RuntimeError, match="b_local"):
             hook.apply_belief_memory_for_request(5, memory)
+
+
+# ---------------------------------------------------------------------------
+# Per-request primitives (live post-prefill compaction seam)
+# ---------------------------------------------------------------------------
+
+class TestPerRequestPrimitives:
+    def test_get_kv_for_request_shape_and_values(self):
+        ctx = _make_context(n_layers=2, n_heads=1, d_head=4, block_size=4, seq_len=6)
+        hook = MegatronInferenceHook(ctx)
+        k, v = hook.get_kv_for_request(0)
+        assert k.shape == (2, 6, 1, 4) and v.shape == (2, 6, 1, 4)
+        # _make_context fills position t with value t+1.
+        assert abs(k[0, 2, 0, 0].item() - 3.0) < 1e-6
+
+    def test_get_kv_for_request_out_of_range(self):
+        ctx = _make_context()
+        hook = MegatronInferenceHook(ctx)
+        with pytest.raises(RuntimeError, match="b_local"):
+            hook.get_kv_for_request(5)
+
+    def test_apply_mask_for_request_prunes_and_updates_bookkeeping(self):
+        ctx = _make_context(n_layers=1, n_heads=1, d_head=1, block_size=4, seq_len=8)
+        hook = MegatronInferenceHook(ctx)
+        hook.apply_mask_for_request(0, [0, 2, 5])
+        # 3 retained → 1 block; verify every engine-side field the decode step reads.
+        assert ctx.request_kv_block_counts[0].item() == 1
+        assert ctx.request_last_kv_block_offset[0].item() == 2      # (3-1) % 4
+        assert ctx.request_kv_length_offsets[0].item() == 3          # next pos id / write slot
+        assert ctx.request_last_kv_block_id[0].item() == ctx.request_to_kv_block_ids[0, 0].item()
+        # Values compacted contiguously (positions 0,2,5 had values 1,3,6).
+        k, _ = hook.get_kv_for_request(0)
+        assert [round(k[0, i, 0, 0].item()) for i in range(3)] == [1, 3, 6]
+
+    def test_apply_mask_for_request_empty_raises(self):
+        ctx = _make_context()
+        hook = MegatronInferenceHook(ctx)
+        with pytest.raises(RuntimeError, match="empty"):
+            hook.apply_mask_for_request(0, [])
+
+    def test_batch_apply_mask_matches_per_request(self):
+        retained = [1, 3, 5, 7]
+        ctx_a = _make_context(n_layers=1, n_heads=1, d_head=1, block_size=4, seq_len=8)
+        ctx_b = _make_context(n_layers=1, n_heads=1, d_head=1, block_size=4, seq_len=8)
+        MegatronInferenceHook(ctx_a).apply_mask(
+            KVMask(run_id="r", step_id=0, retained_positions=retained,
+                   total_positions=8, strategy="topk"))
+        MegatronInferenceHook(ctx_b).apply_mask_for_request(0, retained)
+        ka, _ = MegatronInferenceHook(ctx_a).get_kv_for_request(0)
+        kb, _ = MegatronInferenceHook(ctx_b).get_kv_for_request(0)
+        assert torch.equal(ka, kb)
+        assert ctx_a.request_kv_length_offsets[0].item() == ctx_b.request_kv_length_offsets[0].item()
 
 
 # ---------------------------------------------------------------------------
