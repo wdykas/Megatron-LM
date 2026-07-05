@@ -1,0 +1,132 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+"""Tests for the CPU KV archive + negative-cache retrieval primitives."""
+
+import pytest
+import torch
+
+from megatron.rl.compaction.kv.archive import KVArchive
+from megatron.rl.compaction.kv.megatron_hook import MegatronInferenceHook
+
+from tests.unit_tests.rl.compaction.test_megatron_hook import _make_context
+
+
+class TestAppendKvToRequest:
+    def test_append_within_block(self):
+        ctx = _make_context(n_layers=1, n_heads=1, d_head=1, block_size=8, seq_len=5)
+        hook = MegatronInferenceHook(ctx)
+        add = torch.full((1, 2, 1, 1), 42.0)
+        hook.append_kv_to_request(0, add, add * 2)
+        assert ctx.request_kv_length_offsets[0].item() == 7
+        assert ctx.request_kv_block_counts[0].item() == 1
+        assert ctx.request_last_kv_block_offset[0].item() == 7
+        k, v = hook.get_kv_for_request(0)
+        assert k.shape[1] == 7
+        assert k[0, 5, 0, 0].item() == 42.0 and v[0, 6, 0, 0].item() == 84.0
+
+    def test_append_allocates_new_block(self):
+        ctx = _make_context(n_layers=1, n_heads=1, d_head=1, block_size=4, seq_len=3)
+        hook = MegatronInferenceHook(ctx)
+        add = torch.full((1, 3, 1, 1), 9.0)          # 3 + 3 = 6 -> 2 blocks
+        hook.append_kv_to_request(0, add, add)
+        assert ctx.request_kv_block_counts[0].item() == 2
+        assert ctx.request_kv_length_offsets[0].item() == 6
+        assert ctx.request_last_kv_block_offset[0].item() == 2
+        k, _ = hook.get_kv_for_request(0)
+        assert k.shape[1] == 6
+        assert k[0, 5, 0, 0].item() == 9.0
+
+    def test_append_to_block_boundary_keeps_empty_current(self):
+        ctx = _make_context(n_layers=1, n_heads=1, d_head=1, block_size=4, seq_len=6)
+        hook = MegatronInferenceHook(ctx)
+        add = torch.ones(1, 2, 1, 1)                  # 6 + 2 = 8 = 2 full blocks
+        hook.append_kv_to_request(0, add, add)
+        assert ctx.request_kv_block_counts[0].item() == 3   # 2 data + 1 empty current
+        assert ctx.request_last_kv_block_offset[0].item() == 0
+        assert ctx.request_kv_length_offsets[0].item() == 8
+
+    def test_prune_then_append_round_trip(self):
+        """The retrieval flow: prune, then append the evicted tokens back."""
+        ctx = _make_context(n_layers=1, n_heads=1, d_head=1, block_size=4, seq_len=8)
+        hook = MegatronInferenceHook(ctx)
+        k0, v0 = hook.get_kv_for_request(0)
+        evicted = [3, 4, 5]
+        retained = [p for p in range(8) if p not in evicted]
+        hook.apply_mask_for_request(0, retained)
+        hook.append_kv_to_request(0, k0[:, evicted], v0[:, evicted])
+        k1, _ = hook.get_kv_for_request(0)
+        assert k1.shape[1] == 8
+        # Retained prefix order then restored span.
+        got = [round(k1[0, i, 0, 0].item()) for i in range(8)]
+        assert got == [1, 2, 3, 7, 8, 4, 5, 6]
+
+    def test_empty_append_raises(self):
+        ctx = _make_context()
+        hook = MegatronInferenceHook(ctx)
+        with pytest.raises(RuntimeError, match="nothing to append"):
+            hook.append_kv_to_request(0, torch.zeros(2, 0, 1, 4), torch.zeros(2, 0, 1, 4))
+
+
+class TestKVArchive:
+    def _kv(self, L=2, S=24, H=1, D=8, seed=0):
+        g = torch.Generator(device="cuda").manual_seed(seed)
+        k = torch.randn(L, S, H, D, device="cuda", generator=g)
+        return k, torch.randn(L, S, H, D, device="cuda", generator=g)
+
+    def test_store_and_span_structure(self):
+        k, v = self._kv()
+        arch = KVArchive(max_span=4)
+        retained = list(range(0, 24, 3))              # evict 2-token runs
+        arch.store_evicted(7, k, v, retained)
+        assert arch.has(7) and not arch.empty
+        # every evicted position appears in exactly one span
+        spans = arch._spans[7]
+        all_pos = sorted(p for sp in spans for p in sp.positions)
+        assert all_pos == sorted(set(range(24)) - set(retained))
+        assert all(len(sp.positions) <= 4 for sp in spans)
+        assert spans[0].keys.device.type == "cpu"
+        assert spans[0].centroids.device.type == "cuda"
+
+    def test_score_finds_matching_span(self):
+        """A query aligned with one evicted span's shared direction must name
+        that span with positive margin (models a needle: its keys share a strong
+        content direction that the question's query points at)."""
+        k, v = self._kv(S=32)
+        L, _, H, D = k.shape
+        u = torch.randn(L, H, D, device="cuda")
+        u = 5.0 * u / u.norm(dim=-1, keepdim=True)
+        k[:, 24:28] += u.unsqueeze(1)                 # plant the needle span
+        arch = KVArchive(max_span=4)
+        retained = list(range(16))                    # evict the back half
+        arch.store_evicted(1, k, v, retained)
+        spans = arch._spans[1]
+        target = next(i for i, sp in enumerate(spans) if sp.positions[0] == 24)
+        q = [u[li] for li in range(L)]                # query = the planted direction
+        margin, best = arch.score(1, q, k[:, retained])
+        assert best == target
+        assert margin > 0, f"margin {margin} not positive"
+
+    def test_take_removes_and_returns(self):
+        k, v = self._kv()
+        arch = KVArchive(max_span=4)
+        arch.store_evicted(3, k, v, list(range(0, 24, 2)))
+        n = len(arch._spans[3])
+        tk, tv = arch.take(3, 0)
+        assert tk.shape == tv.shape and tk.shape[1] <= 4
+        assert len(arch._spans[3]) == n - 1
+        assert arch.retrievals == 1
+
+    def test_lifecycle_gc(self):
+        k, v = self._kv()
+        arch = KVArchive()
+        arch.store_evicted(1, k, v, [0, 1])
+        arch.store_evicted(2, k, v, [0, 1])
+        arch.drop_all_except({2})
+        assert not arch.has(1) and arch.has(2)
+        arch.drop(2)
+        assert arch.empty
+
+    def test_score_none_when_no_entries(self):
+        arch = KVArchive()
+        assert arch.score(9, [torch.zeros(2, 8, device="cuda")],
+                          torch.zeros(2, 4, 1, 8, device="cuda")) is None

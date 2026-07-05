@@ -71,6 +71,9 @@ class LiveKVCompactor:
         min_tokens: int = 128,
         compactor_checkpoint: str | None = None,
         n_compress: int = 64,
+        archive: bool = False,
+        retrieval_margin: float | None = None,
+        max_retrievals_per_request: int = 4,
     ) -> None:
         if strategy not in _LIVE_STRATEGIES:
             # Route through the factory for the canonical error (h2o explains
@@ -92,6 +95,34 @@ class LiveKVCompactor:
         self.compactor_checkpoint = compactor_checkpoint
         self.n_compress = n_compress
         self._updater = None   # lazy: belief_still builds/loads on first request
+        # CPU archive + negative-cache retrieval (Track D). Evicted spans are
+        # demoted to CPU instead of deleted; a per-decode-step trigger restores
+        # them on demand. Needs per-step Q → decode must run EAGER (no CUDA
+        # graphs at all); enforced at the first missed capture.
+        self.archive_enabled = archive
+        self.retrieval_margin = retrieval_margin
+        self.max_retrievals_per_request = max_retrievals_per_request
+        self._archive = None
+        self._retrieval_counts: dict[int, int] = {}
+        if archive:
+            if strategy == "belief_still":
+                raise ValueError(
+                    "archive mode restores exact evicted spans; belief_still "
+                    "replaces the cache with synthetic tokens, so there are no "
+                    "evicted spans to archive. Use snapkv or streaming_llm.")
+            if retrieval_margin is None:
+                raise ValueError(
+                    "archive mode needs an explicit retrieval_margin. The margin "
+                    "(max evicted-centroid logit − max retained-key logit) is "
+                    "model-scale dependent and typically NEGATIVE — a span "
+                    "centroid rarely beats the max over all retained keys — so "
+                    "there is no universal default; 0.0 would silently never "
+                    "fire. Calibrate per model: run once with "
+                    "KV_COMPACTION_DEBUG=1, read the per-step margins, and set "
+                    "the threshold between need-steps and idle steps "
+                    "(trained Nano: −3.0).")
+            from .archive import KVArchive
+            self._archive = KVArchive()
 
         # Pruning keeps each retained key's cached (post-embedding) value while the
         # engine renumbers positions to the compacted slots. With RoPE the retained
@@ -113,7 +144,7 @@ class LiveKVCompactor:
         self._prefill_locals: list[int] = []
         self._cu_q: torch.Tensor | None = None
         self._q_per_layer: list[torch.Tensor] = []
-        if strategy == "snapkv":
+        if strategy == "snapkv" or archive:
             self._register_q_hooks(engine)
         self.compacted_requests = 0
         self.tokens_evicted = 0
@@ -169,7 +200,9 @@ class LiveKVCompactor:
         """
         self._prefill_locals: list[int] = []
         self._cu_q: torch.Tensor | None = None
-        self._capturing = False
+        self._capturing = self.archive_enabled
+        if self.archive_enabled and self._q_per_layer:
+            self._q_per_layer = [None] * len(self._q_per_layer)  # type: ignore[list-item]
         if os.environ.get("KV_COMPACTION_DEBUG"):
             self._debug_dump()
         if is_decode_only:
@@ -186,9 +219,58 @@ class LiveKVCompactor:
         # Packed-Q row boundaries in active-slice order (THD layout).
         qlens = ctx.request_query_lengths[active].to(torch.long)
         self._cu_q = torch.cat([qlens.new_zeros(1), qlens.cumsum(0)])
-        if self.strategy == "snapkv":
+        if self.strategy == "snapkv" and not self._capturing:
             self._capturing = True
             self._q_per_layer = [None] * len(self._q_per_layer)  # type: ignore[list-item]
+
+    def retrieve_for_decoding_requests(self) -> None:
+        """Negative-cache retrieval: restore archived spans the decode queries ask for.
+
+        Runs post-bookkeep on decode-only steps. Uses this step's captured Q
+        (one token per active request, active-slice order under eager decode).
+        """
+        ctx = self._ctx
+        n_active = ctx.total_request_count - ctx.paused_request_count
+        if n_active <= 0 or self._archive.empty:
+            return
+        if any(q is None for q in self._q_per_layer):
+            raise RuntimeError(
+                "archive mode: no Q captured this decode step — decode ran under a "
+                "CUDA graph. Archive retrieval needs fully eager decoding: launch "
+                "with --cuda-graph-impl none.")
+        live_ids = set()
+        for b_local in range(n_active):
+            b_global = ctx.paused_request_count + b_local
+            rid = int(ctx.request_ids[b_global].item())
+            live_ids.add(rid)
+            if not self._archive.has(rid):
+                continue
+            if self._retrieval_counts.get(rid, 0) >= self.max_retrievals_per_request:
+                continue
+            k, v = self._hook.get_kv_for_request(b_local)      # (L, C, H, D)
+            q_step = [q[b_local] for q in self._q_per_layer]   # per layer (Hq, D)
+            scored = self._archive.score(rid, q_step, k)
+            if scored is None:
+                continue
+            margin, span_idx = scored
+            if os.environ.get("KV_COMPACTION_DEBUG"):
+                logger.info("[kv-retrieval] request id=%d: margin %.3f (threshold %.3f, "
+                            "best span %d)", rid, margin, self.retrieval_margin, span_idx)
+            if margin <= self.retrieval_margin:
+                continue
+            ak, av = self._archive.take(rid, span_idx)
+            self._hook.append_kv_to_request(b_local, ak.cuda(), av.cuda())
+            self._repoint_pending_token(
+                b_local, b_global, int(ctx.request_kv_length_offsets[b_global]))
+            ctx.request_output_lengths[b_global] += ak.shape[1]
+            self._retrieval_counts[rid] = self._retrieval_counts.get(rid, 0) + 1
+            logger.info(
+                "[kv-retrieval] request id=%d: restored %d tokens (margin %.3f, "
+                "%d spans left)", rid, ak.shape[1], margin,
+                len(self._archive._spans.get(rid, [])))
+        self._archive.drop_all_except(live_ids)
+        for rid in [r for r in self._retrieval_counts if r not in live_ids]:
+            del self._retrieval_counts[rid]
 
     def compact_prefilled_requests(self, is_decode_only: bool) -> None:
         """Prune the paged KV of every request whose prefill just completed.
@@ -199,9 +281,13 @@ class LiveKVCompactor:
         those entries at the compacted cache. A chunked-prefill request is
         skipped — its prompt is still streaming in.
         """
-        if is_decode_only or not self._prefill_locals:
+        if is_decode_only:
+            if self.archive_enabled:
+                self.retrieve_for_decoding_requests()
             return
-        self._capturing = False
+        if not self._prefill_locals:
+            return
+        self._capturing = self.archive_enabled
         cu_q = self._cu_q
         ctx = self._ctx
         chunked_global = ctx.get_index_of_chunked_prefill_request(safe=True)
@@ -236,6 +322,9 @@ class LiveKVCompactor:
                 recent_start = max(n_sink, S - (budget - n_sink))
                 positions = sorted(set(sinks + list(range(recent_start, S))))
 
+            if self._archive is not None:
+                rid = int(ctx.request_ids[b_global].item())
+                self._archive.store_evicted(rid, k, v, positions)
             self._hook.apply_mask_for_request(b_local, positions)
             self._repoint_pending_token(b_local, b_global, len(positions))
             # Termination compares current length against request_output_lengths

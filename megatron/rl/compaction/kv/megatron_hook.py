@@ -279,6 +279,65 @@ class MegatronInferenceHook:
         ctx.request_last_kv_block_id[b_global] = block_ids[n_new_blocks - 1]
         ctx.request_kv_length_offsets[b_global] = n_retained
 
+    def append_kv_to_request(
+        self, b_local: int, keys: torch.Tensor, values: torch.Tensor
+    ) -> None:
+        """Append T tokens of K/V to the END of one active request's cache.
+
+        The retrieval primitive: restores archived (evicted) KV spans back into
+        the paged cache. keys/values: (n_layers, T, H, D), written after the
+        request's current last token; new blocks are allocated as needed and
+        every bookkeeping field is advanced (the appended tokens simply extend
+        the attention span — sound for position-embedding-free models, which is
+        the only kind live compaction supports).
+        """
+        got = self._context_kv()
+        if got is None:
+            raise RuntimeError(
+                "append_kv_to_request: no live KV cache (engine not allocated "
+                "or no active requests)."
+            )
+        ctx, buf, n_active = got
+        if b_local >= n_active:
+            raise RuntimeError(
+                f"append_kv_to_request: b_local={b_local} >= n_active={n_active}"
+            )
+        b_global = ctx.paused_request_count + b_local
+        BS = ctx.block_size_tokens
+        T = keys.shape[1]
+        if T < 1:
+            raise RuntimeError("append_kv_to_request: nothing to append.")
+
+        n_blocks = int(ctx.request_kv_block_counts[b_global].item())
+        last_offset = int(ctx.request_last_kv_block_offset[b_global].item())
+        cur_len = (n_blocks - 1) * BS + last_offset
+        new_len = cur_len + T
+        n_total_blocks = math.ceil(new_len / BS) + (1 if new_len % BS == 0 else 0)
+
+        if n_total_blocks > n_blocks:
+            extra = ctx.block_allocator.allocate_memory_blocks(n_total_blocks - n_blocks)
+            if extra is None:
+                raise RuntimeError(
+                    f"append_kv_to_request: cannot allocate "
+                    f"{n_total_blocks - n_blocks} blocks (allocator exhausted)."
+                )
+            ctx.request_to_kv_block_ids[
+                b_global, n_blocks:n_total_blocks
+            ] = extra.to(ctx.request_to_kv_block_ids.dtype)
+
+        block_ids = ctx.request_to_kv_block_ids[b_global, :n_total_blocks].to(buf.device)
+        keys = keys.to(device=buf.device, dtype=buf.dtype)
+        values = values.to(device=buf.device, dtype=buf.dtype)
+        for t in range(T):
+            pos = cur_len + t
+            buf[0, :, block_ids[pos // BS], pos % BS] = keys[:, t]
+            buf[1, :, block_ids[pos // BS], pos % BS] = values[:, t]
+
+        ctx.request_kv_block_counts[b_global] = n_total_blocks
+        ctx.request_last_kv_block_offset[b_global] = new_len % BS
+        ctx.request_last_kv_block_id[b_global] = block_ids[n_total_blocks - 1]
+        ctx.request_kv_length_offsets[b_global] = new_len
+
     def get_kv_for_request(
         self, b_local: int
     ) -> tuple[torch.Tensor, torch.Tensor]:

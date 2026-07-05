@@ -114,6 +114,33 @@ Live strategies: `snapkv`, `streaming_llm`, and `belief_still` (the learned
 compactor from `../learned/` — loads a trained checkpoint and replaces the
 prompt KV with `n_compress` synthetic tokens).
 
+## CPU archive + negative-cache retrieval (`archive.py`, Track D)
+
+With `--kv-compaction-archive`, eviction becomes **demotion, not deletion**:
+the pruned spans' exact KV tensors move to pinned CPU memory, and a tiny GPU
+index of the *evicted* content stays behind — one mean-key centroid per
+contiguous span per layer (the "negative cache": an index of what is absent).
+Every decode step, the request's query is scored with the same attention math
+against retained keys *and* against these centroids; a query that scores
+unusually high on a centroid is demonstrably reaching for dropped content. The
+winning centroid names the span, `KVArchive.take` pulls its exact KV back from
+CPU, and `append_kv_to_request` splices it into the paged cache — one
+computation gives both the *when* (trigger) and the *where* (span address).
+
+Calibration: the margin (max centroid logit − max retained logit) is
+model-scale dependent and typically **negative** — a 16-key span centroid
+rarely beats the max over hundreds of retained keys. What separates need-steps
+from idle steps is a ~2-logit gap (trained Nano: fire at `-3.0`). There is no
+universal default, so `--kv-compaction-retrieval-margin` is required with the
+archive; calibrate by reading the per-step `[kv-retrieval] … margin` lines
+under `KV_COMPACTION_DEBUG=1`.
+
+Constraints: needs per-step decode Q, so the whole engine must run eagerly
+(`--cuda-graph-impl none`); incompatible with `belief_still` (synthetic tokens
+have no evicted spans to archive). Verified end-to-end on Nano: a needle that
+`streaming_llm @ 0.4` alone loses (model confabulates) is recovered exactly
+once the trigger restores its span mid-generation.
+
 ### Serving flags (`tools/run_dynamic_text_generation_server.py`)
 
 ```
@@ -124,6 +151,9 @@ prompt KV with `n_compress` synthetic tokens).
 --kv-compaction-compactor-checkpoint …  # belief_still trained checkpoint
 --kv-compaction-n-compress 64           # belief_still synthetic slots
 --decode-only-cuda-graphs               # required for snapkv
+--kv-compaction-archive                 # CPU archive + retrieval (Track D)
+--kv-compaction-retrieval-margin -3.0   # trigger threshold, REQUIRED w/ archive
+                                        # (with archive: --cuda-graph-impl none)
 ```
 
 ### RL-rollout flags (GRPO loop, `MegatronLocal.launch`)

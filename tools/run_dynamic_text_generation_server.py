@@ -50,6 +50,20 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
         "--kv-compaction-n-compress", type=int, default=64,
         help="Synthetic memory slots for belief_still.",
     )
+    parser.add_argument(
+        "--kv-compaction-archive", action="store_true", default=False,
+        help="Demote evicted KV spans to a CPU archive and restore them on demand "
+             "via the negative-cache trigger. Needs fully eager decoding "
+             "(--cuda-graph-impl none).",
+    )
+    parser.add_argument(
+        "--kv-compaction-retrieval-margin", type=float, default=None,
+        help="Trigger threshold: restore when the evicted-centroid attention "
+             "margin over retained keys exceeds this. REQUIRED with "
+             "--kv-compaction-archive; margins are model-scale dependent and "
+             "typically negative — calibrate with KV_COMPACTION_DEBUG=1 "
+             "(trained Nano: -3.0).",
+    )
     return parser
 
 
@@ -123,6 +137,8 @@ if __name__ == "__main__":
                 min_tokens=args.kv_compaction_min_tokens,
                 compactor_checkpoint=args.kv_compaction_compactor_checkpoint,
                 n_compress=args.kv_compaction_n_compress,
+                archive=args.kv_compaction_archive,
+                retrieval_margin=args.kv_compaction_retrieval_margin,
             )
             print(f"[kv-compaction] live compaction enabled: "
                   f"{args.kv_compaction_strategy} @ {args.kv_compaction_budget_ratio}")
