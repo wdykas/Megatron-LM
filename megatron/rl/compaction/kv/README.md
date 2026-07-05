@@ -89,6 +89,22 @@ Caveat: v0 signal is from a single text family — retrain on a diverse corpus
 before trusting it broadly, and retrain per model/TP layout (the checkpoint
 records d_key/n_layers and the loader hard-fails on mismatch).
 
+### `eviction_policy.py` — EvictionPolicy + GRPO trainer (Track B1, ours)
+Eviction as a stochastic policy with exact logprobs: the C2 scorer
+architecture (same [key, position, layer] features) emits per-token retain
+logits; masks sample Bernoulli(sigmoid(score)) so the set logprob is exact —
+the budget is a reward penalty λ·kept_fraction rather than a hard top-k,
+which also lets the policy learn prompt-dependent budgets (B3 for free).
+Training is offline GRPO (`train_eviction_policy_grpo`): a group of masks per
+prompt, within-group reward normalization, REINFORCE. The canonical reward is
+negative sufficiency-KL through the real frozen model
+(`make_sufficiency_reward` — inject the retained rows via the student
+forward, compare with full-cache teacher logits). Reconstruction preserves
+what attention looked at; this preserves what the task needed — the selection
+gap between the two is the Track B result. A trained policy's `.scorer`
+deploys live via `--kv-compaction-oracle-checkpoint` (mind the protected
+recent window the live path adds).
+
 ### `selectors.py` — AttentionSumScorer / UniformScorer
 Simple online selectors sharing the same protocol: attention-sum (or key-norm
 proxy when no queries) with a protected recent window, and uniform subsampling.

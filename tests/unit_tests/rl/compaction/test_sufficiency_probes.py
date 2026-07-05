@@ -105,6 +105,36 @@ class TestSufficiencyKlRealModel:
         }
         Utils.destroy_model_parallel()
 
+    def test_eviction_policy_grpo_with_real_reward(self, model_and_data):
+        """B1 v0 end-to-end: GRPO steps with sufficiency-KL reward through the
+        real model — rewards finite, gradients flow, keeping more helps."""
+        from megatron.rl.compaction.kv.eviction_policy import (
+            EvictionGRPOConfig, EvictionPolicy, make_sufficiency_reward,
+            train_eviction_policy_grpo,
+        )
+        from megatron.rl.compaction.kv.oracle import OracleScorerConfig
+        d = model_and_data
+        reward_fn = make_sufficiency_reward(
+            d["model"], d["query_tokens"], d["prefix_kv"], d["teacher_logits"])
+
+        # Sanity: the full cache is a better retained set than a sliver.
+        P = d["P"]
+        full = torch.ones(P, dtype=torch.bool, device="cuda")
+        sliver = torch.zeros(P, dtype=torch.bool, device="cuda")
+        sliver[:4] = True
+        assert reward_fn(full) > reward_fn(sliver)
+
+        d_kv = d["prefix_kv"][0][0].shape[-1]
+        keys = [k[0].float() for k, _ in d["prefix_kv"]]        # per layer (P, d_kv)
+        policy = EvictionPolicy(
+            OracleScorerConfig(d_key=d_kv, n_layers=len(keys), hidden=32)).cuda()
+        logs = train_eviction_policy_grpo(
+            policy, [(keys, reward_fn)],
+            EvictionGRPOConfig(group_size=4, budget_lambda=0.5, lr=1e-3), steps=3)
+        assert len(logs) == 3
+        assert all(torch.isfinite(torch.tensor(lg["loss"])) for lg in logs)
+        assert all(torch.isfinite(torch.tensor(lg["mean_reward"])) for lg in logs)
+
     def test_student_and_teacher_outputs_capture_hidden(self, model_and_data):
         """C5 plumbing through the real model: hidden capture + gradient flow."""
         from megatron.rl.compaction.learned.capture.student_forward import (

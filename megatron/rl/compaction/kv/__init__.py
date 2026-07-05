@@ -12,6 +12,12 @@ from .h2o import H2OAccumulator                                 # Zhang et al. 2
 from .snapkv import SnapKVCompressor                            # Li et al. 2024
 from .streaming_llm import StreamingLLMCompressor               # Xiao et al. 2023
 from .benchmark import KVCompactionBenchmark, CompactionBenchmarkResult
+from .eviction_policy import (                                  # Track B1
+    EvictionGRPOConfig,
+    EvictionPolicy,
+    make_sufficiency_reward,
+    train_eviction_policy_grpo,
+)
 from .oracle import (                                           # Track C2
     LearnedOracleScorer,
     OracleCompressor,
@@ -93,6 +99,10 @@ __all__ = [
     "H2OAccumulator",
     "SnapKVCompressor",
     "StreamingLLMCompressor",
+    "EvictionGRPOConfig",
+    "EvictionPolicy",
+    "make_sufficiency_reward",
+    "train_eviction_policy_grpo",
     "LearnedOracleScorer",
     "OracleCompressor",
     "OracleScorerConfig",
