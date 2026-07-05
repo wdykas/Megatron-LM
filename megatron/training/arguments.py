@@ -2326,9 +2326,10 @@ def _add_rl_args(parser):
         '--rl-compaction-strategy',
         type=str,
         default='topk',
-        choices=['topk', 'h2o', 'streaming_llm', 'omp', 'still', 'belief_still'],
-        help='KV compaction strategy: topk/h2o/streaming_llm/omp use selection; '
-             'still/belief_still use Perceiver-based synthesis.',
+        choices=['topk', 'h2o', 'snapkv', 'streaming_llm', 'omp', 'still', 'belief_still'],
+        help='KV compaction strategy. Live-deployable: snapkv, streaming_llm, '
+             'belief_still (learned synthesis). topk/h2o/omp are offline-only '
+             'and hard-fail in live mode with the reason.',
     )
     group.add_argument(
         '--rl-compaction-mode',

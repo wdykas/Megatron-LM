@@ -132,6 +132,28 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             from megatron.rl.compaction.kv import MegatronInferenceHook
             launched_server._kv_hook = MegatronInferenceHook.from_engine(inference_engine)
 
+            # Live mode: every rollout decodes over a compacted cache — the
+            # engine prunes (or belief_still-synthesizes) each request's prompt
+            # KV right after its prefill, identically to the serving path.
+            if args.rl_compaction_mode == "live":
+                from megatron.rl.compaction.kv.live import LiveKVCompactor
+                if (args.rl_compaction_strategy == "snapkv"
+                        and not args.decode_only_cuda_graphs):
+                    raise ValueError(
+                        "--rl-compaction-strategy snapkv in live mode needs eager "
+                        "prefill for observation-window Q capture: add "
+                        "--decode-only-cuda-graphs.")
+                inference_engine.kv_compactor = LiveKVCompactor(
+                    inference_engine,
+                    strategy=args.rl_compaction_strategy,
+                    budget_ratio=args.rl_compaction_kv_budget_ratio,
+                    n_compress=args.rl_compaction_n_compress,
+                    compactor_checkpoint=args.rl_compaction_compactor_checkpoint,
+                )
+                log_single_rank(logger, logging.INFO,
+                                f"[kv-compaction] live rollout compaction: "
+                                f"{args.rl_compaction_strategy}")
+
         concurrency_limit = args.grpo_prompts_per_step * args.grpo_group_size * args.rl_parallel_generation_tasks
         custom_limits = httpx.Limits(
             max_connections=concurrency_limit,
