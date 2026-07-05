@@ -240,6 +240,12 @@ class LiveKVCompactor:
                 "[kv-compaction] request b_local=%d: %d -> %d tokens (%s, ratio %.2f)",
                 b_local, S, len(positions), self.strategy, self.budget_ratio,
             )
+        if self.compacted_requests:
+            # The prune's gather/scatter kernels run on the default stream, but the
+            # next decode step may replay a CUDA graph on its own stream. Without a
+            # barrier the replay races the in-flight cache surgery (observed as
+            # cudaErrorIllegalAddress; disappears under CUDA_LAUNCH_BLOCKING=1).
+            torch.cuda.synchronize()
         self._prefill_locals = []
         self._cu_q = None
 
