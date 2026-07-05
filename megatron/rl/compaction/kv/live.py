@@ -313,8 +313,8 @@ class LiveKVCompactor:
 
     def _debug_dump(self) -> None:
         ctx = self._ctx
-        if ctx.total_request_count <= ctx.paused_request_count and ctx.paused_request_count == 0:
-            return
+        if ctx.total_request_count - ctx.paused_request_count <= 0:
+            return  # no active request to dump
         b = ctx.paused_request_count  # first active (or first paused if none active)
         logger.info(
             "[kv-dbg] step=%s paused=%d total=%d | kvlen=%d qlen=%d blocks=%d "

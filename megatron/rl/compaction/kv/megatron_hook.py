@@ -1,21 +1,20 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Concrete InferenceEngineHook backed by DynamicInferenceContext.
+"""Paged-KV cache access for Megatron's DynamicInferenceContext.
 
-Reads per-layer KV matrices directly from Megatron's paged KV cache
-after each inference step, making them available for BeliefUpdater training
-and KV compaction benchmarking.  Also supports live compaction via
-``apply_mask()`` and ``apply_belief_memory()``.
+The low-level read/write primitives every compaction consumer builds on:
+reads (``get_kv_matrices``, ``get_kv_for_request``, ``approx_attention_scores``)
+poll the live paged cache; writes (``apply_mask``, ``apply_mask_for_request``,
+``apply_belief_memory*``) prune or replace a request's cache in place while
+keeping ALL of the engine's per-request bookkeeping consistent (block table,
+counts, last-block id/offset, kv_length_offsets). See kv/README.md for the
+offset semantics these maintain.
 
 Usage
 -----
-    # At inference engine startup (inside MegatronLocal.launch):
     hook = MegatronInferenceHook.from_engine(inference_engine)
-
-    # Pass to the recorder:
-    recorder = PomdpRolloutRecorder(..., kv_hook=hook, belief_updater=updater)
-
-    # That's it.  The recorder calls hook methods after each step.
+    # Live post-prefill compaction builds on this in kv/live.py; the pomdp
+    # recorder polls it per step in shadow mode.
 
 Tensor parallelism
 ------------------
