@@ -108,6 +108,7 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
                 kv_cache_staleness=[response.kv_cache_staleness],
                 completed_at_step=[response.completed_at_step],
                 num_evictions=[response.num_evictions],
+                kv_compacted=[response.kv_compacted],
             )
         else:
             rollout = Rollout(
@@ -119,6 +120,7 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
                 kv_cache_staleness=[response.kv_cache_staleness],
                 completed_at_step=[response.completed_at_step],
                 num_evictions=[response.num_evictions],
+                kv_compacted=[response.kv_compacted],
             )
 
         return rollout

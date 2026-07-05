@@ -289,6 +289,8 @@ class RolloutStats:
     kv_cache_staleness: list[list[int]]
     completed_at_steps: list[list[int]]
     num_evictions: list[list[int]]
+    # A1 split-group: per-rollout compaction arm, grouped (None = split off).
+    kv_compact_arms: None | list[list[bool | None]] = None
 
 
 # Runtime state container for RL-specific data that shouldn't be checkpointed
@@ -764,28 +766,46 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             return logprobs
 
 
-def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[int]]) -> np.ndarray:
+def calculate_grpo_advantages(
+    rewards: list[list[float]],
+    num_turns: list[list[int]],
+    kv_compact_arms: list[list[bool | None]] | None = None,
+) -> np.ndarray:
     """Calculate GRPO advantages from rewards/num_turns.
 
     For multiturn rollouts, the logic is a bit more involved.
     # For training, we'll be turning each turn into a trajectory with the same reward
     # within a trajectory, e.g. if [[a,b],[c,d,e]] trajectory has reward 1.0, we will
     # get [a,b] with 1.0 and [c,d,e] with 1.0 when doing updates.
+
+    With a split-group compaction run (kv_compact_arms), each rollout is
+    normalized against ITS ARM's mean/std within the group: the compact arm's
+    reward deficit is a measurement (surfaced as kv_compact_reward_gap), not a
+    learning signal, so neither arm should see the other's baseline. An arm
+    with fewer than two members falls back to whole-group statistics.
     """
 
     rewards = np.array(rewards)
 
     num_turns = np.array(num_turns)
-    # Each outer dimension of num_turns is a group. Sum of those gives total num_turns per group.
-    # Let's use this to calculate advantage.
-    # mean/std should be repeated based on group lens
-    group_turns = num_turns.sum(axis=-1)
-    reward_means = rewards.mean(axis=1, keepdims=True).repeat(group_turns)
-    reward_stds = rewards.std(axis=1, keepdims=True).repeat(group_turns)
+    # Per-rollout baseline: whole-group mean/std, overridden within-arm below.
+    reward_means = rewards.mean(axis=1, keepdims=True).repeat(rewards.shape[1], axis=1)
+    reward_stds = rewards.std(axis=1, keepdims=True).repeat(rewards.shape[1], axis=1)
+    if kv_compact_arms is not None:
+        arms = np.array(kv_compact_arms, dtype=object)
+        for g in range(rewards.shape[0]):
+            for arm in (True, False):
+                members = arms[g] == arm
+                if members.sum() >= 2:
+                    reward_means[g, members] = rewards[g, members].mean()
+                    reward_stds[g, members] = rewards[g, members].std()
 
+    # Each turn of a rollout carries its rollout's reward and baseline.
     # rewards are originally [g, group_size]
     # Making an assumption that all groups are of the same size!
     # @vitalyk: this will go away when we start sending env-based sample reqs.
+    reward_means = reward_means.flatten().repeat(num_turns.flatten())
+    reward_stds = reward_stds.flatten().repeat(num_turns.flatten())
     rewards = rewards.flatten().repeat(num_turns.flatten())
 
     return ((rewards - reward_means) / (1e-4 + reward_stds)).tolist()
@@ -817,7 +837,9 @@ def compute_group_stats(
     all_kv_cache_staleness = []
     all_completed_at_steps = []
     all_num_evictions = []
+    all_kv_compact_arms = []
     for group in rollouts:
+        group_kv_compact_arms = []
         group_rewards = []
         group_traj_lengths = []
         group_turn_lengths = []
@@ -850,10 +872,15 @@ def compute_group_stats(
             group_kv_staleness.extend(s for turn in rollout.kv_cache_staleness for s in turn)
             group_completed_at_steps.extend(rollout.completed_at_step)
             group_num_evictions.append(sum(rollout.num_evictions))
+            # Rollout-level arm: defined only when every turn ran the same arm.
+            turn_arms = set(rollout.kv_compacted or [None])
+            group_kv_compact_arms.append(
+                turn_arms.pop() if len(turn_arms) == 1 else None)
         all_policy_staleness.append(group_policy_staleness)
         all_kv_cache_staleness.append(group_kv_staleness)
         all_completed_at_steps.append(group_completed_at_steps)
         all_num_evictions.append(group_num_evictions)
+        all_kv_compact_arms.append(group_kv_compact_arms)
         traj_lens.append(group_traj_lengths)
         turn_lens.append(group_turn_lengths)
         env_ids.append(group[0].env_id) # All rollouts in a group share the env_id by design.
@@ -871,7 +898,10 @@ def compute_group_stats(
         # with the inner list being the group data.
         env_ids=env_ids,
         num_turns=num_turns,
-        advantages=calculate_grpo_advantages(rewards, num_turns),
+        advantages=calculate_grpo_advantages(
+            rewards, num_turns,
+            kv_compact_arms=all_kv_compact_arms if any(a is not None for g in all_kv_compact_arms for a in g) else None),
+        kv_compact_arms=all_kv_compact_arms if any(a is not None for g in all_kv_compact_arms for a in g) else None,
         min_piold_to_inf_prob=None,
         max_piold_to_inf_prob=None,
         mean_piold_to_inf_prob=None,
@@ -1066,6 +1096,19 @@ def maybe_log_training_metrics(
         'max_inf_prob': group_stats.max_inf_prob,
         'mean_inf_prob': group_stats.mean_inf_prob,
     }
+
+    # A1 split-group counterfactual: per-prompt compact-vs-full reward gap,
+    # averaged over groups where both arms are present.
+    if group_stats.kv_compact_arms is not None:
+        gaps = []
+        for g_rewards, g_arms in zip(group_stats.rewards, group_stats.kv_compact_arms):
+            compact = [r for r, a in zip(g_rewards, g_arms) if a is True]
+            full = [r for r, a in zip(g_rewards, g_arms) if a is False]
+            if compact and full:
+                gaps.append(np.mean(compact) - np.mean(full))
+        metrics['kv_compact_split_groups'] = len(gaps)
+        if gaps:
+            metrics['kv_compact_reward_gap'] = float(np.mean(gaps))
 
     traj_lens = group_stats.traj_lens
     turn_lens = group_stats.turn_lens

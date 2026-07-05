@@ -52,6 +52,8 @@ class Rollout(AgentBaseModel):
     kv_cache_staleness: list[list[int]]
     completed_at_step: list[int]
     num_evictions: list[int]
+    # A1 split-group: per-turn compaction arm (None when the split is off).
+    kv_compacted: list[bool | None] | None = None
 
 
 class TokenRollout(AgentBaseModel):
@@ -67,6 +69,8 @@ class TokenRollout(AgentBaseModel):
     kv_cache_staleness: list[list[int]]
     completed_at_step: list[int]
     num_evictions: list[int]
+    # A1 split-group: per-turn compaction arm (None when the split is off).
+    kv_compacted: list[bool | None] | None = None
 
 
 class ContrastiveRollout(AgentBaseModel):

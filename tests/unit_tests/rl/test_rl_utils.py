@@ -504,6 +504,40 @@ class TestRLUtils:
             rtol=1e-5,
         )
 
+    def test_split_arm_advantage_calculation(self):
+        """A1 split-group: each rollout normalizes against its own arm."""
+        rewards = [[1.0, 0.0, 0.5, 0.3]]
+        num_turns = [[1, 1, 1, 1]]
+        arms = [[True, True, False, False]]
+        advs = rl_utils.calculate_grpo_advantages(rewards, num_turns, kv_compact_arms=arms)
+        # compact arm: mean 0.5 std 0.5; full arm: mean 0.4 std 0.1
+        expected = [0.5 / 0.5001, -0.5 / 0.5001, 0.1 / 0.1001, -0.1 / 0.1001]
+        torch.testing.assert_close(
+            torch.tensor(advs).double(), torch.tensor(expected).double(),
+            atol=1e-4, rtol=1e-5,
+        )
+
+    def test_split_arm_falls_back_to_group_for_small_arm(self):
+        """An arm with <2 members (incl. None arms) uses whole-group stats."""
+        rewards = [[1.0, 0.0, 0.5, 0.3]]
+        num_turns = [[1, 1, 1, 1]]
+        arms = [[True, True, False, None]]           # full arm has 1 member
+        advs = rl_utils.calculate_grpo_advantages(rewards, num_turns, kv_compact_arms=arms)
+        g = np.array(rewards[0])
+        gm, gs = g.mean(), g.std()
+        expected = [0.5 / 0.5001, -0.5 / 0.5001,
+                    (0.5 - gm) / (1e-4 + gs), (0.3 - gm) / (1e-4 + gs)]
+        torch.testing.assert_close(
+            torch.tensor(advs).double(), torch.tensor(expected).double(),
+            atol=1e-4, rtol=1e-5,
+        )
+
+    def test_no_arms_matches_legacy_advantages(self):
+        rewards = [[-1, 1], [4, 4]]
+        num_turns = [[2, 1], [1, 3]]
+        assert rl_utils.calculate_grpo_advantages(rewards, num_turns) == \
+            rl_utils.calculate_grpo_advantages(rewards, num_turns, kv_compact_arms=None)
+
     def test_pad_list_of_nones(self):
         with pytest.raises(ValueError) as e_info:
             rl_utils._pad_nonnull_with_zeros([None] * 3, 42)
