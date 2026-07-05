@@ -2326,7 +2326,8 @@ def _add_rl_args(parser):
         '--rl-compaction-strategy',
         type=str,
         default='topk',
-        choices=['topk', 'h2o', 'snapkv', 'streaming_llm', 'omp', 'still', 'belief_still'],
+        choices=['topk', 'h2o', 'snapkv', 'streaming_llm', 'omp', 'still', 'belief_still',
+                 'learned_oracle'],
         help='KV compaction strategy. Live-deployable: snapkv, streaming_llm, '
              'belief_still (learned synthesis). topk/h2o/omp are offline-only '
              'and hard-fail in live mode with the reason.',
@@ -2355,6 +2356,9 @@ def _add_rl_args(parser):
                        help='Directory to save collected KV trajectories for offline training.')
     group.add_argument('--rl-compaction-compactor-checkpoint', type=str, default=None,
                        help='Path to trained Still/Belief-Still checkpoint for live compaction.')
+    group.add_argument('--rl-compaction-oracle-checkpoint', type=str, default=None,
+                       help='Trained heavy-hitter scorer (save_oracle_scorer output) for '
+                            '--rl-compaction-strategy learned_oracle.')
     # Online STILL training during the RL loop
     group.add_argument('--rl-compaction-compactor-train', action='store_true', default=False,
                        help='Train a GatedRecurrentUpdater online during RL rollouts using '

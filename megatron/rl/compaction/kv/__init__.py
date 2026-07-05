@@ -12,6 +12,15 @@ from .h2o import H2OAccumulator                                 # Zhang et al. 2
 from .snapkv import SnapKVCompressor                            # Li et al. 2024
 from .streaming_llm import StreamingLLMCompressor               # Xiao et al. 2023
 from .benchmark import KVCompactionBenchmark, CompactionBenchmarkResult
+from .oracle import (                                           # Track C2
+    LearnedOracleScorer,
+    OracleCompressor,
+    OracleScorerConfig,
+    fit_oracle_scorer,
+    load_oracle_scorer,
+    save_oracle_scorer,
+    token_level_oracle,
+)
 
 
 # Live H2O is intentionally NOT wired: H2O's heavy-hitter score is the attention
@@ -58,9 +67,16 @@ def build_kv_compressor(
         return TopKCompressor()
     if s in ("streaming_llm", "streaming"):
         return StreamingLLMCompressor()
+    if s == "learned_oracle":
+        raise ValueError(
+            "learned_oracle needs a trained scorer: construct "
+            "OracleCompressor(load_oracle_scorer(path)) directly for offline "
+            "use, or serve with --kv-compaction-strategy learned_oracle "
+            "--kv-compaction-oracle-checkpoint <path>."
+        )
     raise ValueError(
         f"unknown KV compaction strategy {strategy!r}; "
-        "expected one of: h2o, snapkv, omp, topk, streaming_llm"
+        "expected one of: h2o, snapkv, omp, topk, streaming_llm, learned_oracle"
     )
 
 
@@ -77,6 +93,13 @@ __all__ = [
     "H2OAccumulator",
     "SnapKVCompressor",
     "StreamingLLMCompressor",
+    "LearnedOracleScorer",
+    "OracleCompressor",
+    "OracleScorerConfig",
+    "fit_oracle_scorer",
+    "load_oracle_scorer",
+    "save_oracle_scorer",
+    "token_level_oracle",
     "KVCompactionBenchmark",
     "CompactionBenchmarkResult",
     "build_kv_compressor",

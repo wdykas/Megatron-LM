@@ -73,6 +73,22 @@ Positional: keep `n_sink` initial tokens (attention sinks) + the most recent
 `budget - n_sink`. Content-blind — the cheap floor every content-aware method
 must beat (on RULER NIAH @2k/0.5 it scores EM 0.38 where SnapKV holds 1.00).
 
+### `oracle.py` — LearnedOracleScorer / OracleCompressor (Track C2, ours)
+The learned heavy-hitter oracle: a small TE MLP on [key vector, position/P,
+layer one-hot] trained offline to predict H2O's true accumulated-attention
+score — the quantity flash attention makes unobservable live. On trained-Nano
+captures it predicts the oracle BETTER than SnapKV's last-32-real-queries
+proxy (held-out Spearman 0.97 vs 0.82, recall@40% 0.93 vs 0.75). Query-free by
+construction, so the live strategy needs no Q capture, no eager prefill, and
+is fully CUDA-graph compatible. Train with `fit_oracle_scorer` on
+(keys, queries) captures, persist with `save_oracle_scorer` (plain torch.save
+— the scorer is offline-trained and deployed replicated read-only, unlike the
+collectively-trained compactor which requires dist_checkpointing), serve with
+`--kv-compaction-strategy learned_oracle --kv-compaction-oracle-checkpoint`.
+Caveat: v0 signal is from a single text family — retrain on a diverse corpus
+before trusting it broadly, and retrain per model/TP layout (the checkpoint
+records d_key/n_layers and the loader hard-fails on mismatch).
+
 ### `selectors.py` — AttentionSumScorer / UniformScorer
 Simple online selectors sharing the same protocol: attention-sum (or key-norm
 proxy when no queries) with a protected recent window, and uniform subsampling.
@@ -173,6 +189,7 @@ sync copy.
 --kv-compaction-obs-window 32           # snapkv observation window
 --kv-compaction-min-tokens 128          # skip shorter prompts
 --kv-compaction-compactor-checkpoint …  # belief_still trained checkpoint
+--kv-compaction-oracle-checkpoint …     # learned_oracle trained scorer
 --kv-compaction-n-compress 64           # belief_still synthetic slots
 --decode-only-cuda-graphs               # required for snapkv
 --kv-compaction-archive                 # CPU archive + retrieval (Track D)

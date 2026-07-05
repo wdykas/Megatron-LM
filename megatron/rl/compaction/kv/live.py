@@ -38,7 +38,7 @@ from .megatron_hook import MegatronInferenceHook
 
 logger = logging.getLogger(__name__)
 
-_LIVE_STRATEGIES = ("snapkv", "streaming_llm", "belief_still")
+_LIVE_STRATEGIES = ("snapkv", "streaming_llm", "belief_still", "learned_oracle")
 
 
 class LiveKVCompactor:
@@ -70,6 +70,7 @@ class LiveKVCompactor:
         n_sink: int = 4,
         min_tokens: int = 128,
         compactor_checkpoint: str | None = None,
+        oracle_checkpoint: str | None = None,
         n_compress: int = 64,
         archive: bool = False,
         retrieval_margin: float | None = None,
@@ -95,8 +96,10 @@ class LiveKVCompactor:
         self.n_sink = n_sink
         self.min_tokens = min_tokens
         self.compactor_checkpoint = compactor_checkpoint
+        self.oracle_checkpoint = oracle_checkpoint
         self.n_compress = n_compress
         self._updater = None   # lazy: belief_still builds/loads on first request
+        self._oracle = None    # lazy: learned_oracle builds/loads on first request
         # CPU archive + negative-cache retrieval (Track D). Evicted spans are
         # demoted to CPU instead of deleted; a per-decode-step trigger restores
         # them on demand. Needs per-step Q → decode must run EAGER (no CUDA
@@ -424,6 +427,16 @@ class LiveKVCompactor:
                 positions = _select_recent_plus_heavy(
                     scores, S, budget, n_recent=min(self.obs_window, budget)
                 )
+            elif self.strategy == "learned_oracle":
+                # Query-free: the scorer predicts each key's future attention
+                # mass from content + position alone — no Q capture, so this
+                # strategy has no eager-prefill requirement.
+                if self._oracle is None:
+                    self._init_oracle(n_layers=k.shape[0], d_key=k.shape[2] * k.shape[3])
+                scores = self._oracle.score_tokens(k)
+                positions = _select_recent_plus_heavy(
+                    scores, S, budget, n_recent=min(self.obs_window, budget)
+                )
             else:  # streaming_llm: sinks + recent window, no scores.
                 n_sink = min(self.n_sink, budget)
                 sinks = list(range(n_sink))
@@ -485,6 +498,44 @@ class LiveKVCompactor:
             "[kv-compaction] request b_local=%d: %d -> %d synthetic tokens (belief_still)",
             b_local, S, C,
         )
+
+    def _init_oracle(self, n_layers: int, d_key: int) -> None:
+        """Build (or load) the learned heavy-hitter scorer, replicated per rank.
+
+        With a checkpoint: every rank torch.loads the same file (the scorer is
+        trained offline, deployed read-only). Without one: RANDOM INIT — the
+        selection is garbage; plumbing smoke only, logged loudly.
+        """
+        from .oracle import LearnedOracleScorer, OracleScorerConfig, load_oracle_scorer
+        from megatron.rl.compaction.learned.training.parallel import (
+            build_compactor_pg_collection,
+        )
+        # Singleton TP groups: the scorer is replicated per rank — without this
+        # the TE linears shard over the WORLD TP group (and the 1-dim output
+        # layer cannot shard at all).
+        pgc = build_compactor_pg_collection()
+        if self.oracle_checkpoint:
+            self._oracle = load_oracle_scorer(
+                self.oracle_checkpoint, params_dtype=torch.bfloat16,
+                pg_collection=pgc)
+            if (self._oracle.cfg.d_key != d_key
+                    or self._oracle.cfg.n_layers != n_layers):
+                raise ValueError(
+                    f"oracle checkpoint was trained for d_key="
+                    f"{self._oracle.cfg.d_key}, n_layers={self._oracle.cfg.n_layers} "
+                    f"but this model's TP-local KV is d_key={d_key}, "
+                    f"n_layers={n_layers} — retrain on captures from this "
+                    "model/TP configuration.")
+            logger.info("[kv-compaction] learned_oracle checkpoint loaded: %s",
+                        self.oracle_checkpoint)
+        else:
+            logger.warning(
+                "[kv-compaction] learned_oracle WITHOUT a checkpoint: RANDOM-INIT "
+                "scorer — selection is garbage, plumbing smoke only.")
+            self._oracle = LearnedOracleScorer(
+                OracleScorerConfig(d_key=d_key, n_layers=n_layers),
+                params_dtype=torch.bfloat16, pg_collection=pgc,
+            ).cuda().to(torch.bfloat16).eval()
 
     def _init_updater(self, n_attn_layers: int, d_kv: int) -> None:
         """Build (or load) the learned compactor, replicated on every rank.

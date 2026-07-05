@@ -27,8 +27,10 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
     )
     parser.add_argument(
         "--kv-compaction-strategy", type=str, default=None,
-        help="Live post-prefill KV compaction strategy (snapkv, streaming_llm). "
-             "Requires --decode-only-cuda-graphs so prefill forwards run eagerly.",
+        help="Live post-prefill KV compaction strategy (snapkv, streaming_llm, "
+             "belief_still, learned_oracle). snapkv requires "
+             "--decode-only-cuda-graphs so prefill forwards run eagerly; "
+             "learned_oracle is query-free and has no such requirement.",
     )
     parser.add_argument(
         "--kv-compaction-budget-ratio", type=float, default=0.5,
@@ -45,6 +47,11 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--kv-compaction-compactor-checkpoint", type=str, default=None,
         help="Trained compactor checkpoint for --kv-compaction-strategy belief_still.",
+    )
+    parser.add_argument(
+        "--kv-compaction-oracle-checkpoint", type=str, default=None,
+        help="Trained heavy-hitter scorer (save_oracle_scorer output) for "
+             "--kv-compaction-strategy learned_oracle.",
     )
     parser.add_argument(
         "--kv-compaction-n-compress", type=int, default=64,
@@ -152,6 +159,7 @@ if __name__ == "__main__":
                 obs_window=args.kv_compaction_obs_window,
                 min_tokens=args.kv_compaction_min_tokens,
                 compactor_checkpoint=args.kv_compaction_compactor_checkpoint,
+                oracle_checkpoint=args.kv_compaction_oracle_checkpoint,
                 n_compress=args.kv_compaction_n_compress,
                 archive=args.kv_compaction_archive,
                 retrieval_margin=args.kv_compaction_retrieval_margin,
