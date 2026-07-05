@@ -312,6 +312,10 @@ class LiveKVCompactor:
             b_global = ctx.paused_request_count + b_local
             if b_global == chunked_global:
                 continue
+            # Per-request arm flag (A1 split-group): kv_compact=False exempts
+            # this request — the control arm of a compact-vs-full comparison.
+            if not bool(ctx.request_metadata["kv_compact"][b_global].item()):
+                continue
             k, v = self._hook.get_kv_for_request(b_local)   # (L, S, H, D)
             S = k.shape[1]
             if S < self.min_tokens:

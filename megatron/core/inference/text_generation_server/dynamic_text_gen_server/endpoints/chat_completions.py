@@ -347,6 +347,7 @@ try:
                 num_tokens_to_generate=(int(max_tokens) if max_tokens is not None else None),
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 add_BOS=add_BOS,
+                kv_compact=bool(req.get("kv_compact", True)),
             )
         except ValueError as e:
             return Response(f"Invalid sampling parameter: {e}", status=400)

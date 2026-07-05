@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import random
 
 import httpx
 import torch.distributed as dist
@@ -52,6 +53,14 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         # Use the shared, optimized client instead of spinning up a new one
         client = self._openai_client
 
+        # A1 split-group counterfactual: draw this rollout's compaction arm.
+        # GRPO groups are issued as rollouts_per_group concurrent identical
+        # requests, so a per-request Bernoulli split partitions every group into
+        # compact and full-cache arms; the arm is recorded on the response.
+        kv_compacted = None
+        if args.rl_compaction_split_fraction is not None:
+            kv_compacted = random.random() < args.rl_compaction_split_fraction
+
         # Things that may be problematic when doing this switch
         # - Add BOS token
         # - Skip prompt logprobs
@@ -65,6 +74,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             extra_body={
                 "skip_prompt_log_probs": True,
                 "add_BOS": (not args.rl_skip_bos_token and tokenizer.bos is not None),
+                **({} if kv_compacted is None else {"kv_compact": kv_compacted}),
             },
         )
 
@@ -81,6 +91,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             kv_cache_staleness=choice.kv_cache_staleness,
             completed_at_step=args.curr_iteration,
             num_evictions=getattr(choice, 'num_evictions', 0),
+            kv_compacted=kv_compacted,
         )
 
     @classmethod
@@ -135,6 +146,14 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             # Live mode: every rollout decodes over a compacted cache — the
             # engine prunes (or belief_still-synthesizes) each request's prompt
             # KV right after its prefill, identically to the serving path.
+            if args.rl_compaction_split_fraction is not None and (
+                    args.rl_compaction_mode != "live"
+                    or not 0.0 < args.rl_compaction_split_fraction <= 1.0):
+                raise ValueError(
+                    "--rl-compaction-split-fraction needs --rl-compaction-mode "
+                    "live and a value in (0, 1]; got "
+                    f"mode={args.rl_compaction_mode!r} "
+                    f"fraction={args.rl_compaction_split_fraction}.")
             if args.rl_compaction_mode == "live":
                 from megatron.rl.compaction.kv.live import LiveKVCompactor
                 if (args.rl_compaction_strategy == "snapkv"

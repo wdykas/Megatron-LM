@@ -488,6 +488,7 @@ class DynamicInferenceRequest(InferenceRequest):
             ("return_log_probs", torch.bool, False),  # CPU for non-selective logprobs
             ("skip_prompt_log_probs", torch.bool, False),  # CPU for non-selective logprobs
             ("top_n_logprobs", torch.int32, False),  # CPU for torch sampling
+            ("kv_compact", torch.bool, True),  # live KV compaction arm (A/B per request)
         ]
 
     def add_event(

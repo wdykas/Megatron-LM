@@ -33,6 +33,8 @@ class SamplingParams:
     stop_words: Optional[List[str]] = (
         None  # List of strings that will stop generation when produced
     )
+    kv_compact: bool = True  # Live KV compaction arm: False exempts this request
+
 
     def __post_init__(self):
         """Ensure backward compatibility for return_prompt_top_n_logprobs.

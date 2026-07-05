@@ -27,3 +27,5 @@ class InferenceResponse(BaseModel):
     kv_cache_staleness: list[int]
     completed_at_step: int
     num_evictions: int
+    # A1 split-group: which compaction arm this rollout ran on (None = split off).
+    kv_compacted: bool | None = None

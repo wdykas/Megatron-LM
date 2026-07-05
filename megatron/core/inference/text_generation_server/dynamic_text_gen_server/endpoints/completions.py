@@ -108,6 +108,7 @@ try:
                 top_n_logprobs=top_n_logprobs,
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 num_tokens_to_generate=int(req.get("max_tokens", 16)),
+                kv_compact=bool(req.get("kv_compact", True)),
             )
         except ValueError as e:
             return f"Invalid sampling parameter: {e}", 400
@@ -123,6 +124,7 @@ try:
                 top_n_logprobs=sampling_params.top_n_logprobs,
                 skip_prompt_log_probs=sampling_params.skip_prompt_log_probs,
                 num_tokens_to_generate=sampling_params.num_tokens_to_generate,
+                kv_compact=sampling_params.kv_compact,
             )
             tasks.append(client.add_request(prompt_tokens, per_req_params))
 
