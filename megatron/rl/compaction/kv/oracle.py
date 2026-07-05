@@ -110,8 +110,10 @@ class LearnedOracleScorer(torch.nn.Module):
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         """features (N, in_dim) → predicted log1p oracle mass (N,)."""
-        x = (features - self.feat_mu) / self.feat_sd
-        x = x.to(self.feat_mu.dtype)
+        # Normalise in fp32 (the buffers stay fp32 across checkpoint loads),
+        # then cast to the TE linears' parameter dtype (bf16 when serving).
+        x = (features.float() - self.feat_mu) / self.feat_sd
+        x = x.to(next(self.parameters()).dtype)
         x = F.gelu(self.fc1(x)[0])
         x = F.gelu(self.fc2(x)[0])
         return self.fc3(x)[0].squeeze(-1)
