@@ -2344,7 +2344,7 @@ def _add_rl_args(parser):
     group.add_argument('--rl-compaction-n-compress', type=int, default=64,
                        help='Number of synthetic memory slots C for Still/Belief-Still.')
     group.add_argument('--rl-compaction-chunk-size', type=int, default=256,
-                       help='Token chunk size for HookTrajectoryCollector.')
+                       help='Token chunk size for compactor trajectory capture.')
     group.add_argument('--rl-compaction-trajectory-dir', type=str, default=None,
                        help='Directory to save collected KV trajectories for offline training.')
     group.add_argument('--rl-compaction-compactor-checkpoint', type=str, default=None,

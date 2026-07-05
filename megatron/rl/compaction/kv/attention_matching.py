@@ -21,6 +21,7 @@ from .compressors import (
     _nnls_pgd,
     _fit_bias,
     _fit_values,
+    _validate_budget,
 )
 
 
@@ -56,7 +57,7 @@ class TopKCompressor:
     ) -> CompactionResult:
         t0 = time.perf_counter()
         T = keys.shape[0]
-        budget = max(1, min(budget, T))
+        budget = _validate_budget(budget, T)
 
         if ref_queries is None:
             raise ValueError("TopKCompressor requires ref_queries for scoring.")
@@ -69,7 +70,7 @@ class TopKCompressor:
         C_k = keys[positions]
 
         if self.fit_bias:
-            beta, _ = _fit_bias(keys, C_k, ref_queries)
+            beta = _fit_bias(keys, C_k, ref_queries)
         else:
             beta = torch.zeros(len(positions), device=keys.device, dtype=keys.dtype)
 
@@ -133,7 +134,7 @@ class OMPCompressor:
     ) -> CompactionResult:
         t0 = time.perf_counter()
         T = keys.shape[0]
-        budget = max(1, min(budget, T))
+        budget = _validate_budget(budget, T)
 
         if ref_queries is None:
             raise ValueError("OMPCompressor requires ref_queries for scoring.")

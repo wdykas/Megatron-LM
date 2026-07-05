@@ -16,7 +16,6 @@ from megatron.rl.compaction.learned.models.belief import BeliefMemory, BeliefUpd
 from megatron.rl.compaction.learned.models.compactor import PerceiverCompactor, PerceiverConfig
 from megatron.rl.compaction.learned.training.data import Trajectory, TrainingProbe
 from megatron.rl.compaction.learned.training.data import TrajectoryDataset, trajectory_collate_fn
-from megatron.rl.compaction.learned.training.data import PipelineConfig
 from megatron.rl.compaction.learned.training.training import BeliefCompactorTrainer
 from megatron.rl.compaction.learned.training.data import CompactorTrainerConfig
 from megatron.rl.compaction.learned.training.data import CompactKV, StudentFn

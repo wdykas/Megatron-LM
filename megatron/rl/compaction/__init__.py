@@ -22,7 +22,8 @@ from .kv import (
     AttentionSumScorer, UniformScorer,
     MegatronInferenceHook, NullHook,
     CompactionResult, KVCompressor,
-    TopKCompressor, OMPCompressor,
+    TopKCompressor, OMPCompressor, H2OAccumulator, SnapKVCompressor,
+    StreamingLLMCompressor, build_kv_compressor,
     KVCompactionBenchmark, CompactionBenchmarkResult,
 )
 from .learned import (
@@ -47,7 +48,8 @@ __all__ = [
     "AttentionSumScorer", "UniformScorer",
     "MegatronInferenceHook", "NullHook",
     "CompactionResult", "KVCompressor",
-    "TopKCompressor", "OMPCompressor",
+    "TopKCompressor", "OMPCompressor", "H2OAccumulator", "SnapKVCompressor",
+    "StreamingLLMCompressor", "build_kv_compressor",
     "KVCompactionBenchmark", "CompactionBenchmarkResult",
     "KLResult", "KLSufficiencyProbe",
     "BeliefFieldDiff", "BeliefDiffer",

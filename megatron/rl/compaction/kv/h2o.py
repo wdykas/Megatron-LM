@@ -14,13 +14,17 @@ Shared types/helpers live in `compressors.py`.
 """
 from __future__ import annotations
 
-import math
 import time
 
 import torch
 import torch.nn.functional as F
 
-from .compressors import CompactionResult
+from .compressors import (
+    CompactionResult,
+    _select_recent_plus_heavy,
+    _softmax_attention,
+    _validate_budget,
+)
 
 
 class H2OAccumulator:
@@ -91,28 +95,15 @@ class H2OAccumulator:
                 )
             # Offline H2O score: total softmax attention each key received over the
             # queries (the paper's accumulated-attention F_score).
-            d = keys.shape[1]
-            scores = torch.softmax(ref_queries @ keys.T / math.sqrt(d), dim=-1).sum(dim=0)
+            scores = _softmax_attention(ref_queries, keys).sum(dim=0)
 
         t0 = time.perf_counter()
         T = keys.shape[0]
-        budget = max(1, min(budget, T))
+        budget = _validate_budget(budget, T)
 
-        # Recent window: the last n_recent positions, always kept.
-        n_recent = min(budget, round(budget * self.recent_ratio))
-        recent_positions = list(range(T - n_recent, T)) if n_recent > 0 else []
-
-        # Heavy hitters: top scorers among the remaining (non-recent) positions.
-        n_heavy = budget - n_recent
-        if n_heavy > 0 and T > n_recent:
-            heavy_scores = scores[:T].clone()
-            heavy_scores[T - n_recent:] = -torch.inf   # exclude the recent window
-            n_select = min(n_heavy, T - n_recent)
-            heavy_positions = heavy_scores.topk(n_select).indices.tolist()
-        else:
-            heavy_positions = []
-
-        positions = sorted(set(recent_positions + heavy_positions))
+        positions = _select_recent_plus_heavy(
+            scores, T, budget, n_recent=round(budget * self.recent_ratio)
+        )
         return CompactionResult(
             run_id=run_id, step_id=step_id,
             retained_positions=positions,

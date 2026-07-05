@@ -27,9 +27,7 @@ from megatron.rl.compaction.learned.training.data import (
     TrajectoryDataset,
     trajectory_collate_fn,
     CompactorTrainerConfig,
-    PipelineConfig,
 )
-from megatron.rl.compaction.learned.capture.hook_collector import HookTrajectoryCollector
 from megatron.rl.compaction.learned.serving.belief_compactor import BeliefSession, BeliefSessionStore, BeliefServerCompactor
 from megatron.rl.compaction.learned.training.checkpoint import (
     CheckpointMeta,
@@ -55,8 +53,6 @@ __all__ = [
     "CompactKV", "StudentFn",
     "TrainingProbe", "Trajectory", "TrajectoryDataset", "trajectory_collate_fn",
     "CompactorTrainerConfig",
-    "PipelineConfig",
-    "HookTrajectoryCollector",
     "BeliefSession", "BeliefSessionStore", "BeliefServerCompactor",
     "CheckpointMeta", "save_checkpoint", "load_checkpoint",
     "load_optimizer_state",

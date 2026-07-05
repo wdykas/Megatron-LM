@@ -1,26 +1,16 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Offline KV cache compressors.
+"""Shared KV-compression types and attention-math primitives.
 
-These algorithms take raw K/V tensors, optionally reference queries, and
-return a CompactionResult with selected positions, compacted
-key/value arrays, and optional bias.
+Holds the pieces every compressor builds on: the ``CompactionResult`` output
+type, the ``KVCompressor`` protocol, and the attention/fitting helpers
+(softmax attention, mass features, NNLS bias fit, OLS value fit, recent+heavy
+selection). The algorithms themselves live one file per paper:
+``attention_matching.py`` (TopK/OMP), ``h2o.py``, ``snapkv.py``,
+``streaming_llm.py`` — see ``kv/__init__.py`` for the full index and the
+``build_kv_compressor`` factory.
 
-All math runs on GPU via PyTorch. Input tensors should be on the same device.
-
-Algorithms
-----------
-TopKCompressor         — top-k by RMS attention weight; fast heuristic baseline.
-OMPCompressor          — greedy key selection via Orthogonal Matching Pursuit.
-H2OAccumulator         — paper-faithful H2O heavy-hitter eviction; accumulates real
-                         softmax mass online (update()) or scores ref_queries offline.
-StreamingLLMCompressor — attention sinks + recent window; no query-based scoring.
-
-References
-----------
-Attention Matching: Zweiger et al., 2026 (arXiv:2602.16284)
-H2O:               Zhang et al., 2023 (arXiv:2306.14048)
-StreamingLLM:      Xiao et al., 2023  (arXiv:2309.17453)
+All math runs on GPU via PyTorch. Input tensors must share a device.
 """
 
 from __future__ import annotations
@@ -116,6 +106,43 @@ class KVCompressor(Protocol):
 # Math primitives
 # ---------------------------------------------------------------------------
 
+def _validate_budget(budget: int, T: int) -> int:
+    """Validate a retention budget against sequence length T.
+
+    budget < 1 is a caller bug and hard-fails; budget > T clamps to T
+    (retaining everything is well-defined).
+    """
+    if budget < 1:
+        raise ValueError(f"KV retention budget must be >= 1, got {budget}")
+    return min(budget, T)
+
+
+def _softmax_attention(queries: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
+    """Normalised softmax attention softmax(q·Kᵀ/√d) of each query row.  Shape (n, T)."""
+    d = keys.shape[1]
+    return torch.softmax(queries @ keys.T / math.sqrt(d), dim=-1)
+
+
+def _select_recent_plus_heavy(
+    scores: torch.Tensor, T: int, budget: int, n_recent: int
+) -> list[int]:
+    """Retain the last ``n_recent`` positions plus the top-``budget - n_recent``
+    scorers among the rest. Shared by the H2O and SnapKV selection policies."""
+    n_recent = min(n_recent, budget)
+    recent_positions = list(range(T - n_recent, T))
+
+    n_heavy = budget - n_recent
+    if n_heavy > 0 and T > n_recent:
+        heavy_scores = scores[:T].clone()
+        heavy_scores[T - n_recent:] = -torch.inf   # don't double-count the recent window
+        n_select = min(n_heavy, T - n_recent)
+        heavy_positions = heavy_scores.topk(n_select).indices.tolist()
+    else:
+        heavy_positions = []
+
+    return sorted(set(recent_positions + heavy_positions))
+
+
 def _mass_features(queries: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
     """Unnormalised attention mass Φ_ij = exp(q_i · K_j^T / sqrt(d)).  Shape (n, T)."""
     d = keys.shape[1]
@@ -162,11 +189,11 @@ def _fit_bias(
     keys_orig: torch.Tensor,
     keys_compact: torch.Tensor,
     ref_queries: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """Fit bias β to match original attention mass via L2-regularised NNLS (Section 3.2).
 
     Solves:  min_{w ≥ 0}  ||Φ_compact w - m_orig||²  + λ||w||²
-    Returns β = log(w), w (clamped for numerical safety).
+    Returns β = log(w) (w clamped for numerical safety).
     """
     d = keys_orig.shape[1]
     logits_orig = ref_queries @ keys_orig.T / math.sqrt(d)    # (n, T)
@@ -188,8 +215,7 @@ def _fit_bias(
     b_aug = torch.cat([m, torch.zeros(t, device=m.device, dtype=m.dtype)])
 
     w = _nnls_pgd(A_aug, b_aug)
-    w = w.clamp(min=1e-30)
-    return torch.log(w), w
+    return torch.log(w.clamp(min=1e-30))
 
 
 def _fit_values(

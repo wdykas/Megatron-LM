@@ -10,8 +10,10 @@ import torch
 
 from megatron.rl.compaction.kv import (
     H2OAccumulator,
+    SnapKVCompressor,
     StreamingLLMCompressor,
     CompactionResult,
+    build_kv_compressor,
 )
 from megatron.rl.compaction.kv.benchmark import KVCompactionBenchmark
 from megatron.rl.compaction.learned.training.checkpoint import (
@@ -116,6 +118,99 @@ class TestH2OAccumulator:
         )
         assert len(results) == 1
         assert results[0].algorithm == "h2o"
+
+
+# ===========================================================================
+# SnapKVCompressor  (observation-window heavy hitters — flash-compatible live baseline)
+# ===========================================================================
+
+class TestSnapKVCompressor:
+    def test_obs_window_always_kept(self):
+        snap = SnapKVCompressor(obs_window=8)
+        K, V, Q = _kv_np(T=40)
+        r = snap.compress(K, V, 16, ref_queries=Q, run_id="r", step_id=0)
+        assert isinstance(r, CompactionResult)
+        assert len(r.retained_positions) == 16
+        assert all(p in r.retained_positions for p in range(32, 40))
+        assert r.retained_positions == sorted(r.retained_positions)
+
+    def test_heavy_span_selected_and_pooled(self):
+        """A key span the window queries attend to survives; pooling keeps neighbours."""
+        torch.manual_seed(0)
+        T, d = 200, 32
+        K = torch.randn(T, d)
+        V = torch.randn(T, d)
+        heavy = torch.randn(1, d) * 4
+        K[60:64] = heavy
+        Qw = heavy * 0.5 + torch.randn(16, d) * 0.3   # window queries point at the span
+        snap = SnapKVCompressor(obs_window=16, pool_kernel=7)
+        r = snap.compress(K, V, 48, ref_queries=Qw)
+        hits = [p for p in r.retained_positions if 57 <= p <= 66]
+        assert len(hits) >= 4, f"heavy span not retained: {hits}"
+
+    def test_no_fitting(self):
+        """SnapKV keeps original K/V, zero bias — selection only."""
+        snap = SnapKVCompressor(obs_window=4)
+        K, V, Q = _kv_np(T=30)
+        r = snap.compress(K, V, 10, ref_queries=Q[:4])
+        assert torch.equal(r.compacted_keys, K[r.retained_positions])
+        assert torch.equal(r.compacted_values, V[r.retained_positions])
+        assert (r.bias == 0).all()
+
+    def test_requires_ref_queries(self):
+        snap = SnapKVCompressor()
+        K, V, _ = _kv_np()
+        with pytest.raises(ValueError):
+            snap.compress(K, V, 8)
+
+    def test_budget_smaller_than_window(self):
+        """budget < obs_window keeps only the last `budget` tokens."""
+        snap = SnapKVCompressor(obs_window=16)
+        K, V, Q = _kv_np(T=32)
+        r = snap.compress(K, V, 4, ref_queries=Q)
+        assert r.retained_positions == [28, 29, 30, 31]
+
+    def test_invalid_params(self):
+        with pytest.raises(ValueError):
+            SnapKVCompressor(obs_window=0)
+        with pytest.raises(ValueError):
+            SnapKVCompressor(pool_kernel=4)   # must be odd
+
+    def test_strategy_string(self):
+        assert SnapKVCompressor(obs_window=32, pool_kernel=7).strategy == "snapkv_w32_p7"
+
+    def test_in_benchmark(self):
+        bench = KVCompactionBenchmark()
+        K, V, Q = _kv_np(T=40)
+        results = bench.run(
+            compressors={"snapkv": SnapKVCompressor(obs_window=4)},
+            keys=K, values=V, ref_queries=Q, eval_queries=Q, budget=10,
+        )
+        assert len(results) == 1
+        assert results[0].algorithm == "snapkv"
+
+
+# ===========================================================================
+# build_kv_compressor  (strategy factory: live vs offline)
+# ===========================================================================
+
+class TestBuildKvCompressor:
+    def test_all_strategies_resolve(self):
+        assert isinstance(build_kv_compressor("h2o"), H2OAccumulator)
+        assert isinstance(build_kv_compressor("snapkv"), SnapKVCompressor)
+        assert isinstance(build_kv_compressor("streaming_llm"), StreamingLLMCompressor)
+
+    def test_live_h2o_hard_fails(self):
+        """H2O needs accumulated attention weights; flash never materialises them."""
+        with pytest.raises(NotImplementedError, match="flash"):
+            build_kv_compressor("h2o", inference=True)
+
+    def test_live_snapkv_allowed(self):
+        assert isinstance(build_kv_compressor("snapkv", inference=True), SnapKVCompressor)
+
+    def test_unknown_strategy_raises(self):
+        with pytest.raises(ValueError):
+            build_kv_compressor("nope")
 
 
 # ===========================================================================

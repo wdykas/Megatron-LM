@@ -19,11 +19,7 @@ from __future__ import annotations
 import torch
 from typing import List, Optional, Tuple
 
-try:
-    from megatron.core.packed_seq_params import PackedSeqParams
-    _HAVE_PACKED_SEQ_PARAMS = True
-except ImportError:
-    _HAVE_PACKED_SEQ_PARAMS = False
+from megatron.core.packed_seq_params import PackedSeqParams
 
 
 def _unwrap_model(model):
@@ -48,8 +44,14 @@ def capture_kv_from_forward(
     model,
     tokens: torch.Tensor,
     position_ids: Optional[torch.Tensor] = None,
-) -> Optional[Tuple[List[torch.Tensor], List[torch.Tensor]]]:
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     """Run a forward pass and capture K/V from all attention layers.
+
+    Raises on every failure mode (no attention layers, forward error, partial
+    capture) — the CALLER owns failure policy. In the online loop that caller is
+    ``build_compactor_trajectories``, which catches the exception, all-reduces a
+    per-rank success flag, and skips the sequence on ALL ranks together (the
+    NCCL-deadlock guard); swallowing errors here would hide real bugs from it.
 
     All TP ranks must call this simultaneously (it issues collective
     communications inside the model forward).  Each rank captures only its
@@ -71,7 +73,7 @@ def capture_kv_from_forward(
 
     Returns
     -------
-    (keys_per_layer, vals_per_layer) or None.
+    (keys_per_layer, vals_per_layer).
         Each list has one tensor per attention layer, shape (1, S, H_kv * d_head).
     """
     gpt = _unwrap_model(model)
@@ -79,7 +81,9 @@ def capture_kv_from_forward(
     n_layers = len(cores)
 
     if n_layers == 0:
-        return None
+        raise RuntimeError(
+            "capture_kv_from_forward: model has no self-attention layers to capture."
+        )
 
     captured: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [None] * n_layers
     hooks = []
@@ -114,21 +118,19 @@ def capture_kv_from_forward(
     # code path as logprob computation (avoids CUDA-graph signature mismatch and
     # flash-attention format errors that cause rank 0 to fail before the first
     # NCCL collective, deadlocking the other TP ranks).
-    packed_seq_params = None
-    if _HAVE_PACKED_SEQ_PARAMS:
-        S = tokens.shape[1]
-        cu_seqlens = torch.tensor([0, S], dtype=torch.int32, device=tokens.device)
-        packed_seq_params = PackedSeqParams(
-            qkv_format='thd',
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_kv=cu_seqlens,
-            max_seqlen_q=S,
-            max_seqlen_kv=S,
-            total_tokens=S,
-        )
+    S = tokens.shape[1]
+    cu_seqlens = torch.tensor([0, S], dtype=torch.int32, device=tokens.device)
+    packed_seq_params = PackedSeqParams(
+        qkv_format='thd',
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        max_seqlen_q=S,
+        max_seqlen_kv=S,
+        total_tokens=S,
+    )
 
     # Match the logprobs forward path: eval mode + flash_decode disabled.
-    flash_decode = getattr(gpt.config, 'flash_decode', False)
+    flash_decode = gpt.config.flash_decode
     gpt.config.flash_decode = False
     was_training = gpt.training
     gpt.eval()
@@ -142,9 +144,6 @@ def capture_kv_from_forward(
                 packed_seq_params=packed_seq_params,
                 runtime_gather_output=True,
             )
-    except Exception as exc:
-        import warnings
-        warnings.warn(f"capture_kv_from_forward: forward pass failed: {exc}")
     finally:
         for h in hooks:
             h.remove()
@@ -152,16 +151,15 @@ def capture_kv_from_forward(
         if was_training:
             gpt.train()
 
-    good = [c for c in captured if c is not None]
-    if len(good) < n_layers:
-        import warnings
-        warnings.warn(
-            f"capture_kv_from_forward: only {len(good)}/{n_layers} layers captured K/V. "
-            "The hooks may have fired in a format other than SBHD/THD."
+    missing = [i for i, c in enumerate(captured) if c is None]
+    if missing:
+        raise RuntimeError(
+            f"capture_kv_from_forward: {len(missing)}/{n_layers} attention layers "
+            f"captured no K/V (layer indices {missing[:8]}...). The hooks fired in a "
+            "format other than SBHD/THD — a silently smaller capture would mis-size "
+            "the compactor."
         )
-    if not good:
-        return None
 
-    keys = [c[0] for c in captured if c is not None]
-    vals = [c[1] for c in captured if c is not None]
+    keys = [c[0] for c in captured]
+    vals = [c[1] for c in captured]
     return keys, vals

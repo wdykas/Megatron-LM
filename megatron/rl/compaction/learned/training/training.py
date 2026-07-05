@@ -202,7 +202,7 @@ def train_compactor_trajectory(
                 # VD mode:    weight by task reward (rollout_return).
                 _vd_return = (
                     trajectory.teacher_logprob_return
-                    if (getattr(cfg, "use_teacher_logprob_weight", False)
+                    if (cfg.use_teacher_logprob_weight
                         and trajectory.teacher_logprob_return is not None)
                     else trajectory.rollout_return
                 )
@@ -214,7 +214,7 @@ def train_compactor_trajectory(
                     kv_recon_w = _probe_weight(_vd_probe, cfg.vd_cfg, _vd_return)
                     adv_weight_vals.append(kv_recon_w)
             # Future-accuracy weighting of kv_reconstruction
-            if getattr(cfg, 'use_future_accuracy_weight', False) and future_kv_recon_vals and kv_recon_vals:
+            if cfg.use_future_accuracy_weight and future_kv_recon_vals and kv_recon_vals:
                 _last_future = future_kv_recon_vals[-1]
                 _last_current = kv_recon_vals[-1]
                 kv_recon_w = kv_recon_w * float(min(4.0, max(0.5, _last_future / (_last_current + 1e-6))))
@@ -223,7 +223,7 @@ def train_compactor_trajectory(
 
         if student_fn is not None:
             for probe in trajectory.probes_at(chunk_idx):
-                if getattr(cfg, "use_teacher_kl", False):
+                if cfg.use_teacher_kl:
                     # True STILL paper objective: CE(model(response | compact_kv), response_tokens).
                     # student_fn returns (B, S, vocab) logits; shift to get next-token prediction.
                     _logits = student_fn(probe.query_tokens, compact_kv)  # (B, S, V)
@@ -255,7 +255,7 @@ def train_compactor_trajectory(
                     # Future-horizon KL (position-weighted distillation)
                     if (cfg.loss_weights.future_horizon_kl > 0.0
                             and probe.teacher_logits is not None
-                            and getattr(cfg, 'future_horizon_gamma', 1.0) < 1.0):
+                            and cfg.future_horizon_gamma < 1.0):
                         fh_l = future_horizon_kl_loss(
                             probe.teacher_logits, _student_logits,
                             temperature=cfg.temperature,
@@ -265,7 +265,7 @@ def train_compactor_trajectory(
                         future_horizon_kl_vals.append(fh_l.item())
 
         # Merged-chunk consistency (path-independence of compression)
-        if (getattr(cfg, 'merged_chunk_prob', 0.0) > 0.0
+        if (cfg.merged_chunk_prob > 0.0
                 and chunk_idx > 0
                 and prev_chunk_keys is not None
                 and _use_update):

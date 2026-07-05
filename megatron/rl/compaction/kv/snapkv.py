@@ -1,0 +1,98 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+"""SnapKV compressor.
+
+Source: Li et al., 2024 (arXiv:2404.14469).
+
+SnapKV is the flash-attention-compatible heavy-hitter method: instead of
+accumulating attention over every decode step (which flash attention never
+materialises), it scores prefix keys using only a small **observation window**
+of the most-recent query tokens. Those window queries' attention to the prefix
+is computed explicitly (a cheap W×T partial attention), pooled over neighbouring
+keys (clustering), and the top scorers are retained together with the
+observation window itself. Retained K/V are the originals — no fitting.
+
+This is why SnapKV deploys live where paper-exact H2O cannot: it needs attention
+for only W queries, computable alongside a flash forward, rather than the full
+accumulated attention matrix.
+"""
+from __future__ import annotations
+
+import time
+
+import torch
+import torch.nn.functional as F
+
+from .compressors import (
+    CompactionResult,
+    _select_recent_plus_heavy,
+    _softmax_attention,
+    _validate_budget,
+)
+
+
+class SnapKVCompressor:
+    """SnapKV: observation-window heavy hitters + the recent window, K/V kept.
+
+    Parameters
+    ----------
+    obs_window:   Number of most-recent tokens used as the observation window;
+                  these queries score the prefix and are themselves always kept.
+    pool_kernel:  1-D max-pool kernel over the key axis (clustering, so a whole
+                  important span is retained, not isolated tokens). Paper uses 7.
+
+    ``compress`` expects ``ref_queries`` to be the observation-window query
+    vectors (the last ``obs_window`` real queries). Retains ``budget`` keys:
+    the observation window plus the top pooled-attention prefix keys.
+    """
+
+    def __init__(self, obs_window: int = 32, pool_kernel: int = 7) -> None:
+        if obs_window < 1:
+            raise ValueError(f"obs_window must be >= 1, got {obs_window}")
+        if pool_kernel < 1 or pool_kernel % 2 == 0:
+            raise ValueError(f"pool_kernel must be a positive odd int, got {pool_kernel}")
+        self.obs_window = obs_window
+        self.pool_kernel = pool_kernel
+
+    @property
+    def strategy(self) -> str:
+        return f"snapkv_w{self.obs_window}_p{self.pool_kernel}"
+
+    def compress(
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        budget: int,
+        ref_queries: torch.Tensor | None = None,
+        run_id: str = "",
+        step_id: int = 0,
+    ) -> CompactionResult:
+        if ref_queries is None:
+            raise ValueError(
+                "SnapKVCompressor needs ref_queries (the observation-window queries) "
+                "to score prefix keys."
+            )
+        t0 = time.perf_counter()
+        T = keys.shape[0]
+        budget = _validate_budget(budget, T)
+
+        # Attention of the observation-window queries over all keys, summed, then
+        # max-pooled over neighbouring keys so an important span is kept together.
+        scores = _softmax_attention(ref_queries, keys).sum(dim=0)   # (T,)
+        pad = self.pool_kernel // 2
+        pooled = F.max_pool1d(
+            scores[None, None, :], kernel_size=self.pool_kernel, stride=1, padding=pad
+        )[0, 0]
+
+        positions = _select_recent_plus_heavy(
+            pooled, T, budget, n_recent=min(self.obs_window, budget)
+        )
+        return CompactionResult(
+            run_id=run_id, step_id=step_id,
+            retained_positions=positions,
+            compacted_keys=keys[positions],
+            compacted_values=values[positions],
+            bias=torch.zeros(len(positions), device=keys.device, dtype=keys.dtype),
+            strategy=self.strategy, original_length=T,
+            wall_time_s=time.perf_counter() - t0,
+        )

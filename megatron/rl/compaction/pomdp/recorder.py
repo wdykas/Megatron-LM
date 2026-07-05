@@ -55,8 +55,6 @@ class PomdpRolloutRecorder:
         kv_hook: MegatronInferenceHook | None = None,
         # Belief-Still: BeliefUpdater instance (duck-typed to avoid hard torch dep).
         belief_updater: Any | None = None,
-        # Legacy kwarg for backward compat — ignored when algorithm is supplied.
-        compactor: Any | None = None,
         tokenizer: Any | None = None,
     ) -> None:
         self._config = config
@@ -64,13 +62,9 @@ class PomdpRolloutRecorder:
         self._context_builder = context_builder
         self._tokenizer = tokenizer
         self._trigger: CompactionTrigger = trigger if trigger is not None else AlwaysTrigger()
-        # Prefer explicit algorithm; fall back to wrapping a legacy compactor, then default.
-        if algorithm is not None:
-            self._algorithm: CompactionAlgorithm = algorithm
-        elif compactor is not None:
-            self._algorithm = _LegacyCompactorAdapter(compactor)
-        else:
-            self._algorithm = DeterministicAlgorithm()
+        self._algorithm: CompactionAlgorithm = (
+            algorithm if algorithm is not None else DeterministicAlgorithm()
+        )
         self._kv_algorithm = kv_algorithm
         self._kv_hook: MegatronInferenceHook = kv_hook if kv_hook is not None else NullHook()
         self._belief_updater = belief_updater
@@ -530,26 +524,3 @@ class PomdpRolloutRecorder:
         self._store.put_transition(transition)
         self._store.append_transition_to_run(run_id, transition.transition_id)
         return next_belief
-
-
-# ---------------------------------------------------------------------------
-# Legacy adapter — wraps a BeliefCompactor as a CompactionAlgorithm
-# ---------------------------------------------------------------------------
-
-class _LegacyCompactorAdapter:
-    """Adapts the old BeliefCompactor interface to CompactionAlgorithm."""
-
-    def __init__(self, compactor: Any) -> None:
-        self._c = compactor
-
-    def initialize(self, run_id: str, task_text: str, **kwargs: Any) -> Any:
-        meta = kwargs.get("task_metadata")
-        return self._c.initialize_belief(run_id, task_text, meta)
-
-    def update(self, belief: Any, action: Any, observation: Any) -> Any:
-        return self._c.update_belief(belief, action, observation)
-
-    async def async_update(self, belief: Any, action: Any, observation: Any) -> Any:
-        if hasattr(self._c, "update_belief_async"):
-            return await self._c.update_belief_async(belief, action, observation)
-        return self.update(belief, action, observation)

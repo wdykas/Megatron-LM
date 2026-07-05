@@ -115,6 +115,46 @@ def trajectory_collate_fn(batch: list[Trajectory]) -> list[Trajectory]:
     return batch
 
 
+def save_trajectory(
+    trajectory: Trajectory, trajectory_dir: str, iteration: int, prompt_idx: int
+) -> str:
+    """Pickle a Trajectory to ``trajectory_dir`` for the offline pipeline.
+
+    Tensors are moved to CPU first so the file loads on any machine. Returns
+    the written path (``iter<NNNNNNN>_prompt<NNNNN>.pt``).
+    """
+    import dataclasses
+    import os
+    import pickle
+
+    cpu_chunks = [
+        ([k.cpu() for k in chunk_keys], [v.cpu() for v in chunk_vals])
+        for chunk_keys, chunk_vals in trajectory.chunks
+    ]
+    cpu_probes: dict[int, list[TrainingProbe]] = {}
+    for chunk_idx, probes in trajectory.probes_by_chunk.items():
+        cpu_probes[chunk_idx] = [
+            dataclasses.replace(p, **{
+                f.name: getattr(p, f.name).cpu()
+                for f in dataclasses.fields(p)
+                if isinstance(getattr(p, f.name), torch.Tensor)
+            })
+            for p in probes
+        ]
+    cpu_traj = Trajectory(
+        chunks=cpu_chunks,
+        probes_by_chunk=cpu_probes,
+        rollout_return=trajectory.rollout_return,
+        teacher_logprob_return=trajectory.teacher_logprob_return,
+    )
+
+    os.makedirs(trajectory_dir, exist_ok=True)
+    path = os.path.join(trajectory_dir, f"iter{iteration:07d}_prompt{prompt_idx:05d}.pt")
+    with open(path, "wb") as f:
+        pickle.dump(cpu_traj, f)
+    return path
+
+
 # ---------------------------------------------------------------------------
 # Trainer config (moved here from trainer.py so rl_utils.py can import it
 # without pulling in the full trainer module)
@@ -166,15 +206,3 @@ class CompactorTrainerConfig:
             self.loss_weights = CompactorLossWeights()
 
 
-# ---------------------------------------------------------------------------
-# Pipeline configuration
-# ---------------------------------------------------------------------------
-
-@dataclass
-class PipelineConfig:
-    """Chunking/probing config for the online HookTrajectoryCollector."""
-
-    chunk_size:     int = 256
-    probe_stride:   int = 1
-    probe_query_len: int = 32
-    max_probes:     int | None = None

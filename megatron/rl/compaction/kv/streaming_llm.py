@@ -18,6 +18,7 @@ from .compressors import (
     CompactionResult,
     _fit_bias,
     _fit_values,
+    _validate_budget,
 )
 
 
@@ -70,7 +71,7 @@ class StreamingLLMCompressor:
     ) -> CompactionResult:
         t0 = time.perf_counter()
         T = keys.shape[0]
-        budget = max(1, min(budget, T))
+        budget = _validate_budget(budget, T)
         n_sink = min(self.n_sink, budget)
 
         sink_positions = list(range(n_sink))
@@ -84,11 +85,13 @@ class StreamingLLMCompressor:
         if self.fit_bias:
             if ref_queries is None:
                 raise ValueError("StreamingLLMCompressor requires ref_queries when fit_bias=True.")
-            beta, _ = _fit_bias(keys, C_k, ref_queries)
+            beta = _fit_bias(keys, C_k, ref_queries)
         else:
             beta = torch.zeros(len(positions), device=keys.device, dtype=keys.dtype)
 
-        if self.fit_values and ref_queries is not None:
+        if self.fit_values:
+            if ref_queries is None:
+                raise ValueError("StreamingLLMCompressor requires ref_queries when fit_values=True.")
             C_v = _fit_values(keys, values, C_k, beta, ref_queries)
         else:
             C_v = values[positions]

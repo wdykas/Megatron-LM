@@ -9,24 +9,25 @@ They operate directly on K/V tensors (shape T×d) rather than token_id lists.
 
 from __future__ import annotations
 
+import time
+
 import torch
 
-from .compressors import CompactionResult
+from .compressors import (
+    CompactionResult,
+    _select_recent_plus_heavy,
+    _softmax_attention,
+    _validate_budget,
+)
 
-
-# ---------------------------------------------------------------------------
-# AttentionSumScorer
-# ---------------------------------------------------------------------------
 
 class AttentionSumScorer:
-    """Keep the top-k positions by cumulative attention received.
+    """Keep the top-k positions by attention received, protecting a recent window.
 
-    Always protects the last ``min_recent`` positions regardless of score,
-    mirroring the H2O (Heavy-Hitter Oracle) heuristic.
-
-    When ref_queries is provided, scores are computed as the mean softmax
-    attention weight across ref_queries rows. When ref_queries is None,
-    key L2-norm is used as a proxy score.
+    The last ``min(min_recent, budget)`` positions are always retained; the rest
+    of the budget goes to the highest scorers. When ref_queries is provided,
+    scores are the mean softmax attention weight across ref_queries rows;
+    otherwise key L2-norm is used as a proxy score.
     """
 
     def __init__(self, min_recent: int = 32) -> None:
@@ -43,36 +44,18 @@ class AttentionSumScorer:
         run_id: str = "",
         step_id: int = 0,
     ) -> CompactionResult:
-        n = keys.shape[0]
-        budget = max(1, min(budget, n))
+        t0 = time.perf_counter()
+        T = keys.shape[0]
+        budget = _validate_budget(budget, T)
 
         if ref_queries is not None:
-            import math
-            d = keys.shape[1]
-            logits = ref_queries @ keys.T / math.sqrt(d)    # (n_q, T)
-            logits = logits - logits.max(dim=1, keepdim=True).values
-            weights = torch.softmax(logits, dim=1)           # (n_q, T)
-            scores = weights.mean(dim=0)                     # (T,)
+            scores = _softmax_attention(ref_queries, keys).mean(dim=0)   # (T,)
         else:
-            scores = keys.norm(dim=-1)                       # (T,)
+            scores = keys.norm(dim=-1)                                   # (T,)
 
-        recent_start = max(0, n - self.min_recent)
-        protected = set(range(recent_start, n))
-
-        remaining_budget = max(0, budget - len(protected))
-        # Score positions not in protected set
-        candidate_indices = list(range(recent_start))
-        if candidate_indices and remaining_budget > 0:
-            candidate_scores = scores[:recent_start]
-            k = min(remaining_budget, len(candidate_indices))
-            top_indices = candidate_scores.topk(k).indices.tolist()
-            top = set(top_indices)
-        else:
-            top = set()
-
-        retained = sorted(top | protected)
-        positions = retained
-
+        positions = _select_recent_plus_heavy(
+            scores, T, budget, n_recent=min(self.min_recent, budget)
+        )
         return CompactionResult(
             run_id=run_id,
             step_id=step_id,
@@ -81,14 +64,10 @@ class AttentionSumScorer:
             compacted_values=values[positions],
             bias=torch.zeros(len(positions), device=keys.device, dtype=keys.dtype),
             strategy="attention_sum",
-            original_length=n,
-            wall_time_s=0.0,
+            original_length=T,
+            wall_time_s=time.perf_counter() - t0,
         )
 
-
-# ---------------------------------------------------------------------------
-# UniformScorer
-# ---------------------------------------------------------------------------
 
 class UniformScorer:
     """Keep every Nth token (uniform subsampling). Does not use ref_queries."""
@@ -102,12 +81,13 @@ class UniformScorer:
         run_id: str = "",
         step_id: int = 0,
     ) -> CompactionResult:
-        n = keys.shape[0]
-        budget = max(1, min(budget, n))
-        if budget >= n:
-            positions = list(range(n))
+        t0 = time.perf_counter()
+        T = keys.shape[0]
+        budget = _validate_budget(budget, T)
+        if budget >= T:
+            positions = list(range(T))
         else:
-            step = n / budget
+            step = T / budget
             positions = sorted(set(int(i * step) for i in range(budget)))
 
         return CompactionResult(
@@ -118,6 +98,6 @@ class UniformScorer:
             compacted_values=values[positions],
             bias=torch.zeros(len(positions), device=keys.device, dtype=keys.dtype),
             strategy="uniform",
-            original_length=n,
-            wall_time_s=0.0,
+            original_length=T,
+            wall_time_s=time.perf_counter() - t0,
         )

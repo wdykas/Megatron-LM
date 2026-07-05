@@ -95,7 +95,8 @@ class TestFitBias:
         K, V, Q_ref, _ = small_kv
         budget = 16
         C_k = K[:budget]
-        beta, w = _fit_bias(K, C_k, Q_ref)
+        beta = _fit_bias(K, C_k, Q_ref)
+        w = torch.exp(beta)   # β = log(w)
         assert beta.shape == (budget,)
         assert w.shape == (budget,)
         assert (w > 0).all(), "NNLS weights must be non-negative"
@@ -104,7 +105,7 @@ class TestFitBias:
         K, V, Q_ref, _ = small_kv
         budget = 16
         C_k = K[:budget]
-        beta, w = _fit_bias(K, C_k, Q_ref)
+        w = torch.exp(_fit_bias(K, C_k, Q_ref))
 
         d = K.shape[1]
         logits_orig = Q_ref @ K.T / math.sqrt(d)
@@ -129,10 +130,10 @@ class TestFitBias:
         K = torch.randn(64, d) * 5.0   # large magnitude — high logits
         C_k = torch.randn(4, d) * 0.01  # tiny magnitude — compact logits << row_max
         Q_ref = torch.randn(8, d)
-        beta, w = _fit_bias(K, C_k, Q_ref)
+        beta = _fit_bias(K, C_k, Q_ref)
         assert not torch.isnan(beta).any(), "bias must not be NaN"
         assert not torch.isinf(beta).any(), "bias must not be ±inf"
-        assert (w > 0).all(), "NNLS weights must be positive"
+        assert (torch.exp(beta) > 0).all(), "NNLS weights must be positive"
 
 
 class TestFitValues:
@@ -214,10 +215,11 @@ class TestTopKCompressor:
         result = TopKCompressor().compress(K, V, K.shape[0] + 100, ref_queries=Q_ref)
         assert len(result.retained_positions) == K.shape[0]
 
-    def test_budget_clamp_at_1(self, small_kv):
+    def test_budget_below_one_raises(self, small_kv):
+        """budget < 1 is a caller bug and must hard-fail, not silently clamp."""
         K, V, Q_ref, _ = small_kv
-        result = TopKCompressor().compress(K, V, 0, ref_queries=Q_ref)
-        assert len(result.retained_positions) == 1
+        with pytest.raises(ValueError, match="budget"):
+            TopKCompressor().compress(K, V, 0, ref_queries=Q_ref)
 
 
 # ---------------------------------------------------------------------------

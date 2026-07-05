@@ -74,21 +74,19 @@ def init_compactor_from_kv(runtime_state: Any, args, n_attn_layers: int, d_kv: i
     _loaded_ckpt_payload = None
     if _ckpt_path:
         from megatron.rl.compaction.learned import load_checkpoint as _load_ckpt
-        try:
-            # dist_checkpointing builds TE layers (CUDA-only) and load() is collective —
-            # all ranks reach here together via build_compactor_trajectories.
-            compactor, _meta = _load_ckpt(
-                _ckpt_path, map_location="cuda", params_dtype=_dtype, pg_collection=pg_collection,
-            )
-            compactor = compactor.to(_dtype).train()
-            _loaded_step = getattr(_meta, "step", None)
-            _loaded_ckpt_payload = _ckpt_path  # stash path for optimizer state restore
-            log_single_rank(logger, logging.INFO,
-                            f"[STILL online] Loaded compactor checkpoint: {_ckpt_path} "
-                            f"(step={_loaded_step})")
-        except Exception as _e:
-            log_single_rank(logger, logging.WARNING,
-                            f"[STILL online] Failed to load compactor checkpoint {_ckpt_path}: {_e}")
+        # dist_checkpointing builds TE layers (CUDA-only) and load() is collective —
+        # all ranks reach here together via build_compactor_trajectories. A load
+        # failure must abort: continuing would silently train from random init
+        # while the user believes they resumed.
+        compactor, _meta = _load_ckpt(
+            _ckpt_path, map_location="cuda", params_dtype=_dtype, pg_collection=pg_collection,
+        )
+        compactor = compactor.to(_dtype).train()
+        _loaded_step = getattr(_meta, "step", None)
+        _loaded_ckpt_payload = _ckpt_path  # stash path for optimizer state restore
+        log_single_rank(logger, logging.INFO,
+                        f"[STILL online] Loaded compactor checkpoint: {_ckpt_path} "
+                        f"(step={_loaded_step})")
 
     # Optimizer is created lazily in attach_compactor_optimizer once the Megatron
     # optimizer is available (first maybe_train_compactor call).
@@ -113,13 +111,15 @@ def init_compactor_from_kv(runtime_state: Any, args, n_attn_layers: int, d_kv: i
         use_future_accuracy_weight=getattr(args, "rl_compaction_compactor_use_future_accuracy_weight", False),
         merged_chunk_prob=getattr(args, "rl_compaction_compactor_merged_chunk_prob", 0.0),
     )
-    # Warn on loss weights that are silently inert online (term enabled but its
-    # precondition is off, so it contributes no gradient).
+    # A loss weight that is silently inert online (term enabled but its
+    # precondition off, so it contributes zero gradient) is a misconfiguration.
     _w = trainer_cfg.loss_weights
     if _w.future_horizon_kl > 0.0 and (trainer_cfg.future_horizon_gamma >= 1.0 or _use_teacher_kl):
-        log_single_rank(logger, logging.WARNING,
-                        "[STILL online] future-horizon-KL > 0 is inert online (needs gamma < 1.0 and "
-                        "per-probe teacher_logits, which only the offline pipeline captures).")
+        raise ValueError(
+            "future-horizon-KL > 0 is inert online: it needs gamma < 1.0 and per-probe "
+            "teacher_logits, which only the offline pipeline captures. Remove the flag "
+            "or run the offline pipeline."
+        )
 
     runtime_state.compactor = compactor
     runtime_state.compactor_optimizer = None  # set by attach_compactor_optimizer
@@ -154,7 +154,7 @@ def attach_compactor_optimizer(runtime_state: Any, megatron_opt=None) -> None:
     ddp_model, optimizer = wrap_compactor_for_training(
         runtime_state.compactor,
         runtime_state._compactor_lr,
-        pg_collection=getattr(runtime_state, "_compactor_pg_collection", None),
+        pg_collection=runtime_state._compactor_pg_collection,
     )
 
     # Restore FP32 masters + Adam moments from checkpoint if available.
@@ -195,12 +195,19 @@ def build_compactor_trajectories(runtime_state: Any, model, args) -> None:
     local d_kv (consistent across ranks by symmetric GQA+TP replication), so it
     always matches the data exactly.
 
-    No-op when online training is disabled. Collective: every rank loops the same
-    number of sequences and runs the forward together.
+    Also the single disk-save path for the offline pipeline: when
+    ``--rl-compaction-trajectory-dir`` is set, rank 0 pickles its local-slice
+    Trajectory per sequence (this replaced the old rank-0 paged-cache collector,
+    which captured nothing online — the cache is drained before it could read).
+
+    No-op when neither online training nor trajectory saving is enabled.
+    Collective: every rank loops the same sequences and runs the forward together.
     """
     from megatron.training import get_args
     args_obj = args if args is not None else get_args()
-    if not getattr(args_obj, "rl_compaction_compactor_train", False):
+    _train = getattr(args_obj, "rl_compaction_compactor_train", False)
+    _traj_dir = getattr(args_obj, "rl_compaction_trajectory_dir", None)
+    if not (_train or _traj_dir):
         return
 
     # Training model for the teacher-KL student forward (set on all ranks).
@@ -210,7 +217,9 @@ def build_compactor_trajectories(runtime_state: Any, model, args) -> None:
     runtime_state.compactor_raw_sequences = []
 
     from megatron.rl.compaction.learned.capture.kv_capture import capture_kv_from_forward
-    from megatron.rl.compaction.learned.training.data import Trajectory, TrainingProbe
+    from megatron.rl.compaction.learned.training.data import (
+        Trajectory, TrainingProbe, save_trajectory,
+    )
 
     # Lockstep count across ranks (raw_seqs is identical by construction, but guard
     # against any drift so the collective forwards below stay matched).
@@ -261,9 +270,11 @@ def build_compactor_trajectories(runtime_state: Any, model, args) -> None:
 
         # Collective agreement: if the forward failed on ANY rank, ALL ranks skip
         # this sequence together to keep collectives matched (avoids NCCL deadlock).
+        # This is the ONE place capture failure is tolerated — capture_kv_from_forward
+        # itself raises on every failure mode.
         _ok_t = torch.tensor([_fwd_ok], dtype=torch.long, device="cuda")
         torch.distributed.all_reduce(_ok_t, op=torch.distributed.ReduceOp.MIN)
-        if _ok_t.item() == 0 or kv_result is None:
+        if _ok_t.item() == 0:
             continue
 
         keys, vals = kv_result
@@ -272,7 +283,9 @@ def build_compactor_trajectories(runtime_state: Any, model, args) -> None:
 
         # Initialize compactor from the actual captured local d_kv (collective: the
         # checkpoint load inside is collective and all ranks reach it together).
-        init_compactor_from_kv(runtime_state, args_obj, n_attn_layers, d_kv)
+        # Only needed for training — pure trajectory collection has no compactor.
+        if _train:
+            init_compactor_from_kv(runtime_state, args_obj, n_attn_layers, d_kv)
 
         # Trim padding back to the original sequence length before chunking.
         keys = [k[:, :seq_len, :] for k in keys]
@@ -296,11 +309,20 @@ def build_compactor_trajectories(runtime_state: Any, model, args) -> None:
             answer_tokens=None,
             advantage=reward if reward != 0.0 else None,
         )
-        runtime_state.compactor_trajectories.append(Trajectory(
+        trajectory = Trajectory(
             chunks=chunks,
             probes_by_chunk={last_idx: [probe]},
             rollout_return=reward,
-        ))
+        )
+        if _train:
+            runtime_state.compactor_trajectories.append(trajectory)
+        # Offline pipeline: rank 0 saves its local-slice trajectory to disk.
+        if _traj_dir and torch.distributed.get_rank() == 0:
+            path = save_trajectory(
+                trajectory, _traj_dir,
+                iteration=getattr(args_obj, "curr_iteration", 0), prompt_idx=i,
+            )
+            log_single_rank(logger, logging.INFO, f"[STILL online] trajectory saved: {path}")
 
 
 def maybe_train_compactor(runtime_state: Any, args=None, optimizer=None) -> None:
@@ -344,33 +366,32 @@ def maybe_train_compactor(runtime_state: Any, args=None, optimizer=None) -> None
     # student_fn: (query_tokens, compact_kv) → logits (B, S, vocab)
     # The CE loss with correct next-token shift is applied inside train_compactor_trajectory.
     _student_fn = None
-    if getattr(runtime_state.compactor_cfg, "use_teacher_kl", False):
-        _still_model = getattr(runtime_state, "compactor_student_model", None)
-        if _still_model is not None:
-            from megatron.rl.compaction.learned.capture.student_forward import student_logits as _sf
-            _m = _still_model  # capture for closure
-            _student_fn = lambda q, kv: _sf(_m, q, kv)
-        else:
-            log_single_rank(logger, logging.WARNING,
-                            "[STILL online] teacher-KL mode active but compactor_student_model is None; "
-                            "skipping student forward this iteration.")
+    if runtime_state.compactor_cfg.use_teacher_kl:
+        _still_model = runtime_state.compactor_student_model
+        if _still_model is None:
+            raise RuntimeError(
+                "teacher-KL mode is active but compactor_student_model is None — "
+                "build_compactor_trajectories must run before maybe_train_compactor."
+            )
+        from megatron.rl.compaction.learned.capture.student_forward import student_logits as _sf
+        _m = _still_model  # capture for closure
+        _student_fn = lambda q, kv: _sf(_m, q, kv)
 
+    # A failed training step raises: all ranks train identical schedules on their
+    # own local KV slice, so any exception is deterministic across ranks and the
+    # raise is collective-safe. Silently skipping would leave the compactor
+    # quietly untrained.
     _opt_state_before = len(runtime_state.compactor_optimizer.state)
     for trajectory in trajectories:
-        try:
-            log = train_compactor_trajectory(
-                model=runtime_state.compactor_ddp,
-                optimizer=runtime_state.compactor_optimizer,
-                trajectory=trajectory,
-                student_fn=_student_fn,
-                cfg=runtime_state.compactor_cfg,
-            )
-            if log:
-                log_single_rank(logger, logging.INFO, f"[STILL online] {log}")
-        except Exception as exc:
-            import traceback as _tb
-            log_single_rank(logger, logging.WARNING,
-                            f"[STILL online] training step failed: {exc}\n{_tb.format_exc()}")
+        log = train_compactor_trajectory(
+            model=runtime_state.compactor_ddp,
+            optimizer=runtime_state.compactor_optimizer,
+            trajectory=trajectory,
+            student_fn=_student_fn,
+            cfg=runtime_state.compactor_cfg,
+        )
+        if log:
+            log_single_rank(logger, logging.INFO, f"[STILL online] {log}")
     _opt_state_after = len(runtime_state.compactor_optimizer.state)
     log_single_rank(logger, logging.INFO,
                     f"[STILL online] opt state: {_opt_state_before} -> {_opt_state_after}, "
