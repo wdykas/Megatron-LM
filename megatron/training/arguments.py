@@ -2343,6 +2343,13 @@ def _add_rl_args(parser):
     )
     group.add_argument('--rl-compaction-kv-budget-ratio', type=float, default=0.5,
                        help='Fraction of KV positions to retain per step (0-1).')
+    group.add_argument('--rl-compaction-budget-final', type=float, default=None,
+                       help='A3 budget annealing: linearly anneal the live compaction '
+                            'budget from --rl-compaction-kv-budget-ratio to this value '
+                            'over --rl-compaction-budget-anneal-iters GRPO iterations.')
+    group.add_argument('--rl-compaction-budget-anneal-iters', type=int, default=None,
+                       help='Iterations over which the A3 budget anneal runs (set '
+                            'together with --rl-compaction-budget-final).')
     group.add_argument('--rl-compaction-split-fraction', type=float, default=None,
                        help='A1 split-group counterfactual: probability that a rollout '
                             'request runs with live compaction (kv_compact arm); the '

@@ -78,6 +78,8 @@ class LiveKVCompactor:
         prefetch_horizon: int | None = None,
         max_retrievals_per_request: int = 4,
         rope_mode: str | None = None,
+        budget_final: float | None = None,
+        budget_anneal_iters: int | None = None,
     ) -> None:
         if strategy not in _LIVE_STRATEGIES:
             # Route through the factory for the canonical error (h2o explains
@@ -92,6 +94,23 @@ class LiveKVCompactor:
             raise ValueError(f"budget_ratio must be in (0, 1), got {budget_ratio}")
         self.strategy = strategy
         self.budget_ratio = budget_ratio
+        # A3 budget annealing (RL loop only): budget_ratio moves linearly from
+        # its starting value to budget_final over budget_anneal_iters GRPO
+        # iterations. Every TP rank runs begin_step in lockstep with the same
+        # args, so the schedule stays consistent without any broadcast.
+        self._budget_start = budget_ratio
+        self.budget_final = budget_final
+        self.budget_anneal_iters = budget_anneal_iters
+        if (budget_final is None) != (budget_anneal_iters is None):
+            raise ValueError(
+                "budget_final and budget_anneal_iters must be set together "
+                f"(got final={budget_final}, anneal_iters={budget_anneal_iters}).")
+        if budget_final is not None:
+            if not 0.0 < budget_final < 1.0:
+                raise ValueError(f"budget_final must be in (0, 1), got {budget_final}")
+            if budget_anneal_iters < 1:
+                raise ValueError(
+                    f"budget_anneal_iters must be >= 1, got {budget_anneal_iters}")
         self.obs_window = obs_window
         self.pool_kernel = pool_kernel
         self.n_sink = n_sink
@@ -254,6 +273,22 @@ class LiveKVCompactor:
     # Engine seam
     # ------------------------------------------------------------------
 
+    def schedule_ratio(self, iteration: int) -> float:
+        """Linear anneal from the starting budget to budget_final."""
+        frac = min(1.0, max(0.0, iteration / self.budget_anneal_iters))
+        return self._budget_start + (self.budget_final - self._budget_start) * frac
+
+    def _apply_budget_schedule(self) -> None:
+        from megatron.training import get_args
+        iteration = getattr(get_args(), "curr_iteration", None)
+        if iteration is None:
+            return
+        new_ratio = self.schedule_ratio(iteration)
+        if abs(new_ratio - self.budget_ratio) > 1e-9:
+            logger.info("[kv-compaction] budget anneal: ratio %.3f -> %.3f "
+                        "(iteration %d)", self.budget_ratio, new_ratio, iteration)
+            self.budget_ratio = new_ratio
+
     def begin_step(self, is_decode_only: bool) -> None:
         """Snapshot which active requests will prefill this step, and arm Q capture.
 
@@ -264,6 +299,8 @@ class LiveKVCompactor:
         self._prefill_locals: list[int] = []
         self._cu_q: torch.Tensor | None = None
         self._capturing = self.archive_enabled
+        if self.budget_final is not None:
+            self._apply_budget_schedule()
         if self.archive_enabled and self._q_per_layer:
             self._q_per_layer = [None] * len(self._q_per_layer)  # type: ignore[list-item]
         if os.environ.get("KV_COMPACTION_DEBUG"):

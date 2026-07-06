@@ -229,6 +229,8 @@ step to stage from.
 --rl-compaction-n-compress 64
 --rl-compaction-compactor-checkpoint …
 --rl-compaction-split-fraction 0.5      # A1 split-group: P(rollout compacts)
+--rl-compaction-budget-final 0.3        # A3: anneal budget to this ...
+--rl-compaction-budget-anneal-iters 200 # ... over this many GRPO iterations
 ```
 
 With a split fraction, each rollout draws its compaction arm Bernoulli(p) —

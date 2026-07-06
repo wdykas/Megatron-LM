@@ -185,6 +185,34 @@ class TestPrefetchTrigger:
             self._comp(prefetch_horizon=0)
 
 
+class TestBudgetAnneal:
+    """A3: linear budget schedule (RL loop)."""
+
+    def _comp(self, **kw):
+        from megatron.rl.compaction.kv.live import LiveKVCompactor
+        return LiveKVCompactor(_StubEngine("none"), strategy="streaming_llm",
+                               budget_ratio=0.8, **kw)
+
+    def test_linear_schedule(self):
+        comp = self._comp(budget_final=0.2, budget_anneal_iters=100)
+        assert comp.schedule_ratio(0) == pytest.approx(0.8)
+        assert comp.schedule_ratio(50) == pytest.approx(0.5)
+        assert comp.schedule_ratio(100) == pytest.approx(0.2)
+        assert comp.schedule_ratio(500) == pytest.approx(0.2)   # clamped
+
+    def test_flags_must_be_set_together(self):
+        with pytest.raises(ValueError, match="set together"):
+            self._comp(budget_final=0.2)
+        with pytest.raises(ValueError, match="set together"):
+            self._comp(budget_anneal_iters=10)
+
+    def test_final_and_iters_validated(self):
+        with pytest.raises(ValueError, match="budget_final"):
+            self._comp(budget_final=1.5, budget_anneal_iters=10)
+        with pytest.raises(ValueError, match="anneal_iters"):
+            self._comp(budget_final=0.2, budget_anneal_iters=0)
+
+
 class TestOverwriteKeys:
     def test_round_trip_keys_only(self):
         ctx = _make_context(n_layers=2, n_heads=1, d_head=4, block_size=4, seq_len=6)
