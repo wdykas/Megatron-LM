@@ -25,12 +25,19 @@ from .kv_capture import _unwrap_model
 
 
 def _attention_layers(model):
-    """Return (layer_index, layer) for each TransformerLayer that has self_attention."""
+    """(layer_index, layer) for each REAL attention layer.
+
+    Same predicate as kv_capture: hybrid models stub non-attention layers with
+    self_attention=IdentityOp, which still HAS the attribute — only layers
+    whose self_attention owns a core_attention are attention layers, and this
+    ordering matches the captured KV list layer-for-layer.
+    """
     gpt = _unwrap_model(model)
     return [
         (i, layer)
         for i, layer in enumerate(gpt.decoder.layers)
         if hasattr(layer, "self_attention")
+        and hasattr(layer.self_attention, "core_attention")
     ]
 
 
