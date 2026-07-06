@@ -74,26 +74,30 @@ def _inject_compact_kv(model, compact_kv_list: List[Tuple[torch.Tensor, torch.Te
             def _pre_hook(module, args):
                 if len(args) < 3:
                     return args
-                query = args[0]   # (S_q, B, n_heads, d_head)
-                orig_key = args[1]  # (S_k, B, n_kv_groups, d_head)
-
-                B = orig_key.shape[1]
-                n_kv_groups = orig_key.shape[2]
-                d_head = orig_key.shape[3]
+                query = args[0]
+                orig_key = args[1]
                 C = ck_cap.shape[1]
 
-                # (B, C, d_kv) → (B, C, n_kv_groups, d_head) → (C, B, n_kv_groups, d_head).
-                # contiguous(): the sources may be views (e.g. BeliefMemory
-                # per-layer slices) and TE rejects permuted strides with
-                # 'The provided qkv memory layout is not supported!'.
-                ck_r = ck_cap.reshape(B, C, n_kv_groups, d_head).permute(1, 0, 2, 3).contiguous()
-                cv_r = cv_cap.reshape(B, C, n_kv_groups, d_head).permute(1, 0, 2, 3).contiguous()
+                if orig_key.dim() == 3:
+                    # THD packed format: (T_kv, n_kv_groups, d_head). Only
+                    # B=1 is meaningful for a packed injected forward.
+                    if ck_cap.shape[0] != 1:
+                        raise ValueError(
+                            f"THD injection requires B=1 compact KV, got "
+                            f"B={ck_cap.shape[0]}")
+                    n_kv_groups, d_head = orig_key.shape[1], orig_key.shape[2]
+                    ck_r = ck_cap.reshape(C, n_kv_groups, d_head).contiguous()
+                    cv_r = cv_cap.reshape(C, n_kv_groups, d_head).contiguous()
+                else:
+                    # SBHD: (S_k, B, n_kv_groups, d_head).
+                    B = orig_key.shape[1]
+                    n_kv_groups, d_head = orig_key.shape[2], orig_key.shape[3]
+                    ck_r = (ck_cap.reshape(B, C, n_kv_groups, d_head)
+                            .permute(1, 0, 2, 3).contiguous())
+                    cv_r = (cv_cap.reshape(B, C, n_kv_groups, d_head)
+                            .permute(1, 0, 2, 3).contiguous())
 
                 # attention_mask=None: all query positions attend to all C slots.
-                # query.contiguous(): q is typically a strided slice of the
-                # fused QKV projection; TE's joint layout detection only
-                # recognises the (q, k, v) family when strides are plain, and
-                # our replacement k/v no longer share the fused strides.
                 return (query.contiguous(), ck_r, cv_r, None) + tuple(args[4:])
             return _pre_hook
 
@@ -156,7 +160,8 @@ def _allow_nonflash_attention():
 
 
 def _forward_outputs(gpt, response_token_ids: torch.Tensor,
-                     gather_logits: bool = False):
+                     gather_logits: bool = False,
+                     packed_thd_kv_len: int | None = None):
     """One forward returning (logits, final hidden), both batch-first.
 
     ``gather_logits`` all-gathers the vocab-parallel output across TP — REQUIRED
@@ -169,14 +174,43 @@ def _forward_outputs(gpt, response_token_ids: torch.Tensor,
     # Probe tokens are stored CPU-side (trajectories are CPU-resident by
     # design); the forward runs wherever the model lives.
     response_token_ids = response_token_ids.to(next(gpt.parameters()).device)
-    hidden_sink: list = []
-    with _capture_final_hidden(gpt, hidden_sink), _allow_nonflash_attention():
-        output = gpt(
-            input_ids=response_token_ids,
-            position_ids=None,
-            attention_mask=None,
-            runtime_gather_output=gather_logits or None,
+    forward_kwargs = dict(
+        position_ids=None,
+        attention_mask=None,
+        runtime_gather_output=gather_logits or None,
+    )
+    saved_flash_decode = None
+    if packed_thd_kv_len is not None:
+        # The RL training model runs THD/packed attention — mirror the
+        # capture-forward recipe (kv_capture.py): THD PackedSeqParams +
+        # flash_decode disabled. cu_seqlens_kv reflects the INJECTED length,
+        # identical for every attention layer (one compact memory size C).
+        from megatron.core.packed_seq_params import PackedSeqParams
+        S = response_token_ids.shape[1]
+        device = response_token_ids.device
+        forward_kwargs["position_ids"] = torch.arange(
+            S, device=device).unsqueeze(0)
+        forward_kwargs["packed_seq_params"] = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=torch.tensor([0, S], dtype=torch.int32, device=device),
+            cu_seqlens_kv=torch.tensor([0, packed_thd_kv_len], dtype=torch.int32,
+                                       device=device),
+            max_seqlen_q=S,
+            max_seqlen_kv=packed_thd_kv_len,
+            total_tokens=S,
         )
+        saved_flash_decode = gpt.config.flash_decode
+        gpt.config.flash_decode = False
+    hidden_sink: list = []
+    try:
+        with _capture_final_hidden(gpt, hidden_sink), _allow_nonflash_attention():
+            output = gpt(
+                input_ids=response_token_ids,
+                **forward_kwargs,
+            )
+    finally:
+        if saved_flash_decode is not None:
+            gpt.config.flash_decode = saved_flash_decode
     # GPTModel returns (logits, ...) or just logits depending on version.
     logits = output[0] if isinstance(output, (tuple, list)) else output
     if len(hidden_sink) != 1:
@@ -191,6 +225,7 @@ def student_outputs(
     response_token_ids: torch.Tensor,
     compact_kv_list: List[Tuple[torch.Tensor, torch.Tensor]],
     gather_logits: bool = False,
+    packed_thd: bool = False,
 ):
     """Student forward with compact KV as context → StudentOutput.
 
@@ -215,9 +250,11 @@ def student_outputs(
     for p in frozen:
         p.requires_grad_(False)
 
+    kv_len = compact_kv_list[0][0].shape[1] if packed_thd else None
     try:
         with _inject_compact_kv(model, compact_kv_list):
-            return _forward_outputs(gpt, response_token_ids, gather_logits)
+            return _forward_outputs(gpt, response_token_ids, gather_logits,
+                                    packed_thd_kv_len=kv_len)
     finally:
         for p in frozen:
             p.requires_grad_(True)

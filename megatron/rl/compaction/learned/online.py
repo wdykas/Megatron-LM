@@ -403,7 +403,8 @@ def _train_compactor_impl(runtime_state: Any, args=None, optimizer=None) -> None
             )
         from megatron.rl.compaction.learned.capture.student_forward import student_outputs as _sf
         _m = _still_model  # capture for closure
-        _student_fn = lambda q, kv: _sf(_m, q, kv)
+        # packed_thd: the RL training model runs THD/packed attention.
+        _student_fn = lambda q, kv: _sf(_m, q, kv, packed_thd=True)
 
     # A failed training step raises: all ranks train identical schedules on their
     # own local KV slice, so any exception is deterministic across ranks and the
