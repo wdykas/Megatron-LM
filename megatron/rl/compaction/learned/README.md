@@ -27,7 +27,12 @@ captured KV (TP-local), never hardcoded.
 
 Weighted terms in `CompactorLossWeights`, combined per-chunk by
 `train_compactor_trajectory` (`training/training.py`, truncated-BPTT over
-chunks):
+chunks). **Defaults are minimal: only `teacher_kl` is on.** The recommended
+ladder is (1) `teacher_kl` alone — zero extra hyperparameters, the floor;
+(2) + one `future_latent` weight — the direct NextLat form (`dynamics` and
+`future_kv_reconstruction` are its proxies, the consistency terms are one
+idea expressed three ways); (3) decomposed proxies only to diagnose a
+failure of (2). Terms that lose the sweep get deleted, not left at zero:
 
 | term | signal |
 |---|---|

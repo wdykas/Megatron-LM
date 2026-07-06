@@ -52,18 +52,23 @@ from megatron.rl.compaction.learned.training.data import CompactKV, StudentFn
 class CompactorLossWeights:
     """Per-term weights for the combined training objective.
 
-    Start with ``teacher_kl=1.0`` and gradually introduce ``future_kl``
-    after warm-up to avoid destabilising early training.
+    DEFAULTS ARE MINIMAL BY DESIGN: only ``teacher_kl`` is on. Every other
+    term is strictly opt-in — the recommended ladder is (1) teacher_kl alone
+    (the STILL paper objective, zero extra hyperparameters), (2) + one
+    ``future_latent`` weight (the direct NextLat form; ``dynamics`` and
+    ``future_kv_reconstruction`` are its proxies), (3) decomposed proxies
+    only to diagnose a failure of (2). Terms that lose the C1 sweep get
+    DELETED, not left as zero-weight options.
     """
 
     teacher_kl:                float = 1.0
-    future_kl:                 float = 0.5
-    consistency:               float = 0.1
+    future_kl:                 float = 0.0
+    consistency:               float = 0.0
     task:                      float = 0.0    # enable after switching to RL training
-    retrieval:                 float = 0.1   # exact-recall probes (names, numbers, dates)
+    retrieval:                 float = 0.0   # exact-recall probes (names, numbers, dates)
     weighted_kl:               float = 0.0   # low-entropy token weighting; enable after warm-up
     path_consistency:          float = 0.0   # sequential vs combined path agreement
-    predictive:                float = 0.1   # weight for POMDP predictive coding loss
+    predictive:                float = 0.0   # weight for POMDP predictive coding loss
     kv_reconstruction:         float = 0.0  # attention-output matching loss; use when student_fn is not available
     future_kv_reconstruction:  float = 0.0
     dynamics:                  float = 0.0
