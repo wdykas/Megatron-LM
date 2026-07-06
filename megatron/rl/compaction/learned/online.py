@@ -343,6 +343,17 @@ def maybe_train_compactor(runtime_state: Any, args=None, optimizer=None) -> None
     optimizer: the Megatron MegatronOptimizer for the LLM (passed through to the
                attach step, which deliberately builds a standalone optimizer).
     """
+    # This is a TRAINING routine reached from the RL data path, which may run
+    # under an enclosing no_grad. Do not inherit the caller's grad mode: with
+    # grads disabled the mcore DDP wrap fails to build its grad-accumulation
+    # hooks (param.expand_as(param).grad_fn is None) and — worse — the trainer's
+    # ``if chunk_loss.requires_grad`` guards would skip every optimizer step
+    # SILENTLY.
+    with torch.enable_grad():
+        _train_compactor_impl(runtime_state, args, optimizer)
+
+
+def _train_compactor_impl(runtime_state: Any, args=None, optimizer=None) -> None:
     # Always drain the trajectory buffer to avoid unbounded GPU memory growth
     # even when the compactor is not yet ready.
     trajectories = runtime_state.compactor_trajectories
