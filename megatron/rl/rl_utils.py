@@ -268,6 +268,37 @@ Rollouts = list[TokenRollout | Rollout]
 GroupedRollouts = list[Rollouts]
 
 
+def extract_compactor_sequences(
+    rollouts: GroupedRollouts,
+) -> list[tuple[list[int], float]]:
+    """Full token sequences + rewards for the compactor's KV-capture replay.
+
+    One sequence per group (the group's first rollout — all share the prompt);
+    the sequence is the concatenation of the rollout's turn trajectories.
+    Hard-fails on text (non-token) rollouts: the compactor replays token ids
+    through a collective forward, so token trajectories are a requirement of
+    --rl-compaction-compactor-train / --rl-compaction-trajectory-dir.
+    """
+    out: list[tuple[list[int], float]] = []
+    for group in rollouts:
+        if not group or group[0] is None:
+            continue
+        r0 = group[0]
+        traj = r0.trajectory
+        if not traj:
+            continue
+        if not isinstance(traj[0], list):
+            raise TypeError(
+                "compactor capture needs TokenRollout (token-id trajectories); "
+                f"got {type(r0).__name__} with trajectory[0] of type "
+                f"{type(traj[0]).__name__}. Use an inference interface that "
+                "returns tokens.")
+        seq_ids = [t for turn in traj for t in turn]
+        if seq_ids:
+            out.append((seq_ids, float(r0.reward)))
+    return out
+
+
 @dataclass(slots=True)
 class RolloutStats:
     rewards: list[list[float]] # inner list is for a group
@@ -659,18 +690,8 @@ def get_environment_rollouts(
         if (getattr(args, "rl_compaction_compactor_train", False)
                 or getattr(args, "rl_compaction_trajectory_dir", None)):
             _rs = get_rl_runtime_state()
-            for group in rollouts:
-                if not group or group[0] is None:
-                    continue
-                _prompt_ids = list(getattr(group[0], "prompt_tokens", []) or [])
-                _resp_ids = list(getattr(group[0], "response_tokens", []) or [])
-                if not (_prompt_ids or _resp_ids):
-                    continue
-                _reward = sum(
-                    float(r.reward) for r in group
-                    if r is not None and getattr(r, "reward", None) is not None
-                )
-                _rs.compactor_raw_sequences.append((_prompt_ids + _resp_ids, _reward))
+            _rs.compactor_raw_sequences.extend(
+                extract_compactor_sequences(rollouts))
 
     if args.rl_offload_optimizer_during_inference:
         with nvtx_range("restore-optimizer-state-and-grad-buffers-after-inference"):

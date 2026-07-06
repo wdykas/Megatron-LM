@@ -565,6 +565,34 @@ class TestRLUtils:
             torch.ones(1, 5, dtype=torch.bool), torch.zeros(1, 6), gs)
         assert gs.kv_stale_token_frac is None             # silently skipped
 
+    def test_extract_compactor_sequences(self):
+        """The KV-capture collector reads TokenRollout.trajectory — the field
+        that exists — and hard-fails on text rollouts (the old getattr-default
+        version silently collected nothing for 14 iterations)."""
+        from megatron.rl.agent.api import TokenRollout
+        def tr(turns, reward):
+            return TokenRollout(
+                trajectory=turns, reward=reward, env_id="e",
+                policy_staleness=[[0]] * len(turns),
+                kv_cache_staleness=[[0]] * len(turns),
+                completed_at_step=[0] * len(turns),
+                num_evictions=[0] * len(turns))
+        groups = [
+            [tr([[1, 2, 3], [4, 5]], 1.5), tr([[9]], 0.0)],
+            [],                                            # empty group skipped
+            [tr([[7, 8]], -1.0)],
+        ]
+        seqs = rl_utils.extract_compactor_sequences(groups)
+        assert seqs == [([1, 2, 3, 4, 5], 1.5), ([7, 8], -1.0)]
+
+    def test_extract_compactor_sequences_rejects_text(self):
+        from megatron.rl.agent.api import Rollout
+        text = Rollout(trajectory=["hello"], reward=1.0, env_id="e",
+                       policy_staleness=[[0]], kv_cache_staleness=[[0]],
+                       completed_at_step=[0], num_evictions=[0])
+        with pytest.raises(TypeError, match="TokenRollout"):
+            rl_utils.extract_compactor_sequences([[text]])
+
     def test_align_generated_series_matches_logprob_alignment(self):
         """The shared alignment core places series at the same positions the
         inference-logprob alignment uses."""
