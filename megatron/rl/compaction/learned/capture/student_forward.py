@@ -16,6 +16,7 @@ This implements the STILL paper's teacher-student training objective:
 
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from typing import List, Tuple
 
@@ -119,6 +120,34 @@ def _capture_final_hidden(gpt, sink: list):
         h.remove()
 
 
+@contextmanager
+def _allow_nonflash_attention():
+    """Permit fused/unfused attention for the injected forward.
+
+    Serving configs force the flash backend (--attention-backend flash sets
+    NVTE_FUSED_ATTN=0 and NVTE_UNFUSED_ATTN=0), and flash cannot run the
+    injected student forward's shape (S_q queries over C replaced slots,
+    no_mask) — leaving NO available backend. Re-enable the other backends and
+    force TE to re-select for this forward, then restore the serving
+    configuration (and force re-selection again) on exit.
+    """
+    import transformer_engine.pytorch.attention.dot_product_attention as _dpa
+
+    saved = {k: os.environ.get(k) for k in ("NVTE_FUSED_ATTN", "NVTE_UNFUSED_ATTN")}
+    os.environ["NVTE_FUSED_ATTN"] = "1"
+    os.environ["NVTE_UNFUSED_ATTN"] = "1"
+    _dpa._attention_backends["backend_selection_requires_update"] = True
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        _dpa._attention_backends["backend_selection_requires_update"] = True
+
+
 def _forward_outputs(gpt, response_token_ids: torch.Tensor,
                      gather_logits: bool = False):
     """One forward returning (logits, final hidden), both batch-first.
@@ -134,7 +163,7 @@ def _forward_outputs(gpt, response_token_ids: torch.Tensor,
     # design); the forward runs wherever the model lives.
     response_token_ids = response_token_ids.to(next(gpt.parameters()).device)
     hidden_sink: list = []
-    with _capture_final_hidden(gpt, hidden_sink):
+    with _capture_final_hidden(gpt, hidden_sink), _allow_nonflash_attention():
         output = gpt(
             input_ids=response_token_ids,
             position_ids=None,
