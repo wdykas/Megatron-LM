@@ -81,7 +81,12 @@ class NixlPullHandle:
         self._xfer = None
 
     def wait(self) -> None:
-        """Block until the transfer completes."""
+        """Block until the transfer completes.
+
+        Used on backpressure paths that must drain a transfer now; NIXL has
+        no blocking wait, so this polls. The steady state polls in-flight
+        transfers once per engine step instead and never blocks here.
+        """
         while not self.poll():
             time.sleep(_POLL_INTERVAL_S)
 
