@@ -145,7 +145,14 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
             prompt, request.generation_args
         )
 
-        responses = await asyncio.gather(*[request.inference_interface.agenerate(inference_request) for _ in range(request.rollouts_per_group)])
+        # Tag each group member with its index so the inference side can make
+        # deterministic within-group treatment splits (e.g. A1 kv_compact arms).
+        responses = await asyncio.gather(*[
+            request.inference_interface.agenerate(
+                inference_request.model_copy(update={"rollout_index": i})
+            )
+            for i in range(request.rollouts_per_group)
+        ])
         return [await self.rollout_from_response(request, response, golden) for response in responses]
 
     async def _evaluation(

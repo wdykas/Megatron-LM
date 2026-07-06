@@ -565,6 +565,19 @@ class TestRLUtils:
             torch.ones(1, 5, dtype=torch.bool), torch.zeros(1, 6), gs)
         assert gs.kv_stale_token_frac is None             # silently skipped
 
+    def test_deterministic_split_arm(self):
+        """A1: Bresenham arm assignment — exact proportions over any prefix."""
+        from megatron.rl.inference.api import deterministic_split_arm
+        # fraction 0.5 alternates
+        arms = [deterministic_split_arm(i, 0.5) for i in range(8)]
+        assert arms == [False, True, False, True, False, True, False, True]
+        # any fraction: first-n counts are exact
+        for frac in (0.25, 0.5, 0.75, 1.0):
+            for n in (4, 8, 16):
+                got = sum(deterministic_split_arm(i, frac) for i in range(n))
+                assert got == round(n * frac), (frac, n, got)
+        assert not any(deterministic_split_arm(i, 0.0) for i in range(8))
+
     def test_extract_compactor_sequences(self):
         """The KV-capture collector reads TokenRollout.trajectory — the field
         that exists — and hard-fails on text rollouts (the old getattr-default

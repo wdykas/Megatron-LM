@@ -59,7 +59,14 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         # compact and full-cache arms; the arm is recorded on the response.
         kv_compacted = None
         if args.rl_compaction_split_fraction is not None:
-            kv_compacted = random.random() < args.rl_compaction_split_fraction
+            if request.rollout_index is not None:
+                # Deterministic within-group split: exact arm proportions in
+                # every group (Bernoulli fallback only for untagged requests).
+                from megatron.rl.inference.api import deterministic_split_arm
+                kv_compacted = deterministic_split_arm(
+                    request.rollout_index, args.rl_compaction_split_fraction)
+            else:
+                kv_compacted = random.random() < args.rl_compaction_split_fraction
 
         # Things that may be problematic when doing this switch
         # - Add BOS token
