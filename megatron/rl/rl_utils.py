@@ -289,6 +289,9 @@ class RolloutStats:
     min_inf_prob: None | float
     max_inf_prob: None | float
     mean_inf_prob: None | float
+    current_policy_step: None | float
+    prox_policy_step: None | float
+    prox_to_current_step_ratio: None | float
     policy_epoch: list[list[int]]
     kv_cache_epoch: list[list[int]]
     completed_epochs: list[list[int]]
@@ -315,6 +318,8 @@ class RLRuntimeState:
         self.actual_tokens_per_sec = None
         # Fraction of bin capacity filled with real tokens (actual / total capacity)
         self.packing_efficiency = None
+        self.ema_probe = None
+        self.ema_probe_prev = None
 
     def reset_iteration_counters(self, iteration):
         """Reset per-iteration counters."""
@@ -1178,6 +1183,9 @@ def compute_group_stats(
         min_inf_prob=None,
         max_inf_prob=None,
         mean_inf_prob=None,
+        current_policy_step=None,
+        prox_policy_step=None,
+        prox_to_current_step_ratio=None,
         policy_epoch=all_policy_epoch,
         kv_cache_epoch=all_kv_cache_epoch,
         completed_epochs=all_completed_epochs,
@@ -1365,6 +1373,9 @@ def maybe_log_training_metrics(
         'min_inf_prob': group_stats.min_inf_prob,
         'max_inf_prob': group_stats.max_inf_prob,
         'mean_inf_prob': group_stats.mean_inf_prob,
+        'ema/current_policy_step': group_stats.current_policy_step,
+        'ema/prox_policy_step': group_stats.prox_policy_step,
+        'ema/prox_to_current_step_ratio': group_stats.prox_to_current_step_ratio,
     }
 
     traj_lens = group_stats.traj_lens
@@ -1934,11 +1945,30 @@ def prepare_data_for_update(
             pg_collection = get_attr_wrapped_model(model, "pg_collection")
             pp_group = pg_collection.pp
 
+            if runtime_state.ema_probe is None:
+                probe_pos = torch.arange(trajs.shape[1]).unsqueeze(0)
+                runtime_state.ema_probe = (
+                    trajs[:1].cpu(),
+                    probe_pos,
+                    generation_masks[:1, 1:].cpu(),
+                )
+
+            def probe_logprobs():
+                probe_tokens, probe_pos, _ = runtime_state.ema_probe
+                return compute_logprobs_batch(
+                    model, DataLoader(TensorDataset(probe_tokens, probe_pos), batch_size=1),
+                    forward_backward_func, None, 1, args.seq_length, 1,
+                    args.decoder_seq_length, dtype, pp_group, False,
+                ).float()
+
+            current_probe_logprobs = probe_logprobs()
+
             cur_st_dict = {
                 k: (v.cpu() if v is not None else v) for k, v in model.state_dict().items()
             }
             with torch.no_grad(), nvtx_range("rl/compute-old-logprobs", time=True):
                 model.load_state_dict(prox_pi_state_dict)
+                prox_probe_logprobs = probe_logprobs()
                 old_logprobs = compute_logprobs_batch(
                     model=model,
                     data_loader=data_loader,
@@ -1971,6 +2001,25 @@ def prepare_data_for_update(
 
                 # logprobs are [b, seq, h] now.
                 model.load_state_dict(cur_st_dict)
+
+                if runtime_state.ema_probe_prev is not None:
+                    prev_current, prev_prox = runtime_state.ema_probe_prev
+                    valid = runtime_state.ema_probe[2]
+                    stats = torch.tensor([
+                        (current_probe_logprobs - prev_current).abs()[valid].sum(),
+                        (prox_probe_logprobs - prev_prox).abs()[valid].sum(),
+                        valid.sum(),
+                    ], device='cuda', dtype=torch.float64)
+                    torch.distributed.all_reduce(
+                        stats, group=mpu.get_data_parallel_group()
+                    )
+                    group_stats.current_policy_step = (stats[0] / stats[2]).item()
+                    group_stats.prox_policy_step = (stats[1] / stats[2]).item()
+                    group_stats.prox_to_current_step_ratio = (stats[1] / stats[0]).item()
+                runtime_state.ema_probe_prev = (
+                    current_probe_logprobs,
+                    prox_probe_logprobs,
+                )
 
                 with nvtx_range("rl/synchronize-cuda-and-collect-garbage", time=True):
                     torch.cuda.synchronize()
