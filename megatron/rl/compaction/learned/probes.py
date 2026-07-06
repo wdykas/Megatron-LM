@@ -45,6 +45,7 @@ def sufficiency_kl(
     query_tokens: torch.Tensor,
     compact_kv: List[Tuple[torch.Tensor, torch.Tensor]],
     teacher_logits: torch.Tensor,
+    gather_logits: bool = False,
 ) -> torch.Tensor:
     """Per-position sufficiency KL of a compacted cache.
 
@@ -56,5 +57,6 @@ def sufficiency_kl(
     Returns (B, S_q) fp32 KL per position. Mean it for a scalar sufficiency
     score; argmax it to localize the worst-hit positions.
     """
-    student = student_outputs(model, query_tokens, compact_kv).logits
+    student = student_outputs(model, query_tokens, compact_kv,
+                               gather_logits=gather_logits).logits
     return kl_from_logits(teacher_logits, student)

@@ -80,7 +80,8 @@ class EvictionPolicy(torch.nn.Module):
 
 def make_sufficiency_reward(model, query_tokens: torch.Tensor,
                             full_kv: list[tuple[torch.Tensor, torch.Tensor]],
-                            teacher_logits: torch.Tensor):
+                            teacher_logits: torch.Tensor,
+                            gather_logits: bool = False):
     """Reward = −(mean sufficiency-KL of the retained rows), via the real model.
 
     full_kv: per attention layer (K, V), each (B, S, d_kv) — the captured full
@@ -94,7 +95,8 @@ def make_sufficiency_reward(model, query_tokens: torch.Tensor,
             return -float(teacher_logits.shape[-1])
         subset = [(k[:, mask], v[:, mask]) for k, v in full_kv]
         with torch.no_grad():
-            kl = sufficiency_kl(model, query_tokens, subset, teacher_logits)
+            kl = sufficiency_kl(model, query_tokens, subset, teacher_logits,
+                                gather_logits=gather_logits)
         return -kl.mean().item()
 
     return reward

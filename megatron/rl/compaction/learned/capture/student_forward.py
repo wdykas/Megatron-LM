@@ -112,8 +112,15 @@ def _capture_final_hidden(gpt, sink: list):
         h.remove()
 
 
-def _forward_outputs(gpt, response_token_ids: torch.Tensor):
-    """One forward returning (logits, final hidden), both batch-first."""
+def _forward_outputs(gpt, response_token_ids: torch.Tensor,
+                     gather_logits: bool = False):
+    """One forward returning (logits, final hidden), both batch-first.
+
+    ``gather_logits`` all-gathers the vocab-parallel output across TP — REQUIRED
+    for any softmax/KL over the vocab axis under TP>1 (a vocab shard softmax is
+    silently wrong). Default False preserves the trainer's behaviour (TP-1
+    training, CE handled elsewhere).
+    """
     from megatron.rl.compaction.learned.training.data import StudentOutput
 
     hidden_sink: list = []
@@ -122,6 +129,7 @@ def _forward_outputs(gpt, response_token_ids: torch.Tensor):
             input_ids=response_token_ids,
             position_ids=None,
             attention_mask=None,
+            runtime_gather_output=gather_logits or None,
         )
     # GPTModel returns (logits, ...) or just logits depending on version.
     logits = output[0] if isinstance(output, (tuple, list)) else output
@@ -136,6 +144,7 @@ def student_outputs(
     model,
     response_token_ids: torch.Tensor,
     compact_kv_list: List[Tuple[torch.Tensor, torch.Tensor]],
+    gather_logits: bool = False,
 ):
     """Student forward with compact KV as context → StudentOutput.
 
@@ -162,14 +171,15 @@ def student_outputs(
 
     try:
         with _inject_compact_kv(model, compact_kv_list):
-            return _forward_outputs(gpt, response_token_ids)
+            return _forward_outputs(gpt, response_token_ids, gather_logits)
     finally:
         for p in frozen:
             p.requires_grad_(True)
 
 
 @torch.no_grad()
-def teacher_outputs(model, response_token_ids: torch.Tensor):
+def teacher_outputs(model, response_token_ids: torch.Tensor,
+                    gather_logits: bool = False):
     """Full-KV teacher forward → StudentOutput (logits + final hidden).
 
     The capture side of the future-latent loss: run the frozen model with its
@@ -178,4 +188,4 @@ def teacher_outputs(model, response_token_ids: torch.Tensor):
     ``TrainingProbe.teacher_logits`` / ``teacher_hidden``.
     """
     gpt = _unwrap_model(model)
-    return _forward_outputs(gpt, response_token_ids)
+    return _forward_outputs(gpt, response_token_ids, gather_logits)
