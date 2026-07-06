@@ -82,9 +82,12 @@ def _inject_compact_kv(model, compact_kv_list: List[Tuple[torch.Tensor, torch.Te
                 d_head = orig_key.shape[3]
                 C = ck_cap.shape[1]
 
-                # (B, C, d_kv) → (B, C, n_kv_groups, d_head) → (C, B, n_kv_groups, d_head)
-                ck_r = ck_cap.reshape(B, C, n_kv_groups, d_head).permute(1, 0, 2, 3)
-                cv_r = cv_cap.reshape(B, C, n_kv_groups, d_head).permute(1, 0, 2, 3)
+                # (B, C, d_kv) → (B, C, n_kv_groups, d_head) → (C, B, n_kv_groups, d_head).
+                # contiguous(): the sources may be views (e.g. BeliefMemory
+                # per-layer slices) and TE rejects permuted strides with
+                # 'The provided qkv memory layout is not supported!'.
+                ck_r = ck_cap.reshape(B, C, n_kv_groups, d_head).permute(1, 0, 2, 3).contiguous()
+                cv_r = cv_cap.reshape(B, C, n_kv_groups, d_head).permute(1, 0, 2, 3).contiguous()
 
                 # attention_mask=None: all query positions attend to all C slots
                 return (query, ck_r, cv_r, None) + tuple(args[4:])
