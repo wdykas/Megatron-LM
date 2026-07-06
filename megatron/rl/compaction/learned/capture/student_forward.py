@@ -89,8 +89,12 @@ def _inject_compact_kv(model, compact_kv_list: List[Tuple[torch.Tensor, torch.Te
                 ck_r = ck_cap.reshape(B, C, n_kv_groups, d_head).permute(1, 0, 2, 3).contiguous()
                 cv_r = cv_cap.reshape(B, C, n_kv_groups, d_head).permute(1, 0, 2, 3).contiguous()
 
-                # attention_mask=None: all query positions attend to all C slots
-                return (query, ck_r, cv_r, None) + tuple(args[4:])
+                # attention_mask=None: all query positions attend to all C slots.
+                # query.contiguous(): q is typically a strided slice of the
+                # fused QKV projection; TE's joint layout detection only
+                # recognises the (q, k, v) family when strides are plain, and
+                # our replacement k/v no longer share the fused strides.
+                return (query.contiguous(), ck_r, cv_r, None) + tuple(args[4:])
             return _pre_hook
 
         h = layer.self_attention.core_attention.register_forward_pre_hook(
