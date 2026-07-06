@@ -130,6 +130,9 @@ def _forward_outputs(gpt, response_token_ids: torch.Tensor,
     """
     from megatron.rl.compaction.learned.training.data import StudentOutput
 
+    # Probe tokens are stored CPU-side (trajectories are CPU-resident by
+    # design); the forward runs wherever the model lives.
+    response_token_ids = response_token_ids.to(next(gpt.parameters()).device)
     hidden_sink: list = []
     with _capture_final_hidden(gpt, hidden_sink):
         output = gpt(
