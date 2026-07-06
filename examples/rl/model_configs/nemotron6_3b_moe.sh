@@ -65,8 +65,6 @@ MODEL_OPTIONS="\
   --cuda-graph-impl local \
   --use-checkpoint-args \
   --enable-experimental \
-  --cross-entropy-loss-fusion \
-  --cross-entropy-fusion-impl native \
   --moe-aux-loss-coeff 0.0 \
   --moe-router-dtype fp64 \
   --moe-router-load-balancing-type aux_loss \
@@ -109,8 +107,11 @@ MODEL_OPTIONS="\
   --overlap-grad-reduce \
   --overlap-param-gather \
   --no-create-attention-mask-in-dataloader \
-  --lr 3e-6 \
-  --min-lr 3e-6 \
+  --adam-beta1 0.9 \
+  --adam-beta2 0.999 \
+  --adam-eps 1e-8 \
+  --lr 3e-5 \
+  --min-lr 3e-5 \
   --lr-decay-style constant \
   --lr-warmup-samples 640 \
   --lr-warmup-init 0.3e-7 "

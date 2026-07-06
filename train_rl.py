@@ -134,6 +134,7 @@ def loss_func(
     truncated_from_above_flat = truncated_from_above.float().reshape(-1).to(device)
     truncated_from_below_flat = truncated_from_below.float().reshape(-1).to(device)
 
+
     masked_kl = torch.sum(loss_mask_flat * kl_term_flat)
     masked_ratios = torch.sum(loss_mask_flat * ratios_flat)
     masked_entropy = torch.sum(loss_mask_flat * entropy_term_flat)

@@ -3735,6 +3735,8 @@ def train(
         # this iteration, so save_checkpoint_and_time persists a value consistent with the
         # saved weights. beta=0 => prox == current weights (vanilla GRPO baseline).
         if args.perform_rl_step:
+            if args.overlap_param_gather:
+                force_param_sync(model)
             cur_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
             b = args.grpo_prox_ewma_beta
             prox_pi_state_dict = {k: ((1. - b) * cur_state_dict[k] + b * v if v is not None else v) for k, v in prox_pi_state_dict.items()}
