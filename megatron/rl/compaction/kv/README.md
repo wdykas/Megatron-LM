@@ -189,13 +189,17 @@ have no evicted spans to archive). Verified end-to-end on Nano: a needle that
 `streaming_llm @ 0.4` alone loses (model confabulates) is recovered exactly
 once the trigger restores its span mid-generation.
 
-Speculative prefetch (`--kv-compaction-prefetch-margin`, optional, must be ≤
-the firing margin): when the margin crosses this lower threshold, the best
-span's CPU→GPU copy starts on a side stream while decode continues; a later
+Speculative prefetch — two independent triggers, either stages the best
+span's CPU→GPU copy on a side stream while decode continues, so a later
 firing splices the staged copy with no synchronous PCIe stall (`take` logs
-`prefetched` vs `sync copy`). Only helps when the margin dwells in the
-prefetch band before firing — a fire on the first decode step is always a
-sync copy.
+`prefetched` vs `sync copy`):
+- `--kv-compaction-prefetch-margin` (≤ the firing margin): static band —
+  margins close to the threshold in absolute terms.
+- `--kv-compaction-prefetch-horizon N`: rising trend — the one-step margin
+  slope predicts a crossing of the firing threshold within N decode steps;
+  catches a query warming up toward evicted content before any static band.
+A fire on the first decode step is always a sync copy — there was no earlier
+step to stage from.
 
 ### Serving flags (`tools/run_dynamic_text_generation_server.py`)
 
@@ -211,6 +215,7 @@ sync copy.
 --kv-compaction-archive                 # CPU archive + retrieval (Track D)
 --kv-compaction-retrieval-margin -3.2   # trigger threshold, REQUIRED w/ archive
 --kv-compaction-prefetch-margin -5.0    # optional speculative staging threshold
+--kv-compaction-prefetch-horizon 4      # optional trend-predictive staging
 --kv-compaction-rope-mode logical       # RoPE models: logical | renumber
                                         # (with archive: --cuda-graph-impl none)
 ```

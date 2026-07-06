@@ -75,6 +75,7 @@ class LiveKVCompactor:
         archive: bool = False,
         retrieval_margin: float | None = None,
         prefetch_margin: float | None = None,
+        prefetch_horizon: int | None = None,
         max_retrievals_per_request: int = 4,
         rope_mode: str | None = None,
     ) -> None:
@@ -107,9 +108,11 @@ class LiveKVCompactor:
         self.archive_enabled = archive
         self.retrieval_margin = retrieval_margin
         self.prefetch_margin = prefetch_margin
+        self.prefetch_horizon = prefetch_horizon
         self.max_retrievals_per_request = max_retrievals_per_request
         self._archive = None
         self._retrieval_counts: dict[int, int] = {}
+        self._last_margin: dict[int, float] = {}
         self._prefetch_stream: torch.cuda.Stream | None = None
         if archive:
             if strategy == "belief_still":
@@ -134,9 +137,12 @@ class LiveKVCompactor:
                     f"retrieval_margin ({retrieval_margin}): prefetch is the "
                     "more permissive threshold — it starts the CPU->GPU copy "
                     "early so the firing threshold splices a staged span.")
+            if prefetch_horizon is not None and prefetch_horizon < 1:
+                raise ValueError(
+                    f"prefetch_horizon must be >= 1 steps, got {prefetch_horizon}")
             from .archive import KVArchive
             self._archive = KVArchive()
-            if prefetch_margin is not None:
+            if prefetch_margin is not None or prefetch_horizon is not None:
                 self._prefetch_stream = torch.cuda.Stream()
 
         # Position embeddings. Cached keys are stored POST-rotation, so pruning
@@ -316,6 +322,25 @@ class LiveKVCompactor:
         for rid in [r for r in self._logical_pos if r not in live_ids]:
             del self._logical_pos[rid]
 
+    def _should_prefetch(self, margin: float, last_margin: float | None) -> bool:
+        """Speculative staging decision for a below-threshold margin.
+
+        Two independent triggers (either fires):
+        - static band: margin above ``prefetch_margin`` (close to the
+          firing threshold in absolute terms);
+        - rising trend: the one-step slope predicts the margin crosses the
+          firing threshold within ``prefetch_horizon`` decode steps —
+          catches a query warming up toward evicted content before it
+          enters any static band.
+        """
+        if self.prefetch_margin is not None and margin > self.prefetch_margin:
+            return True
+        if self.prefetch_horizon is not None and last_margin is not None:
+            slope = margin - last_margin
+            return (slope > 0
+                    and margin + self.prefetch_horizon * slope > self.retrieval_margin)
+        return False
+
     def retrieve_for_decoding_requests(self) -> None:
         """Negative-cache retrieval: restore archived spans the decode queries ask for.
 
@@ -349,8 +374,10 @@ class LiveKVCompactor:
             if os.environ.get("KV_COMPACTION_DEBUG"):
                 logger.info("[kv-retrieval] request id=%d: margin %.3f (threshold %.3f, "
                             "best span %d)", rid, margin, self.retrieval_margin, span_idx)
+            last_margin = self._last_margin.get(rid)
+            self._last_margin[rid] = margin
             if margin <= self.retrieval_margin:
-                if self.prefetch_margin is not None and margin > self.prefetch_margin:
+                if self._should_prefetch(margin, last_margin):
                     # Speculative: stage the likely span on the side stream so a
                     # later firing splices it without a synchronous PCIe copy.
                     self._archive.prefetch(rid, span_idx, self._prefetch_stream)
@@ -378,6 +405,8 @@ class LiveKVCompactor:
         self._archive.drop_all_except(live_ids)
         for rid in [r for r in self._retrieval_counts if r not in live_ids]:
             del self._retrieval_counts[rid]
+        for rid in [r for r in self._last_margin if r not in live_ids]:
+            del self._last_margin[rid]
 
     def compact_prefilled_requests(self, is_decode_only: bool) -> None:
         """Prune the paged KV of every request whose prefill just completed.

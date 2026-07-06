@@ -98,7 +98,13 @@ class _StubEngine:
 
     def __init__(self, pos_emb, rotary=None):
         from types import SimpleNamespace
-        model = SimpleNamespace(position_embedding_type=pos_emb)
+        # One fake attention layer so archive/snapkv modes can register Q hooks.
+        attn = SimpleNamespace(core_attention=object(),
+                               flash_decode_and_prefill=lambda *a, **k: None)
+        model = SimpleNamespace(
+            position_embedding_type=pos_emb,
+            decoder=SimpleNamespace(layers=[SimpleNamespace(self_attention=attn)]),
+        )
         if rotary is not None:
             model.rotary_pos_emb = rotary
         self.context = _make_context()
@@ -139,6 +145,44 @@ class TestRopeModeGuards:
     def test_logical_mode_builds_on_rope_model(self):
         comp = self._build("rope", rope_mode="logical")
         assert comp.rope_mode == "logical" and comp._inv_freq is None
+
+
+class TestPrefetchTrigger:
+    """The static-band + rising-trend prefetch predicate (D3)."""
+
+    def _comp(self, prefetch_margin=None, prefetch_horizon=None):
+        from megatron.rl.compaction.kv.live import LiveKVCompactor
+        return LiveKVCompactor(
+            _StubEngine("none"), strategy="streaming_llm", budget_ratio=0.5,
+            archive=True, retrieval_margin=-3.0,
+            prefetch_margin=prefetch_margin, prefetch_horizon=prefetch_horizon)
+
+    def test_static_band(self):
+        comp = self._comp(prefetch_margin=-5.0)
+        assert comp._should_prefetch(-4.0, None)
+        assert not comp._should_prefetch(-5.5, None)
+
+    def test_rising_trend_predicts_crossing(self):
+        comp = self._comp(prefetch_horizon=3)
+        # -6 -> -4: slope +2, predicted -4 + 3*2 = +2 > -3 -> stage.
+        assert comp._should_prefetch(-4.0, -6.0)
+        # falling margin never stages.
+        assert not comp._should_prefetch(-4.0, -3.5)
+        # rising but too slow for the horizon: -4 + 3*0.1 = -3.7 <= -3.
+        assert not comp._should_prefetch(-4.0, -4.1)
+        # no history yet.
+        assert not comp._should_prefetch(-4.0, None)
+
+    def test_either_trigger_fires(self):
+        comp = self._comp(prefetch_margin=-4.5, prefetch_horizon=2)
+        assert comp._should_prefetch(-4.0, -3.9)   # band, despite falling trend
+        assert comp._should_prefetch(-5.0, -4.0) is False  # below band, falling
+        assert comp._should_prefetch(-5.0, -6.5)   # below band, trend predicts
+
+    def test_horizon_validation(self):
+        import pytest as _pytest
+        with _pytest.raises(ValueError, match="prefetch_horizon"):
+            self._comp(prefetch_horizon=0)
 
 
 class TestOverwriteKeys:

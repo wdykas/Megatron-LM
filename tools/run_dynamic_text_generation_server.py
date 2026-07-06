@@ -79,6 +79,12 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
              "firing splices a staged span with no PCIe stall.",
     )
     parser.add_argument(
+        "--kv-compaction-prefetch-horizon", type=int, default=None,
+        help="Trend-predictive prefetch: stage the best span when the margin's "
+             "one-step slope predicts it crosses the firing threshold within "
+             "this many decode steps.",
+    )
+    parser.add_argument(
         "--kv-compaction-rope-mode", type=str, default=None,
         choices=["logical", "renumber"],
         help="Required for RoPE models. 'logical': keep original positions of "
@@ -164,6 +170,7 @@ if __name__ == "__main__":
                 archive=args.kv_compaction_archive,
                 retrieval_margin=args.kv_compaction_retrieval_margin,
                 prefetch_margin=args.kv_compaction_prefetch_margin,
+                prefetch_horizon=args.kv_compaction_prefetch_horizon,
                 rope_mode=args.kv_compaction_rope_mode,
             )
             print(f"[kv-compaction] live compaction enabled: "
