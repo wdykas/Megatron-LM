@@ -310,10 +310,17 @@ def build_compactor_trajectories(runtime_state: Any, model, args) -> None:
         if not chunks:
             continue
 
-        # Probe at the last chunk so kv_recon has a query target.
+        # Probe at the last chunk so kv_recon has a query target. Sequence
+        # parallelism scatters the forward along S, so probe length must be
+        # TP-divisible (same constraint the capture forward above satisfies);
+        # trim the trailing remainder here so the student logits stay aligned
+        # with the CE labels derived from these SAME tokens.
+        probe_len = seq_len - (seq_len % tp_size)
+        if probe_len == 0:
+            continue
         last_idx = len(chunks) - 1
         probe = TrainingProbe(
-            query_tokens=token_t[:seq_len].unsqueeze(0).cpu(),
+            query_tokens=token_t[:probe_len].unsqueeze(0).cpu(),
             teacher_logits=None,
             answer_tokens=None,
             advantage=reward if reward != 0.0 else None,
