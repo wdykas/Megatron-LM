@@ -132,6 +132,39 @@ class TestKVArchive:
         assert arch.score(9, [torch.zeros(2, 8, device="cuda")],
                           torch.zeros(2, 4, 1, 8, device="cuda")) is None
 
+    def test_flywheel_logs_restored_and_unused(self, tmp_path):
+        """take() spans log label 1, spans left at request end log label 0."""
+        k, v = self._kv()
+        arch = KVArchive(max_span=4, flywheel_dir=str(tmp_path))
+        arch.store_evicted(5, k, v, list(range(0, 24, 2)))
+        n_spans = len(arch._spans[5])
+        arch.take(5, 0)                                   # a proven mistake
+        arch.drop_all_except(set())                       # request finishes
+        files = list(tmp_path.glob("events_*.pt"))
+        assert len(files) == 1
+        blob = torch.load(files[0], weights_only=True)
+        assert sorted(blob["labels"], reverse=True)[0] == 1
+        assert blob["labels"].count(1) == 1
+        assert blob["labels"].count(0) == n_spans - 1
+        assert blob["keys"][0].dim() == 4                 # (L, T, H, D)
+
+    def test_flywheel_rotation_bounds_files(self, tmp_path):
+        k, v = self._kv()
+        arch = KVArchive(max_span=4, flywheel_dir=str(tmp_path),
+                         flywheel_max_files=3)
+        for rid in range(7):
+            arch.store_evicted(rid, k, v, [0, 1])
+            arch.drop(rid)
+        assert len(list(tmp_path.glob("events_*.pt"))) <= 3
+
+    def test_flywheel_off_by_default(self, tmp_path):
+        k, v = self._kv()
+        arch = KVArchive(max_span=4)
+        arch.store_evicted(5, k, v, [0, 1])
+        arch.take(5, 0)
+        arch.drop_all_except(set())
+        assert not list(tmp_path.glob("events_*.pt"))
+
     def test_prefetch_then_take_returns_staged_gpu(self):
         k, v = self._kv()
         arch = KVArchive(max_span=4)

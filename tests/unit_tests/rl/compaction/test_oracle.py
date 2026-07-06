@@ -106,6 +106,53 @@ class TestLearnedOracleScorer:
         torch.testing.assert_close(loaded.score_tokens(k), scorer.score_tokens(k))
 
 
+class TestFlywheelRefit:
+    def _events(self, tmp_path, u):
+        """Two event files: spans aligned with u were restored (label 1)."""
+        from megatron.rl.compaction.kv.archive import KVArchive
+        g = torch.Generator(device="cuda").manual_seed(0)
+        arch = KVArchive(max_span=4, flywheel_dir=str(tmp_path))
+        for rid in range(4):
+            k = torch.randn(L, 24, H, D, device="cuda", generator=g)
+            k[:, 8:12] += u.view(1, 1, H, D) * 4.0        # the "needed" span
+            arch.store_evicted(rid, k, k.clone(), list(range(0, 8)))
+            # restore the span that contains positions 8..12
+            target = next(i for i, sp in enumerate(arch._spans[rid])
+                          if sp.positions[0] == 8)
+            arch.take(rid, target)
+            arch.drop(rid)
+
+    def test_refit_separates_restored_from_unused(self, tmp_path):
+        from megatron.rl.compaction.kv.oracle import fit_scorer_on_flywheel
+        torch.manual_seed(0)
+        u = torch.randn(H * D, device="cuda")
+        u = u / u.norm()
+        self._events(tmp_path, u)
+        scorer = LearnedOracleScorer(
+            OracleScorerConfig(d_key=H * D, n_layers=L, hidden=32)).cuda()
+        losses = fit_scorer_on_flywheel(scorer, str(tmp_path), epochs=150, lr=3e-3)
+        assert losses[-1] < losses[0] * 0.6
+        # Restored-like keys must now outscore unused-like keys.
+        g = torch.Generator(device="cuda").manual_seed(9)
+        base = torch.randn(16, H * D, device="cuda", generator=g)
+        needed = base + u * 4.0
+        s_need = scorer(scorer.features(needed, 0)).mean()
+        s_rest = scorer(scorer.features(base, 0)).mean()
+        assert (s_need - s_rest).item() > 0.5
+
+    def test_refit_requires_both_classes(self, tmp_path):
+        from megatron.rl.compaction.kv.archive import KVArchive
+        from megatron.rl.compaction.kv.oracle import fit_scorer_on_flywheel
+        arch = KVArchive(max_span=4, flywheel_dir=str(tmp_path))
+        k = torch.randn(L, 8, H, D, device="cuda")
+        arch.store_evicted(1, k, k.clone(), [0, 1])
+        arch.drop(1)                                      # all label 0
+        scorer = LearnedOracleScorer(
+            OracleScorerConfig(d_key=H * D, n_layers=L, hidden=32)).cuda()
+        with pytest.raises(ValueError, match="one class"):
+            fit_scorer_on_flywheel(scorer, str(tmp_path), epochs=1)
+
+
 class TestOracleCompressor:
     def test_protocol(self):
         scorer = LearnedOracleScorer(OracleScorerConfig(d_key=H * D, n_layers=L)).cuda()

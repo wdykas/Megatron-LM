@@ -201,6 +201,17 @@ firing splices the staged copy with no synchronous PCIe stall (`take` logs
 A fire on the first decode step is always a sync copy — there was no earlier
 step to stage from.
 
+### The retrieval flywheel (self-labeling eviction data)
+
+With `--kv-compaction-flywheel-dir`, the archive logs every finished request's
+labelled spans: a span the trigger RESTORED is a proven eviction mistake
+(label 1 — the model's own future queries demanded it back); a span still
+archived at request end was correctly evicted (label 0). File names rotate
+(bounded disk). `fit_scorer_on_flywheel` then fine-tunes the learned scorer
+on these events (BCE, no new hyperparameters) — the eviction policy learns
+from its own misses on real traffic, and the training distribution IS the
+deployment distribution. Archive → safety net → teacher.
+
 ### Serving flags (`tools/run_dynamic_text_generation_server.py`)
 
 ```
@@ -216,6 +227,7 @@ step to stage from.
 --kv-compaction-retrieval-margin -3.2   # trigger threshold, REQUIRED w/ archive
 --kv-compaction-prefetch-margin -5.0    # optional speculative staging threshold
 --kv-compaction-prefetch-horizon 4      # optional trend-predictive staging
+--kv-compaction-flywheel-dir DIR        # log self-labeling eviction data
 --kv-compaction-rope-mode logical       # RoPE models: logical | renumber
                                         # (with archive: --cuda-graph-impl none)
 ```

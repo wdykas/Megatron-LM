@@ -185,6 +185,55 @@ def fit_oracle_scorer(
     return losses
 
 
+def fit_scorer_on_flywheel(
+    scorer: LearnedOracleScorer,
+    flywheel_dir: str,
+    epochs: int = 100,
+    lr: float = 1e-4,
+) -> list[float]:
+    """Refit the scorer on retrieval-flywheel events (the self-labeling loop).
+
+    Every archived span that live decoding RESTORED is a proven eviction
+    mistake (label 1 — should have been kept); every span still archived when
+    its request finished was correctly evicted (label 0). Fine-tunes the
+    scorer with BCE on its score output so restored-like keys rank higher —
+    the eviction policy learns from its own misses on real traffic. No new
+    hyperparameters beyond the optimizer's.
+    """
+    import os
+
+    files = sorted(
+        os.path.join(flywheel_dir, f) for f in os.listdir(flywheel_dir)
+        if f.startswith("events_") and f.endswith(".pt"))
+    if not files:
+        raise ValueError(f"fit_scorer_on_flywheel: no event files in {flywheel_dir}")
+    feats, labels = [], []
+    for f in files:
+        blob = torch.load(f, map_location="cuda", weights_only=True)
+        for keys, positions, label in zip(blob["keys"], blob["positions"],
+                                          blob["labels"]):
+            L, T, H, D = keys.shape
+            k = keys.cuda().float()
+            for li in range(L):
+                feats.append(scorer.features(k[li].reshape(T, H * D), li))
+                labels.append(torch.full((T,), float(label), device="cuda"))
+    X = torch.cat(feats)
+    y = torch.cat(labels)
+    if y.min() == y.max():
+        raise ValueError(
+            "fit_scorer_on_flywheel: events are all one class "
+            f"(label {int(y[0].item())}) — need both restored and unused spans.")
+    opt = torch.optim.AdamW(scorer.parameters(), lr=lr, weight_decay=1e-4)
+    losses = []
+    for _ in range(epochs):
+        loss = F.binary_cross_entropy_with_logits(scorer(X).float(), y)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    return losses
+
+
 def save_oracle_scorer(scorer: LearnedOracleScorer, path: str) -> None:
     """Persist config + weights (plain torch.save — see module docstring)."""
     torch.save({"cfg": asdict(scorer.cfg), "state_dict": scorer.state_dict()}, path)

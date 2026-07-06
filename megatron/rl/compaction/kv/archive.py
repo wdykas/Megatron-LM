@@ -35,12 +35,24 @@ class _Span:
 class KVArchive:
     """Per-request store of evicted KV spans with a GPU negative-cache index."""
 
-    def __init__(self, max_span: int = 16) -> None:
+    def __init__(self, max_span: int = 16,
+                 flywheel_dir: str | None = None,
+                 flywheel_max_files: int = 512) -> None:
         if max_span < 1:
             raise ValueError(f"max_span must be >= 1, got {max_span}")
         self.max_span = max_span
         self._spans: dict[int, list[_Span]] = {}
         self.retrievals = 0
+        # Retrieval flywheel: every take() is a proven eviction MISTAKE (the
+        # model's own future queries demanded the span back) and every span
+        # still archived when its request finishes was a CORRECT eviction.
+        # Logged per finished request as scorer training data — the archive
+        # self-labels the eviction policy on real traffic. Bounded: filenames
+        # rotate modulo flywheel_max_files, so disk usage is capped.
+        self.flywheel_dir = flywheel_dir
+        self.flywheel_max_files = flywheel_max_files
+        self._flywheel_seq = 0
+        self._restored: dict[int, list[_Span]] = {}
         # Speculative prefetch staging: at most one span in flight, identified
         # by (request_id, span_idx) — span indices shift on take, so staging is
         # invalidated whenever the request's span list changes.
@@ -178,6 +190,8 @@ class KVArchive:
         if self._staged_key is not None and self._staged_key[0] == int(request_id):
             self._staged_key = None
             self._staged = None
+        if self.flywheel_dir is not None:
+            self._restored.setdefault(int(request_id), []).append(span)
         k, v = staged if staged is not None else (span.keys, span.values)
         return k, v, span.positions
 
@@ -192,9 +206,32 @@ class KVArchive:
     def empty(self) -> bool:
         return not self._spans
 
+    def _flush_flywheel(self, request_id: int,
+                        remaining: list[_Span] | None) -> None:
+        """Write one finished request's labelled spans (restored=1, unused=0)."""
+        if self.flywheel_dir is None:
+            return
+        restored = self._restored.pop(int(request_id), [])
+        events = ([(sp, 1) for sp in restored]
+                  + [(sp, 0) for sp in (remaining or [])])
+        if not events:
+            return
+        import os
+        os.makedirs(self.flywheel_dir, exist_ok=True)
+        path = os.path.join(
+            self.flywheel_dir,
+            f"events_{self._flywheel_seq % self.flywheel_max_files:05d}.pt")
+        self._flywheel_seq += 1
+        torch.save({
+            "keys": [sp.keys.clone() for sp, _ in events],       # (L, T, H, D) cpu
+            "positions": [sp.positions for sp, _ in events],
+            "labels": [lab for _, lab in events],
+        }, path)
+
     def drop(self, request_id: int) -> None:
         """Free a finished request's archive (CPU tensors + GPU centroids)."""
-        self._spans.pop(int(request_id), None)
+        remaining = self._spans.pop(int(request_id), None)
+        self._flush_flywheel(request_id, remaining)
         if self._staged_key is not None and self._staged_key[0] == int(request_id):
             self._staged_key = None
             self._staged = None
@@ -202,7 +239,9 @@ class KVArchive:
     def drop_all_except(self, live_ids: set[int]) -> None:
         """Garbage-collect entries whose requests are no longer live."""
         for rid in [r for r in self._spans if r not in live_ids]:
-            del self._spans[rid]
+            self._flush_flywheel(rid, self._spans.pop(rid))
+        for rid in [r for r in self._restored if r not in live_ids]:
+            self._flush_flywheel(rid, None)
         if self._staged_key is not None and self._staged_key[0] not in live_ids:
             self._staged_key = None
             self._staged = None

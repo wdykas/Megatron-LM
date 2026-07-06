@@ -85,6 +85,12 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
              "this many decode steps.",
     )
     parser.add_argument(
+        "--kv-compaction-flywheel-dir", type=str, default=None,
+        help="Log retrieval-flywheel events here (restored span = eviction "
+             "mistake, unused span = correct eviction) as scorer training "
+             "data; file names rotate, disk use is bounded.",
+    )
+    parser.add_argument(
         "--kv-compaction-rope-mode", type=str, default=None,
         choices=["logical", "renumber"],
         help="Required for RoPE models. 'logical': keep original positions of "
@@ -172,6 +178,7 @@ if __name__ == "__main__":
                 prefetch_margin=args.kv_compaction_prefetch_margin,
                 prefetch_horizon=args.kv_compaction_prefetch_horizon,
                 rope_mode=args.kv_compaction_rope_mode,
+                flywheel_dir=args.kv_compaction_flywheel_dir,
             )
             print(f"[kv-compaction] live compaction enabled: "
                   f"{args.kv_compaction_strategy} @ {args.kv_compaction_budget_ratio}")
