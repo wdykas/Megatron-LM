@@ -158,10 +158,12 @@ def attach_compactor_optimizer(runtime_state: Any, megatron_opt=None) -> None:
     if runtime_state.compactor is None:
         return
 
+    _cfg = runtime_state.compactor_cfg
     ddp_model, optimizer = wrap_compactor_for_training(
         runtime_state.compactor,
         runtime_state._compactor_lr,
         pg_collection=runtime_state._compactor_pg_collection,
+        clip_grad=(_cfg.clip_grad_norm if _cfg is not None else None),
     )
 
     # Restore FP32 masters + Adam moments from checkpoint if available.
@@ -362,9 +364,10 @@ def maybe_train_compactor(runtime_state: Any, args=None, optimizer=None) -> None
     if not trajectories:
         return
 
-    # Option C: every rank trains on its OWN local KV slice. The optimizer's step()
-    # runs finalize_model_grads, which all-reduces gradients across the whole world
-    # (DP+TP collapsed), so replicas stay bit-identical without any bespoke sync.
+    # Option C: every rank trains on its OWN local KV slice. The DDP's
+    # finish_grad_sync() (called before optimizer.step in the trainer) all-reduces
+    # gradients across the whole world (DP+TP collapsed), so replicas stay
+    # bit-identical without any bespoke sync.
     # All ranks have the same number of trajectories (built in lockstep) and each
     # trajectory drives the same number of optimizer steps (same chunk count / BPTT
     # schedule), so the per-step finalize collectives stay matched across ranks.

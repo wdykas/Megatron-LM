@@ -303,7 +303,11 @@ def train_compactor_trajectory(
         if n_since_detach >= cfg.truncated_bptt_steps:
             if chunk_loss.requires_grad:
                 chunk_loss.backward()
-                if cfg.clip_grad_norm is not None:
+                if cfg.clip_grad_norm is not None and _ddp_sync is None:
+                    # Offline bare module only. Under mcore DDP grads live in
+                    # main_grad buffers (param.grad is None — this call would be
+                    # a silent no-op); the Megatron optimizer clips the FP32
+                    # main grads inside step() via OptimizerConfig.clip_grad.
                     torch.nn.utils.clip_grad_norm_(list(updater.parameters()), cfg.clip_grad_norm)
                 _step()
                 _zero_grad()
@@ -316,7 +320,7 @@ def train_compactor_trajectory(
     # this is the ONLY backward/step for the trajectory.
     if n_since_detach > 0 and chunk_loss.requires_grad:
         chunk_loss.backward()
-        if cfg.clip_grad_norm is not None:
+        if cfg.clip_grad_norm is not None and _ddp_sync is None:
             torch.nn.utils.clip_grad_norm_(list(updater.parameters()), cfg.clip_grad_norm)
         _step()
         _zero_grad()

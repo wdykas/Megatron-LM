@@ -58,7 +58,8 @@ def build_compactor_pg_collection() -> ProcessGroupCollection:
     )
 
 
-def wrap_compactor_for_training(compactor, lr: float, pg_collection=None):
+def wrap_compactor_for_training(compactor, lr: float, pg_collection=None,
+                                clip_grad: float | None = None):
     """DDP-wrap the compactor and build its Megatron optimizer (the standard way).
 
     Returns ``(ddp_model, optimizer)``. ``ddp_model`` is an mcore
@@ -67,6 +68,11 @@ def wrap_compactor_for_training(compactor, lr: float, pg_collection=None):
     gradients across every rank. The optimizer is a real ``get_megatron_optimizer``
     result (mixed precision: BF16 params + FP32 masters), checkpointable via its
     own ``sharded_state_dict``.
+
+    ``clip_grad`` is enforced INSIDE ``optimizer.step()`` on the FP32 main grads
+    (the Megatron way). Do not call ``torch.nn.utils.clip_grad_norm_`` on the
+    module under mcore DDP: gradients live in the DDP ``main_grad`` buffers and
+    ``param.grad`` is None, so that call is a silent no-op.
     """
     ddp_config = DistributedDataParallelConfig(
         grad_reduce_in_fp32=True,
@@ -93,7 +99,7 @@ def wrap_compactor_for_training(compactor, lr: float, pg_collection=None):
             fp16=(params_dtype == torch.float16),
             params_dtype=params_dtype,
             use_distributed_optimizer=False,
-            clip_grad=0.0,
+            clip_grad=clip_grad if clip_grad is not None else 0.0,
             log_num_zeros_in_grad=False,
         ),
         [ddp_model],
