@@ -64,38 +64,14 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
              "(--cuda-graph-impl none).",
     )
     parser.add_argument(
-        "--kv-compaction-retrieval-margin", type=float, default=None,
-        help="Trigger threshold: restore when the evicted-centroid attention "
-             "margin over retained keys exceeds this. REQUIRED with "
-             "--kv-compaction-archive; margins are model-scale dependent and "
-             "typically negative — calibrate with KV_COMPACTION_DEBUG=1 "
-             "(trained Nano: -3.0).",
-    )
+        "--kv-compaction-retrieval-alpha", type=float, default=0.2,
+        help="Archive trigger fast path: fire a span whose centroid "
+             "attention-mass fraction reaches this (scale-free, in (0,1)).")
     parser.add_argument(
-        "--kv-compaction-prefetch-margin", type=float, default=None,
-        help="Speculative prefetch threshold (<= retrieval margin): when the "
-             "trigger margin crosses this but not the firing threshold, the "
-             "best span's CPU->GPU copy starts on a side stream so a later "
-             "firing splices a staged span with no PCIe stall.",
-    )
-    parser.add_argument(
-        "--kv-compaction-prefetch-horizon", type=int, default=None,
-        help="Trend-predictive prefetch: stage the best span when the margin's "
-             "one-step slope predicts it crosses the firing threshold within "
-             "this many decode steps.",
-    )
-    parser.add_argument(
-        "--kv-compaction-archive-transfer", type=str, default="pinned",
-        choices=["pinned", "nixl"],
-        help="Archive span-byte tier: pinned host memory (on-node default) or "
-             "NIXL (remote/disaggregated; needs the nixl package).",
-    )
-    parser.add_argument(
-        "--kv-compaction-flywheel-dir", type=str, default=None,
-        help="Log retrieval-flywheel events here (restored span = eviction "
-             "mistake, unused span = correct eviction) as scorer training "
-             "data; file names rotate, disk use is bounded.",
-    )
+        "--kv-compaction-retrieval-cusum", type=float, default=0.4,
+        help="Archive trigger CUSUM threshold h: fire when a span's "
+             "accumulated (alpha - own EMA baseline - drift) crosses h — "
+             "novel persistent reaches fire, chronically hot spans don't.")
     parser.add_argument(
         "--kv-compaction-rope-mode", type=str, default=None,
         choices=["logical", "renumber"],
@@ -180,9 +156,8 @@ if __name__ == "__main__":
                 oracle_checkpoint=args.kv_compaction_oracle_checkpoint,
                 n_compress=args.kv_compaction_n_compress,
                 archive=args.kv_compaction_archive,
-                retrieval_margin=args.kv_compaction_retrieval_margin,
-                prefetch_margin=args.kv_compaction_prefetch_margin,
-                prefetch_horizon=args.kv_compaction_prefetch_horizon,
+                retrieval_alpha=args.kv_compaction_retrieval_alpha,
+                retrieval_cusum=args.kv_compaction_retrieval_cusum,
                 rope_mode=args.kv_compaction_rope_mode,
                 flywheel_dir=args.kv_compaction_flywheel_dir,
                 archive_transfer=args.kv_compaction_archive_transfer,

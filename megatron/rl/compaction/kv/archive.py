@@ -120,43 +120,49 @@ class KVArchive:
     # Trigger + retrieval (called per decode step)
     # ------------------------------------------------------------------
 
-    def score(
+    def span_alphas(
         self,
         request_id: int,
         q_per_layer: list[torch.Tensor],   # per layer (Hq, D) — this step's query
         retained_keys: torch.Tensor,        # (L, C, H, D) — current cache
-    ) -> tuple[float, int] | None:
-        """Return (margin, best_span_idx) for the negative-cache trigger.
+    ) -> tuple[torch.Tensor, list[int]] | None:
+        """Per-span attention-mass fractions α̂ for the retrieval trigger.
 
-        margin = mean over layers of (max attention logit to any evicted-span
-        centroid) − (max logit to any retained key). Higher ⇒ the query is
-        reaching for dropped content. Absolute values are model-scale dependent
-        and typically negative (a span centroid rarely beats the max over ALL
-        retained keys); what matters is the gap between need-steps and idle
-        steps (~2 logits on trained Nano), so the firing threshold must be
-        calibrated per model. None when the request has no archived spans.
+        α̂_i = |E_i|·exp(q·c_i) / (Σ_retained exp(q·k) + Σ_j |E_j|·exp(q·c_j)),
+        aggregated as the max over (layer, KV group). The centroid estimate is
+        deliberately NOT exact span mass: averaging suppresses spans whose heat
+        comes from one incoherent outlier key while preserving semantically
+        aligned spans — measured on needle captures it separates need (0.25-
+        0.37) from idle (0.13-0.15) where exact per-span mass does not
+        (chronically hot filler spans). Scale-free in [0, 1): one threshold
+        transfers across models and eviction patterns, unlike the old
+        max-logit margin (removed — it required per-model calibration and had
+        no separation at all under content-blind mass eviction).
+
+        Returns (alphas (n_spans,), span_ids) or None when nothing is archived.
         """
         entries = self._spans.get(int(request_id))
         if not entries:
             return None
         L, C, H, D = retained_keys.shape
         scale = 1.0 / math.sqrt(D)
-        margin = 0.0
-        span_total = torch.zeros(len(entries), device=retained_keys.device)
+        counts = torch.tensor([len(e.positions) for e in entries],
+                              device=retained_keys.device, dtype=torch.float32)
+        best = torch.zeros(len(entries), device=retained_keys.device)
         for li in range(L):
             q = q_per_layer[li].float()                        # (Hq, D)
             group = q.shape[0] // H
-            neg_l = torch.zeros(len(entries), device=retained_keys.device)
-            pos_best = -float("inf")
             for g in range(H):
                 qg = q[g * group:(g + 1) * group].mean(dim=0)  # (D,)
-                cg = torch.stack([e.centroids[li, g] for e in entries])  # (n, D)
-                neg_l += cg @ qg * scale
-                pos_best = max(pos_best,
-                               float((retained_keys[li, :, g].float() @ qg).max()) * scale)
-            margin += float(neg_l.max()) / H - pos_best
-            span_total += neg_l
-        return margin / L, int(span_total.argmax())
+                lr = (retained_keys[li, :, g].float() @ qg) * scale        # (C,)
+                cg = torch.stack([e.centroids[li, g] for e in entries])    # (n, D)
+                le = (cg @ qg) * scale                                     # (n,)
+                mx = torch.maximum(lr.max(), le.max())
+                denom_r = torch.exp(lr - mx).sum()
+                mass = counts * torch.exp(le - mx)
+                alphas = mass / (denom_r + mass.sum())
+                best = torch.maximum(best, alphas)
+        return best, [e.span_id for e in entries]
 
     def prefetch(self, request_id: int, span_idx: int, stream: torch.cuda.Stream) -> None:
         """Start the CPU→GPU copy of one span on a side stream (speculative).

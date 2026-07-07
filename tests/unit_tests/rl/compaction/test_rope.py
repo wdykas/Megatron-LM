@@ -147,42 +147,52 @@ class TestRopeModeGuards:
         assert comp.rope_mode == "logical" and comp._inv_freq is None
 
 
-class TestPrefetchTrigger:
-    """The static-band + rising-trend prefetch predicate (D3)."""
+class TestAlphaCusumTrigger:
+    """The α̂/CUSUM retrieval trigger (scale-free, per-span novelty)."""
 
-    def _comp(self, prefetch_margin=None, prefetch_horizon=None):
+    def _comp(self, **kw):
         from megatron.rl.compaction.kv.live import LiveKVCompactor
         return LiveKVCompactor(
-            _StubEngine("none"), strategy="streaming_llm", budget_ratio=0.5,
-            archive=True, retrieval_margin=-3.0,
-            prefetch_margin=prefetch_margin, prefetch_horizon=prefetch_horizon)
+            _StubEngine("none"), strategy="snapkv", budget_ratio=0.5,
+            archive=True, **kw)
 
-    def test_static_band(self):
-        comp = self._comp(prefetch_margin=-5.0)
-        assert comp._should_prefetch(-4.0, None)
-        assert not comp._should_prefetch(-5.5, None)
+    def test_defaults_are_scale_free_fractions(self):
+        comp = self._comp()
+        assert 0.0 < comp.retrieval_alpha < 1.0
+        assert comp.retrieval_cusum > 0.0
 
-    def test_rising_trend_predicts_crossing(self):
-        comp = self._comp(prefetch_horizon=3)
-        # -6 -> -4: slope +2, predicted -4 + 3*2 = +2 > -3 -> stage.
-        assert comp._should_prefetch(-4.0, -6.0)
-        # falling margin never stages.
-        assert not comp._should_prefetch(-4.0, -3.5)
-        # rising but too slow for the horizon: -4 + 3*0.1 = -3.7 <= -3.
-        assert not comp._should_prefetch(-4.0, -4.1)
-        # no history yet.
-        assert not comp._should_prefetch(-4.0, None)
-
-    def test_either_trigger_fires(self):
-        comp = self._comp(prefetch_margin=-4.5, prefetch_horizon=2)
-        assert comp._should_prefetch(-4.0, -3.9)   # band, despite falling trend
-        assert comp._should_prefetch(-5.0, -4.0) is False  # below band, falling
-        assert comp._should_prefetch(-5.0, -6.5)   # below band, trend predicts
-
-    def test_horizon_validation(self):
+    def test_alpha_validation(self):
         import pytest as _pytest
-        with _pytest.raises(ValueError, match="prefetch_horizon"):
-            self._comp(prefetch_horizon=0)
+        with _pytest.raises(ValueError, match="retrieval_alpha"):
+            self._comp(retrieval_alpha=1.5)
+        with _pytest.raises(ValueError, match="retrieval_cusum"):
+            self._comp(retrieval_cusum=0.0)
+
+    def test_cusum_fires_on_novel_persistent_span_not_chronic(self):
+        """A span sitting at a HIGH but constant alpha never fires (its EMA
+        baseline absorbs it); a span that jumps from ~0 fires within a few
+        steps — the exact false-positive mode measured under mass eviction."""
+        comp = self._comp(retrieval_alpha=0.9)   # disable the fast path
+        state = {}
+        def step(sid, a):
+            b, S = state.get(sid, (a, 0.0))
+            S = max(0.0, S + a - b - comp.cusum_drift)
+            b = comp.ema_decay * b + (1.0 - comp.ema_decay) * a
+            state[sid] = (b, S)
+            return S
+        # chronically hot filler: alpha 0.4 every step -> never crosses
+        for _ in range(50):
+            S_hot = step(1, 0.4)
+        assert S_hot < comp.retrieval_cusum
+        # novel needle: idle at 0.01 for 20 steps, then 0.25 sustained
+        for _ in range(20):
+            step(2, 0.01)
+        fired_at = None
+        for t in range(10):
+            if step(2, 0.25) >= comp.retrieval_cusum:
+                fired_at = t
+                break
+        assert fired_at is not None and fired_at <= 5
 
 
 class TestBudgetAnneal:

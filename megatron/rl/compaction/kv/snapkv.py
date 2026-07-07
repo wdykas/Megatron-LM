@@ -83,7 +83,10 @@ class SnapKVCompressor:
         # leaks the window keys' large scores into the last pool_kernel//2
         # prefix positions and silently spends budget there every time.
         scores = _softmax_attention(ref_queries, keys, causal_tail=True).sum(dim=0)
-        n_recent = min(self.obs_window, budget, ref_queries.shape[0], T)
+        # Official semantics: the observation WINDOW KV is retained
+        # unconditionally (window_size tokens), independent of how many query
+        # rows the caller supplies; the causal mask handles the query count.
+        n_recent = min(self.obs_window, budget, T)
         prefix = scores[: T - n_recent]
         pad = self.pool_kernel // 2
         if prefix.numel():

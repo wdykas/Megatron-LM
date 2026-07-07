@@ -86,10 +86,10 @@ class TestKVArchive:
         assert all(len(sp.positions) <= 4 for sp in spans)
         assert spans[0].centroids.device.type == "cuda"
 
-    def test_score_finds_matching_span(self):
-        """A query aligned with one evicted span's shared direction must name
-        that span with positive margin (models a needle: its keys share a strong
-        content direction that the question's query points at)."""
+    def test_span_alphas_finds_matching_span(self):
+        """A query aligned with one evicted span's shared direction must give
+        that span the dominant attention-mass fraction (models a needle: its
+        keys share a strong content direction the question's query points at)."""
         k, v = self._kv(S=32)
         L, _, H, D = k.shape
         u = torch.randn(L, H, D, device="cuda")
@@ -101,9 +101,10 @@ class TestKVArchive:
         spans = arch._spans[1]
         target = next(i for i, sp in enumerate(spans) if sp.positions[0] == 24)
         q = [u[li] for li in range(L)]                # query = the planted direction
-        margin, best = arch.score(1, q, k[:, retained])
-        assert best == target
-        assert margin > 0, f"margin {margin} not positive"
+        alphas, span_ids = arch.span_alphas(1, q, k[:, retained])
+        assert int(alphas.argmax()) == target
+        assert float(alphas[target]) > 0.5, f"needle span alpha {alphas[target]}"
+        assert len(span_ids) == len(spans)
 
     def test_take_removes_and_returns(self):
         k, v = self._kv()
@@ -126,10 +127,10 @@ class TestKVArchive:
         arch.drop(2)
         assert arch.empty
 
-    def test_score_none_when_no_entries(self):
+    def test_span_alphas_none_when_no_entries(self):
         arch = KVArchive()
-        assert arch.score(9, [torch.zeros(2, 8, device="cuda")],
-                          torch.zeros(2, 4, 1, 8, device="cuda")) is None
+        assert arch.span_alphas(9, [torch.zeros(2, 8, device="cuda")],
+                                torch.zeros(2, 4, 1, 8, device="cuda")) is None
 
     def test_flywheel_logs_restored_and_unused(self, tmp_path):
         """take() spans log label 1, spans left at request end log label 0."""

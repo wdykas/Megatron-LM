@@ -74,9 +74,8 @@ class LiveKVCompactor:
         oracle_checkpoint: str | None = None,
         n_compress: int = 64,
         archive: bool = False,
-        retrieval_margin: float | None = None,
-        prefetch_margin: float | None = None,
-        prefetch_horizon: int | None = None,
+        retrieval_alpha: float = 0.2,
+        retrieval_cusum: float = 0.4,
         max_retrievals_per_request: int = 4,
         rope_mode: str | None = None,
         flywheel_dir: str | None = None,
@@ -128,13 +127,20 @@ class LiveKVCompactor:
         # them on demand. Needs per-step Q → decode must run EAGER (no CUDA
         # graphs at all); enforced at the first missed capture.
         self.archive_enabled = archive
-        self.retrieval_margin = retrieval_margin
-        self.prefetch_margin = prefetch_margin
-        self.prefetch_horizon = prefetch_horizon
+        # α̂/CUSUM trigger (scale-free, no per-model calibration): fire a span
+        # when its centroid attention-mass fraction spikes above the fast-path
+        # threshold, or when its CUSUM of (α̂ − own EMA baseline) crosses h —
+        # chronically hot spans self-absorb into their baselines, so only a
+        # NOVEL, persistent reach for evicted content fires.
+        self.retrieval_alpha = retrieval_alpha
+        self.retrieval_cusum = retrieval_cusum
+        self.cusum_drift = 0.02
+        self.ema_decay = 0.9
         self.max_retrievals_per_request = max_retrievals_per_request
         self._archive = None
         self._retrieval_counts: dict[int, int] = {}
-        self._last_margin: dict[int, float] = {}
+        # rid -> span_id -> [ema_baseline, cusum_S]
+        self._trigger_state: dict[int, dict[int, list[float]]] = {}
         self._prefetch_stream: torch.cuda.Stream | None = None
         if archive:
             if strategy == "belief_still":
@@ -144,62 +150,27 @@ class LiveKVCompactor:
                     "evicted spans to archive. Use snapkv or learned_oracle.")
             if strategy == "streaming_llm":
                 logger.warning(
-                    "[kv-compaction] archive+streaming_llm: the retrieval "
-                    "trigger has NO measurable need-vs-idle separation under "
-                    "content-blind mass eviction (margins compress; measured "
-                    "offline and live retrievals=0) — expect no recoveries. "
-                    "The archive is effective with content-aware strategies "
+                    "[kv-compaction] archive+streaming_llm: under content-blind "
+                    "mass eviction the trigger signal is weak (measured); the "
+                    "archive is most effective with content-aware strategies "
                     "(snapkv, learned_oracle).")
-            if retrieval_margin is None:
+            if not 0.0 < retrieval_alpha < 1.0:
                 raise ValueError(
-                    "archive mode needs an explicit retrieval_margin. The margin "
-                    "(max evicted-centroid logit − max retained-key logit) is "
-                    "model-scale dependent and typically NEGATIVE — a span "
-                    "centroid rarely beats the max over all retained keys — so "
-                    "there is no universal default; 0.0 would silently never "
-                    "fire. Calibrate per model: run once with "
-                    "KV_COMPACTION_DEBUG=1, read the per-step margins, and set "
-                    "the threshold between need-steps and idle steps "
-                    "(trained Nano: −3.0).")
-            if prefetch_margin is not None and prefetch_margin > retrieval_margin:
-                raise ValueError(
-                    f"prefetch_margin ({prefetch_margin}) must be <= "
-                    f"retrieval_margin ({retrieval_margin}): prefetch is the "
-                    "more permissive threshold — it starts the CPU->GPU copy "
-                    "early so the firing threshold splices a staged span.")
-            if prefetch_horizon is not None and prefetch_horizon < 1:
-                raise ValueError(
-                    f"prefetch_horizon must be >= 1 steps, got {prefetch_horizon}")
-            from .archive import KVArchive
-            self._archive = KVArchive(flywheel_dir=flywheel_dir,
-                                      transfer=archive_transfer)
-            if prefetch_margin is not None or prefetch_horizon is not None:
-                self._prefetch_stream = torch.cuda.Stream()
-
-        # Position embeddings. Cached keys are stored POST-rotation, so pruning
-        # (which renumbers cache slots) is only transparent when attention has no
-        # positional encoding (e.g. Nemotron Nano's hybrid — Mamba carries
-        # position). RoPE models must pick one of two supported conventions:
-        #   'logical'  — positions of record never change: stored rotations stay
-        #                exact and begin_step patches each decode token's
-        #                token_to_pos_ids to its ORIGINAL sequence position
-        #                (rotary reads that tensor; cache write slots come from
-        #                the separate token_to_* fields). Exact geometry; archive
-        #                splice-back needs no rotation. The full-cache
-        #                counterfactual semantics.
-        #   'renumber' — StreamingLLM semantics: cache positions are contiguous
-        #                0..C-1; retained keys are delta-rotated to their new
-        #                positions (rope.py) and restored archive spans to the
-        #                cache tail. Positions stay bounded by cache size
-        #                (beyond-training-window generation), at the cost of
-        #                collapsing the gaps evicted content occupied.
-        from megatron.rl.compaction.learned.capture.kv_capture import _unwrap_model
-        model = _unwrap_model(engine.controller.inference_wrapped_model.model)
-        pos_emb = getattr(model, "position_embedding_type", "none")
+                    f"retrieval_alpha is an attention-mass fraction in (0, 1); "
+                    f"got {retrieval_alpha}")
+            if retrieval_cusum <= 0.0:
+                raise ValueError(f"retrieval_cusum must be > 0, got {retrieval_cusum}")
         self.rope_mode = rope_mode
         self._inv_freq: torch.Tensor | None = None
         self._rope_interleaved = False
         self._logical_pos: dict[int, int] = {}
+        # RoPE handling: 'logical' keeps original token positions (exact,
+        # counterfactual semantics; archive splice-back needs no rotation);
+        # 'renumber' is StreamingLLM semantics (contiguous cache positions,
+        # retained keys delta-rotated, restored spans to the cache tail).
+        from megatron.rl.compaction.learned.capture.kv_capture import _unwrap_model
+        model = _unwrap_model(engine.controller.inference_wrapped_model.model)
+        pos_emb = getattr(model, "position_embedding_type", "none")
         if pos_emb in ("none", None):
             if rope_mode is not None:
                 raise ValueError(
@@ -394,25 +365,6 @@ class LiveKVCompactor:
         for rid in [r for r in self._logical_pos if r not in all_ids]:
             del self._logical_pos[rid]
 
-    def _should_prefetch(self, margin: float, last_margin: float | None) -> bool:
-        """Speculative staging decision for a below-threshold margin.
-
-        Two independent triggers (either fires):
-        - static band: margin above ``prefetch_margin`` (close to the
-          firing threshold in absolute terms);
-        - rising trend: the one-step slope predicts the margin crosses the
-          firing threshold within ``prefetch_horizon`` decode steps —
-          catches a query warming up toward evicted content before it
-          enters any static band.
-        """
-        if self.prefetch_margin is not None and margin > self.prefetch_margin:
-            return True
-        if self.prefetch_horizon is not None and last_margin is not None:
-            slope = margin - last_margin
-            return (slope > 0
-                    and margin + self.prefetch_horizon * slope > self.retrieval_margin)
-        return False
-
     def retrieve_for_decoding_requests(self) -> None:
         """Negative-cache retrieval: restore archived spans the decode queries ask for.
 
@@ -439,21 +391,37 @@ class LiveKVCompactor:
                 continue
             k, v = self._hook.get_kv_for_request(b_local)      # (L, C, H, D)
             q_step = [q[b_local] for q in self._q_per_layer]   # per layer (Hq, D)
-            scored = self._archive.score(rid, q_step, k)
+            scored = self._archive.span_alphas(rid, q_step, k)
             if scored is None:
                 continue
-            margin, span_idx = scored
+            alphas, span_ids = scored
+            state = self._trigger_state.setdefault(rid, {})
+            fire_idx, fire_alpha, best_S, best_idx = -1, 0.0, 0.0, -1
+            for i, (a, sid) in enumerate(zip(alphas.tolist(), span_ids)):
+                b, S = state.get(sid, (a, 0.0))     # EMA seeds at first sight
+                S = max(0.0, S + a - b - self.cusum_drift)
+                b = self.ema_decay * b + (1.0 - self.ema_decay) * a
+                state[sid] = [b, S]
+                if S > best_S:
+                    best_S, best_idx = S, i
+                fired = a >= self.retrieval_alpha or S >= self.retrieval_cusum
+                if fired and a > fire_alpha:
+                    fire_idx, fire_alpha = i, a
             if os.environ.get("KV_COMPACTION_DEBUG"):
-                logger.info("[kv-retrieval] request id=%d: margin %.3f (threshold %.3f, "
-                            "best span %d)", rid, margin, self.retrieval_margin, span_idx)
-            last_margin = self._last_margin.get(rid)
-            self._last_margin[rid] = margin
-            if margin <= self.retrieval_margin:
-                if self._should_prefetch(margin, last_margin):
-                    # Speculative: stage the likely span on the side stream so a
-                    # later firing splices it without a synchronous PCIe copy.
-                    self._archive.prefetch(rid, span_idx, self._prefetch_stream)
+                logger.info(
+                    "[kv-retrieval] request id=%d: alpha max %.3f (fast %.2f) "
+                    "cusum max %.3f (h %.2f) spans=%d",
+                    rid, float(alphas.max()), self.retrieval_alpha,
+                    best_S, self.retrieval_cusum, len(span_ids))
+            if fire_idx < 0:
+                # Speculative staging: the leading CUSUM candidate is warming
+                # up toward the firing threshold — start its PCIe copy early.
+                if best_idx >= 0 and (best_S >= self.retrieval_cusum / 2
+                                      or float(alphas[best_idx]) >= self.retrieval_alpha / 2):
+                    self._archive.prefetch(rid, best_idx, self._prefetch_stream)
                 continue
+            span_idx = fire_idx
+            state.pop(span_ids[span_idx], None)
             ak, av, apos = self._archive.take(rid, span_idx)  # staged GPU or pinned CPU
             was_staged = ak.is_cuda
             ak, av = ak.cuda(), av.cuda()
@@ -470,15 +438,15 @@ class LiveKVCompactor:
             ctx.request_output_lengths[b_global] += ak.shape[1]
             self._retrieval_counts[rid] = self._retrieval_counts.get(rid, 0) + 1
             logger.info(
-                "[kv-retrieval] request id=%d: restored %d tokens (margin %.3f, "
-                "%d spans left, %s)", rid, ak.shape[1], margin,
+                "[kv-retrieval] request id=%d: restored %d tokens (alpha %.3f, "
+                "%d spans left, %s)", rid, ak.shape[1], fire_alpha,
                 len(self._archive._spans.get(rid, [])),
                 "prefetched" if was_staged else "sync copy")
         self._archive.drop_all_except(live_ids)
         for rid in [r for r in self._retrieval_counts if r not in live_ids]:
             del self._retrieval_counts[rid]
-        for rid in [r for r in self._last_margin if r not in live_ids]:
-            del self._last_margin[rid]
+        for rid in [r for r in self._trigger_state if r not in live_ids]:
+            del self._trigger_state[rid]
 
     def compact_prefilled_requests(self, is_decode_only: bool) -> None:
         """Prune the paged KV of every request whose prefill just completed.
