@@ -74,7 +74,9 @@ class TopKCompressor:
         else:
             beta = torch.zeros(len(positions), device=keys.device, dtype=keys.dtype)
 
-        C_v = _fit_values(keys, values, C_k, beta, ref_queries) if self.fit_values else values[positions]
+        C_v = (_fit_values(keys, values, C_k, beta, ref_queries,
+                           values_init=values[positions])
+               if self.fit_values else values[positions])
 
         return CompactionResult(
             run_id=run_id, step_id=step_id,
@@ -109,7 +111,9 @@ class OMPCompressor:
         self,
         keys_per_iter: int = 4,
         nnls_every: int = 1,
+        fit_bias: bool = True,
         fit_values: bool = True,
+        drop_key_beta_cutoff: float = -10.0,
     ) -> None:
         if keys_per_iter < 1:
             raise ValueError(f"keys_per_iter must be >= 1, got {keys_per_iter}")
@@ -117,11 +121,18 @@ class OMPCompressor:
             raise ValueError(f"nnls_every must be >= 1, got {nnls_every}")
         self.keys_per_iter = keys_per_iter
         self.nnls_every = nnls_every
+        self.fit_bias = fit_bias
         self.fit_values = fit_values
+        # Official refinement (drop_key_beta_cutoff): a key whose fitted
+        # log-weight falls below this is effectively deleted from attention —
+        # drop it from the retained set instead of carrying a dead slot.
+        self.drop_key_beta_cutoff = drop_key_beta_cutoff
 
     @property
     def strategy(self) -> str:
-        return f"omp_k{self.keys_per_iter}" + ("+values" if self.fit_values else "")
+        return (f"omp_k{self.keys_per_iter}"
+                + ("+bias" if self.fit_bias else "")
+                + ("+values" if self.fit_values else ""))
 
     def compress(
         self,
@@ -140,16 +151,24 @@ class OMPCompressor:
             raise ValueError("OMPCompressor requires ref_queries for scoring.")
 
         positions, w = self._omp(keys, ref_queries, budget)
-        w = w[:len(positions)].clamp(min=1e-30)
+        w = w[:len(positions)].clamp(min=1e-12)
 
         sort_idx = torch.argsort(torch.tensor(positions, dtype=torch.long))
         positions = [positions[i] for i in sort_idx.tolist()]
         w = w[sort_idx]
 
+        beta = None
+        if self.fit_bias:
+            beta = torch.log(w)
+            live = beta >= self.drop_key_beta_cutoff
+            if not bool(live.all()) and bool(live.any()):
+                positions = [p for p, keep in zip(positions, live.tolist()) if keep]
+                beta = beta[live]
         C_k = keys[positions]
-        beta = torch.log(w)
 
-        C_v = _fit_values(keys, values, C_k, beta, ref_queries) if self.fit_values else values[positions]
+        C_v = (_fit_values(keys, values, C_k, beta, ref_queries,
+                           values_init=values[positions])
+               if self.fit_values else values[positions])
 
         return CompactionResult(
             run_id=run_id, step_id=step_id,
@@ -164,7 +183,10 @@ class OMPCompressor:
     ) -> tuple[list[int], torch.Tensor]:
         Phi = _mass_features(ref_queries, keys)      # (n, T)
         m = Phi.sum(dim=1)                           # (n,) target mass
-        lam = float(m.mean().item()) * 0.1
+        # Mild ridge toward w=1 (bias 0); the old mean(m)*0.1 ridge toward 0
+        # crushed weights on real captures (beta -> very negative = keys
+        # deleted from attention at eval).
+        lam = float(Phi.pow(2).sum(dim=0).mean().item()) * 1e-3 + 1e-12
 
         r = m.clone()
         S: list[int] = []
@@ -188,7 +210,7 @@ class OMPCompressor:
                 if len(S) >= budget:
                     reg = math.sqrt(lam) * torch.eye(t, device=Phi.device, dtype=Phi.dtype)
                     A_aug = torch.cat([Phi_S, reg], dim=0)
-                    b_aug = torch.cat([m, torch.zeros(t, device=m.device, dtype=m.dtype)])
+                    b_aug = torch.cat([m, math.sqrt(lam) * torch.ones(t, device=m.device, dtype=m.dtype)])
                     w = _nnls_pgd(A_aug, b_aug)
                 else:
                     w = _nnls_pgd(Phi_S, m)

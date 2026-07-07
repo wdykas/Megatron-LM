@@ -169,19 +169,33 @@ def _attention_output(
     return weights @ values, mass
 
 
-# TODO(Peter): there is likely a better library for this rather than writing it out manually.
 def _nnls_pgd(A: torch.Tensor, b: torch.Tensor, max_iter: int = 500) -> torch.Tensor:
-    """Non-negative least squares via projected gradient descent.
+    """Non-negative least squares: FISTA-accelerated projected gradient.
 
-    Solves min_{w >= 0} ||A @ w - b||^2 using a fixed step size derived from
-    the Frobenius norm of A^T A (a safe upper bound on the spectral radius).
+    Warm-started from the clamped least-squares solution; step size from the
+    spectral norm of A^T A (power iteration) rather than the Frobenius bound —
+    on ill-conditioned real attention features the Frobenius step is orders of
+    magnitude too small and plain PGD from zero never leaves the origin.
     """
     AtA = A.T @ A
     Atb = A.T @ b
-    step = 1.0 / (torch.linalg.norm(AtA).item() + 1e-8)
-    w = torch.zeros(A.shape[1], device=A.device, dtype=A.dtype)
+    # spectral norm via power iteration (tight step bound)
+    z = torch.randn(A.shape[1], device=A.device, dtype=A.dtype)
+    for _ in range(20):
+        z = AtA @ z
+        z = z / (z.norm() + 1e-30)
+    L = float(z @ (AtA @ z)) + 1e-8
+    step = 1.0 / L
+    try:
+        w = torch.linalg.lstsq(A, b).solution.clamp(min=0)
+    except Exception:
+        w = torch.zeros(A.shape[1], device=A.device, dtype=A.dtype)
+    y, t_acc = w.clone(), 1.0
     for _ in range(max_iter):
-        w = (w - step * (AtA @ w - Atb)).clamp(min=0)
+        w_next = (y - step * (AtA @ y - Atb)).clamp(min=0)
+        t_next = (1 + (1 + 4 * t_acc * t_acc) ** 0.5) / 2
+        y = w_next + ((t_acc - 1) / t_next) * (w_next - w)
+        w, t_acc = w_next, t_next
     return w
 
 
@@ -207,42 +221,53 @@ def _fit_bias(
     Phi_c    = torch.exp(logits_c    - row_max)               # (n, t)
 
     m = Phi_orig.sum(dim=1)                                   # (n,)
-    lam = float(m.mean().item()) * 0.1
-
     n, t = Phi_c.shape
+    # Mild ridge REGULARIZED TOWARD w=1 (bias 0): over-regularization then
+    # degrades to "no bias" instead of w→0 = bias→-inf, which silently
+    # DELETES retained keys from attention at eval (the old mean(m)*0.1
+    # ridge toward zero did exactly that on real captures).
+    lam = float(Phi_c.pow(2).sum(dim=0).mean().item()) * 1e-3 + 1e-12
     reg = math.sqrt(lam) * torch.eye(t, device=Phi_c.device, dtype=Phi_c.dtype)
     A_aug = torch.cat([Phi_c, reg], dim=0)
-    b_aug = torch.cat([m, torch.zeros(t, device=m.device, dtype=m.dtype)])
+    b_aug = torch.cat([m, math.sqrt(lam) * torch.ones(t, device=m.device, dtype=m.dtype)])
 
     w = _nnls_pgd(A_aug, b_aug)
-    return torch.log(w.clamp(min=1e-30))
+    return torch.log(w.clamp(min=1e-12))
 
 
 def _fit_values(
     keys_orig: torch.Tensor,
     values_orig: torch.Tensor,
     keys_compact: torch.Tensor,
-    bias: torch.Tensor,
+    bias: torch.Tensor | None,
     ref_queries: torch.Tensor,
+    values_init: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Fit compacted values via closed-form OLS (Section 3.2, Eq. 3–4).
+    """Fit compacted values via closed-form ridge OLS (Section 3.2, Eq. 3–4).
 
-    min_{C_v}  ||X C_v - Y||_F²  where Y_i = Attn(q_i; K_orig, V_orig).
-    Returns C_v (t, d).
+    Solved in RESIDUAL form around ``values_init`` (the original values at the
+    retained positions): C_v = V_init + D with the ridge shrinking D toward 0.
+    With n ref queries < t retained keys the plain system is underdetermined —
+    solving for C_v directly zeroes the null space and destroys the values of
+    weakly-attended keys; the residual form degrades to the ORIGINAL values
+    instead. Returns C_v (t, d).
     """
     Y, _ = _attention_output(ref_queries, keys_orig, values_orig)   # (n, d)
     d_orig = keys_orig.shape[1]
 
-    logits_c = ref_queries @ keys_compact.T / math.sqrt(d_orig) + bias
+    logits_c = ref_queries @ keys_compact.T / math.sqrt(d_orig)
+    if bias is not None:
+        logits_c = logits_c + bias
     logits_c = logits_c - logits_c.max(dim=1, keepdim=True).values
     exp_c = torch.exp(logits_c)
     X = exp_c / exp_c.sum(dim=1, keepdim=True)                      # (n, t)
 
-    # Ridge regression: (X^T X + λI) C_v = X^T Y.  Regularization prevents
-    # extreme solutions when X is near-rank-deficient (e.g. one-hot attention
-    # from peaked logits), without significantly perturbing well-constrained cols.
     t = X.shape[1]
+    if values_init is None:
+        values_init = torch.zeros(t, values_orig.shape[1],
+                                  device=values_orig.device, dtype=values_orig.dtype)
     XtX = X.T @ X                                       # (t, t)
-    lam = XtX.diagonal().mean().clamp(min=1e-8) * 1e-4
+    lam = XtX.diagonal().mean().clamp(min=1e-8) * 1e-2
     A = XtX + lam * torch.eye(t, device=X.device, dtype=X.dtype)
-    return torch.linalg.solve(A, X.T @ Y)               # (t, d)
+    D = torch.linalg.solve(A, X.T @ (Y - X @ values_init))
+    return values_init + D                              # (t, d)

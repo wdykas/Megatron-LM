@@ -241,8 +241,10 @@ class TestOMPCompressor:
         assert len(set(result.retained_positions)) == len(result.retained_positions)
 
     def test_strategy_string(self):
-        assert OMPCompressor(keys_per_iter=4).strategy == "omp_k4+values"
-        assert OMPCompressor(keys_per_iter=1, fit_values=False).strategy == "omp_k1"
+        assert OMPCompressor(keys_per_iter=4).strategy == "omp_k4+bias+values"
+        assert OMPCompressor(keys_per_iter=4, fit_bias=False,
+                             fit_values=False).strategy == "omp_k4"
+        assert OMPCompressor(keys_per_iter=1, fit_values=False).strategy == "omp_k1+bias"
 
     def test_invalid_params(self):
         with pytest.raises(ValueError):
