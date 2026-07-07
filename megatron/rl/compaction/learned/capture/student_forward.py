@@ -204,10 +204,24 @@ def _forward_outputs(gpt, response_token_ids: torch.Tensor,
     hidden_sink: list = []
     try:
         with _capture_final_hidden(gpt, hidden_sink), _allow_nonflash_attention():
-            output = gpt(
-                input_ids=response_token_ids,
-                **forward_kwargs,
-            )
+            try:
+                output = gpt(
+                    input_ids=response_token_ids,
+                    **forward_kwargs,
+                )
+            except RuntimeError as e:
+                if "qkv memory layout" in str(e):
+                    raise RuntimeError(
+                        "injected student forward hit TE qkv-layout rejection: "
+                        f"tokens={tuple(response_token_ids.shape)} "
+                        f"packed_thd_kv_len={packed_thd_kv_len} "
+                        f"flash_decode={getattr(gpt.config, 'flash_decode', None)} "
+                        f"sequence_parallel={getattr(gpt.config, 'sequence_parallel', None)}. "
+                        "Known-good path: the inference-engine model (SBHD, B1/"
+                        "c_ladder recipe). The TRAINING model's packed/THD attention "
+                        "still rejects injected KV — track shapes at the "
+                        "core_attention pre-hook to close this.") from e
+                raise
     finally:
         if saved_flash_decode is not None:
             gpt.config.flash_decode = saved_flash_decode
