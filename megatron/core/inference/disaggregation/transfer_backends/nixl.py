@@ -138,101 +138,44 @@ class NixlTransferBackend:
         self.agent_name = agent_name
         self._memory_buffer = memory_buffer
 
-        if (mamba_layout is None) != (mamba_state_kind is None):
-            raise ValueError(
-                "mamba_layout and mamba_state_kind must be provided together"
-            )
-        if mamba_state_kind not in (None, "conv", "ssm"):
-            raise ValueError("mamba_state_kind must be 'conv' or 'ssm'")
+        # Addressing geometry shared with the other backends.
+        from megatron.core.inference.disaggregation.transfer_backends.base import (
+            compute_buffer_geometry,
+        )
 
-        layout_capable = (
-            None
-            not in (
-                global_rank,
-                tp_size,
-                tp_rank,
-                pp_size,
-                pp_rank,
-                num_layers_global,
-                num_kv_heads_global,
-                heads_per_partition,
-                head_dim,
-                tokens_per_block,
-                layer_start,
-                layer_end,
-            )
-            and heads_per_partition * tp_size == num_kv_heads_global
-        )  # type: ignore[operator]
-        # Locate the blocks axis by allocator size instead of layout position.
-        # The inference KV layout is [2, L, B, T, H, d].
+        geometry = compute_buffer_geometry(
+            memory_buffer,
+            expected_num_blocks,
+            backend_name="NixlTransferBackend",
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            num_kv_heads_global=num_kv_heads_global,
+            heads_per_partition=heads_per_partition,
+            head_dim=head_dim,
+            tokens_per_block=tokens_per_block,
+            global_rank=global_rank,
+            pp_size=pp_size,
+            pp_rank=pp_rank,
+            num_layers_global=num_layers_global,
+            layer_start=layer_start,
+            layer_end=layer_end,
+            mamba_layout=mamba_layout,
+            mamba_state_kind=mamba_state_kind,
+        )
+        self._geometry = geometry
         shape = list(memory_buffer.shape)
-        candidates = [i for i, dim in enumerate(shape) if dim == expected_num_blocks]
-        if not candidates:
-            raise RuntimeError(
-                f"NixlTransferBackend: no axis in memory_buffer shape {shape} "
-                f"matches expected_num_blocks={expected_num_blocks}. Layout "
-                "is unrecognized; bug in caller or new Megatron tensor shape."
-            )
-        if len(candidates) > 1:
-            raise RuntimeError(
-                f"NixlTransferBackend: ambiguous blocks axis in shape {shape} "
-                f"(expected_num_blocks={expected_num_blocks} matches multiple "
-                f"axes {candidates}). Caller must pass a more distinctive value."
-            )
-        blocks_axis = candidates[0]
-        self._buf_ptr = memory_buffer.data_ptr()
-        self._element_size = memory_buffer.element_size()
-        self._device_id = memory_buffer.device.index if memory_buffer.is_cuda else 0
-
-        # Each (outer, block) pair is one contiguous slice. The outer stride
-        # skips over the full block pool for that outer index.
-        elements_per_slice = 1
-        for dim in shape[blocks_axis + 1 :]:
-            elements_per_slice *= dim
-        bytes_per_slice = self._element_size * elements_per_slice
-        num_outer = 1
-        for dim in shape[:blocks_axis]:
-            num_outer *= dim
-        self._outer_stride_bytes = expected_num_blocks * bytes_per_slice
-        self._num_outer = num_outer
-        self._bytes_per_slice = bytes_per_slice
-        self._blocks_axis = blocks_axis
-        self._num_blocks = expected_num_blocks
-        self._heads_per_partition = heads_per_partition
-        self._head_dim = head_dim
-        self._tokens_per_block = tokens_per_block
-
-        # Canonical KV layout. Mamba agents carry their separate typed layout.
-        self._layout = None
-        if layout_capable:
-            self._layout = KVShardLayout(
-                num_layers=int(num_layers_global),
-                num_heads=int(num_kv_heads_global),
-                tp_size=int(tp_size),
-                tp_rank=int(tp_rank),
-                pp_size=int(pp_size),
-                pp_rank=int(pp_rank),
-                global_rank=int(global_rank),
-                layer_start=int(layer_start),
-                num_local_layers=int(layer_end) - int(layer_start),
-            )
-            if self._blocks_axis != 2:
-                raise ValueError(
-                    "inference KV transfers require the [2, L, B, T, H, d] layout"
-                )
-            if self._layout.local_num_heads() != heads_per_partition:
-                raise ValueError(
-                    "heads_per_partition does not match the canonical KV layout: "
-                    f"{heads_per_partition} vs {self._layout.local_num_heads()}"
-                )
-            if self._num_outer % self._layout.local_num_layers() != 0:
-                raise ValueError(
-                    f"num_outer={self._num_outer} is not divisible by local layers="
-                    f"{self._layout.local_num_layers()}"
-                )
-
-        if self._layout is not None and mamba_layout is not None:
-            raise ValueError("a transfer backend cannot have both KV and Mamba layouts")
+        self._buf_ptr = geometry.buf_ptr
+        self._element_size = geometry.element_size
+        self._device_id = geometry.device_id
+        self._outer_stride_bytes = geometry.outer_stride_bytes
+        self._num_outer = geometry.num_outer
+        self._bytes_per_slice = geometry.bytes_per_slice
+        self._blocks_axis = geometry.blocks_axis
+        self._num_blocks = geometry.num_blocks
+        self._heads_per_partition = geometry.heads_per_partition
+        self._head_dim = geometry.head_dim
+        self._tokens_per_block = geometry.tokens_per_block
+        self._layout = geometry.layout
         self._mamba_layout = mamba_layout
         self._mamba_state_kind = mamba_state_kind
 

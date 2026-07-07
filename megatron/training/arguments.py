@@ -2034,7 +2034,7 @@ def _add_inference_args(parser):
                             'inference (prefill hands KV to the decode pool); a dp>1 decode shard '
                             'is several independent decode instances.')
     group.add_argument('--disagg-kv-transport-backend', type=str, default='nixl',
-                       choices=['nixl'],
+                       choices=['nixl', 'nccl'],
                        help='KV transfer backend for the disaggregated prefill->decode '
                        'hand-off.')
     return parser

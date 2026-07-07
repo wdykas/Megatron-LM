@@ -333,6 +333,12 @@ class DynamicInferenceEngine(AbstractEngine):
     def setup_kv_transfer(self, role: str) -> None:
         self._raise_kv_handoff_not_enabled("KV transfer setup")
 
+    def push_handoff_kv(self, request_id: int, decode_metas: list) -> None:
+        self._raise_kv_handoff_not_enabled("SEND_KV")
+
+    def _poll_pending_kv_pushes(self) -> int:
+        return 0
+
     def add_request_with_kv_handoff(
         self, request_id, prompt, sampling_params, kv_meta, src_block_ids
     ) -> None:
@@ -787,11 +793,17 @@ class DynamicInferenceEngine(AbstractEngine):
             self.socket_for_receiving_requests.connect(dp_addr)
 
             if disagg_config is not None:
-                # Register with the disaggregated coordinator: role only; the
-                # per-request hand-off metadata is self-describing.
+                # Register with the disaggregated coordinator: role, transport,
+                # and this instance's per-rank transfer metadata (push
+                # transports need the decode's metas relayed in SEND_KV).
                 self.socket_for_receiving_requests.send(
                     msgpack.packb(
-                        [Headers.REGISTER_ROLE.value, disagg_config["role"]],
+                        [
+                            Headers.REGISTER_ROLE.value,
+                            disagg_config["role"],
+                            disagg_config["kv_transport_backend"],
+                            getattr(self, "_instance_transfer_meta", None),
+                        ],
                         use_bin_type=True,
                     )
                 )
@@ -2530,6 +2542,10 @@ class DynamicInferenceEngine(AbstractEngine):
             elif header == Headers.RELEASE_KV:
                 # Coordinator-broadcast release. Unknown request ids are no-ops.
                 self.release_handoff_blocks(int(data[1]))
+            elif header == Headers.SEND_KV:
+                # Push transport: send a pinned hand-off's KV to the decode
+                # instance the coordinator picked.
+                self.push_handoff_kv(int(data[1]), data[2])
             elif header == Headers.ABORT_REQUEST:
                 request_id = int(data[1])
                 entry = self.requests.get(request_id)
@@ -2556,6 +2572,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self._pending_signals.append(message)
 
         self._poll_pending_kv_imports()
+        self._poll_pending_kv_pushes()
 
         if new_generation_epoch is not None:
             self._generation_epoch = new_generation_epoch

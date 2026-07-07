@@ -210,6 +210,8 @@ class DataParallelInferenceCoordinator:
         self._disagg_outstanding: dict = {}  # prefill identity -> outstanding count
         self._disagg_submit_queue: dict = {}  # prefill identity -> deque of pending submits
         self._disagg_max_outstanding = 32  # TODO: tune.
+        self._engine_transport: dict = {}  # identity -> transfer backend name
+        self._engine_metas: dict = {}  # identity -> instance per-rank transfer metas
 
         self.request_id_to_client_id = {}
         self.request_id_to_client_request_id = {}
@@ -298,6 +300,8 @@ class DataParallelInferenceCoordinator:
             for rid in self._disagg.requests_involving(identity):
                 self._drop_disagg_request(rid, f"engine {identity!r} removed")
             self._disagg_outstanding.pop(identity, None)
+            self._engine_transport.pop(identity, None)
+            self._engine_metas.pop(identity, None)
         logging.warning(
             "Coordinator: removed engine %s (now %d engines)",
             identity,
@@ -384,6 +388,13 @@ class DataParallelInferenceCoordinator:
         if not self._send_to_engine(decode_id, payload):
             # _remove_engine's sweep already dropped this request.
             return
+        prefill_id = self._disagg_prefill_of.get(request_id)
+        if prefill_id is not None and self._engine_transport.get(prefill_id) == "nccl":
+            # Two-sided transport: the decode posted its receives above; tell
+            # the prefill to post the matching sends toward that instance.
+            self._disagg_send(
+                prefill_id, Headers.SEND_KV, request_id, self._engine_metas[decode_id]
+            )
 
     def _handle_kv_read_done(self, request_id):
         """Hop 3: the decode imported the hand-off's KV. Release the prefill's
@@ -551,13 +562,17 @@ class DataParallelInferenceCoordinator:
             header = Headers(deserialized_payload[0])
 
             if header == Headers.REGISTER_ROLE:
-                # Disaggregated engine registration (dynamic, order-independent).
+                # Disaggregated engine registration (dynamic, order-independent):
+                # role, transfer backend name, and the instance's per-rank
+                # transfer metadata (relayed to push prefills in SEND_KV).
                 assert self.disaggregated, "REGISTER_ROLE on a non-disaggregated coordinator"
-                _, role = deserialized_payload
+                _, role, transport, instance_meta = deserialized_payload
                 if sender_identity not in self.identities_of_data_parallel_ranks:
                     self.identities_of_data_parallel_ranks.append(sender_identity)
                     self._register_rank_identity(sender_identity)
                 self._disagg.register(sender_identity, role)
+                self._engine_transport[sender_identity] = transport
+                self._engine_metas[sender_identity] = instance_meta
                 continue
 
             if header == Headers.CONNECT:

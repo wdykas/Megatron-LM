@@ -37,6 +37,8 @@ def _coord(max_outstanding=32):
     c.request_id_to_client_request_id = {}
     c.client_request_to_request_id = {}
     c.identities_of_data_parallel_ranks = [b"p0", b"d0"]
+    c._engine_transport = {b"p0": "nixl", b"d0": "nixl"}
+    c._engine_metas = {b"p0": [{"global_rank": 0}], b"d0": [{"global_rank": 2}]}
     c._disagg.register(b"p0", "prefill")
     c._disagg.register(b"d0", "decode")
     c.sent = []  # (identity, [header, *parts])
@@ -72,6 +74,20 @@ def test_prefill_reply_resubmits_to_decode_with_kv():
     assert msg[1] == 5 and msg[2] == [1, 2, 3]
     assert msg[3] == {"temperature": 0.0}
     assert msg[4] == HANDOFF["kv_meta"] and msg[5] == [4, 5]
+
+
+def test_push_prefill_reply_also_emits_send_kv():
+    c = _coord()
+    c._engine_transport[b"p0"] = "nccl"
+    c._route_submit_disagg(5, [1, 2, 3], {})
+    c.sent.clear()
+    c._handle_prefill_done(5, {"request_id": 5, "disaggregated_params": HANDOFF})
+    headers = [(ident, Headers(m[0])) for ident, m in c.sent]
+    assert (b"d0", Headers.SUBMIT_REQUEST_WITH_KV) in headers
+    # Two-sided transport: the prefill is told where to send, with the decode
+    # instance's transfer metas.
+    send = [m for ident, m in c.sent if Headers(m[0]) == Headers.SEND_KV]
+    assert send and send[0][1] == 5 and send[0][2] == [{"global_rank": 2}]
 
 
 def test_prefill_reply_without_handoff_drops_request():

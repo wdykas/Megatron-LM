@@ -33,6 +33,8 @@ class InferenceStateHandoffMixin:
         self._mamba_transfer_agents = {}
         self._mamba_peer_metas = {}
         self._pending_kv_imports = deque()
+        self._pending_kv_pushes: list = []
+        self._instance_transfer_meta = None
 
     @property
     def pending_kv_import_count(self) -> int:
@@ -210,6 +212,76 @@ class InferenceStateHandoffMixin:
                 state_kind: agent.export_meta()
                 for state_kind, agent in self._mamba_transfer_agents.items()
             }
+
+        # Gather this instance's per-rank transfer metadata (KV plus Mamba
+        # kinds), model-parallel-wide. The MP coordinator registers it with
+        # the shared coordinator; push transports ship it to the prefill in
+        # SEND_KV so both sides enumerate the same reshard plan.
+        entry = self._kv_transfer_agent.export_meta()
+        if self._mamba_transfer_agents:
+            entry["mamba"] = dict(self._mamba_peer_metas)
+        mp_group = self.pg_collection.mp
+        if torch.distributed.is_initialized() and get_pg_size(mp_group) > 1:
+            gathered: list = [None] * get_pg_size(mp_group)
+            torch.distributed.all_gather_object(gathered, entry, group=mp_group)
+        else:
+            gathered = [entry]
+        self._instance_transfer_meta = gathered
+
+    def push_handoff_kv(self, request_id: int, decode_metas: list) -> None:
+        """Push a pinned hand-off's KV (and Mamba snapshots) to the decode
+        instance described by `decode_metas` (two-sided transports only).
+
+        The decode posted its matching receives when SUBMIT_REQUEST_WITH_KV
+        arrived; the sends are reaped asynchronously and the pins stay until
+        the coordinator's RELEASE_KV."""
+        block_ids = self._pinned_handoff_blocks.get(request_id)
+        if not block_ids:
+            logging.warning(
+                "SEND_KV for request %d with no pinned hand-off blocks; skipping",
+                request_id,
+            )
+            return
+        kv_peer = {"tp_metas": list(decode_metas)}
+        handles = [self._kv_transfer_agent.begin_push_blocks(kv_peer, block_ids)]
+        if self._mamba_transfer_agents:
+            msa = self.context.mamba_slot_allocator
+            slots = [
+                int(msa.get_slot(int(block)))
+                for block in block_ids
+                if msa.get_slot(int(block)) >= 0
+            ]
+            if slots:
+                for state_kind, agent in self._mamba_transfer_agents.items():
+                    peer = {
+                        "tp_metas": [
+                            e["mamba"][state_kind]
+                            for e in decode_metas
+                            if isinstance(e, dict) and e.get("mamba")
+                        ]
+                    }
+                    handles.append(agent.begin_push_blocks(peer, slots))
+        self._pending_kv_pushes.append((request_id, handles))
+        logging.info(
+            "DISAGG_PREFILL_PUSH request_id=%d blocks=%d mamba=%d",
+            request_id,
+            len(block_ids),
+            len(handles) - 1,
+        )
+
+    def _poll_pending_kv_pushes(self) -> int:
+        """Reap completed push sends; unfinished ones stay pending."""
+        if not self._pending_kv_pushes:
+            return 0
+        remaining = []
+        reaped = 0
+        for request_id, handles in self._pending_kv_pushes:
+            if all(h.poll() for h in handles):
+                reaped += 1
+            else:
+                remaining.append((request_id, handles))
+        self._pending_kv_pushes = remaining
+        return reaped
 
     def _capture_handoff_meta(
         self, request: "DynamicInferenceRequest", block_ids: list
