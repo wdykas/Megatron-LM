@@ -86,16 +86,23 @@ def _inject_compact_kv(model, compact_kv_list: List[Tuple[torch.Tensor, torch.Te
                             f"THD injection requires B=1 compact KV, got "
                             f"B={ck_cap.shape[0]}")
                     n_kv_groups, d_head = orig_key.shape[1], orig_key.shape[2]
-                    ck_r = ck_cap.reshape(C, n_kv_groups, d_head).contiguous()
-                    cv_r = cv_cap.reshape(C, n_kv_groups, d_head).contiguous()
+                    ck_r = ck_cap.reshape(C, n_kv_groups, d_head).clone()
+                    cv_r = cv_cap.reshape(C, n_kv_groups, d_head).clone()
                 else:
                     # SBHD: (S_k, B, n_kv_groups, d_head).
                     B = orig_key.shape[1]
                     n_kv_groups, d_head = orig_key.shape[2], orig_key.shape[3]
+                    # clone(), not contiguous(): BeliefMemory hands per-layer
+                    # VIEWS at storage offset l*C*d, and .contiguous() is a
+                    # NO-OP when the non-contiguity hides in size-1 dims — the
+                    # offset survives and TE's three-chunk layout check
+                    # (which requires zero storage offsets) rejects every
+                    # layer past the first. clone() gives fresh storage at
+                    # offset 0.
                     ck_r = (ck_cap.reshape(B, C, n_kv_groups, d_head)
-                            .permute(1, 0, 2, 3).contiguous())
+                            .permute(1, 0, 2, 3).clone())
                     cv_r = (cv_cap.reshape(B, C, n_kv_groups, d_head)
-                            .permute(1, 0, 2, 3).contiguous())
+                            .permute(1, 0, 2, 3).clone())
 
                 # attention_mask=None: all query positions attend to all C slots.
                 return (query.contiguous(), ck_r, cv_r, None) + tuple(args[4:])
