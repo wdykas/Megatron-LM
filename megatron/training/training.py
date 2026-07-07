@@ -1241,11 +1241,28 @@ def pretrain(
         # separate CP=1 inference model (CP ranks become extra DP replicas, dp*=cp).
         force_cp1_inference_model = args.context_parallel_size > 1
         if is_disagg_rollout(args):
+            # Same weight-allocation context selection as the separate
+            # inference model below (UVM pool / memory-saver region / none).
+            uvm_level = args.rl_inference_model_unified_memory_level
+            uvm_mempool = create_unified_mempool() if uvm_level and uvm_level > 0 else None
+            if (
+                args.rl_offload_inference_model_weights_when_idle
+                and uvm_level == 0
+                and HAVE_TORCH_MEMORY_SAVER
+            ):
+                model_alloc_ctx = torch_memory_saver.region(
+                    tag="rl_inference_model", enable_cpu_backup=True
+                )
+            elif uvm_mempool is not None:
+                model_alloc_ctx = torch.cuda.use_mem_pool(uvm_mempool)
+            else:
+                model_alloc_ctx = nullcontext()
+
             # Disaggregated rollouts: build this rank's prefill/decode shard
             # model on its shard groups; the per-pool refit keeps it fresh.
             inference_model = build_disagg_inference_model(
                 args, model_provider, model_type, model_cfg, get_model,
-                model_alloc_ctx=_rl_inference_model_alloc_ctx(args),
+                model_alloc_ctx=model_alloc_ctx,
             )
         elif (
             args.rl_inference_tensor_model_parallel_size is not None
