@@ -85,6 +85,12 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
              "this many decode steps.",
     )
     parser.add_argument(
+        "--kv-compaction-archive-transfer", type=str, default="pinned",
+        choices=["pinned", "nixl"],
+        help="Archive span-byte tier: pinned host memory (on-node default) or "
+             "NIXL (remote/disaggregated; needs the nixl package).",
+    )
+    parser.add_argument(
         "--kv-compaction-flywheel-dir", type=str, default=None,
         help="Log retrieval-flywheel events here (restored span = eviction "
              "mistake, unused span = correct eviction) as scorer training "
@@ -179,6 +185,7 @@ if __name__ == "__main__":
                 prefetch_horizon=args.kv_compaction_prefetch_horizon,
                 rope_mode=args.kv_compaction_rope_mode,
                 flywheel_dir=args.kv_compaction_flywheel_dir,
+                archive_transfer=args.kv_compaction_archive_transfer,
             )
             print(f"[kv-compaction] live compaction enabled: "
                   f"{args.kv_compaction_strategy} @ {args.kv_compaction_budget_ratio}")

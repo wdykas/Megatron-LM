@@ -84,7 +84,6 @@ class TestKVArchive:
         all_pos = sorted(p for sp in spans for p in sp.positions)
         assert all_pos == sorted(set(range(24)) - set(retained))
         assert all(len(sp.positions) <= 4 for sp in spans)
-        assert spans[0].keys.device.type == "cpu"
         assert spans[0].centroids.device.type == "cuda"
 
     def test_score_finds_matching_span(self):
@@ -165,11 +164,29 @@ class TestKVArchive:
         arch.drop_all_except(set())
         assert not list(tmp_path.glob("events_*.pt"))
 
+    def test_take_round_trips_bytes_through_the_store(self):
+        """Backend-agnostic: bytes that go in must come back exactly."""
+        k, v = self._kv()
+        arch = KVArchive(max_span=4)
+        arch.store_evicted(3, k, v, list(range(0, 24, 2)))
+        tk, tv, tpos = arch.take(3, 0)
+        idx = torch.tensor(tpos, device=k.device)
+        torch.testing.assert_close(tk.cuda(), k[:, idx])
+        torch.testing.assert_close(tv.cuda(), v[:, idx])
+
+    def test_nixl_backend_absent_raises_with_guidance(self):
+        with pytest.raises(ImportError, match="nixl"):
+            KVArchive(max_span=4, transfer="nixl")
+
+    def test_unknown_backend_raises(self):
+        with pytest.raises(ValueError, match="transfer backend"):
+            KVArchive(max_span=4, transfer="carrier-pigeon")
+
     def test_prefetch_then_take_returns_staged_gpu(self):
         k, v = self._kv()
         arch = KVArchive(max_span=4)
         arch.store_evicted(5, k, v, list(range(0, 24, 2)))
-        want_k = arch._spans[5][1].keys.clone()
+        want_k = arch._store._data[arch._spans[5][1].span_id][0].clone()
         stream = torch.cuda.Stream()
         arch.prefetch(5, 1, stream)
         arch.prefetch(5, 1, stream)                      # idempotent re-stage
@@ -185,7 +202,7 @@ class TestKVArchive:
         arch.store_evicted(5, k, v, list(range(0, 24, 2)))
         arch.prefetch(5, 2, torch.cuda.Stream())
         tk, _, _ = arch.take(5, 0)                        # indices shift
-        assert not tk.is_cuda and arch.prefetch_hits == 0
+        assert arch.prefetch_hits == 0                    # staging not used
         assert arch._staged_key is None                   # stale staging cleared
 
     def test_gc_clears_staging(self):

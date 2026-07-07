@@ -19,17 +19,21 @@ swaps); LiveKVCompactor drops a request's entries when it finishes.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
+
+from .transfer import build_span_store
 
 
 @dataclass
 class _Span:
     positions: list[int]           # original token positions (bookkeeping only)
-    keys: torch.Tensor             # (L, T, H, D) pinned CPU
-    values: torch.Tensor           # (L, T, H, D) pinned CPU
+    span_id: int                   # key into the transfer-backend store
     centroids: torch.Tensor        # (L, Hkv, D) GPU — mean evicted key per layer/group
+    # Host copy kept ONLY when the flywheel logs (an on-node feature);
+    # the authoritative bytes live in the SpanStore.
+    cpu_keys: torch.Tensor | None = field(default=None, repr=False)
 
 
 class KVArchive:
@@ -37,10 +41,16 @@ class KVArchive:
 
     def __init__(self, max_span: int = 16,
                  flywheel_dir: str | None = None,
-                 flywheel_max_files: int = 512) -> None:
+                 flywheel_max_files: int = 512,
+                 transfer: str = "pinned",
+                 **transfer_kwargs) -> None:
         if max_span < 1:
             raise ValueError(f"max_span must be >= 1, got {max_span}")
         self.max_span = max_span
+        # Byte movement is delegated to the store: 'pinned' host memory
+        # on-node, 'nixl' for a remote/disaggregated archive tier.
+        self._store = build_span_store(transfer, **transfer_kwargs)
+        self._next_span_id = 0
         self._spans: dict[int, list[_Span]] = {}
         self.retrievals = 0
         # Retrieval flywheel: every take() is a proven eviction MISTAKE (the
@@ -94,11 +104,15 @@ class KVArchive:
             idx = torch.tensor(span, device=keys.device)
             k = keys[:, idx]                                   # (L, T, H, D)
             v = values[:, idx]
+            sid = self._next_span_id
+            self._next_span_id += 1
+            self._store.put(sid, k, v)
             entries.append(_Span(
                 positions=span,
-                keys=k.to("cpu", non_blocking=True).pin_memory(),
-                values=v.to("cpu", non_blocking=True).pin_memory(),
+                span_id=sid,
                 centroids=k.float().mean(dim=1),               # (L, H, D) on GPU
+                cpu_keys=(k.detach().cpu() if self.flywheel_dir is not None
+                          else None),
             ))
         self._spans[int(request_id)] = entries
 
@@ -156,11 +170,7 @@ class KVArchive:
         if self._staged_key == key:
             return
         span = self._spans[int(request_id)][span_idx]
-        with torch.cuda.stream(stream):
-            gk = span.keys.to("cuda", non_blocking=True)
-            gv = span.values.to("cuda", non_blocking=True)
-        event = torch.cuda.Event()
-        event.record(stream)
+        gk, gv, event = self._store.get_async(span.span_id, stream)
         self._staged_key = key
         self._staged = (gk, gv, event)
 
@@ -192,7 +202,11 @@ class KVArchive:
             self._staged = None
         if self.flywheel_dir is not None:
             self._restored.setdefault(int(request_id), []).append(span)
-        k, v = staged if staged is not None else (span.keys, span.values)
+        if staged is not None:
+            k, v = staged
+        else:
+            k, v = self._store.get(span.span_id)
+        self._store.drop(span.span_id)
         return k, v, span.positions
 
     # ------------------------------------------------------------------
@@ -223,14 +237,16 @@ class KVArchive:
             f"events_{self._flywheel_seq % self.flywheel_max_files:05d}.pt")
         self._flywheel_seq += 1
         torch.save({
-            "keys": [sp.keys.clone() for sp, _ in events],       # (L, T, H, D) cpu
+            "keys": [sp.cpu_keys.clone() for sp, _ in events],   # (L, T, H, D) cpu
             "positions": [sp.positions for sp, _ in events],
             "labels": [lab for _, lab in events],
         }, path)
 
     def drop(self, request_id: int) -> None:
-        """Free a finished request's archive (CPU tensors + GPU centroids)."""
+        """Free a finished request's archive (store bytes + GPU centroids)."""
         remaining = self._spans.pop(int(request_id), None)
+        for sp in (remaining or []):
+            self._store.drop(sp.span_id)
         self._flush_flywheel(request_id, remaining)
         if self._staged_key is not None and self._staged_key[0] == int(request_id):
             self._staged_key = None
@@ -239,7 +255,10 @@ class KVArchive:
     def drop_all_except(self, live_ids: set[int]) -> None:
         """Garbage-collect entries whose requests are no longer live."""
         for rid in [r for r in self._spans if r not in live_ids]:
-            self._flush_flywheel(rid, self._spans.pop(rid))
+            dead = self._spans.pop(rid)
+            for sp in dead:
+                self._store.drop(sp.span_id)
+            self._flush_flywheel(rid, dead)
         for rid in [r for r in self._restored if r not in live_ids]:
             self._flush_flywheel(rid, None)
         if self._staged_key is not None and self._staged_key[0] not in live_ids:

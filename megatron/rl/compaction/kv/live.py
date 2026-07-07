@@ -79,6 +79,7 @@ class LiveKVCompactor:
         max_retrievals_per_request: int = 4,
         rope_mode: str | None = None,
         flywheel_dir: str | None = None,
+        archive_transfer: str = "pinned",
         budget_final: float | None = None,
         budget_anneal_iters: int | None = None,
     ) -> None:
@@ -161,7 +162,8 @@ class LiveKVCompactor:
                 raise ValueError(
                     f"prefetch_horizon must be >= 1 steps, got {prefetch_horizon}")
             from .archive import KVArchive
-            self._archive = KVArchive(flywheel_dir=flywheel_dir)
+            self._archive = KVArchive(flywheel_dir=flywheel_dir,
+                                      transfer=archive_transfer)
             if prefetch_margin is not None or prefetch_horizon is not None:
                 self._prefetch_stream = torch.cuda.Stream()
 
