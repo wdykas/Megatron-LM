@@ -836,7 +836,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.zmq_context, process_group=None, hostname=hostname
             )
 
-        if launch_inference_coordinator and self.is_dp_coordinator:
+        if spawn_coordinator:
             await await_process_call(
                 coordinator_ready_event.wait, self.inference_coordinator_process
             )
