@@ -131,7 +131,9 @@ class KVCompactionBenchmark:
         d = keys_orig.shape[1]
         logits_full = eval_queries @ keys_orig.T / math.sqrt(d)
         row_max = logits_full.max(dim=1, keepdim=True).values
-        logits_c = eval_queries @ result.compacted_keys.T / math.sqrt(d) + result.bias
+        logits_c = eval_queries @ result.compacted_keys.T / math.sqrt(d)
+        if result.bias is not None:   # selection-only compressors fit no bias
+            logits_c = logits_c + result.bias
         mass_compact = torch.exp(logits_c - row_max).sum(dim=1)
         rel_err = (mass_full - mass_compact).abs() / (mass_full + 1e-12)
         return float(rel_err.mean().item())
