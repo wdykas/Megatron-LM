@@ -338,10 +338,12 @@ class DataParallelInferenceCoordinator:
         self._disagg_outstanding[prefill_id] = self._disagg_outstanding.get(prefill_id, 0) + 1
         self._disagg_hop1.add(request_id)
         # The prefill stops after the prompt KV is populated and pins it for
-        # the hand-off; the decode regenerates from the prompt.
+        # the hand-off; the decode regenerates from the prompt, so the prefill
+        # copy needs no log probs and generates no tokens.
         prefill_params = dict(sampling_params)
         prefill_params["do_kv_handoff"] = True
         prefill_params["num_tokens_to_generate"] = 0
+        prefill_params["return_log_probs"] = False
         if "num_tokens_total" in prefill_params:
             prefill_params["num_tokens_total"] = None
         self._disagg_send(
