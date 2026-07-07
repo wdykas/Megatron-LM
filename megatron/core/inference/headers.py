@@ -25,6 +25,8 @@ class Headers(Enum):
     SUBMIT_REQUEST_WITH_KV = auto()  # Decode-side KV import.
     RELEASE_KV = auto()  # Free pinned handoff blocks.
     ABORT_REQUEST = auto()  # Cancel one in-flight request.
+    REGISTER_ROLE = auto()  # Engine announces its disagg role (prefill/decode).
+    KV_READ_DONE = auto()  # Decode finished importing a hand-off's KV.
 
 class UnknownHeaderError(Exception):
     """A signal with an unrecognized header was received by the coordinator."""

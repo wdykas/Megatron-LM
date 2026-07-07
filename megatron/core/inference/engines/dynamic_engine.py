@@ -68,6 +68,7 @@ from megatron.core.utils import (
     trace_async_exceptions,
     unwrap_model,
 )
+
 from .async_zmq_communicator import AsyncZMQCommunicator
 
 try:
@@ -586,6 +587,32 @@ class DynamicInferenceEngine(AbstractEngine):
         self.capture_stats = capture_stats
 
     @internal_api
+    def set_disaggregation_config(
+        self, *, role, identity, spawn_coordinator, disagg_router="round_robin",
+        kv_transport_backend="nixl",
+    ):
+        """Mark this engine as a disaggregated prefill/decode instance for the
+        coordinator-native 2-hop mode. Call before
+        start_listening_to_data_parallel_coordinator.
+
+        Args:
+            role: "prefill" or "decode".
+            identity: unique ZMQ identity for this instance's MP coordinator
+                (must differ across instances).
+            spawn_coordinator: whether this rank spawns the shared coordinator.
+            disagg_router: routing policy name the coordinator resolves.
+            kv_transport_backend: transfer backend name ("nixl").
+        """
+        assert role in ("prefill", "decode")
+        self._disagg_config = {
+            "role": role,
+            "identity": identity,
+            "spawn_coordinator": spawn_coordinator,
+            "disagg_router": disagg_router,
+            "kv_transport_backend": kv_transport_backend,
+        }
+        self.setup_kv_transfer(role, backend=kv_transport_backend)
+
     async def start_listening_to_data_parallel_coordinator(
         self,
         inference_coordinator_port: int | None = None,
@@ -666,8 +693,14 @@ class DynamicInferenceEngine(AbstractEngine):
 
         local_ip = hostname or socket.gethostname()
 
+        disagg_config = getattr(self, "_disagg_config", None)
+
         # Spawn a DP coordinator process and get the connection info.
-        if launch_inference_coordinator and self.is_dp_coordinator:
+        if disagg_config is not None:
+            spawn_coordinator = disagg_config["spawn_coordinator"] and self.is_mp_coordinator
+        else:
+            spawn_coordinator = launch_inference_coordinator and self.is_dp_coordinator
+        if spawn_coordinator:
             spawn_context = multiprocessing.get_context('spawn')
             deterministic_mode = torch.are_deterministic_algorithms_enabled()
             dp_pipe, dp_process_pipe = spawn_context.Pipe()
@@ -677,7 +710,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 kwargs={
                     "pipe_connection": dp_process_pipe,
                     "ready_event": coordinator_ready_event,
-                    "data_parallel_size": get_pg_size(self.pg_collection.dp),
+                    # Disaggregated engines register dynamically via
+                    # REGISTER_ROLE; the coordinator must not block on a count.
+                    "data_parallel_size": (
+                        0 if disagg_config is not None else get_pg_size(self.pg_collection.dp)
+                    ),
                     "tokenizer": self.controller.tokenizer,
                     "max_requests": self.context.max_requests,
                     "inference_coordinator_port": inference_coordinator_port,
@@ -688,6 +725,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     "prefix_caching_routing_alpha": self.context.prefix_caching_routing_alpha,
                     "schedule_output_path": coordinator_schedule_output_path,
                     "hostname": hostname,
+                    "disaggregated": disagg_config is not None,
+                    "disagg_router": (
+                        disagg_config["disagg_router"] if disagg_config is not None else "round_robin"
+                    ),
                 },
             )
             self.inference_coordinator_process.start()
@@ -708,6 +749,14 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             dp_addr = None
 
+        if disagg_config is not None and launch_inference_coordinator:
+            # Disaggregated instances have disjoint process-group collections,
+            # so the spawner shares the coordinator address over the default
+            # (world) group; global rank 0 spawns per coordinator_setup.
+            bcast = [dp_addr]
+            torch.distributed.broadcast_object_list(bcast, src=0)
+            [dp_addr] = bcast
+
         # Find available ports for MP and bind to them.
         if self.is_mp_coordinator:
             mp_req_sock = self.zmq_context.socket(zmq.PUB)
@@ -725,7 +774,10 @@ class DynamicInferenceEngine(AbstractEngine):
         torch.distributed.broadcast_object_list(bcast, src=mp_src, group=mp_group)
         [mp_req_addr] = bcast
 
-        identity = f'mp-coord-{dp_rank}'
+        if disagg_config is not None:
+            identity = disagg_config["identity"]
+        else:
+            identity = f'mp-coord-{dp_rank}'
         if self.is_mp_coordinator:
             # 1. Create dealer sockets where tp_rank = 0 and pp_rank = 0
             #    These will receive requests from an InferenceCoordinator.
@@ -734,8 +786,18 @@ class DynamicInferenceEngine(AbstractEngine):
             self.socket_for_receiving_requests.setsockopt(zmq.IDENTITY, identity.encode('utf-8'))
             self.socket_for_receiving_requests.connect(dp_addr)
 
-            # send empty string. this is used to register with the coordinator.
-            self.socket_for_receiving_requests.send(b"")
+            if disagg_config is not None:
+                # Register with the disaggregated coordinator: role only; the
+                # per-request hand-off metadata is self-describing.
+                self.socket_for_receiving_requests.send(
+                    msgpack.packb(
+                        [Headers.REGISTER_ROLE.value, disagg_config["role"]],
+                        use_bin_type=True,
+                    )
+                )
+            else:
+                # send empty string. this is used to register with the coordinator.
+                self.socket_for_receiving_requests.send(b"")
 
             # 2. Create a publisher socket. This is used to publish or broadcast
             #    requests within the model parallel group

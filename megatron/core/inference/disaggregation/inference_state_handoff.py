@@ -491,6 +491,20 @@ class InferenceStateHandoffMixin:
             precomputed_block_hashes=pending.hashes[:n] if n > 0 else None,
         )
 
+        # Coordinator-native mode: tell the coordinator the read drained so it
+        # releases the prefill's pinned blocks and a flow-control slot. In the
+        # Dynamo mode the client triggers the release instead.
+        if getattr(self, "_disagg_config", None) is not None and self.is_mp_coordinator:
+            import msgpack
+
+            from megatron.core.inference.headers import Headers
+
+            self.socket_for_receiving_requests.send(
+                msgpack.packb(
+                    [Headers.KV_READ_DONE.value, pending.request_id], use_bin_type=True
+                )
+            )
+
         def _relay_result(src: asyncio.Future) -> None:
             if pending.future.done():
                 return
@@ -535,15 +549,51 @@ class InferenceStateHandoffMixin:
                 pass
         return safe_to_release
 
+    def _admission_flags(self) -> list:
+        """Per-pending (done, exception) pairs, with the done flags agreed
+        across the model-parallel group.
+
+        Each rank polls its own transfer handles; the done flags are
+        AND-reduced over the MP group so every rank admits the same imports on
+        the same step. Pending order is identical across ranks (the submits
+        arrive via the TP broadcast in order). A poll failure is recorded and
+        re-raised by the caller's quarantine path; it flags as done because
+        the failure is terminal on this rank either way."""
+        local = []
+        for p in self._pending_kv_imports:
+            try:
+                done = all(handle.poll() for handle in self._pending_transfer_handles(p))
+                local.append((done, None))
+            except Exception as exc:  # quarantined by the caller
+                local.append((True, exc))
+        mp_group = getattr(self.pg_collection, "mp", None)
+        if (
+            mp_group is not None
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(mp_group) > 1
+        ):
+            flags = torch.tensor(
+                [1 if d else 0 for d, _ in local], dtype=torch.int32, device="cuda"
+            )
+            torch.distributed.all_reduce(
+                flags, op=torch.distributed.ReduceOp.MIN, group=mp_group
+            )
+            local = [(bool(f), exc) for f, (_, exc) in zip(flags.tolist(), local)]
+        return local
+
     def _poll_pending_kv_imports(self) -> int:
         if not self._pending_kv_imports:
             return 0
+        admission = deque(self._admission_flags())
         ready = 0
         remaining = deque()
         while self._pending_kv_imports:
             pending = self._pending_kv_imports.popleft()
+            done, poll_exc = admission.popleft()
             try:
-                if self._kv_import_done(pending):
+                if poll_exc is not None:
+                    raise poll_exc
+                if done:
                     self._finalize_kv_handoff_import(pending)
                     ready += 1
                 else:
