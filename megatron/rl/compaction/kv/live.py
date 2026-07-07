@@ -25,6 +25,7 @@ H2O offline. See ``build_kv_compressor``.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -232,6 +233,18 @@ class LiveKVCompactor:
             self._register_q_hooks(engine)
         self.compacted_requests = 0
         self.tokens_evicted = 0
+
+    def stats(self) -> dict:
+        """Cumulative counters, identical on every TP rank (compaction runs in
+        lockstep), so the LAST [kv-compaction-stats] log line is exact — no
+        divide-by-TP guesswork for eval scrapers."""
+        s = {"compactions": self.compacted_requests,
+             "tokens_evicted": self.tokens_evicted,
+             "budget_ratio": round(self.budget_ratio, 4)}
+        if self._archive is not None:
+            s["retrievals"] = self._archive.retrievals
+            s["prefetch_hits"] = self._archive.prefetch_hits
+        return s
 
     # ------------------------------------------------------------------
     # Q capture (snapkv). The dynamic-batching path invokes
@@ -558,6 +571,7 @@ class LiveKVCompactor:
                 "[kv-compaction] request b_local=%d: %d -> %d tokens (%s, ratio %.2f)",
                 b_local, S, len(positions), self.strategy, self.budget_ratio,
             )
+            logger.info("[kv-compaction-stats] %s", json.dumps(self.stats()))
         self._prefill_rids = []
 
     def _compact_with_updater(self, b_local: int, b_global: int,
@@ -583,6 +597,7 @@ class LiveKVCompactor:
             "[kv-compaction] request b_local=%d: %d -> %d synthetic tokens (belief_still)",
             b_local, S, C,
         )
+        logger.info("[kv-compaction-stats] %s", json.dumps(self.stats()))
 
     def _init_oracle(self, n_layers: int, d_key: int) -> None:
         """Build (or load) the learned heavy-hitter scorer, replicated per rank.

@@ -55,6 +55,9 @@ class CompactionBenchmarkResult:
     wall_time_s: float
     original_length: int
     compacted_length: int
+    # Which token positions survived — the raw material for selector-overlap
+    # and needle-retention diagnostics (which tokens, not just how many).
+    retained_positions: list[int] | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -105,6 +108,7 @@ class KVCompactionBenchmark:
                 wall_time_s=result.wall_time_s,
                 original_length=result.original_length,
                 compacted_length=len(result.retained_positions),
+                retained_positions=list(result.retained_positions),
             ))
 
         results.sort(key=lambda r: r.output_mse)
