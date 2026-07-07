@@ -236,7 +236,7 @@ def get_load_checkpoint_path_by_args(args, load_arg="load"):
     tracker_filename = 'because load directory is not defined'
     if load_dir is not None:
         tracker_filename = get_checkpoint_tracker_filename(load_dir)
-        if isfile(tracker_filename):
+        if _tracker_isfile(tracker_filename):
             iteration, release = read_metadata(tracker_filename)
 
     # Allow user to specify the loaded iteration.
@@ -314,6 +314,20 @@ def checkpoint_exists(checkpoints_path):
         return False
     path = get_checkpoint_tracker_filename(checkpoints_path)
     return isfile(path)
+
+
+def _tracker_isfile(tracker_filename):
+    """isfile with retries — a transient lustre miss on ONE rank makes that
+    rank skip read_metadata while others enter its all-reduce, desyncing the
+    collectives (observed as a garbage max-iteration and NCCL aborts when many
+    jobs stat the same tracker simultaneously). Retrying until the ranks agree
+    is cheap; a genuinely absent file just costs a few seconds once."""
+    import time
+    for _ in range(10):
+        if isfile(tracker_filename):
+            return True
+        time.sleep(1.0)
+    return isfile(tracker_filename)
 
 
 def read_metadata(tracker_filename):
@@ -1105,7 +1119,7 @@ def _get_non_persistent_iteration(non_persistent_global_dir, args, checkpointing
         return -1
     elif args.non_persistent_ckpt_type == "global":
         tracker_filename = get_checkpoint_tracker_filename(non_persistent_global_dir)
-        if isfile(tracker_filename):
+        if _tracker_isfile(tracker_filename):
             iteration, release = read_metadata(tracker_filename)
             if release:
                 raise RuntimeError('Non-persistent checkpoint can\'t be a release checkpoint')
@@ -1246,7 +1260,7 @@ def _load_base_checkpoint(
     tracker_filename = 'because load directory is not defined'
     if load_dir is not None:
         tracker_filename = get_checkpoint_tracker_filename(load_dir)
-        if isfile(tracker_filename):
+        if _tracker_isfile(tracker_filename):
             iteration, release = read_metadata(tracker_filename)
 
     # Allow user to specify the loaded iteration.
