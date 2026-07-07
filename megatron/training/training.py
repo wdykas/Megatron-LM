@@ -6,6 +6,16 @@ import time
 
 from megatron.training.config.container import PretrainConfigContainer
 
+def _fp32_cpu_state_dict(state_dict):
+    return {
+        k: (
+            v.detach().cpu().float()
+            if v is not None and v.is_floating_point()
+            else v.detach().cpu() if v is not None else None
+        )
+        for k, v in state_dict.items()
+    }
+
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
 
@@ -3330,7 +3340,9 @@ def train(
             prox_pi_state_dict = load_prox_pi_state(args.load, args.iteration)
             if prox_pi_state_dict is None:
                 print_rank_0("> No saved PPO-EWMA proximal policy; initializing from current weights.")
-                prox_pi_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
+                #prox_pi_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
+                prox_pi_state_dict = _fp32_cpu_state_dict(model[0].state_dict())
+
             else:
                 print_rank_0(f"> Restored PPO-EWMA proximal policy at iteration {args.iteration}.")
 
@@ -3737,9 +3749,15 @@ def train(
         if args.perform_rl_step:
             if args.overlap_param_gather:
                 force_param_sync(model)
-            cur_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
+            #cur_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
+            cur_state_dict = model[0].state_dict()
             b = args.grpo_prox_ewma_beta
-            prox_pi_state_dict = {k: ((1. - b) * cur_state_dict[k] + b * v if v is not None else v) for k, v in prox_pi_state_dict.items()}
+            #prox_pi_state_dict = {k: ((1. - b) * cur_state_dict[k] + b * v if v is not None else v) for k, v in prox_pi_state_dict.items()}
+            with torch.no_grad():
+                for k, prox in prox_pi_state_dict.items():
+                    if prox is not None and prox.is_floating_point():
+                        current = cur_state_dict[k].detach().cpu().float()
+                        prox.lerp_(current, 1. - b)
             _set_current_prox_pi(prox_pi_state_dict)
         if should_checkpoint:
             save_checkpoint_and_time(
