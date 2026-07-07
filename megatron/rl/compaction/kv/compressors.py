@@ -117,10 +117,26 @@ def _validate_budget(budget: int, T: int) -> int:
     return min(budget, T)
 
 
-def _softmax_attention(queries: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
-    """Normalised softmax attention softmax(q·Kᵀ/√d) of each query row.  Shape (n, T)."""
+def _softmax_attention(queries: torch.Tensor, keys: torch.Tensor,
+                       causal_tail: bool = False) -> torch.Tensor:
+    """Normalised softmax attention softmax(q·Kᵀ/√d) of each query row. (n, T).
+
+    ``causal_tail=True`` treats the n query rows as the LAST n positions of the
+    sequence (how window queries are captured) and masks each row's future
+    keys before the softmax — the official SnapKV/H2O kernels are causal;
+    without the mask, earlier window queries leak probability mass to keys
+    they could never attend to, systematically deflating prefix scores.
+    Softmax in fp32 (official SnapKV): bf16 loses tail-key mass over long T.
+    """
     d = keys.shape[1]
-    return torch.softmax(queries @ keys.T / math.sqrt(d), dim=-1)
+    logits = (queries @ keys.T / math.sqrt(d)).float()
+    if causal_tail:
+        n, T = logits.shape
+        col = torch.arange(T, device=logits.device)
+        row = torch.arange(n, device=logits.device)
+        future = col[None, :] > (T - n + row)[:, None]
+        logits = logits.masked_fill(future, float("-inf"))
+    return torch.softmax(logits, dim=-1)
 
 
 def _select_recent_plus_heavy(
@@ -144,9 +160,10 @@ def _select_recent_plus_heavy(
 
 
 def _mass_features(queries: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
-    """Unnormalised attention mass Φ_ij = exp(q_i · K_j^T / sqrt(d)).  Shape (n, T)."""
+    """Unnormalised attention mass Φ_ij = exp(q_i · K_j^T / sqrt(d)). (n, T).
+    fp32 throughout (official policy: QK matmul in model dtype, exp/solve fp32)."""
     d = keys.shape[1]
-    logits = queries @ keys.T / math.sqrt(d)
+    logits = (queries @ keys.T).float() / math.sqrt(d)
     logits = logits - logits.max(dim=1, keepdim=True).values
     return torch.exp(logits)
 
@@ -169,33 +186,38 @@ def _attention_output(
     return weights @ values, mass
 
 
-def _nnls_pgd(A: torch.Tensor, b: torch.Tensor, max_iter: int = 500) -> torch.Tensor:
-    """Non-negative least squares: FISTA-accelerated projected gradient.
+def _nnls_box(A: torch.Tensor, b: torch.Tensor, lower: float = 1e-12,
+              upper: float | None = None, iters: int = 0) -> torch.Tensor:
+    """Official AM-OMP weight solve (Zweiger et al. base.py _nnls_pg).
 
-    Warm-started from the clamped least-squares solution; step size from the
-    spectral norm of A^T A (power iteration) rather than the Frobenius bound —
-    on ill-conditioned real attention features the Frobenius step is orders of
-    magnitude too small and plain PGD from zero never leaves the origin.
+    iters=0 (the paper default) is NOT iterative NNLS: it is a plain
+    unregularized least-squares solve followed by clamping into
+    [lower, upper]. iters>0 runs that many projected-gradient steps from the
+    clamped-lstsq init with a spectral step size. All math in fp32.
     """
-    AtA = A.T @ A
-    Atb = A.T @ b
-    # spectral norm via power iteration (tight step bound)
-    z = torch.randn(A.shape[1], device=A.device, dtype=A.dtype)
-    for _ in range(20):
-        z = AtA @ z
-        z = z / (z.norm() + 1e-30)
-    L = float(z @ (AtA @ z)) + 1e-8
-    step = 1.0 / L
+    A32, b32 = A.float(), b.float()
     try:
-        w = torch.linalg.lstsq(A, b).solution.clamp(min=0)
+        w = torch.linalg.lstsq(A32, b32.unsqueeze(1), driver="gels").solution.squeeze(1)
     except Exception:
-        w = torch.zeros(A.shape[1], device=A.device, dtype=A.dtype)
-    y, t_acc = w.clone(), 1.0
-    for _ in range(max_iter):
-        w_next = (y - step * (AtA @ y - Atb)).clamp(min=0)
-        t_next = (1 + (1 + 4 * t_acc * t_acc) ** 0.5) / 2
-        y = w_next + ((t_acc - 1) / t_next) * (w_next - w)
-        w, t_acc = w_next, t_next
+        # official fallback: tiny-ridge Cholesky
+        AtA = A32.T @ A32
+        lam = 1e-6 * AtA.diagonal().mean().clamp(min=1e-12)
+        w = torch.linalg.solve(AtA + lam * torch.eye(A32.shape[1], device=A32.device), A32.T @ b32)
+    w = w.clamp(min=lower)
+    if upper is not None:
+        w = w.clamp(max=upper)
+    if iters > 0:
+        AtA = A32.T @ A32
+        Atb = A32.T @ b32
+        z = torch.randn(A32.shape[1], device=A32.device)
+        for _ in range(3):
+            z = AtA @ z
+            z = z / (z.norm() + 1e-30)
+        step = 1.0 / (float(z @ (AtA @ z)) + 1e-8)
+        for _ in range(iters):
+            w = (w - step * (AtA @ w - Atb)).clamp(min=lower)
+            if upper is not None:
+                w = w.clamp(max=upper)
     return w
 
 
@@ -221,18 +243,11 @@ def _fit_bias(
     Phi_c    = torch.exp(logits_c    - row_max)               # (n, t)
 
     m = Phi_orig.sum(dim=1)                                   # (n,)
-    n, t = Phi_c.shape
-    # Mild ridge REGULARIZED TOWARD w=1 (bias 0): over-regularization then
-    # degrades to "no bias" instead of w→0 = bias→-inf, which silently
-    # DELETES retained keys from attention at eval (the old mean(m)*0.1
-    # ridge toward zero did exactly that on real captures).
-    lam = float(Phi_c.pow(2).sum(dim=0).mean().item()) * 1e-3 + 1e-12
-    reg = math.sqrt(lam) * torch.eye(t, device=Phi_c.device, dtype=Phi_c.dtype)
-    A_aug = torch.cat([Phi_c, reg], dim=0)
-    b_aug = torch.cat([m, math.sqrt(lam) * torch.ones(t, device=m.device, dtype=m.dtype)])
-
-    w = _nnls_pgd(A_aug, b_aug)
-    return torch.log(w.clamp(min=1e-12))
+    # Official AM-HighestAttnKeys paper config: 2 projected-gradient steps
+    # from the clamped-lstsq init, weights boxed into [e^-3, e^3] (beta in
+    # [-3, 3]) — regularization is the box clamp, not a ridge.
+    w = _nnls_box(Phi_c, m, lower=math.exp(-3.0), upper=math.exp(3.0), iters=2)
+    return torch.log(w).to(keys_orig.dtype)
 
 
 def _fit_values(
@@ -262,12 +277,19 @@ def _fit_values(
     exp_c = torch.exp(logits_c)
     X = exp_c / exp_c.sum(dim=1, keepdim=True)                      # (n, t)
 
-    t = X.shape[1]
     if values_init is None:
-        values_init = torch.zeros(t, values_orig.shape[1],
-                                  device=values_orig.device, dtype=values_orig.dtype)
-    XtX = X.T @ X                                       # (t, t)
+        # Official AM-OMP 'lsq': plain unregularized least squares in fp32
+        # (gels => minimum-norm when underdetermined). NOTE the official
+        # pipeline fits against ~10k GENERATED queries per KV head; with far
+        # fewer queries this is underdetermined and the min-norm solution
+        # zeroes weakly-attended values — pass values_init for the residual
+        # form, which degrades to the original values instead.
+        C2 = torch.linalg.lstsq(X.float(), Y.float(), driver="gels").solution
+        return C2.to(values_orig.dtype)
+    t = X.shape[1]
+    X32, Y32 = X.float(), Y.float()
+    XtX = X32.T @ X32                                   # (t, t)
     lam = XtX.diagonal().mean().clamp(min=1e-8) * 1e-2
-    A = XtX + lam * torch.eye(t, device=X.device, dtype=X.dtype)
-    D = torch.linalg.solve(A, X.T @ (Y - X @ values_init))
-    return values_init + D                              # (t, d)
+    A = XtX + lam * torch.eye(t, device=X.device, dtype=torch.float32)
+    D = torch.linalg.solve(A, X32.T @ (Y32 - X32 @ values_init.float()))
+    return (values_init.float() + D).to(values_orig.dtype)  # (t, d)

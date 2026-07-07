@@ -93,9 +93,11 @@ class H2OAccumulator:
                     "decode step (online), pass accumulated_scores, or pass ref_queries "
                     "to score offline."
                 )
-            # Offline H2O score: total softmax attention each key received over the
-            # queries (the paper's accumulated-attention F_score).
-            scores = _softmax_attention(ref_queries, keys).sum(dim=0)
+            # Offline H2O score: total CAUSAL softmax attention each key received
+            # over the queries (the paper's accumulated-attention F_score; the
+            # official kernel is causally masked — non-causal scoring leaks mass
+            # to future keys and deflates sink/early-token scores).
+            scores = _softmax_attention(ref_queries, keys, causal_tail=True).sum(dim=0)
 
         t0 = time.perf_counter()
         T = keys.shape[0]

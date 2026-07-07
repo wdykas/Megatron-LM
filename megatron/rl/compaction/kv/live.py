@@ -141,7 +141,15 @@ class LiveKVCompactor:
                 raise ValueError(
                     "archive mode restores exact evicted spans; belief_still "
                     "replaces the cache with synthetic tokens, so there are no "
-                    "evicted spans to archive. Use snapkv or streaming_llm.")
+                    "evicted spans to archive. Use snapkv or learned_oracle.")
+            if strategy == "streaming_llm":
+                logger.warning(
+                    "[kv-compaction] archive+streaming_llm: the retrieval "
+                    "trigger has NO measurable need-vs-idle separation under "
+                    "content-blind mass eviction (margins compress; measured "
+                    "offline and live retrievals=0) — expect no recoveries. "
+                    "The archive is effective with content-aware strategies "
+                    "(snapkv, learned_oracle).")
             if retrieval_margin is None:
                 raise ValueError(
                     "archive mode needs an explicit retrieval_margin. The margin "
@@ -735,17 +743,33 @@ class LiveKVCompactor:
         L, S, Hkv, D = keys.shape
         scores = torch.zeros(S, device=keys.device, dtype=torch.float32)
         scale = 1.0 / math.sqrt(D)
+        Tq = q_rows[0].shape[0]
+        # CAUSAL mask for the observation window (official SnapKV): window
+        # query i (the (S - Tq + i)-th token) must not attend to later keys.
+        col = torch.arange(S, device=keys.device)
+        row = torch.arange(Tq, device=keys.device)
+        future = col[None, :] > (S - Tq + row)[:, None]         # (Tq, S)
         for l in range(L):
             q = q_rows[l]                       # (Tq, Hq, D)
-            Tq, Hq, _ = q.shape
+            Tq_l, Hq, _ = q.shape
             group = Hq // Hkv
             # One batched matmul over all KV groups instead of Hkv small GEMMs.
-            qb = (q.reshape(Tq, Hkv, group, D).permute(1, 0, 2, 3)
-                   .reshape(Hkv, Tq * group, D).float())        # (Hkv, Tq*grp, D)
+            qb = (q.reshape(Tq_l, Hkv, group, D).permute(1, 0, 2, 3)
+                   .reshape(Hkv, Tq_l * group, D).float())      # (Hkv, Tq*grp, D)
             kb = keys[l].permute(1, 0, 2).float()               # (Hkv, S, D)
-            attn = torch.softmax(qb @ kb.transpose(1, 2) * scale, dim=-1)
+            logits = qb @ kb.transpose(1, 2) * scale            # (Hkv, Tq*grp, S)
+            mask = future.repeat_interleave(group, dim=0)       # (Tq*grp, S)
+            attn = torch.softmax(logits.masked_fill(mask, float("-inf")), dim=-1)
             scores += attn.sum(dim=(0, 1))
+        # Pool over PREFIX scores only (official drops the window columns
+        # before pooling): pooling across the boundary leaks the window keys'
+        # large scores into the last pool_kernel//2 prefix positions.
+        n_win = min(Tq, S)
         pad = self.pool_kernel // 2
-        return F.max_pool1d(
-            scores[None, None, :], kernel_size=self.pool_kernel, stride=1, padding=pad
-        )[0, 0]
+        prefix = scores[: S - n_win]
+        if prefix.numel():
+            pooled_prefix = F.max_pool1d(
+                prefix[None, None, :], kernel_size=self.pool_kernel, stride=1, padding=pad
+            )[0, 0]
+            return torch.cat([pooled_prefix, scores[S - n_win:]])
+        return scores

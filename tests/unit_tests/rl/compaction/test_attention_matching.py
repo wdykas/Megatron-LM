@@ -268,7 +268,9 @@ class TestOMPCompressor:
         Q_ref = Q_ref @ K[:8].T @ torch.linalg.pinv(K[:8].T)
         Q_eval = torch.randn(n, d)
 
-        r_omp = OMPCompressor(fit_values=False).compress(K, V, 16, ref_queries=Q_ref)
+        # selection-only: the bias/value fits are query-conditional and this
+        # test's eval queries are unrelated randoms — isolate selection.
+        r_omp = OMPCompressor(fit_bias=False, fit_values=False).compress(K, V, 16, ref_queries=Q_ref)
         r_uni = UniformScorer().compress(K, V, 16)
 
         Y_full, _ = _attention_output(Q_eval, K, V)

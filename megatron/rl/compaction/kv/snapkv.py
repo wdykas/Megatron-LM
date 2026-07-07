@@ -76,16 +76,27 @@ class SnapKVCompressor:
         T = keys.shape[0]
         budget = _validate_budget(budget, T)
 
-        # Attention of the observation-window queries over all keys, summed, then
-        # max-pooled over neighbouring keys so an important span is kept together.
-        scores = _softmax_attention(ref_queries, keys).sum(dim=0)   # (T,)
+        # CAUSAL attention of the observation-window queries over all keys
+        # (official SnapKV masks the window x window block), summed, then
+        # max-pooled over neighbouring PREFIX keys only — the official kernel
+        # drops the window columns before pooling; pooling across the boundary
+        # leaks the window keys' large scores into the last pool_kernel//2
+        # prefix positions and silently spends budget there every time.
+        scores = _softmax_attention(ref_queries, keys, causal_tail=True).sum(dim=0)
+        n_recent = min(self.obs_window, budget, ref_queries.shape[0], T)
+        prefix = scores[: T - n_recent]
         pad = self.pool_kernel // 2
-        pooled = F.max_pool1d(
-            scores[None, None, :], kernel_size=self.pool_kernel, stride=1, padding=pad
-        )[0, 0]
+        if prefix.numel():
+            pooled_prefix = F.max_pool1d(
+                prefix[None, None, :], kernel_size=self.pool_kernel, stride=1, padding=pad
+            )[0, 0]
+            pooled = torch.cat([pooled_prefix, scores[T - n_recent:]])
+        else:
+            pooled = scores
+        pooled = pooled.to(keys.dtype)
 
         positions = _select_recent_plus_heavy(
-            pooled, T, budget, n_recent=min(self.obs_window, budget)
+            pooled, T, budget, n_recent=n_recent
         )
         return CompactionResult(
             run_id=run_id, step_id=step_id,
