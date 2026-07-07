@@ -31,10 +31,7 @@ def test_kv_events_bypass_request_coordinator():
         reporter.observe("ready", {"version": 3})
         engine.listener("stored", {"block_hashes": [101]})
         assert ready.wait(timeout=2.0)
-        assert received == [
-            ("ready", {"version": 3}),
-            ("stored", {"block_hashes": [101]}),
-        ]
+        assert received == [("ready", {"version": 3}), ("stored", {"block_hashes": [101]})]
     finally:
         receiver.stop()
         reporter.stop()

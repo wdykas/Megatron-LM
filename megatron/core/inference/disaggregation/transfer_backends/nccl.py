@@ -48,6 +48,8 @@ class NcclTransferHandle:
         self._done = not works and not scatters
 
     def poll(self) -> bool:
+        """Return True if the transfer has settled, scattering received data
+        into the paged buffers on first completion."""
         if self._done:
             return True
         if not all(w.is_completed() for w in self._works):
@@ -56,6 +58,7 @@ class NcclTransferHandle:
         return True
 
     def wait(self) -> None:
+        """Block until the transfer completes, then scatter."""
         for w in self._works:
             w.wait()
         self._finish()
@@ -178,9 +181,7 @@ class NcclTransferBackend:
         for meta, blocks in peer_records:
             layout = _kv_layout_from_meta(meta)
             if layout.global_rank in peers_by_rank:
-                raise ValueError(
-                    f"duplicate peer global_rank={layout.global_rank} in KV metadata"
-                )
+                raise ValueError(f"duplicate peer global_rank={layout.global_rank} in KV metadata")
             peers_by_rank[layout.global_rank] = meta
             sources.append(layout)
         if mine_is_src:
@@ -260,17 +261,13 @@ class NcclTransferBackend:
                     )
                     buffers.append(buf)
                     ops.append(dist.P2POp(dist.irecv, buf, int(meta["nccl_rank"])))
-                    scatters.append(
-                        _make_copy(self._kv_block_view(int(block), layers, heads), buf)
-                    )
+                    scatters.append(_make_copy(self._kv_block_view(int(block), layers, heads), buf))
 
         works = dist.batch_isend_irecv(ops) if ops else []
         return NcclTransferHandle(works, buffers, scatters)
 
     # --- prefill side ----------------------------------------------------------
-    def begin_push_blocks(
-        self, peer_meta: Any, src_block_ids: List[int]
-    ) -> NcclTransferHandle:
+    def begin_push_blocks(self, peer_meta: Any, src_block_ids: List[int]) -> NcclTransferHandle:
         """Post the sends matching the decode's receives, straight out of the
         pinned source blocks (or Mamba slots). `peer_meta` is the decode
         instance's per-rank metadata in the same nested shape as a hand-off's

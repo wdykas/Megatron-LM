@@ -552,9 +552,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self._kv_event_listeners: list = []
         self._pending_kv_stored_events: list[dict] = []
-        self.kv_block_allocator.add_blocks_deregistered_observer(
-            self._on_kv_blocks_deregistered
-        )
+        self.kv_block_allocator.add_blocks_deregistered_observer(self._on_kv_blocks_deregistered)
 
         # Track request metadata.
         request_metadata_types = inference_config.request_metadata_types
@@ -3068,9 +3066,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                             "token_ids": token_ids,
                             "num_block_tokens": [self.block_size_tokens] * (end - start),
                             "parent_hash": (
-                                int(req.precomputed_block_hashes[start - 1])
-                                if start > 0
-                                else None
+                                int(req.precomputed_block_hashes[start - 1]) if start > 0 else None
                             ),
                         }
                     )

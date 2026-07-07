@@ -89,9 +89,7 @@ class Status(Enum):
 
 
 def compute_block_hashes_batched(
-    prompt_tokens: torch.Tensor,
-    block_size: int,
-    include_partial: bool = False,
+    prompt_tokens: torch.Tensor, block_size: int, include_partial: bool = False
 ) -> List[int]:
     """Compute SHA-256 based hashes for blocks in a prompt.
 

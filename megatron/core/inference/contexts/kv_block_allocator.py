@@ -329,6 +329,7 @@ class KVBlockAllocator:
         self.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
 
     def add_blocks_deregistered_observer(self, observer: Callable) -> None:
+        """Register a callback invoked when cached blocks are deregistered."""
         self._blocks_deregistered_observers.append(observer)
 
     def _deregister_blocks(self, block_ids: Tensor) -> None:

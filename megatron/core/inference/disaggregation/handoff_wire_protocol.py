@@ -17,14 +17,7 @@ def make_submit_request_with_kv_message(
 ) -> list:
     """Build a ``SUBMIT_REQUEST_WITH_KV`` message."""
 
-    return [
-        header_value,
-        int(request_id),
-        prompt,
-        sampling_params,
-        kv_meta,
-        list(src_block_ids),
-    ]
+    return [header_value, int(request_id), prompt, sampling_params, kv_meta, list(src_block_ids)]
 
 
 def parse_submit_request_with_kv_fields(fields: Sequence[Any]) -> Tuple[Any, ...]:

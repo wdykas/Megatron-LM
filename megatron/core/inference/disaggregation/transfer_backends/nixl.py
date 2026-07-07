@@ -47,6 +47,7 @@ _POLL_TIMEOUT_S = 30.0
 
 
 def have_nixl() -> bool:
+    """Whether the nixl Python package is importable."""
     return _HAVE_NIXL
 
 
@@ -63,6 +64,7 @@ class NixlPullHandle:
     error: Optional[str] = None
 
     def poll(self) -> bool:
+        """Return True if every transfer has settled, without blocking."""
         if self.done:
             if self.error is not None:
                 raise RuntimeError(self.error)
@@ -95,6 +97,8 @@ class NixlPullHandle:
         return False
 
     def wait(self) -> None:
+        """Block until the transfer completes; NIXL has no blocking wait, so
+        this polls."""
         while not self.poll():
             time.sleep(_POLL_INTERVAL_S)
 
@@ -217,9 +221,7 @@ class NixlTransferBackend:
         """
         meta = {
             "agent_name": self.agent_name,
-            "agent_metadata_b64": base64.b64encode(self._agent_metadata).decode(
-                "ascii"
-            ),
+            "agent_metadata_b64": base64.b64encode(self._agent_metadata).decode("ascii"),
             "base_addr": self._buf_ptr,
             "outer_stride_bytes": self._outer_stride_bytes,
             "device_id": self._device_id,
@@ -259,15 +261,11 @@ class NixlTransferBackend:
             return existing
         metadata_b64 = peer_meta.get("agent_metadata_b64")
         if not metadata_b64:
-            raise ValueError(
-                f"peer_meta for {peer_name!r} is missing agent_metadata_b64"
-            )
+            raise ValueError(f"peer_meta for {peer_name!r} is missing agent_metadata_b64")
         peer_id = self._agent.add_remote_agent(base64.b64decode(metadata_b64))
         resolved = peer_id if peer_id else peer_name
         self._known_peers[peer_name] = resolved
-        logger.info(
-            "NixlTransferBackend[%s] registered peer %s", self.agent_name, peer_name
-        )
+        logger.info("NixlTransferBackend[%s] registered peer %s", self.agent_name, peer_name)
         return resolved
 
     def _validate_peer(
@@ -287,9 +285,7 @@ class NixlTransferBackend:
             )
         for block in src_block_ids:
             if not 0 <= block < int(meta["num_blocks"]):
-                raise ValueError(
-                    f"source block {block} is outside pool [0, {meta['num_blocks']})"
-                )
+                raise ValueError(f"source block {block} is outside pool [0, {meta['num_blocks']})")
         for block in dst_block_ids:
             if not 0 <= block < self._num_blocks:
                 raise ValueError(
@@ -307,9 +303,7 @@ class NixlTransferBackend:
         }
         fields = ["head_dim", "tokens_per_block", "element_size"]
         if matched_layout:
-            fields.extend(
-                ["num_outer", "bytes_per_slice", "blocks_axis", "heads_per_partition"]
-            )
+            fields.extend(["num_outer", "bytes_per_slice", "blocks_axis", "heads_per_partition"])
         mismatches = [
             f"{field}: peer={meta.get(field)} local={local[field]}"
             for field in fields
@@ -352,10 +346,7 @@ class NixlTransferBackend:
         )
 
     def begin_pull_blocks(
-        self,
-        peer_meta: Any,
-        src_block_ids: List[int],
-        dst_block_ids: List[int],
+        self, peer_meta: Any, src_block_ids: List[int], dst_block_ids: List[int]
     ) -> NixlPullHandle:
         """Submit a pull and return a handle that can be polled later."""
         if not isinstance(peer_meta, dict) or "pp_metas" not in peer_meta:
@@ -385,9 +376,7 @@ class NixlTransferBackend:
                     or self._num_outer != self._mamba_layout.num_layers
                     or self._blocks_axis != 1
                 ):
-                    raise ValueError(
-                        f"local {state_kind} geometry does not match its Mamba layout"
-                    )
+                    raise ValueError(f"local {state_kind} geometry does not match its Mamba layout")
 
                 sources = []
                 peers_by_rank = {}
@@ -398,9 +387,7 @@ class NixlTransferBackend:
                     layout = MambaShardLayout(**raw_layout)
                     self._validate_peer(meta, blocks, dst_block_ids)
                     peer_width = (
-                        layout.conv_dim_local
-                        if state_kind == "conv"
-                        else layout.nheads_local
+                        layout.conv_dim_local if state_kind == "conv" else layout.nheads_local
                     )
                     if (
                         meta.get("heads_per_partition") != peer_width
@@ -462,13 +449,9 @@ class NixlTransferBackend:
                     layout = self._kv_layout_from_meta(meta)
                     self._validate_peer(meta, blocks, dst_block_ids)
                     if meta.get("heads_per_partition") != layout.local_num_heads():
-                        raise ValueError(
-                            "peer heads_per_partition does not match its KV layout"
-                        )
+                        raise ValueError("peer heads_per_partition does not match its KV layout")
                     if int(meta["num_outer"]) % layout.local_num_layers():
-                        raise ValueError(
-                            "peer num_outer is not divisible by its local layer count"
-                        )
+                        raise ValueError("peer num_outer is not divisible by its local layer count")
                     if layout.global_rank in peers_by_rank:
                         raise ValueError(
                             f"duplicate source global_rank={layout.global_rank} in KV metadata"
@@ -513,9 +496,7 @@ class NixlTransferBackend:
                         xfers.append(xfer)
                         contexts.append(ctx)
                         continue
-                    if not full_heads and (
-                        int(meta["blocks_axis"]) != 2 or self._blocks_axis != 2
-                    ):
+                    if not full_heads and (int(meta["blocks_axis"]) != 2 or self._blocks_axis != 2):
                         raise NotImplementedError(
                             "KV head resharding requires the [2, L, B, T, H, d] layout"
                         )
@@ -537,25 +518,16 @@ class NixlTransferBackend:
             else:
                 records = transfer_peer_records(peer_meta, src_block_ids)
                 if len(records) != 1:
-                    raise ValueError(
-                        "matched-layout transfer requires exactly one source peer"
-                    )
+                    raise ValueError("matched-layout transfer requires exactly one source peer")
                 meta, blocks = records[0]
-                self._validate_peer(
-                    meta, blocks, dst_block_ids, matched_layout=True
-                )
-                xfer, ctx = self._begin_transfer(
-                    meta, blocks, dst_block_ids, 0, 0, self._num_outer
-                )
+                self._validate_peer(meta, blocks, dst_block_ids, matched_layout=True)
+                xfer, ctx = self._begin_transfer(meta, blocks, dst_block_ids, 0, 0, self._num_outer)
                 xfers.append(xfer)
                 contexts.append(ctx)
         except Exception as exc:
             if xfers:
                 cleanup = NixlPullHandle(
-                    agent=self._agent,
-                    xfers=xfers,
-                    contexts=contexts,
-                    submitted_at=submitted_at,
+                    agent=self._agent, xfers=xfers, contexts=contexts, submitted_at=submitted_at
                 )
                 try:
                     cleanup.wait()
@@ -569,10 +541,7 @@ class NixlTransferBackend:
                     pass
             raise
         return NixlPullHandle(
-            agent=self._agent,
-            xfers=xfers,
-            contexts=contexts,
-            submitted_at=submitted_at,
+            agent=self._agent, xfers=xfers, contexts=contexts, submitted_at=submitted_at
         )
 
     def _begin_transfer(
@@ -608,18 +577,10 @@ class NixlTransferBackend:
                     src_o = src_o_start + i
                     dst_o = dst_o_start + i
                     src_tuples.append(
-                        (
-                            peer_base + src_o * peer_os + src_b * peer_bps,
-                            peer_bps,
-                            peer_device_id,
-                        )
+                        (peer_base + src_o * peer_os + src_b * peer_bps, peer_bps, peer_device_id)
                     )
                     dst_tuples.append(
-                        (
-                            self._buf_ptr + dst_o * local_os + dst_b * bps,
-                            bps,
-                            self._device_id,
-                        )
+                        (self._buf_ptr + dst_o * local_os + dst_b * bps, bps, self._device_id)
                     )
             ctx = (
                 f"matched peer={peer_id} outer[{src_o_start}:+{n_outer}] "
@@ -642,26 +603,14 @@ class NixlTransferBackend:
                 for i in range(n_outer):
                     src_o = src_o_start + i
                     dst_o = dst_o_start + i
-                    src_slice = (
-                        peer_base + src_o * peer_os + src_b * peer_bps + src_h_off
-                    )
-                    dst_slice = (
-                        self._buf_ptr + dst_o * local_os + dst_b * bps + dst_h_off
-                    )
+                    src_slice = peer_base + src_o * peer_os + src_b * peer_bps + src_h_off
+                    dst_slice = self._buf_ptr + dst_o * local_os + dst_b * bps + dst_h_off
                     for t in range(T):
                         src_tuples.append(
-                            (
-                                src_slice + t * peer_token_stride,
-                                frag_bytes,
-                                peer_device_id,
-                            )
+                            (src_slice + t * peer_token_stride, frag_bytes, peer_device_id)
                         )
                         dst_tuples.append(
-                            (
-                                dst_slice + t * local_token_stride,
-                                frag_bytes,
-                                self._device_id,
-                            )
+                            (dst_slice + t * local_token_stride, frag_bytes, self._device_id)
                         )
             ctx = (
                 f"reshard peer={peer_id} outer[{src_o_start}:+{n_outer}] "
@@ -682,6 +631,7 @@ class NixlTransferBackend:
         return xfer, ctx
 
     def close(self) -> None:
+        """Release the registration and agent."""
         if self._agent is None:
             return
         try:

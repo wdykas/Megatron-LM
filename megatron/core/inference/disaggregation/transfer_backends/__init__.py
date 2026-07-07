@@ -4,7 +4,4 @@
 
 from .base import KVTransportBackend, construct_kv_transfer_backend_class
 
-__all__ = [
-    "KVTransportBackend",
-    "construct_kv_transfer_backend_class",
-]
+__all__ = ["KVTransportBackend", "construct_kv_transfer_backend_class"]

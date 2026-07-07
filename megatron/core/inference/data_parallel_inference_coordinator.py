@@ -350,9 +350,7 @@ class DataParallelInferenceCoordinator:
         prefill_params["return_log_probs"] = False
         if "num_tokens_total" in prefill_params:
             prefill_params["num_tokens_total"] = None
-        self._disagg_send(
-            prefill_id, Headers.SUBMIT_REQUEST, request_id, prompt, prefill_params
-        )
+        self._disagg_send(prefill_id, Headers.SUBMIT_REQUEST, request_id, prompt, prefill_params)
 
     def _handle_prefill_done(self, request_id, finished_request):
         """Hop 2: a prefill engine finished a request and its reply carries
@@ -364,9 +362,7 @@ class DataParallelInferenceCoordinator:
         meta = self._req_meta.get(request_id)
         handoff = finished_request.get("disaggregated_params")
         if meta is None or not handoff:
-            self._drop_disagg_request(
-                request_id, "prefill reply carried no hand-off metadata"
-            )
+            self._drop_disagg_request(request_id, "prefill reply carried no hand-off metadata")
             return
         prompt, sampling_params = meta
         try:
@@ -585,10 +581,7 @@ class DataParallelInferenceCoordinator:
                 # print(f"New client connected: {sender_identity}")
                 known_clients.add(sender_identity)
                 self.router_socket.send_multipart(
-                    [
-                        sender_identity,
-                        msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True),
-                    ]
+                    [sender_identity, msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]
                 )
 
             elif header == Headers.SUBMIT_REQUEST:
@@ -737,8 +730,7 @@ class DataParallelInferenceCoordinator:
                         [
                             client_identity,
                             msgpack.packb(
-                                [header.value, client_request_identity, partial],
-                                use_bin_type=True,
+                                [header.value, client_request_identity, partial], use_bin_type=True
                             ),
                         ]
                     )
@@ -797,7 +789,8 @@ class DataParallelInferenceCoordinator:
                 # Decode-side handoff import, routed like SUBMIT_REQUEST.
                 if sender_identity not in known_clients:
                     logging.info(
-                        f"Received SUBMIT_REQUEST_WITH_KV from unknown client {sender_identity}; ignoring."
+                        "Received SUBMIT_REQUEST_WITH_KV from unknown client "
+                        f"{sender_identity}; ignoring."
                     )
                     continue
                 try:
@@ -806,8 +799,7 @@ class DataParallelInferenceCoordinator:
                     )
                 except ValueError:
                     logging.error(
-                        "Coordinator: malformed SUBMIT_REQUEST_WITH_KV payload "
-                        "with %d fields",
+                        "Coordinator: malformed SUBMIT_REQUEST_WITH_KV payload " "with %d fields",
                         len(deserialized_payload) - 1,
                     )
                     continue
@@ -838,8 +830,7 @@ class DataParallelInferenceCoordinator:
                         break
                 else:
                     logging.error(
-                        "Coordinator: no reachable engines for handoff request %d",
-                        request_id,
+                        "Coordinator: no reachable engines for handoff request %d", request_id
                     )
                     del self.request_id_to_client_id[request_id]
                     del self.request_id_to_client_request_id[request_id]
@@ -864,9 +855,7 @@ class DataParallelInferenceCoordinator:
                 if assigned_rank is not None:
                     self._send_to_engine(
                         assigned_rank,
-                        msgpack.packb(
-                            [Headers.ABORT_REQUEST.value, request_id], use_bin_type=True
-                        ),
+                        msgpack.packb([Headers.ABORT_REQUEST.value, request_id], use_bin_type=True),
                     )
 
             elif header == Headers.RELEASE_KV:
@@ -876,8 +865,7 @@ class DataParallelInferenceCoordinator:
                     continue
                 request_id = int(deserialized_payload[1])
                 broadcast_payload = msgpack.packb(
-                    make_release_kv_message(Headers.RELEASE_KV.value, request_id),
-                    use_bin_type=True,
+                    make_release_kv_message(Headers.RELEASE_KV.value, request_id), use_bin_type=True
                 )
                 for data_parallel_rank_id in list(self.identities_of_data_parallel_ranks):
                     self._send_to_engine(data_parallel_rank_id, broadcast_payload)

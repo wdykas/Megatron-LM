@@ -35,9 +35,9 @@ def _validate_disagg_specs(specs: List[InferenceShardSpec]) -> None:
         f"every shard must declare role=prefill or role=decode for "
         f"disaggregation; {len(untagged)} shard(s) had none: {untagged}"
     )
-    assert prefill and decode, (
-        "disaggregation needs at least one prefill shard and one decode shard."
-    )
+    assert (
+        prefill and decode
+    ), "disaggregation needs at least one prefill shard and one decode shard."
 
 
 @functools.lru_cache(maxsize=None)

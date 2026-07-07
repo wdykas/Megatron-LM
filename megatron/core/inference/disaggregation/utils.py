@@ -24,9 +24,7 @@ def transfers_for_dst(plan, dst_rank):
     return [t for t in plan if t.dst_rank == dst_rank]
 
 
-def transfer_peer_records(
-    peer_meta: Any, src_block_ids: List[int]
-) -> List[Tuple[dict, List[int]]]:
+def transfer_peer_records(peer_meta: Any, src_block_ids: List[int]) -> List[Tuple[dict, List[int]]]:
     """Normalize flat/TP/PP transfer metadata into peer/block records."""
 
     def append_metas(raw_metas: Any, default_blocks: List[int]) -> None:

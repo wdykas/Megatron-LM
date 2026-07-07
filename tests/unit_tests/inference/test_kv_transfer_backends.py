@@ -33,9 +33,7 @@ def test_nixl_direct_backend_exports_metadata_with_fake_agent(monkeypatch):
     monkeypatch.setattr(nixl_mod, "nixl_agent", FakeAgent)
 
     backend = nixl_mod.NixlTransferBackend(
-        "prefill",
-        torch.zeros(2, 3, 5, dtype=torch.float32),
-        expected_num_blocks=3,
+        "prefill", torch.zeros(2, 3, 5, dtype=torch.float32), expected_num_blocks=3
     )
     metadata = backend.export_meta()
 
@@ -84,9 +82,7 @@ def test_nixl_begin_pull_blocks_uses_remote_metadata_with_fake_agent(monkeypatch
     monkeypatch.setattr(nixl_mod, "nixl_agent", FakeAgent)
 
     backend = nixl_mod.NixlTransferBackend(
-        "decode",
-        torch.zeros(2, 3, 5, dtype=torch.float32),
-        expected_num_blocks=3,
+        "decode", torch.zeros(2, 3, 5, dtype=torch.float32), expected_num_blocks=3
     )
     peer_meta = {
         "agent_name": "prefill",
@@ -143,9 +139,7 @@ def test_nixl_begin_pull_blocks_returns_pollable_handle(monkeypatch):
     monkeypatch.setattr(nixl_mod, "nixl_agent", FakeAgent)
 
     backend = nixl_mod.NixlTransferBackend(
-        "decode",
-        torch.zeros(2, 3, 5, dtype=torch.float32),
-        expected_num_blocks=3,
+        "decode", torch.zeros(2, 3, 5, dtype=torch.float32), expected_num_blocks=3
     )
     peer_meta = {
         "agent_name": "prefill",

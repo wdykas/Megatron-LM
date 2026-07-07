@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import time
-from typing import AsyncIterator, List, Optional, Union
+from typing import List, Optional, Union
 
 from megatron.core.inference.disaggregation.handoff_wire_protocol import (
     make_release_kv_message,
@@ -50,6 +50,7 @@ class InferenceStream:
         return item
 
     async def aclose(self) -> None:
+        """Abort the stream's request if it is still open."""
         if not self.closed:
             self.client.abort_request(self.request_id)
             self.closed = True
@@ -294,9 +295,7 @@ class InferenceClient:
             except KeyboardInterrupt:
                 break
 
-    def _connect_with_inference_coordinator(
-        self, timeout_seconds: Optional[float] = None
-    ):
+    def _connect_with_inference_coordinator(self, timeout_seconds: Optional[float] = None):
         """
         Performs the initial handshake with the inference coordinator.
 
@@ -308,9 +307,7 @@ class InferenceClient:
         if timeout_seconds is not None and not self.socket.poll(
             timeout=max(0, int(timeout_seconds * 1000))
         ):
-            raise TimeoutError(
-                "Timed out connecting to the Megatron inference coordinator"
-            )
+            raise TimeoutError("Timed out connecting to the Megatron inference coordinator")
         reply = msgpack.unpackb(self.socket.recv(), raw=False)
         assert Headers(reply[0]) == Headers.CONNECT_ACK
 

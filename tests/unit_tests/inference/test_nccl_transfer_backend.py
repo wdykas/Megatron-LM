@@ -33,9 +33,7 @@ def _global_blocks():
 
 
 def _backend(rank, tp_size, tp_rank, device):
-    from megatron.core.inference.disaggregation.transfer_backends.nccl import (
-        NcclTransferBackend,
-    )
+    from megatron.core.inference.disaggregation.transfer_backends.nccl import NcclTransferBackend
 
     heads_local = H // tp_size
     buf = torch.zeros(2, L, NB, T, heads_local, HD, device=device)
@@ -106,9 +104,7 @@ def _worker(rank, world, port, q):
                 # buffer layout [2, L, B, T, h, d]
                 buf[:, :, block] = g[i, :, :, :, heads, :]
             # In production the decode's metas arrive in SEND_KV.
-            handle = backend.begin_push_blocks(
-                {"tp_metas": [_meta_stub(2, 1, 0)]}, BLOCKS
-            )
+            handle = backend.begin_push_blocks({"tp_metas": [_meta_stub(2, 1, 0)]}, BLOCKS)
             handle.wait()
             q.put((f"prefill{rank}", True))
         else:  # decode TP1

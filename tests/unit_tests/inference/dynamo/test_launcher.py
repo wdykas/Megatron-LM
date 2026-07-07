@@ -133,16 +133,9 @@ def test_owned_engine_command_targets_megatron_only_service():
     assert command[1:4] == ["-m", "torch.distributed.run", "--standalone"]
     assert "--nproc-per-node=2" in command
     assert "megatron.inference.integrations.dynamo.engine_service" in command
-    assert command[command.index("--dynamo-parent-event-address") + 1] == (
-        "tcp://127.0.0.1:5556"
-    )
+    assert command[command.index("--dynamo-parent-event-address") + 1] == ("tcp://127.0.0.1:5556")
     assert "dynamo.megatron" not in command
-    assert command[-4:] == [
-        "--load",
-        "/checkpoints/model",
-        "--tensor-model-parallel-size",
-        "2",
-    ]
+    assert command[-4:] == ["--load", "/checkpoints/model", "--tensor-model-parallel-size", "2"]
 
 
 def test_slurm_engine_command_launches_one_torchrun_agent_per_node():

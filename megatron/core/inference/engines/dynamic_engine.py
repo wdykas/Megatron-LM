@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
 from itertools import repeat
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -309,6 +309,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.create_cuda_graphs()
 
     def add_kv_event_listener(self, listener) -> None:
+        """Register a prefix-cache lifecycle listener on the context."""
         self.context.add_kv_event_listener(listener)
 
     def _initialize_disaggregation_state(self) -> None:
@@ -319,6 +320,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
     @property
     def pending_kv_import_count(self) -> int:
+        """Number of decode requests awaiting a KV import (none here)."""
         return 0
 
     def _poll_pending_kv_imports(self) -> int:
@@ -331,9 +333,11 @@ class DynamicInferenceEngine(AbstractEngine):
         return 0
 
     def setup_kv_transfer(self, role: str) -> None:
+        """Raising stub; the hand-off engine composition overrides it."""
         self._raise_kv_handoff_not_enabled("KV transfer setup")
 
     def push_handoff_kv(self, request_id: int, decode_metas: list) -> None:
+        """Raising stub; the hand-off engine composition overrides it."""
         self._raise_kv_handoff_not_enabled("SEND_KV")
 
     def _poll_pending_kv_pushes(self) -> int:
@@ -342,9 +346,11 @@ class DynamicInferenceEngine(AbstractEngine):
     def add_request_with_kv_handoff(
         self, request_id, prompt, sampling_params, kv_meta, src_block_ids
     ) -> None:
+        """Raising stub; the hand-off engine composition overrides it."""
         self._raise_kv_handoff_not_enabled("SUBMIT_REQUEST_WITH_KV")
 
     def release_handoff_blocks(self, request_id: int) -> None:
+        """Raising stub; the hand-off engine composition overrides it."""
         self._raise_kv_handoff_not_enabled("RELEASE_KV")
 
     @staticmethod
@@ -594,7 +600,12 @@ class DynamicInferenceEngine(AbstractEngine):
 
     @internal_api
     def set_disaggregation_config(
-        self, *, role, identity, spawn_coordinator, disagg_router="round_robin",
+        self,
+        *,
+        role,
+        identity,
+        spawn_coordinator,
+        disagg_router="round_robin",
         kv_transport_backend="nixl",
     ):
         """Mark this engine as a disaggregated prefill/decode instance for the
@@ -733,7 +744,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     "hostname": hostname,
                     "disaggregated": disagg_config is not None,
                     "disagg_router": (
-                        disagg_config["disagg_router"] if disagg_config is not None else "round_robin"
+                        disagg_config["disagg_router"]
+                        if disagg_config is not None
+                        else "round_robin"
                     ),
                 },
             )
@@ -1526,9 +1539,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     request.status = Status.COMPLETED
                     request.add_event_finish()
                     # Keep handoff blocks only when the request needs them.
-                    handoff_blocks = (finished_handoff_block_ids or {}).get(
-                        request_id, []
-                    )
+                    handoff_blocks = (finished_handoff_block_ids or {}).get(request_id, [])
                     if getattr(request.sampling_params, "do_kv_handoff", False):
                         self._capture_handoff_meta(request, handoff_blocks)
                     elif handoff_blocks:
@@ -2234,9 +2245,7 @@ class DynamicInferenceEngine(AbstractEngine):
             if partials:
                 nvtx_range_push("coordinator_streaming")
                 self.socket_for_receiving_requests.send(
-                    msgpack.packb(
-                        [Headers.ENGINE_REPLY_PARTIAL.value, partials], use_bin_type=True
-                    )
+                    msgpack.packb([Headers.ENGINE_REPLY_PARTIAL.value, partials], use_bin_type=True)
                 )
                 nvtx_range_pop("coordinator_streaming")
 
@@ -2552,12 +2561,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 if entry is not None:
                     request = entry.record[-1]
                     # Force active requests to finish on the next step.
-                    request.sampling_params.num_tokens_to_generate = len(
-                        request.generated_tokens
-                    )
-                    active_ids = self.context.request_ids[
-                        : self.context.total_request_count
-                    ]
+                    request.sampling_params.num_tokens_to_generate = len(request.generated_tokens)
+                    active_ids = self.context.request_ids[: self.context.total_request_count]
                     matches = torch.where(active_ids == request_id)[0]
                     if matches.numel() > 0:
                         idx = int(matches[0].item())
