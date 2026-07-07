@@ -2035,6 +2035,10 @@ def _add_inference_args(parser):
                             'is several independent decode instances.')
     return parser
 
+    group.add_argument('--disagg-kv-transport-backend', type=str, default='nixl',
+                       choices=['nixl'],
+                       help='KV transfer backend for the disaggregated prefill->decode '
+                       'hand-off.')
 
 def _add_network_size_args(parser):
     exclude = [

@@ -1235,10 +1235,19 @@ def pretrain(
     # Build a separate inference model for RL if requested.
     inference_model = None
     if args.perform_rl_step:
+        from megatron.rl.inference.disagg import build_disagg_inference_model, is_disagg_rollout
+
         # RL inference doesn't support CP; when training uses CP>1, always build a
         # separate CP=1 inference model (CP ranks become extra DP replicas, dp*=cp).
         force_cp1_inference_model = args.context_parallel_size > 1
-        if (
+        if is_disagg_rollout(args):
+            # Disaggregated rollouts: build this rank's prefill/decode shard
+            # model on its shard groups; the per-pool refit keeps it fresh.
+            inference_model = build_disagg_inference_model(
+                args, model_provider, model_type, model_cfg, get_model,
+                model_alloc_ctx=_rl_inference_model_alloc_ctx(args),
+            )
+        elif (
             args.rl_inference_tensor_model_parallel_size is not None
             or args.rl_inference_pipeline_model_parallel_size is not None
             or args.rl_inference_expert_model_parallel_size is not None
