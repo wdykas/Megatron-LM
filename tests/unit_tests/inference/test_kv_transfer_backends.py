@@ -5,20 +5,15 @@ import torch
 from megatron.core.inference.disaggregation.transfer_backends import base
 
 
-def test_backend_factory_selects_nixl_only(monkeypatch):
-    base.set_kv_transport_backend(None)
-    monkeypatch.setenv("MEGATRON_KV_TRANSFER_BACKEND", "nixl")
-    assert base.get_kv_transport_backend().name == "nixl"
+def test_backend_registry_selects_by_explicit_name():
+    assert base.construct_kv_transfer_backend_class("nixl").name == "nixl"
 
-    base.set_kv_transport_backend(None)
-    monkeypatch.setenv("MEGATRON_KV_TRANSFER_BACKEND", "unsupported")
     try:
-        base.get_kv_transport_backend()
+        base.construct_kv_transfer_backend_class("unsupported")
     except ValueError as exc:
         assert "expected 'nixl'" in str(exc)
     else:
         raise AssertionError("unsupported backend should raise")
-    base.set_kv_transport_backend(None)
 
 
 def test_nixl_direct_backend_exports_metadata_with_fake_agent(monkeypatch):

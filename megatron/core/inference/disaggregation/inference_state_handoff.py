@@ -61,15 +61,19 @@ class InferenceStateHandoffMixin:
                 "Cannot reset while KV handoff transfers may still write to cache storage"
             )
 
-    def setup_kv_transfer(self, role: str) -> None:
-        """Bring up the NIXL transfer agents for this engine.
+    def setup_kv_transfer(self, role: str, backend: str = "nixl") -> None:
+        """Bring up the KV transfer agents for this engine.
 
         Args:
-            role: "prefill" or "decode"; used to name the local NIXL agent.
+            role: "prefill" or "decode"; used to name the local transfer agent.
+            backend: transfer backend name, resolved through the explicit
+                registry ("nixl"; "nccl" selects the two-sided push family).
         """
-        from megatron.core.inference.disaggregation.transfer_backends.nixl import (
-            NixlTransferBackend,
+        from megatron.core.inference.disaggregation.transfer_backends.base import (
+            construct_kv_transfer_backend_class,
         )
+
+        backend_cls = construct_kv_transfer_backend_class(backend)
 
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
@@ -104,7 +108,7 @@ class InferenceStateHandoffMixin:
             mamba_layer_start = 0
         layer_end = layer_start + local_num_layers
 
-        self._kv_transfer_agent = NixlTransferBackend(
+        self._kv_transfer_agent = backend_cls(
             agent_name=f"{role}-rank{rank}",
             memory_buffer=self.context.memory_buffer,
             expected_num_blocks=self.context.kv_block_allocator.total_count,
@@ -192,7 +196,7 @@ class InferenceStateHandoffMixin:
                 ),
             }
             for state_kind, (memory_buffer, width, state_dim) in state_specs.items():
-                self._mamba_transfer_agents[state_kind] = NixlTransferBackend(
+                self._mamba_transfer_agents[state_kind] = backend_cls(
                     agent_name=f"{role}-mamba-{state_kind}-rank{rank}",
                     memory_buffer=memory_buffer,
                     expected_num_blocks=msa.max_slots,
