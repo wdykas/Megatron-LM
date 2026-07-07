@@ -173,7 +173,12 @@ class BeliefServerCompactor:
 
         for b_local in range(n_active):
             b_global = ctx.paused_request_count + b_local
-            req_key = id(ctx.request_to_kv_block_ids[b_global])
+            # Key by the ENGINE request id — stable across steps and slot
+            # swaps. id() of the block-table VIEW was a freed-and-reused
+            # CPython address: the same request produced fresh keys (draining
+            # the pending FIFO every step) and new requests collided with
+            # stale ones (compaction silently skipped).
+            req_key = int(ctx.request_ids[b_global].item())
 
             with self._lock:
                 if req_key in self._seen_ids:

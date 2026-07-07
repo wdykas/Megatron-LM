@@ -101,6 +101,13 @@ def init_compactor_from_kv(runtime_state: Any, args, n_attn_layers: int, d_kv: i
             future_kv_reconstruction=getattr(args, "rl_compaction_compactor_future_kv_reconstruction", 0.0),
             future_horizon_kl=getattr(args, "rl_compaction_compactor_future_horizon_kl", 0.0),
             future_latent=getattr(args, "rl_compaction_compactor_future_latent", 0.0),
+            # The merged-chunk consistency term is weighted by `consistency`;
+            # with the minimal defaults (0.0) a merged-chunk-prob run would
+            # compute the term and silently multiply it by zero. 0.1 is the
+            # documented weight from the ablation matrix.
+            consistency=(0.1 if getattr(
+                args, "rl_compaction_compactor_merged_chunk_prob", 0.0) > 0.0
+                else 0.0),
         ),
         vd_cfg=ValueDirectedConfig(
             advantage_clip=getattr(args, "rl_compaction_compactor_advantage_clip", 5.0),

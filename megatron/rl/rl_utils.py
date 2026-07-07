@@ -293,7 +293,11 @@ def extract_compactor_sequences(
                 f"got {type(r0).__name__} with trajectory[0] of type "
                 f"{type(traj[0]).__name__}. Use an inference interface that "
                 "returns tokens.")
-        seq_ids = [t for turn in traj for t in turn]
+        # Each turn's trajectory already contains the FULL accumulated context
+        # (the next turn's prompt is the previous prompt + generation), so the
+        # last turn IS the complete sequence — concatenating turns would feed
+        # the compactor duplicated context.
+        seq_ids = list(traj[-1])
         if seq_ids:
             out.append((seq_ids, float(r0.reward)))
     return out
@@ -422,15 +426,17 @@ def update_staleness_bias_stats(
     staleness: torch.Tensor,
     group_stats: Any,
 ) -> None:
-    """A2: attribute the inference-vs-train probability gap to KV compaction.
+    """Attribute the inference-vs-train probability gap by KV-cache staleness.
 
-    Tokens with kv_cache_staleness > 0 were generated AFTER their request's
-    cache was compacted — their behaviour logprobs came from the compacted
-    cache while training recomputes over the full sequence. Splitting the
-    |pi_inf - pi_old| gap by staleness measures the compaction-attributable
-    bias directly; the correction itself is the existing truncated importance
-    sampling (--rl-inference-logprobs-is-correction), which covers stale
-    tokens like any other inference/train mismatch.
+    kv_cache_staleness counts TRAINING STEPS since a token's KV was built
+    (incremented by the cross-step cache-retention machinery) — stale tokens
+    decoded over a cache built under an OLDER policy. Splitting the
+    |pi_inf - pi_old| gap by it measures retention-attributable bias; the
+    correction is the existing truncated importance sampling
+    (--rl-inference-logprobs-is-correction). NOTE: live COMPACTION does not
+    increment this counter — attributing the gap to compaction specifically
+    needs a dedicated per-token post-compaction marker (not yet wired); until
+    then the A1 split-group reward gap is the compaction-attribution tool.
     """
     if (mask.shape != old_logprobs.shape
             or staleness.shape != old_logprobs.shape
@@ -846,8 +852,11 @@ def calculate_grpo_advantages(
     With a split-group compaction run (kv_compact_arms), each rollout is
     normalized against ITS ARM's mean/std within the group: the compact arm's
     reward deficit is a measurement (surfaced as kv_compact_reward_gap), not a
-    learning signal, so neither arm should see the other's baseline. An arm
-    with fewer than two members falls back to whole-group statistics.
+    learning signal, so neither arm should see the other's baseline. A
+    SINGLETON arm gets zero advantage (its own reward is its baseline) — the
+    whole-group fallback would leak the compact-vs-full gap straight into the
+    gradient, the exact bias the split exists to remove. Only UNTAGGED
+    rollouts (arm None, e.g. mixed-arm multi-turn) use group statistics.
     """
 
     rewards = np.array(rewards)
@@ -864,6 +873,11 @@ def calculate_grpo_advantages(
                 if members.sum() >= 2:
                     reward_means[g, members] = rewards[g, members].mean()
                     reward_stds[g, members] = rewards[g, members].std()
+                elif members.sum() == 1:
+                    # Zero advantage: no within-arm baseline exists, and the
+                    # group baseline would leak the arm gap into the gradient.
+                    reward_means[g, members] = rewards[g, members]
+                    reward_stds[g, members] = 0.0
 
     # Each turn of a rollout carries its rollout's reward and baseline.
     # rewards are originally [g, group_size]
@@ -1652,10 +1666,16 @@ def prepare_data_for_update(
                             generation_masks=packing_context.original_generation_masks,
                             bin_size=args.seq_length,
                         )
+                        _pinf = packed_inference_logprobs.cpu()
+                        # Exclude never-filled slots (train-side eod etc. stay
+                        # at exactly 0.0 logprob = prob 1.0 and would pollute
+                        # the |pi_inf - pi_old| split).
+                        _mask = (packing_context.packed_loss_mask.cpu()[:, 1:].bool()
+                                 & (_pinf != 0.0))
                         update_staleness_bias_stats(
                             old_logprobs=old_logprobs.cpu(),
-                            inference_logprobs=packed_inference_logprobs.cpu(),
-                            mask=packing_context.packed_loss_mask.cpu()[:, 1:].bool(),
+                            inference_logprobs=_pinf,
+                            mask=_mask,
                             staleness=packed_staleness.cpu(),
                             group_stats=group_stats,
                         )

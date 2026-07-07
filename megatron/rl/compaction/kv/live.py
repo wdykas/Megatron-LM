@@ -226,8 +226,7 @@ class LiveKVCompactor:
         self._ctx = engine.context
         self._hook = MegatronInferenceHook(self._ctx)
         self._capturing = False
-        self._prefill_locals: list[int] = []
-        self._cu_q: torch.Tensor | None = None
+        self._prefill_rids: list[tuple[int, int, int]] = []
         self._q_per_layer: list[torch.Tensor] = []
         if strategy == "snapkv" or archive:
             self._register_q_hooks(engine)
@@ -299,8 +298,7 @@ class LiveKVCompactor:
         and per-request query lengths are definitive here, whereas the flags are
         cleared by ``update_requests`` inside the forward call itself.
         """
-        self._prefill_locals: list[int] = []
-        self._cu_q: torch.Tensor | None = None
+        self._prefill_rids: list[tuple[int, int, int]] = []
         self._capturing = self.archive_enabled
         if self.budget_final is not None:
             self._apply_budget_schedule()
@@ -318,12 +316,21 @@ class LiveKVCompactor:
             return
         active = slice(ctx.paused_request_count, ctx.total_request_count)
         flags = ctx.request_in_prefill_status_tensor[active]
-        self._prefill_locals = torch.nonzero(flags == 1).flatten().tolist()
-        if not self._prefill_locals:
+        prefill_locals = torch.nonzero(flags == 1).flatten().tolist()
+        if not prefill_locals:
             return
-        # Packed-Q row boundaries in active-slice order (THD layout).
+        # Record (request id, packed-Q row range). update_requests — which runs
+        # INSIDE the step, before compact_prefilled_requests — reorders the
+        # active slice (finished requests swap left, block-full requests pause,
+        # paused ones resume), so pre-forward b_local indices are stale by
+        # compaction time; request ids are the only stable handle.
         qlens = ctx.request_query_lengths[active].to(torch.long)
-        self._cu_q = torch.cat([qlens.new_zeros(1), qlens.cumsum(0)])
+        cu_q = torch.cat([qlens.new_zeros(1), qlens.cumsum(0)])
+        self._prefill_rids = [
+            (int(ctx.request_ids[ctx.paused_request_count + b].item()),
+             int(cu_q[b].item()), int(cu_q[b + 1].item()))
+            for b in prefill_locals
+        ]
         if self.strategy == "snapkv" and not self._capturing:
             self._capturing = True
             self._q_per_layer = [None] * len(self._q_per_layer)  # type: ignore[list-item]
@@ -349,6 +356,10 @@ class LiveKVCompactor:
         qlens = ctx.request_query_lengths[active].to(torch.long)
         starts = torch.cat([qlens.new_zeros(1), qlens.cumsum(0)])
         in_prefill = ctx.request_in_prefill_status_tensor[active]
+        # GC against ALL requests (paused included): a compacted request the
+        # engine pauses must keep its logical-position record for resume.
+        all_ids = {int(r) for r in
+                   ctx.request_ids[:ctx.total_request_count].tolist()}
         live_ids = set()
         for b_local in range(n_active):
             b_global = ctx.paused_request_count + b_local
@@ -359,7 +370,7 @@ class LiveKVCompactor:
                 continue
             ctx.token_to_pos_ids[int(starts[b_local].item())] = pos
             self._logical_pos[rid] = pos + 1
-        for rid in [r for r in self._logical_pos if r not in live_ids]:
+        for rid in [r for r in self._logical_pos if r not in all_ids]:
             del self._logical_pos[rid]
 
     def _should_prefetch(self, margin: float, last_margin: float | None) -> bool:
@@ -461,14 +472,20 @@ class LiveKVCompactor:
             if self.archive_enabled:
                 self.retrieve_for_decoding_requests()
             return
-        if not self._prefill_locals:
+        if not self._prefill_rids:
             return
         self._capturing = self.archive_enabled
-        cu_q = self._cu_q
         ctx = self._ctx
         chunked_global = ctx.get_index_of_chunked_prefill_request(safe=True)
 
-        for b_local in self._prefill_locals:
+        active_ids = ctx.request_ids[ctx.paused_request_count:ctx.total_request_count]
+        for rid, q0, q1 in self._prefill_rids:
+            match = torch.nonzero(active_ids == rid).flatten()
+            if match.numel() == 0:
+                # Finished or paused during this step's bookkeeping — nothing
+                # to compact (a paused request resumes with its full cache).
+                continue
+            b_local = int(match[0].item())
             b_global = ctx.paused_request_count + b_local
             if b_global == chunked_global:
                 continue
@@ -491,7 +508,7 @@ class LiveKVCompactor:
                 continue
 
             if self.strategy == "snapkv":
-                q_rows = self._request_q(b_local, cu_q)     # per layer (Tq, Hq, D)
+                q_rows = self._request_q(q0, q1)            # per layer (Tq, Hq, D)
                 scores = self._aggregate_snapkv_scores(k, q_rows)
                 positions = _select_recent_plus_heavy(
                     scores, S, budget, n_recent=min(self.obs_window, budget)
@@ -541,8 +558,7 @@ class LiveKVCompactor:
                 "[kv-compaction] request b_local=%d: %d -> %d tokens (%s, ratio %.2f)",
                 b_local, S, len(positions), self.strategy, self.budget_ratio,
             )
-        self._prefill_locals = []
-        self._cu_q = None
+        self._prefill_rids = []
 
     def _compact_with_updater(self, b_local: int, b_global: int,
                               k: torch.Tensor, v: torch.Tensor) -> None:
@@ -678,10 +694,12 @@ class LiveKVCompactor:
     # Scoring
     # ------------------------------------------------------------------
 
-    def _request_q(self, b_local: int, cu_q: torch.Tensor) -> list[torch.Tensor]:
-        """This request's observation-window Q rows for every layer."""
-        start = int(cu_q[b_local].item())
-        end = int(cu_q[b_local + 1].item())
+    def _request_q(self, start: int, end: int) -> list[torch.Tensor]:
+        """This request's observation-window Q rows for every layer.
+
+        (start, end) are the packed-Q row bounds recorded at begin_step — the
+        Q tensor layout is fixed at forward time, so the rows stay valid even
+        though the bookkeeping reorders request slots afterwards."""
         w_start = max(start, end - self.obs_window)
         out = []
         for i, q in enumerate(self._q_per_layer):

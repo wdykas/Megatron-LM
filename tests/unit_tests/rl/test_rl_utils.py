@@ -518,7 +518,9 @@ class TestRLUtils:
         )
 
     def test_split_arm_falls_back_to_group_for_small_arm(self):
-        """An arm with <2 members (incl. None arms) uses whole-group stats."""
+        """A singleton arm gets ZERO advantage (group baseline would leak the
+        arm gap into the gradient); only untagged (None) rollouts use group
+        statistics."""
         rewards = [[1.0, 0.0, 0.5, 0.3]]
         num_turns = [[1, 1, 1, 1]]
         arms = [[True, True, False, None]]           # full arm has 1 member
@@ -526,7 +528,7 @@ class TestRLUtils:
         g = np.array(rewards[0])
         gm, gs = g.mean(), g.std()
         expected = [0.5 / 0.5001, -0.5 / 0.5001,
-                    (0.5 - gm) / (1e-4 + gs), (0.3 - gm) / (1e-4 + gs)]
+                    0.0, (0.3 - gm) / (1e-4 + gs)]
         torch.testing.assert_close(
             torch.tensor(advs).double(), torch.tensor(expected).double(),
             atol=1e-4, rtol=1e-5,
@@ -591,7 +593,9 @@ class TestRLUtils:
                 completed_at_step=[0] * len(turns),
                 num_evictions=[0] * len(turns))
         groups = [
-            [tr([[1, 2, 3], [4, 5]], 1.5), tr([[9]], 0.0)],
+            # Multi-turn: each turn holds the FULL accumulated context, so the
+            # last turn is the complete sequence (no concatenation).
+            [tr([[1, 2, 3], [1, 2, 3, 4, 5]], 1.5), tr([[9]], 0.0)],
             [],                                            # empty group skipped
             [tr([[7, 8]], -1.0)],
         ]

@@ -145,6 +145,21 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             args.rl_kv_cache_management_mode
         )
 
+        # The A1 split only means anything when live compaction actually runs;
+        # validate UNCONDITIONALLY so a split fraction without --rl-compaction-
+        # enabled (or with a non-live mode) hard-fails instead of silently
+        # tagging arms that were never compacted — a pure-noise counterfactual.
+        if args.rl_compaction_split_fraction is not None and (
+                not getattr(args, "rl_compaction_enabled", False)
+                or args.rl_compaction_mode != "live"
+                or not 0.0 < args.rl_compaction_split_fraction <= 1.0):
+            raise ValueError(
+                "--rl-compaction-split-fraction needs --rl-compaction-enabled, "
+                "--rl-compaction-mode live and a value in (0, 1]; got "
+                f"enabled={getattr(args, 'rl_compaction_enabled', False)} "
+                f"mode={args.rl_compaction_mode!r} "
+                f"fraction={args.rl_compaction_split_fraction}.")
+
         # Wire the KV compaction hook when compaction is enabled.
         if getattr(args, "rl_compaction_enabled", False):
             from megatron.rl.compaction.kv import MegatronInferenceHook
@@ -153,14 +168,6 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             # Live mode: every rollout decodes over a compacted cache — the
             # engine prunes (or belief_still-synthesizes) each request's prompt
             # KV right after its prefill, identically to the serving path.
-            if args.rl_compaction_split_fraction is not None and (
-                    args.rl_compaction_mode != "live"
-                    or not 0.0 < args.rl_compaction_split_fraction <= 1.0):
-                raise ValueError(
-                    "--rl-compaction-split-fraction needs --rl-compaction-mode "
-                    "live and a value in (0, 1]; got "
-                    f"mode={args.rl_compaction_mode!r} "
-                    f"fraction={args.rl_compaction_split_fraction}.")
             if args.rl_compaction_mode == "live":
                 from megatron.rl.compaction.kv.live import LiveKVCompactor
                 if (args.rl_compaction_strategy == "snapkv"
