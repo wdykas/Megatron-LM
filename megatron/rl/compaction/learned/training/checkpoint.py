@@ -157,6 +157,13 @@ def load_optimizer_state(
     Offline (plain torch optimizer): the state is in the common store.
     """
     if hasattr(optimizer, "sharded_state_dict") and model_sharded_state_dict is not None:
+        # Detect weights-only checkpoints BEFORE the sharded load: a missing
+        # template key surfaces from dist_checkpointing as a
+        # CheckpointingException, which callers can't tell apart from real
+        # corruption. Absence of any optimizer.* tensor is the precise signal.
+        meta = dist_checkpointing.load_tensors_metadata(str(path))
+        if not any(k.startswith("optimizer") for k in meta):
+            raise KeyError(f"Checkpoint at {path} has no optimizer state.")
         opt_template = optimizer.sharded_state_dict(model_sharded_state_dict, is_loading=True)
         loaded = dist_checkpointing.load({"optimizer": opt_template}, str(path))
         optimizer.load_state_dict(loaded["optimizer"])

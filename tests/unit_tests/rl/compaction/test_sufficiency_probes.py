@@ -7,13 +7,14 @@ import os
 import pytest
 import torch
 
-from megatron.rl.compaction.learned.probes import kl_from_logits, sufficiency_kl
+from megatron.rl.compaction.learned.probes import sufficiency_kl
+from megatron.rl.compaction.learned.training.losses import per_token_kl
 
 
 class TestKlFromLogits:
     def test_identical_logits_zero_kl(self):
         logits = torch.randn(2, 8, 64, device="cuda")
-        kl = kl_from_logits(logits, logits.clone())
+        kl = per_token_kl(logits, logits.clone())
         assert kl.shape == (2, 8)
         assert torch.allclose(kl, torch.zeros_like(kl), atol=1e-5)
 
@@ -21,14 +22,14 @@ class TestKlFromLogits:
         torch.manual_seed(0)
         p = torch.randn(1, 4, 32, device="cuda")
         q = torch.randn(1, 4, 32, device="cuda")
-        kl_pq = kl_from_logits(p, q)
-        kl_qp = kl_from_logits(q, p)
+        kl_pq = per_token_kl(p, q)
+        kl_qp = per_token_kl(q, p)
         assert (kl_pq > 0).all()
         assert not torch.allclose(kl_pq, kl_qp)
 
     def test_shape_mismatch_raises(self):
         with pytest.raises(ValueError, match="shapes differ"):
-            kl_from_logits(torch.randn(1, 4, 32, device="cuda"),
+            per_token_kl(torch.randn(1, 4, 32, device="cuda"),
                            torch.randn(1, 4, 16, device="cuda"))
 
 

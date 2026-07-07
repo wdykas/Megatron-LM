@@ -329,7 +329,7 @@ def train_compactor_trajectory(
         return {}
 
     # Probe-distillation averages (offline path): teacher_kl / future_kl / weighted_kl
-    # / retrieval / path_consistency / task / total.  all_probe_terms may contain None
+    # / retrieval / task / total.  all_probe_terms may contain None
     # placeholders from the teacher-KL (still_ce) branch, so filter them out.
     _real_probe_terms = [t for t in all_probe_terms if t is not None]
     result = (_average_compactor_terms(_real_probe_terms).as_dict(include_total=True)
@@ -496,7 +496,6 @@ def _average_compactor_terms(terms_list):
         task=_avg("task"),
         retrieval=_avg("retrieval"),
         weighted_kl=_avg("weighted_kl"),
-        path_consistency=_avg("path_consistency"),
         predictive=_avg("predictive"),
         kv_reconstruction=_avg("kv_reconstruction"),
         future_kv_reconstruction=_avg("future_kv_reconstruction"),
@@ -504,74 +503,3 @@ def _average_compactor_terms(terms_list):
         future_horizon_kl=_avg("future_horizon_kl"),
         total=sum(t.total for t in terms_list) / n,
     )
-
-
-def still_train_step(
-    compactor,          # PerceiverCompactor
-    optimizer,          # torch.optim.Optimizer for the compactor
-    keys_per_layer,     # list[Tensor] — (B, T, d) per layer
-    values_per_layer,   # list[Tensor]
-    probes,             # list[TrainingProbe]
-    student_fn,         # StudentFn callable, or None for reconstruction-only training
-    cfg,                # CompactorTrainerConfig
-) -> dict:
-    """Single-chunk training step for a single-pass PerceiverCompactor (stateless).
-
-    When ``student_fn`` is None the logit-based losses (teacher_kl, etc.) are
-    skipped and ``cfg.loss_weights.kv_reconstruction`` must be > 0 to produce any
-    gradient. The predictive / consistency losses are trajectory-level and are
-    never computed here regardless.
-    """
-    from megatron.rl.compaction.learned.training.losses import CompactorLosses
-    import warnings
-
-    if cfg.loss_weights.consistency > 0.0 or cfg.loss_weights.predictive > 0.0:
-        warnings.warn(
-            "still_train_step received loss_weights with consistency or predictive > 0, "
-            "but these losses require a trajectory and are not computed here. "
-            "Use train_compactor_trajectory with GatedRecurrentUpdater instead.",
-            stacklevel=2,
-        )
-
-    optimizer.zero_grad()
-    ck_list, cv_list = compactor.compress_all_layers(keys_per_layer, values_per_layer)
-    compact_kv = [(ck_list[l], cv_list[l]) for l in range(len(ck_list))]
-
-    terms_list = []
-
-    if student_fn is not None and probes:
-        for probe in probes:
-            student_logits = student_fn(probe.query_tokens, compact_kv).logits
-            terms = _compute_probe_terms(cfg, probe, student_logits)
-            terms_list.append(terms)
-    else:
-        # No live model — compute kv_reconstruction loss directly from KV tensors.
-        terms = CompactorLosses.compute(
-            weights=cfg.loss_weights,
-            compact_keys=ck_list,
-            compact_values=cv_list,
-            full_keys=keys_per_layer,
-            full_values=values_per_layer,
-        )
-        terms_list.append(terms)
-
-    if not terms_list:
-        return {}
-
-    n = len(terms_list)
-    avg_total = sum(t.total for t in terms_list) / n
-    if not avg_total.requires_grad:
-        return {}
-    avg_total.backward()
-
-    if cfg.clip_grad_norm is not None:
-        torch.nn.utils.clip_grad_norm_(compactor.parameters(), cfg.clip_grad_norm)
-    optimizer.step()
-
-    def _avg(attr):
-        vals = [getattr(t, attr) for t in terms_list if getattr(t, attr) is not None]
-        return float(sum(v.item() if hasattr(v, 'item') else v for v in vals) / len(vals)) if vals else None
-
-    return {k: v for k, v in (
-        (k, _avg(k)) for k in ("teacher_kl", "kv_reconstruction", "future_kl", "consistency", "task")
-    ) if v is not None}

@@ -22,21 +22,9 @@ from __future__ import annotations
 from typing import List, Tuple
 
 import torch
-import torch.nn.functional as F
 
 from megatron.rl.compaction.learned.capture.student_forward import student_outputs
-
-
-def kl_from_logits(teacher_logits: torch.Tensor, student_logits_: torch.Tensor) -> torch.Tensor:
-    """Per-position KL(teacher || student) in fp32.  Inputs (B, S, V) → (B, S)."""
-    if teacher_logits.shape != student_logits_.shape:
-        raise ValueError(
-            f"logit shapes differ: teacher {tuple(teacher_logits.shape)} vs "
-            f"student {tuple(student_logits_.shape)}"
-        )
-    log_p = F.log_softmax(teacher_logits.float(), dim=-1)
-    log_q = F.log_softmax(student_logits_.float(), dim=-1)
-    return (log_p.exp() * (log_p - log_q)).sum(dim=-1)
+from megatron.rl.compaction.learned.training.losses import per_token_kl
 
 
 @torch.no_grad()
@@ -59,4 +47,4 @@ def sufficiency_kl(
     """
     student = student_outputs(model, query_tokens, compact_kv,
                                gather_logits=gather_logits).logits
-    return kl_from_logits(teacher_logits, student)
+    return per_token_kl(teacher_logits, student)

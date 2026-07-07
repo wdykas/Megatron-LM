@@ -722,13 +722,14 @@ class LiveKVCompactor:
         scale = 1.0 / math.sqrt(D)
         for l in range(L):
             q = q_rows[l]                       # (Tq, Hq, D)
-            Hq = q.shape[1]
+            Tq, Hq, _ = q.shape
             group = Hq // Hkv
-            for g in range(Hkv):
-                qg = q[:, g * group:(g + 1) * group, :].reshape(-1, D).float()   # (Tq*grp, D)
-                kg = keys[l, :, g, :].float()                                    # (S, D)
-                attn = torch.softmax(qg @ kg.T * scale, dim=-1)                  # (·, S)
-                scores += attn.sum(dim=0)
+            # One batched matmul over all KV groups instead of Hkv small GEMMs.
+            qb = (q.reshape(Tq, Hkv, group, D).permute(1, 0, 2, 3)
+                   .reshape(Hkv, Tq * group, D).float())        # (Hkv, Tq*grp, D)
+            kb = keys[l].permute(1, 0, 2).float()               # (Hkv, S, D)
+            attn = torch.softmax(qb @ kb.transpose(1, 2) * scale, dim=-1)
+            scores += attn.sum(dim=(0, 1))
         pad = self.pool_kernel // 2
         return F.max_pool1d(
             scores[None, None, :], kernel_size=self.pool_kernel, stride=1, padding=pad

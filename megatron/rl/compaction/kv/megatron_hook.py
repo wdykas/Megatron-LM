@@ -328,10 +328,9 @@ class MegatronInferenceHook:
         block_ids = ctx.request_to_kv_block_ids[b_global, :n_total_blocks].to(buf.device)
         keys = keys.to(device=buf.device, dtype=buf.dtype)
         values = values.to(device=buf.device, dtype=buf.dtype)
-        for t in range(T):
-            pos = cur_len + t
-            buf[0, :, block_ids[pos // BS], pos % BS] = keys[:, t]
-            buf[1, :, block_ids[pos // BS], pos % BS] = values[:, t]
+        pos = torch.arange(cur_len, new_len, device=buf.device)
+        buf[0, :, block_ids[pos // BS], pos % BS] = keys
+        buf[1, :, block_ids[pos // BS], pos % BS] = values
 
         ctx.request_kv_block_counts[b_global] = n_total_blocks
         ctx.request_last_kv_block_offset[b_global] = new_len % BS
@@ -369,8 +368,8 @@ class MegatronInferenceHook:
             )
         block_ids = ctx.request_to_kv_block_ids[b_global, :n_blocks].to(buf.device)
         keys = keys.to(device=buf.device, dtype=buf.dtype)
-        for pos in range(seq_len):
-            buf[0, :, block_ids[pos // BS], pos % BS] = keys[:, pos]
+        pos = torch.arange(seq_len, device=buf.device)
+        buf[0, :, block_ids[pos // BS], pos % BS] = keys
 
     def get_kv_for_request(
         self, b_local: int
@@ -447,26 +446,21 @@ class MegatronInferenceHook:
         keys_per_layer: list[torch.Tensor] = []
         vals_per_layer: list[torch.Tensor] = []
 
+        # Gather each request's blocks once across ALL layers — one block-id
+        # upload and one gather per request, not n_layers × B of each.
+        k_all = torch.zeros(n_layers, B, max_seq, H * D, dtype=buf.dtype, device=buf.device)
+        v_all = torch.zeros(n_layers, B, max_seq, H * D, dtype=buf.dtype, device=buf.device)
+        for b in range(B):
+            n_blocks = int(block_counts[b].item())
+            seq_len = int(seq_lens[b].item())
+            ids = block_ids_all[b, :n_blocks].to(buf.device)
+            # (L, n_blocks, BS, H, D) → (L, n_blocks*BS, H*D), trimmed to seq_len
+            k_all[:, b, :seq_len] = buf[0, :, ids].reshape(n_layers, n_blocks * BS, H * D)[:, :seq_len]
+            v_all[:, b, :seq_len] = buf[1, :, ids].reshape(n_layers, n_blocks * BS, H * D)[:, :seq_len]
+
         for layer in range(n_layers):
-            # Allocate output buffers (padded to max_seq with zeros)
-            k_out = torch.zeros(B, max_seq, H * D, dtype=buf.dtype, device=buf.device)
-            v_out = torch.zeros(B, max_seq, H * D, dtype=buf.dtype, device=buf.device)
-
-            for b in range(B):
-                n_blocks = int(block_counts[b].item())
-                seq_len = int(seq_lens[b].item())
-                req_block_ids = block_ids_all[b, :n_blocks]  # (n_blocks,) on CPU
-
-                # Gather blocks: (n_blocks, BS, H_local, d_head)
-                k_blocks = buf[0, layer, req_block_ids.to(buf.device)]
-                v_blocks = buf[1, layer, req_block_ids.to(buf.device)]
-
-                # Flatten blocks → (n_blocks * BS, H_local, d_head), trim to seq_len
-                k_flat = k_blocks.reshape(n_blocks * BS, H, D)[:seq_len]
-                v_flat = v_blocks.reshape(n_blocks * BS, H, D)[:seq_len]
-
-                k_out[b, :seq_len] = k_flat.reshape(seq_len, H * D)
-                v_out[b, :seq_len] = v_flat.reshape(seq_len, H * D)
+            k_out = k_all[layer]
+            v_out = v_all[layer]
 
             if all_gather and self._tp_group is not None:
                 # All-gather across TP ranks along the head dimension.
@@ -570,7 +564,7 @@ class MegatronInferenceHook:
 
         Same as apply_belief_memory() but for one batch element; ``memory`` has
         batch size 1 (keys shape (n_layers, 1, C, d_model)). Used by
-        BeliefServerCompactor when only one of several active requests updates.
+        LiveKVCompactor's belief_still strategy per prefilled request.
         """
         got = self._context_kv()
         if got is None:

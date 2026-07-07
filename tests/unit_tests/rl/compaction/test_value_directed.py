@@ -8,7 +8,6 @@ import torch.nn as nn
 
 from megatron.rl.compaction.learned.training.data import Trajectory, TrainingProbe, CompactorTrainerConfig
 from megatron.rl.compaction.learned.training.losses import (
-    advantage_weighted_kl_loss,
     teacher_kl_loss,
     CompactorLossWeights,
 )
@@ -69,58 +68,6 @@ def _trajectory(n_chunks=4, probe_chunk=2, advantage=None):
     chunks = [_random_kv() for _ in range(n_chunks)]
     probes = {probe_chunk: [_probe(advantage=advantage)]}
     return Trajectory(chunks=chunks, probes_by_chunk=probes)
-
-
-# ---------------------------------------------------------------------------
-# Test 1: positive advantage increases weight
-# ---------------------------------------------------------------------------
-
-def test_advantage_weighted_kl_loss_positive_advantage_increases_weight():
-    full_logits    = torch.randn(B, 4, V)
-    compact_logits = torch.randn(B, 4, V)
-
-    loss_zero = advantage_weighted_kl_loss(full_logits, compact_logits, advantage=0.0)
-    loss_pos  = advantage_weighted_kl_loss(full_logits, compact_logits, advantage=3.0)
-
-    # Positive advantage → weight > 1.0 → higher loss
-    assert loss_pos.item() > loss_zero.item(), (
-        f"Expected positive advantage to give higher loss: {loss_pos.item()} vs {loss_zero.item()}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Test 2: negative advantage decreases weight
-# ---------------------------------------------------------------------------
-
-def test_advantage_weighted_kl_loss_negative_advantage_decreases_weight():
-    full_logits    = torch.randn(B, 4, V)
-    compact_logits = torch.randn(B, 4, V)
-
-    loss_zero = advantage_weighted_kl_loss(full_logits, compact_logits, advantage=0.0)
-    loss_neg  = advantage_weighted_kl_loss(full_logits, compact_logits, advantage=-3.0)
-
-    # Negative advantage → weight < 1.0 → lower loss
-    assert loss_neg.item() < loss_zero.item(), (
-        f"Expected negative advantage to give lower loss: {loss_neg.item()} vs {loss_zero.item()}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Test 3: advantage clipping prevents extreme weights
-# ---------------------------------------------------------------------------
-
-def test_advantage_weighted_kl_loss_clip():
-    full_logits    = torch.randn(B, 4, V)
-    compact_logits = torch.randn(B, 4, V)
-    clip = 5.0
-
-    loss_at_clip     = advantage_weighted_kl_loss(full_logits, compact_logits, advantage=clip,      advantage_clip=clip)
-    loss_beyond_clip = advantage_weighted_kl_loss(full_logits, compact_logits, advantage=clip * 2,  advantage_clip=clip)
-
-    # Clipping should make both equal (both clamped to +clip)
-    assert torch.isclose(loss_at_clip, loss_beyond_clip, rtol=1e-5), (
-        f"Clipping failed: {loss_at_clip.item()} vs {loss_beyond_clip.item()}"
-    )
 
 
 # ---------------------------------------------------------------------------

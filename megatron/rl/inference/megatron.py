@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import random
 
 import httpx
 import torch.distributed as dist
@@ -44,7 +43,6 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
     _rl_kv_cache_management_mode: KVCacheManagementMode = PrivateAttr(None)
     _openai_client: AsyncOpenAI = PrivateAttr(None)
-    _kv_hook: object = PrivateAttr(None)   # MegatronInferenceHook (optional)
 
     async def base_generate(self, request: InferenceRequest) -> InferenceResponse:
         tokenizer = get_tokenizer()
@@ -59,14 +57,20 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         # compact and full-cache arms; the arm is recorded on the response.
         kv_compacted = None
         if args.rl_compaction_split_fraction is not None:
-            if request.rollout_index is not None:
-                # Deterministic within-group split: exact arm proportions in
-                # every group (Bernoulli fallback only for untagged requests).
-                from megatron.rl.inference.api import deterministic_split_arm
-                kv_compacted = deterministic_split_arm(
-                    request.rollout_index, args.rl_compaction_split_fraction)
-            else:
-                kv_compacted = random.random() < args.rl_compaction_split_fraction
+            if request.rollout_index is None:
+                # A per-turn coin flip here would let one rollout mix compact
+                # and full-cache turns, contaminating both arms of the
+                # counterfactual. The arm must be a per-rollout property.
+                raise ValueError(
+                    "--rl-compaction-split-fraction requires the agent to tag "
+                    "requests with rollout_index (see "
+                    "RewardOnlyAgent.group_rollout) so the arm is constant "
+                    "across a rollout's turns.")
+            # Deterministic within-group split: exact arm proportions in
+            # every group, stable across the rollout's turns.
+            from megatron.rl.inference.api import deterministic_split_arm
+            kv_compacted = deterministic_split_arm(
+                request.rollout_index, args.rl_compaction_split_fraction)
 
         # Things that may be problematic when doing this switch
         # - Add BOS token
@@ -150,21 +154,17 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         # enabled (or with a non-live mode) hard-fails instead of silently
         # tagging arms that were never compacted — a pure-noise counterfactual.
         if args.rl_compaction_split_fraction is not None and (
-                not getattr(args, "rl_compaction_enabled", False)
+                not args.rl_compaction_enabled
                 or args.rl_compaction_mode != "live"
                 or not 0.0 < args.rl_compaction_split_fraction <= 1.0):
             raise ValueError(
                 "--rl-compaction-split-fraction needs --rl-compaction-enabled, "
                 "--rl-compaction-mode live and a value in (0, 1]; got "
-                f"enabled={getattr(args, 'rl_compaction_enabled', False)} "
+                f"enabled={args.rl_compaction_enabled} "
                 f"mode={args.rl_compaction_mode!r} "
                 f"fraction={args.rl_compaction_split_fraction}.")
 
-        # Wire the KV compaction hook when compaction is enabled.
-        if getattr(args, "rl_compaction_enabled", False):
-            from megatron.rl.compaction.kv import MegatronInferenceHook
-            launched_server._kv_hook = MegatronInferenceHook.from_engine(inference_engine)
-
+        if args.rl_compaction_enabled:
             # Live mode: every rollout decodes over a compacted cache — the
             # engine prunes (or belief_still-synthesizes) each request's prompt
             # KV right after its prefill, identically to the serving path.

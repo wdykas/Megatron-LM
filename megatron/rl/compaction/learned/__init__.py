@@ -6,10 +6,10 @@ from megatron.rl.compaction.learned.training.losses import (
     CompactorLossWeights,
     CompactorLossTerms,
     CompactorLosses,
+    per_token_kl,
     teacher_kl_loss,
     future_kl_loss,
     consistency_loss,
-    path_consistency_loss,
     task_loss,
     retrieval_loss,
     weighted_kl_loss,
@@ -28,20 +28,18 @@ from megatron.rl.compaction.learned.training.data import (
     trajectory_collate_fn,
     CompactorTrainerConfig,
 )
-from megatron.rl.compaction.learned.serving.belief_compactor import BeliefSession, BeliefSessionStore, BeliefServerCompactor
 from megatron.rl.compaction.learned.training.checkpoint import (
     CheckpointMeta,
     save_checkpoint,
     load_checkpoint,
     load_optimizer_state,
 )
-from megatron.rl.compaction.learned.training.losses import advantage_weighted_kl_loss
 from megatron.rl.compaction.learned.training.value_directed import (
     ValueDirectedConfig,
     attach_grpo_advantages,
 )
 
-from megatron.rl.compaction.learned.probes import kl_from_logits, sufficiency_kl
+from megatron.rl.compaction.learned.probes import sufficiency_kl
 
 __all__ = [
     "PerceiverConfig", "PerceiverCompactor",
@@ -49,16 +47,14 @@ __all__ = [
     "GatedUpdaterConfig", "GatedRecurrentUpdater",
     "CompactorLossWeights", "CompactorLossTerms", "CompactorLosses",
     "teacher_kl_loss", "future_kl_loss", "consistency_loss",
-    "path_consistency_loss", "task_loss", "retrieval_loss", "weighted_kl_loss",
+    "task_loss", "retrieval_loss", "weighted_kl_loss",
     "predictive_coding_loss", "kv_reconstruction_loss",
     "future_kv_reconstruction_loss", "dynamics_prediction_loss", "future_horizon_kl_loss",
     "CompactKV", "StudentFn",
     "TrainingProbe", "Trajectory", "TrajectoryDataset", "trajectory_collate_fn",
     "CompactorTrainerConfig",
-    "BeliefSession", "BeliefSessionStore", "BeliefServerCompactor",
     "CheckpointMeta", "save_checkpoint", "load_checkpoint",
     "load_optimizer_state",
-    "advantage_weighted_kl_loss",
     "ValueDirectedConfig", "attach_grpo_advantages",
-    "kl_from_logits", "sufficiency_kl",
+    "per_token_kl", "sufficiency_kl",
 ]

@@ -46,7 +46,7 @@ def init_compactor_from_kv(runtime_state: Any, args, n_attn_layers: int, d_kv: i
     from megatron.rl.compaction.learned.training.value_directed import ValueDirectedConfig
     from megatron.rl.compaction.learned.training.losses import CompactorLossWeights
 
-    n_compress = getattr(args, "rl_compaction_n_compress", 64)
+    n_compress = args.rl_compaction_n_compress
     n_heads = 8
     updater_cfg = GatedUpdaterConfig(
         n_compress=n_compress,
@@ -54,8 +54,8 @@ def init_compactor_from_kv(runtime_state: Any, args, n_attn_layers: int, d_kv: i
         d_kv=d_kv,
         n_attn_layers=n_attn_layers,
     )
-    _dtype = (torch.bfloat16 if getattr(args, 'bf16', False)
-              else torch.float16 if getattr(args, 'fp16', False)
+    _dtype = (torch.bfloat16 if args.bf16
+              else torch.float16 if args.fp16
               else torch.float32)
 
     # The compactor is replicated on every rank, data-parallel across the world.
@@ -69,7 +69,7 @@ def init_compactor_from_kv(runtime_state: Any, args, n_attn_layers: int, d_kv: i
     ).cuda().to(_dtype)
 
     # Load compactor weights from checkpoint if provided (replicated across all ranks).
-    _ckpt_path = getattr(args, "rl_compaction_compactor_checkpoint", None)
+    _ckpt_path = args.rl_compaction_compactor_checkpoint
     _loaded_step = None
     _loaded_ckpt_payload = None
     if _ckpt_path:
@@ -90,39 +90,38 @@ def init_compactor_from_kv(runtime_state: Any, args, n_attn_layers: int, d_kv: i
 
     # Optimizer is created lazily in attach_compactor_optimizer once the Megatron
     # optimizer is available (first maybe_train_compactor call).
-    runtime_state._compactor_lr = getattr(args, "rl_compaction_compactor_lr", 3e-4)
+    runtime_state._compactor_lr = args.rl_compaction_compactor_lr
     runtime_state._compactor_ckpt_path = _loaded_ckpt_payload
 
-    _use_teacher_kl = getattr(args, "rl_compaction_compactor_teacher_kl", False)
+    _use_teacher_kl = args.rl_compaction_compactor_teacher_kl
     trainer_cfg = CompactorTrainerConfig(
         loss_weights=CompactorLossWeights(
             kv_reconstruction=0.0 if _use_teacher_kl else 1.0,
-            dynamics=getattr(args, "rl_compaction_compactor_dynamics", 0.0),
-            future_kv_reconstruction=getattr(args, "rl_compaction_compactor_future_kv_reconstruction", 0.0),
-            future_horizon_kl=getattr(args, "rl_compaction_compactor_future_horizon_kl", 0.0),
-            future_latent=getattr(args, "rl_compaction_compactor_future_latent", 0.0),
+            dynamics=args.rl_compaction_compactor_dynamics,
+            future_kv_reconstruction=args.rl_compaction_compactor_future_kv_reconstruction,
+            future_horizon_kl=args.rl_compaction_compactor_future_horizon_kl,
+            future_latent=args.rl_compaction_compactor_future_latent,
             # The merged-chunk consistency term is weighted by `consistency`;
             # with the minimal defaults (0.0) a merged-chunk-prob run would
             # compute the term and silently multiply it by zero. 0.1 is the
             # documented weight from the ablation matrix.
-            consistency=(0.1 if getattr(
-                args, "rl_compaction_compactor_merged_chunk_prob", 0.0) > 0.0
-                else 0.0),
+            consistency=(0.1 if args.rl_compaction_compactor_merged_chunk_prob > 0.0
+                         else 0.0),
         ),
         vd_cfg=ValueDirectedConfig(
-            advantage_clip=getattr(args, "rl_compaction_compactor_advantage_clip", 5.0),
-            min_weight=getattr(args, "rl_compaction_compactor_advantage_min_weight", 0.1),
+            advantage_clip=args.rl_compaction_compactor_advantage_clip,
+            min_weight=args.rl_compaction_compactor_advantage_min_weight,
         ),
-        use_teacher_logprob_weight=getattr(args, "rl_compaction_compactor_use_teacher_logprob", False),
+        use_teacher_logprob_weight=args.rl_compaction_compactor_use_teacher_logprob,
         use_teacher_kl=_use_teacher_kl,
-        future_horizon_gamma=getattr(args, "rl_compaction_compactor_future_horizon_gamma", 1.0),
-        use_future_accuracy_weight=getattr(args, "rl_compaction_compactor_use_future_accuracy_weight", False),
-        merged_chunk_prob=getattr(args, "rl_compaction_compactor_merged_chunk_prob", 0.0),
+        future_horizon_gamma=args.rl_compaction_compactor_future_horizon_gamma,
+        use_future_accuracy_weight=args.rl_compaction_compactor_use_future_accuracy_weight,
+        merged_chunk_prob=args.rl_compaction_compactor_merged_chunk_prob,
     )
     # A loss weight that is silently inert online (term enabled but its
     # precondition off, so it contributes zero gradient) is a misconfiguration.
     _w = trainer_cfg.loss_weights
-    if _w.future_latent > 0.0 and not getattr(args, "rl_compaction_trajectory_dir", None):
+    if _w.future_latent > 0.0 and not args.rl_compaction_trajectory_dir:
         raise ValueError(
             "--rl-compaction-compactor-future-latent needs probes with teacher_hidden "
             "(the full-KV forward's final hidden states), which only the offline "
@@ -221,8 +220,8 @@ def build_compactor_trajectories(runtime_state: Any, model, args) -> None:
     """
     from megatron.training import get_args
     args_obj = args if args is not None else get_args()
-    _train = getattr(args_obj, "rl_compaction_compactor_train", False)
-    _traj_dir = getattr(args_obj, "rl_compaction_trajectory_dir", None)
+    _train = args_obj.rl_compaction_compactor_train
+    _traj_dir = args_obj.rl_compaction_trajectory_dir
     if not (_train or _traj_dir):
         return
 
@@ -248,9 +247,13 @@ def build_compactor_trajectories(runtime_state: Any, model, args) -> None:
     if n_seqs == 0:
         return
 
-    chunk_size = getattr(args_obj, "rl_compaction_chunk_size", 256)
+    chunk_size = args_obj.rl_compaction_chunk_size
     # Sequence parallel requires S divisible by TP size.
-    tp_size = max(1, getattr(args_obj, "tensor_model_parallel_size", 1))
+    tp_size = max(1, args_obj.tensor_model_parallel_size)
+
+    # Free cached GPU memory once so the capture forwards have headroom —
+    # per-sequence empty_cache would stall the allocator every iteration.
+    torch.cuda.empty_cache()
 
     for i in range(n_seqs):
         seq_ids, reward = raw_seqs[i]
@@ -260,7 +263,7 @@ def build_compactor_trajectories(runtime_state: Any, model, args) -> None:
 
         # Pad to the model's full seq_length so CUDA graphs (captured at that length)
         # replay correctly, and to a TP boundary for sequence-parallel scatter/gather.
-        model_seq_len = getattr(args_obj, "seq_length", 8192)
+        model_seq_len = args_obj.seq_length
         full_len = max(model_seq_len, seq_len)
         pad_len = (tp_size - full_len % tp_size) % tp_size
         padded_len = full_len + pad_len
@@ -269,9 +272,6 @@ def build_compactor_trajectories(runtime_state: Any, model, args) -> None:
         token_t[:seq_len].copy_(torch.tensor(seq_ids, dtype=torch.long))
         tokens = token_t.unsqueeze(0)
         pos_ids = torch.arange(padded_len, dtype=torch.long, device="cuda").unsqueeze(0)
-
-        # Free any cached GPU memory so the forward pass has headroom.
-        torch.cuda.empty_cache()
 
         # All ranks run the SAME collective forward and each captures its own local KV.
         kv_result = None
@@ -448,8 +448,8 @@ def _train_compactor_impl(runtime_state: Any, args=None, optimizer=None) -> None
     # global_step is identical across ranks, so the gate fires on all ranks together.
     # Each checkpoint is a DIRECTORY (sharded model + common optimizer/step state).
     if args is not None:
-        ckpt_dir = getattr(args, "rl_compaction_compactor_checkpoint_dir", None)
-        ckpt_every = getattr(args, "rl_compaction_compactor_checkpoint_every", 100)
+        ckpt_dir = args.rl_compaction_compactor_checkpoint_dir
+        ckpt_every = args.rl_compaction_compactor_checkpoint_every
         if ckpt_dir and global_step % ckpt_every == 0:
             import os
             from megatron.rl.compaction.learned import save_checkpoint

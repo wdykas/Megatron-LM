@@ -207,10 +207,9 @@ class TestTypeConsolidation:
 
     def test_losses_module_no_longer_defines_compact_kv(self):
         import megatron.rl.compaction.learned.training.losses as losses_mod
-        # CompactKV should come from still.types, not be defined locally in losses
-        # The module still has the name (imported), but it must be the same object
-        from megatron.rl.compaction.learned.training.data import CompactKV
-        assert losses_mod.CompactKV is CompactKV
+        # CompactKV is owned by training.data; losses no longer references it
+        # at all (the last user, path_consistency_loss, was deleted).
+        assert not hasattr(losses_mod, "CompactKV")
 
     def test_trainer_classes_in_learned_training(self):
         # The compactor training core lives in compaction/learned/training.py

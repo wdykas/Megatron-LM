@@ -35,13 +35,12 @@ not for KV reconstruction fidelity.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 import torch
 import torch.nn.functional as F
 
 from megatron.rl.compaction.learned.models.belief import BeliefMemory
-from megatron.rl.compaction.learned.training.data import CompactKV, StudentFn
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +66,6 @@ class CompactorLossWeights:
     task:                      float = 0.0    # enable after switching to RL training
     retrieval:                 float = 0.0   # exact-recall probes (names, numbers, dates)
     weighted_kl:               float = 0.0   # low-entropy token weighting; enable after warm-up
-    path_consistency:          float = 0.0   # sequential vs combined path agreement
     predictive:                float = 0.0   # weight for POMDP predictive coding loss
     kv_reconstruction:         float = 0.0  # attention-output matching loss; use when student_fn is not available
     future_kv_reconstruction:  float = 0.0
@@ -76,25 +74,33 @@ class CompactorLossWeights:
     future_latent:             float = 0.0   # C5: match full-KV future hidden states
 
     def as_dict(self) -> dict[str, float]:
-        return {
-            "teacher_kl":               self.teacher_kl,
-            "future_kl":                self.future_kl,
-            "consistency":              self.consistency,
-            "task":                     self.task,
-            "retrieval":                self.retrieval,
-            "weighted_kl":              self.weighted_kl,
-            "path_consistency":         self.path_consistency,
-            "predictive":               self.predictive,
-            "kv_reconstruction":        self.kv_reconstruction,
-            "future_kv_reconstruction": self.future_kv_reconstruction,
-            "dynamics":                 self.dynamics,
-            "future_horizon_kl":        self.future_horizon_kl,
-        }
+        return {f.name: getattr(self, f.name) for f in fields(self)}
 
 
 # ---------------------------------------------------------------------------
 # Individual loss functions
 # ---------------------------------------------------------------------------
+
+def per_token_kl(
+    teacher_logits: torch.Tensor,    # (B, seq, vocab)
+    student_logits: torch.Tensor,    # (B, seq, vocab)
+    temperature:    float = 1.0,
+) -> torch.Tensor:
+    """Per-position KL(p_teacher || p_student) in fp32 → (B, seq).
+
+    THE single per-token KL implementation — every distillation loss and
+    sufficiency probe builds on it. Upcast to fp32 because the softmax/exp
+    and vocab-axis sum lose precision in bf16 (8-bit mantissa) over a 100k+
+    vocab. No T² gradient rescale here — reductions apply it at their level.
+    """
+    if teacher_logits.shape != student_logits.shape:
+        raise ValueError(
+            f"logit shapes differ: teacher {tuple(teacher_logits.shape)} vs "
+            f"student {tuple(student_logits.shape)}")
+    log_p = F.log_softmax(teacher_logits.float() / temperature, dim=-1)
+    log_q = F.log_softmax(student_logits.float() / temperature, dim=-1)
+    return (log_p.exp() * (log_p - log_q)).sum(dim=-1)
+
 
 def teacher_kl_loss(
     full_logits:    torch.Tensor,    # (B, seq, vocab)
@@ -120,16 +126,7 @@ def teacher_kl_loss(
     reduction:      "mean" (default) or "sum" or "none".
     """
     T = temperature
-    # Upcast to fp32: the softmax/exp and vocab-axis sum lose precision in bf16
-    # (8-bit mantissa) over a 100k+ vocab.
-    full_logits = full_logits.float()
-    compact_logits = compact_logits.float()
-    # Work in log-space for numerical stability
-    log_p = F.log_softmax(full_logits / T, dim=-1)    # teacher
-    log_q = F.log_softmax(compact_logits / T, dim=-1)  # student
-    p = log_p.exp()
-
-    kl = (p * (log_p - log_q)).sum(-1)                 # (B, seq)
+    kl = per_token_kl(full_logits, compact_logits, T)  # (B, seq)
 
     if reduction == "mean":
         return kl.mean() * T * T
@@ -137,34 +134,6 @@ def teacher_kl_loss(
         return kl.sum() * T * T
     else:
         return kl * T * T
-
-
-def advantage_weighted_kl_loss(
-    full_logits:    torch.Tensor,
-    compact_logits: torch.Tensor,
-    advantage:      float,
-    temperature:    float = 1.0,
-    advantage_clip: float = 5.0,
-    min_weight:     float = 0.1,
-) -> torch.Tensor:
-    """Teacher KL loss weighted by GRPO advantage.
-
-    Weight mapping: advantage=+clip → w=2.0 (compress this context faithfully),
-    advantage=0 → w=1.0 (baseline), advantage=-clip → w=min_weight (nearly ignore).
-
-    Parameters
-    ----------
-    advantage:       Per-probe GRPO advantage (from calculate_grpo_advantages).
-    advantage_clip:  Clip extreme advantage values.
-    min_weight:      Minimum weight (prevents zeroing out low-advantage probes entirely).
-    """
-    adv = float(advantage)
-    if adv != adv:  # NaN guard
-        return teacher_kl_loss(full_logits, compact_logits, temperature)
-    adv = max(-advantage_clip, min(advantage_clip, adv))
-    # Linear map: [-clip, +clip] → [min_weight, 2.0]
-    w = min_weight + (2.0 - min_weight) * (adv + advantage_clip) / (2.0 * advantage_clip)
-    return w * teacher_kl_loss(full_logits, compact_logits, temperature)
 
 
 def future_kl_loss(
@@ -239,16 +208,11 @@ def weighted_kl_loss(
     reduction:      "mean" (default) or "sum".
     """
     T = temperature
-    full_logits = full_logits.float()      # fp32 for the vocab-axis softmax/sum
-    compact_logits = compact_logits.float()
-    log_p = F.log_softmax(full_logits / T, dim=-1)
-    log_q = F.log_softmax(compact_logits / T, dim=-1)
-    p = log_p.exp()
-
-    kl_per_token = (p * (log_p - log_q)).sum(-1)           # (B, seq)
+    kl_per_token = per_token_kl(full_logits, compact_logits, T)  # (B, seq)
 
     if rho > 0.0:
-        H = -(p * log_p).sum(-1)                            # (B, seq) entropy of teacher
+        log_p = F.log_softmax(full_logits.float() / T, dim=-1)
+        H = -(log_p.exp() * log_p).sum(-1)                  # (B, seq) entropy of teacher
         vocab = full_logits.shape[-1]
         H_max = float(torch.log(torch.tensor(float(vocab))))
         w = 1.0 + rho * (1.0 - H / H_max)                  # (B, seq)
@@ -288,56 +252,6 @@ def consistency_loss(
         w = (1.0 - gates).detach()
         return (w * diff_k).pow(2).mean() + (w * diff_v).pow(2).mean()
     return diff_k.pow(2).mean() + diff_v.pow(2).mean()
-
-
-def path_consistency_loss(
-    updater,   # GatedRecurrentUpdater / BeliefUpdater
-    chunk_a_keys:   list[torch.Tensor],   # n_layers × (B, T_a, d)
-    chunk_a_values: list[torch.Tensor],
-    chunk_b_keys:   list[torch.Tensor],   # n_layers × (B, T_b, d)
-    chunk_b_values: list[torch.Tensor],
-    query_tokens: torch.Tensor,           # (B, S_q)
-    student_fn: StudentFn,
-    temperature: float = 1.0,
-) -> torch.Tensor:
-    """Penalise disagreement between sequential vs combined compression.
-
-    The ideal compressor should satisfy the path-independence property:
-    processing chunks A then B should give the same model behavior as
-    processing the concatenation [A, B] in a single pass.
-
-    Two belief update paths:
-        Path S (sequential): M_A = compress(A)
-                             M_AB = update(M_A, B)
-        Path C (combined):   M_AB' = compress(cat(A, B))
-
-    The loss is KL(p(·|M_AB') || p(·|M_AB)):
-        - M_AB' is treated as the reference (detached)
-        - M_AB  is trained to match it
-
-    Parameters
-    ----------
-    updater:        BeliefUpdater or GatedRecurrentUpdater.
-    chunk_a/b_*:    Position-free keys/values for the two chunks.
-    query_tokens:   (B, S_q) token IDs for the student forward pass.
-    student_fn:     CompactKV → logits (same interface as in SinglePassCompactorTrainer).
-    temperature:    KL distillation temperature.
-    """
-    # --- Path S: compress A, then update with B ----------------------------
-    mem_a  = updater.initial_compress(chunk_a_keys, chunk_a_values)
-    mem_ab = updater(mem_a, chunk_b_keys, chunk_b_values)
-    kv_seq: CompactKV = list(zip(mem_ab.keys_list(), mem_ab.values_list()))
-    logits_seq = student_fn(query_tokens, kv_seq).logits
-
-    # --- Path C: compress cat(A, B) in one shot ----------------------------
-    combined_keys   = [torch.cat([a, b], dim=1) for a, b in zip(chunk_a_keys,   chunk_b_keys)]
-    combined_values = [torch.cat([a, b], dim=1) for a, b in zip(chunk_a_values, chunk_b_values)]
-    mem_combined = updater.initial_compress(combined_keys, combined_values)
-    kv_comb: CompactKV = list(zip(mem_combined.keys_list(), mem_combined.values_list()))
-    logits_comb = student_fn(query_tokens, kv_comb).logits
-
-    # KL(combined || sequential): train sequential path to match combined reference
-    return teacher_kl_loss(logits_comb.detach(), logits_seq, temperature=temperature)
 
 
 def task_loss(
@@ -449,12 +363,7 @@ def future_horizon_kl_loss(full_logits, compact_logits, temperature=1.0, gamma=0
     gamma = 1.0 gives uniform weights (same as teacher_kl_loss).
     """
     T = temperature
-    full_logits = full_logits.float()      # fp32 for the vocab-axis softmax/sum
-    compact_logits = compact_logits.float()
-    log_p = F.log_softmax(full_logits / T, dim=-1)
-    log_q = F.log_softmax(compact_logits / T, dim=-1)
-    p = log_p.exp()
-    kl_per_token = (p * (log_p - log_q)).sum(-1)
+    kl_per_token = per_token_kl(full_logits, compact_logits, T)  # (B, seq)
     S_q = kl_per_token.shape[1]
     if gamma < 1.0 and S_q > 1:
         exponents = torch.arange(S_q, device=kl_per_token.device, dtype=kl_per_token.dtype)
@@ -519,7 +428,6 @@ class CompactorLossTerms:
     task:                     torch.Tensor | None
     retrieval:                torch.Tensor | None
     weighted_kl:              torch.Tensor | None
-    path_consistency:         torch.Tensor | None
     predictive:               torch.Tensor | None
     kv_reconstruction:        torch.Tensor | None
     future_kv_reconstruction: torch.Tensor | None
@@ -535,23 +443,8 @@ class CompactorLossTerms:
         double-counting in downstream loggers that sum all values.  Pass
         ``include_total=True`` if you need the weighted total explicitly.
         """
-        d: dict[str, float] = {}
-        for name, val in [
-            ("teacher_kl",               self.teacher_kl),
-            ("future_kl",                self.future_kl),
-            ("consistency",              self.consistency),
-            ("task",                     self.task),
-            ("retrieval",                self.retrieval),
-            ("weighted_kl",              self.weighted_kl),
-            ("path_consistency",         self.path_consistency),
-            ("predictive",               self.predictive),
-            ("kv_reconstruction",        self.kv_reconstruction),
-            ("future_kv_reconstruction", self.future_kv_reconstruction),
-            ("dynamics",                 self.dynamics),
-            ("future_horizon_kl",        self.future_horizon_kl),
-        ]:
-            if val is not None:
-                d[name] = val.item()
+        d = {f.name: getattr(self, f.name).item() for f in fields(self)
+             if f.name != "total" and getattr(self, f.name) is not None}
         if include_total:
             d["total"] = self.total.item()
         return d
@@ -687,7 +580,6 @@ class CompactorLosses:
             task=t_loss,
             retrieval=retr,
             weighted_kl=wkl,
-            path_consistency=None,  # computed separately via path_consistency_loss()
             predictive=None,
             kv_reconstruction=kv_recon,
             future_kv_reconstruction=None,

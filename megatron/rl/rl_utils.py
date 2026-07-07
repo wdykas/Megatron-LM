@@ -693,8 +693,7 @@ def get_environment_rollouts(
         # now-broadcast `rollouts` (identical on all ranks). build_compactor_trajectories
         # then replays a collective forward so each rank captures its own TP-local KV
         # slice and trains on it (world-DP grad all-reduce keeps replicas in sync).
-        if (getattr(args, "rl_compaction_compactor_train", False)
-                or getattr(args, "rl_compaction_trajectory_dir", None)):
+        if args.rl_compaction_compactor_train or args.rl_compaction_trajectory_dir:
             _rs = get_rl_runtime_state()
             _rs.compactor_raw_sequences.extend(
                 extract_compactor_sequences(rollouts))
@@ -968,6 +967,11 @@ def compute_group_stats(
         # Let's track this.
         num_turns.append(group_num_turns)
 
+    # None unless at least one rollout was arm-tagged (split-group run).
+    kv_compact_arms = (all_kv_compact_arms
+                       if any(a is not None for g in all_kv_compact_arms for a in g)
+                       else None)
+
     stats = RolloutStats(
         traj_lens=traj_lens,
         turn_lens=turn_lens,
@@ -978,9 +982,8 @@ def compute_group_stats(
         env_ids=env_ids,
         num_turns=num_turns,
         advantages=calculate_grpo_advantages(
-            rewards, num_turns,
-            kv_compact_arms=all_kv_compact_arms if any(a is not None for g in all_kv_compact_arms for a in g) else None),
-        kv_compact_arms=all_kv_compact_arms if any(a is not None for g in all_kv_compact_arms for a in g) else None,
+            rewards, num_turns, kv_compact_arms=kv_compact_arms),
+        kv_compact_arms=kv_compact_arms,
         min_piold_to_inf_prob=None,
         max_piold_to_inf_prob=None,
         mean_piold_to_inf_prob=None,
