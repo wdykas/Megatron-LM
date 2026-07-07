@@ -13,7 +13,7 @@ import math
 import pytest
 import torch
 
-from megatron.rl.compaction.kv.megatron_hook import MegatronInferenceHook
+from megatron.rl.compaction.kv.serving.megatron_hook import MegatronInferenceHook
 from megatron.rl.compaction.kv.types import KVMask
 from megatron.rl.compaction.learned.models.belief import BeliefMemory
 

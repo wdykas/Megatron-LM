@@ -14,7 +14,7 @@ import time
 
 import torch
 
-from .compressors import (
+from ..compressors import (
     CompactionResult,
     _fit_bias,
     _fit_values,

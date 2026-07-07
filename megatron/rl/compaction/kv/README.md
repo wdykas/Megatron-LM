@@ -73,7 +73,7 @@ Positional: keep `n_sink` initial tokens (attention sinks) + the most recent
 `budget - n_sink`. Content-blind — the cheap floor every content-aware method
 must beat (on RULER NIAH @2k/0.5 it scores EM 0.38 where SnapKV holds 1.00).
 
-### `oracle.py` — LearnedOracleScorer / OracleCompressor (Track C2, ours)
+### `oracle.py` — LearnedOracleScorer / OracleCompressor (learned oracle, ours)
 The learned heavy-hitter oracle: a small TE MLP on [key vector, position/P,
 layer one-hot] trained offline to predict H2O's true accumulated-attention
 score — the quantity flash attention makes unobservable live. On trained-Nano
@@ -89,8 +89,8 @@ Caveat: v0 signal is from a single text family — retrain on a diverse corpus
 before trusting it broadly, and retrain per model/TP layout (the checkpoint
 records d_key/n_layers and the loader hard-fails on mismatch).
 
-### `eviction_policy.py` — EvictionPolicy + GRPO trainer (Track B1, ours)
-Eviction as a stochastic policy with exact logprobs: the C2 scorer
+### `eviction_policy.py` — EvictionPolicy + GRPO trainer (eviction-policy RL, ours)
+Eviction as a stochastic policy with exact logprobs: the learned-oracle scorer
 architecture (same [key, position, layer] features) emits per-token retain
 logits; masks sample Bernoulli(sigmoid(score)) so the set logprob is exact —
 the budget is a reward penalty λ·kept_fraction rather than a hard top-k,
@@ -101,7 +101,7 @@ negative sufficiency-KL through the real frozen model
 (`make_sufficiency_reward` — inject the retained rows via the student
 forward, compare with full-cache teacher logits). Reconstruction preserves
 what attention looked at; this preserves what the task needed — the selection
-gap between the two is the Track B result. A trained policy's `.scorer`
+gap between the two is the eviction-RL result. A trained policy's `.scorer`
 deploys live via `--kv-compaction-oracle-checkpoint` (mind the protected
 recent window the live path adds).
 
@@ -162,7 +162,7 @@ Live strategies: `snapkv`, `streaming_llm`, and `belief_still` (the learned
 compactor from `../learned/` — loads a trained checkpoint and replaces the
 prompt KV with `n_compress` synthetic tokens).
 
-## CPU archive + negative-cache retrieval (`archive.py`, Track D)
+## CPU archive + negative-cache retrieval (`archive.py`, the archive track)
 
 With `--kv-compaction-archive`, eviction becomes **demotion, not deletion**:
 the pruned spans' exact KV tensors move to pinned CPU memory, and a tiny GPU
@@ -175,29 +175,20 @@ winning centroid names the span, `KVArchive.take` pulls its exact KV back from
 CPU, and `append_kv_to_request` splices it into the paged cache — one
 computation gives both the *when* (trigger) and the *where* (span address).
 
-Calibration: the margin (max centroid logit − max retained logit) is
-model-scale dependent and typically **negative** — a 16-key span centroid
-rarely beats the max over hundreds of retained keys. What separates need-steps
-from idle steps is a ~2-logit gap (trained Nano: fire at `-3.0`). There is no
-universal default, so `--kv-compaction-retrieval-margin` is required with the
-archive; calibrate by reading the per-step `[kv-retrieval] … margin` lines
-under `KV_COMPACTION_DEBUG=1`.
+Trigger: each archived span's centroid attention-mass fraction α̂ — the
+estimated share of the current step's attention that wants that span,
+normalized against the retained keys' mass (`KVArchive.span_alphas`).
+Scale-free in [0, 1): `--kv-compaction-retrieval-alpha` (default 0.2) is the
+single-step fast path, and a per-span CUSUM of (α̂ − the span's own EMA
+baseline − drift) crossing `--kv-compaction-retrieval-cusum` (default 0.4)
+catches novel persistent reaches while chronically hot spans self-absorb
+into their baselines. No per-model calibration. Under content-blind mass
+eviction (streaming) the signal is weaker — measured and warned at
+construction; the archive is most effective with content-aware strategies.
 
-Constraints: needs per-step decode Q, so the whole engine must run eagerly
-(`--cuda-graph-impl none`); incompatible with `belief_still` (synthetic tokens
-have no evicted spans to archive). Verified end-to-end on Nano: a needle that
-`streaming_llm @ 0.4` alone loses (model confabulates) is recovered exactly
-once the trigger restores its span mid-generation.
-
-Speculative prefetch — two independent triggers, either stages the best
-span's CPU→GPU copy on a side stream while decode continues, so a later
-firing splices the staged copy with no synchronous PCIe stall (`take` logs
-`prefetched` vs `sync copy`):
-- `--kv-compaction-prefetch-margin` (≤ the firing margin): static band —
-  margins close to the threshold in absolute terms.
-- `--kv-compaction-prefetch-horizon N`: rising trend — the one-step margin
-  slope predicts a crossing of the firing threshold within N decode steps;
-  catches a query warming up toward evicted content before any static band.
+Speculative prefetch: the leading CUSUM candidate is staged (CPU→GPU on a
+side stream) at half-threshold, so a later firing splices the staged copy
+with no synchronous PCIe stall (`take` logs `prefetched` vs `sync copy`).
 A fire on the first decode step is always a sync copy — there was no earlier
 step to stage from.
 
@@ -223,10 +214,9 @@ deployment distribution. Archive → safety net → teacher.
 --kv-compaction-oracle-checkpoint …     # learned_oracle trained scorer
 --kv-compaction-n-compress 64           # belief_still synthetic slots
 --decode-only-cuda-graphs               # required for snapkv
---kv-compaction-archive                 # CPU archive + retrieval (Track D)
---kv-compaction-retrieval-margin -3.2   # trigger threshold, REQUIRED w/ archive
---kv-compaction-prefetch-margin -5.0    # optional speculative staging threshold
---kv-compaction-prefetch-horizon 4      # optional trend-predictive staging
+--kv-compaction-archive                 # CPU archive + retrieval (archive)
+--kv-compaction-retrieval-alpha 0.2     # trigger fast path (mass fraction)
+--kv-compaction-retrieval-cusum 0.4     # trigger CUSUM threshold h
 --kv-compaction-flywheel-dir DIR        # log self-labeling eviction data
 --kv-compaction-rope-mode logical       # RoPE models: logical | renumber
                                         # (with archive: --cuda-graph-impl none)
@@ -240,8 +230,8 @@ deployment distribution. Archive → safety net → teacher.
 --rl-compaction-kv-budget-ratio 0.5
 --rl-compaction-n-compress 64
 --rl-compaction-compactor-checkpoint …
---rl-compaction-split-fraction 0.5      # A1 split-group: P(rollout compacts)
---rl-compaction-budget-final 0.3        # A3: anneal budget to this ...
+--rl-compaction-split-fraction 0.5      # split-group: P(rollout compacts)
+--rl-compaction-budget-final 0.3        # anneal budget to this ...
 --rl-compaction-budget-anneal-iters 200 # ... over this many GRPO iterations
 ```
 

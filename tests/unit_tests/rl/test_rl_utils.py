@@ -505,7 +505,7 @@ class TestRLUtils:
         )
 
     def test_split_arm_advantage_calculation(self):
-        """A1 split-group: each rollout normalizes against its own arm."""
+        """split-group: each rollout normalizes against its own arm."""
         rewards = [[1.0, 0.0, 0.5, 0.3]]
         num_turns = [[1, 1, 1, 1]]
         arms = [[True, True, False, False]]
@@ -541,7 +541,7 @@ class TestRLUtils:
             rl_utils.calculate_grpo_advantages(rewards, num_turns, kv_compact_arms=None)
 
     def test_staleness_bias_stats_split(self):
-        """A2: the inference/train prob gap is attributed by kv staleness."""
+        """staleness split: the inference/train prob gap is attributed by kv staleness."""
         from types import SimpleNamespace
         old_lp = torch.full((1, 6), -1.0)
         inf_lp = old_lp.clone()
@@ -568,7 +568,7 @@ class TestRLUtils:
         assert gs.kv_stale_token_frac is None             # silently skipped
 
     def test_deterministic_split_arm(self):
-        """A1: Bresenham arm assignment — exact proportions over any prefix."""
+        """Bresenham arm assignment — exact proportions over any prefix."""
         from megatron.rl.inference.api import deterministic_split_arm
         # fraction 0.5 alternates
         arms = [deterministic_split_arm(i, 0.5) for i in range(8)]

@@ -1,24 +1,24 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from .types import KVMask
-from .selectors import (
+from .selectors.baselines import (
     AttentionSumScorer,
     UniformScorer,
 )
-from .megatron_hook import MegatronInferenceHook, NullHook
+from .serving.megatron_hook import MegatronInferenceHook, NullHook
 from .compressors import CompactionResult, KVCompressor
-from .attention_matching import TopKCompressor, OMPCompressor   # Zweiger et al. 2026
-from .h2o import H2OAccumulator                                 # Zhang et al. 2023
-from .snapkv import SnapKVCompressor                            # Li et al. 2024
-from .streaming_llm import StreamingLLMCompressor               # Xiao et al. 2023
+from .selectors.attention_matching import TopKCompressor, OMPCompressor  # Zweiger et al. 2026
+from .selectors.h2o import H2OAccumulator                       # Zhang et al. 2023
+from .selectors.snapkv import SnapKVCompressor                  # Li et al. 2024
+from .selectors.streaming_llm import StreamingLLMCompressor     # Xiao et al. 2023
 from .benchmark import KVCompactionBenchmark, CompactionBenchmarkResult
-from .eviction_policy import (                                  # Track B1
+from .selectors.eviction_policy import (                                  # eviction-policy RL
     EvictionGRPOConfig,
     EvictionPolicy,
     make_sufficiency_reward,
     train_eviction_policy_grpo,
 )
-from .oracle import (                                           # Track C2
+from .selectors.oracle import (                                           # learned oracle
     LearnedOracleScorer,
     OracleCompressor,
     OracleScorerConfig,

@@ -41,12 +41,12 @@ failure of (2). Terms that lose the sweep get deleted, not left at zero:
 | `dynamics` (NextLat) | roll the updater forward and match the next memory (head-free latent dynamics) |
 | `future_kv_reconstruction` (NextLat) | old memory must answer queries from the *future* chunk (belief sufficiency) |
 | `future_horizon_kl` (NextLat, offline-only) | position-weighted teacher KL, γ<1 upweights later positions |
-| `future_latent` (NextLat C5, offline-only) | SmoothL1 between compact-KV and full-KV **final hidden states** over probe tokens — the strongest NextLat form (direct future hidden-state matching) |
+| `future_latent` (NextLat, offline-only) | SmoothL1 between compact-KV and full-KV **final hidden states** over probe tokens — the strongest NextLat form (direct future hidden-state matching) |
 | `consistency` / `merged_chunk_prob` | sequential belief must match one-pass compression of merged chunks (path independence) |
 
 Value-directed weighting (`training/value_directed.py`): scales each probe's
 loss by clipped GRPO advantage — RL-trains-compaction in its weakest form and
-the mandatory baseline for Track B.
+the mandatory baseline for eviction RL.
 
 ## Online integration (`online.py`)
 
@@ -88,7 +88,7 @@ sequence together — the NCCL-deadlock guard).
 --rl-compaction-compactor-use-future-accuracy-weight
 --rl-compaction-compactor-future-horizon-kl 0.3      # offline pipeline only
 --rl-compaction-compactor-future-horizon-gamma 0.8   # γ<1 required with the above
---rl-compaction-compactor-future-latent 0.5          # C5, offline pipeline only
+--rl-compaction-compactor-future-latent 0.5          # NextLat, offline pipeline only
 # value-directed weighting
 --rl-compaction-compactor-advantage-clip 5.0
 --rl-compaction-compactor-advantage-min-weight 0.1

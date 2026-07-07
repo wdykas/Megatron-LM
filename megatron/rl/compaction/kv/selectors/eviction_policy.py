@@ -1,15 +1,15 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Eviction policy as a GRPO agent (Track B1, offline v0).
+"""Eviction policy as a GRPO agent (eviction-policy RL, offline v0).
 
 Reconstruction objectives preserve what attention LOOKED AT; RL preserves what
-the TASK NEEDED — the gap between those selections is the Track B result. Here
+the TASK NEEDED — the gap between those selections is the eviction-RL result. Here
 compaction decisions become actions with exact logprobs:
 
-- The policy is the C2 scorer architecture (``LearnedOracleScorer``: MLP on
+- The policy is the learned-oracle scorer architectureitecture (``LearnedOracleScorer``: MLP on
   [key, position/P, layer one-hot], aggregated token-level) — same features,
-  different training signal. C2 fits it to imitate H2O's accumulated-attention
-  oracle; B1 trains it with task reward.
+  different training signal. the supervised scorer fits it to imitate H2O's accumulated-attention
+  oracle; the RL policy trains it with task reward.
 - Action: per-token retain/evict, sampled Bernoulli(sigmoid(score)) — the
   budget enters as a reward penalty λ·kept_fraction rather than a hard top-k,
   so the set logprob is exact (no Gumbel/Plackett-Luce approximations) and the
@@ -22,7 +22,7 @@ compaction decisions become actions with exact logprobs:
   the group, REINFORCE on the exact mask logprobs.
 
 Offline v0 per the plan: saved captures + sufficiency-KL as reward proxy, no
-server. A trained policy deploys live exactly like the C2 scorer (it IS one:
+server. A trained policy deploys live exactly like the learned-oracle scorer (it IS one:
 ``policy.scorer`` drops into ``--kv-compaction-oracle-checkpoint``) — with the
 caveat that live selection keeps a protected recent window while the policy
 was free-form; retrain or eval with the same convention.

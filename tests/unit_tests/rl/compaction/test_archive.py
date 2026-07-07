@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from megatron.rl.compaction.kv.archive import KVArchive
-from megatron.rl.compaction.kv.megatron_hook import MegatronInferenceHook
+from megatron.rl.compaction.kv.serving.megatron_hook import MegatronInferenceHook
 
 from tests.unit_tests.rl.compaction.test_megatron_hook import _make_context
 

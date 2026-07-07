@@ -34,7 +34,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from .compressors import _select_recent_plus_heavy
+from ..compressors import _select_recent_plus_heavy
 from .megatron_hook import MegatronInferenceHook
 
 logger = logging.getLogger(__name__)
@@ -86,7 +86,7 @@ class LiveKVCompactor:
         if strategy not in _LIVE_STRATEGIES:
             # Route through the factory for the canonical error (h2o explains
             # exactly why it cannot run live).
-            from . import build_kv_compressor
+            from .. import build_kv_compressor
             build_kv_compressor(strategy, inference=True)
             raise ValueError(
                 f"strategy {strategy!r} resolves offline but has no live "
@@ -96,7 +96,7 @@ class LiveKVCompactor:
             raise ValueError(f"budget_ratio must be in (0, 1), got {budget_ratio}")
         self.strategy = strategy
         self.budget_ratio = budget_ratio
-        # A3 budget annealing (RL loop only): budget_ratio moves linearly from
+        # budget annealing (RL loop only): budget_ratio moves linearly from
         # its starting value to budget_final over budget_anneal_iters GRPO
         # iterations. Every TP rank runs begin_step in lockstep with the same
         # args, so the schedule stays consistent without any broadcast.
@@ -122,7 +122,7 @@ class LiveKVCompactor:
         self.n_compress = n_compress
         self._updater = None   # lazy: belief_still builds/loads on first request
         self._oracle = None    # lazy: learned_oracle builds/loads on first request
-        # CPU archive + negative-cache retrieval (Track D). Evicted spans are
+        # CPU archive + negative-cache retrieval (archive). Evicted spans are
         # demoted to CPU instead of deleted; a per-decode-step trigger restores
         # them on demand. Needs per-step Q → decode must run EAGER (no CUDA
         # graphs at all); enforced at the first missed capture.
@@ -478,7 +478,7 @@ class LiveKVCompactor:
             b_global = ctx.paused_request_count + b_local
             if b_global == chunked_global:
                 continue
-            # Per-request arm flag (A1 split-group): kv_compact=False exempts
+            # Per-request arm flag (split-group): kv_compact=False exempts
             # this request — the control arm of a compact-vs-full comparison.
             if not bool(ctx.request_metadata["kv_compact"][b_global].item()):
                 continue
@@ -582,7 +582,7 @@ class LiveKVCompactor:
         trained offline, deployed read-only). Without one: RANDOM INIT — the
         selection is garbage; plumbing smoke only, logged loudly.
         """
-        from .oracle import LearnedOracleScorer, OracleScorerConfig, load_oracle_scorer
+        from ..selectors.oracle import LearnedOracleScorer, OracleScorerConfig, load_oracle_scorer
         from megatron.rl.compaction.learned.training.parallel import (
             build_compactor_pg_collection,
         )

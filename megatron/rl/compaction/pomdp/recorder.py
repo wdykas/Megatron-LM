@@ -11,7 +11,7 @@ from .algorithm import CompactionAlgorithm, DeterministicAlgorithm
 from .config import PomdpConfig
 from .context_builder import ContextBuilder
 from ..kv.compressors import KVCompressor
-from ..kv.megatron_hook import MegatronInferenceHook, NullHook
+from ..kv.serving.megatron_hook import MegatronInferenceHook, NullHook
 from ..kv.types import KVMask
 from .metrics import ShadowRunMetrics, ShadowStepMetrics
 from .store import PomdpTraceStore

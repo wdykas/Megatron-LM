@@ -1,12 +1,12 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Tests for the learned heavy-hitter oracle (Track C2)."""
+"""Tests for the learned heavy-hitter oracle ."""
 
 import pytest
 import torch
 
 from megatron.rl.compaction.kv import build_kv_compressor
-from megatron.rl.compaction.kv.oracle import (
+from megatron.rl.compaction.kv.selectors.oracle import (
     LearnedOracleScorer,
     OracleCompressor,
     OracleScorerConfig,
@@ -123,7 +123,7 @@ class TestFlywheelRefit:
             arch.drop(rid)
 
     def test_refit_separates_restored_from_unused(self, tmp_path):
-        from megatron.rl.compaction.kv.oracle import fit_scorer_on_flywheel
+        from megatron.rl.compaction.kv.selectors.oracle import fit_scorer_on_flywheel
         torch.manual_seed(0)
         u = torch.randn(H * D, device="cuda")
         u = u / u.norm()
@@ -142,7 +142,7 @@ class TestFlywheelRefit:
 
     def test_refit_requires_both_classes(self, tmp_path):
         from megatron.rl.compaction.kv.archive import KVArchive
-        from megatron.rl.compaction.kv.oracle import fit_scorer_on_flywheel
+        from megatron.rl.compaction.kv.selectors.oracle import fit_scorer_on_flywheel
         arch = KVArchive(max_span=4, flywheel_dir=str(tmp_path))
         k = torch.randn(L, 8, H, D, device="cuda")
         arch.store_evicted(1, k, k.clone(), [0, 1])

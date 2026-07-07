@@ -24,7 +24,7 @@ class StudentOutput(NamedTuple):
 
     logits: (B, S_q, vocab) — differentiable w.r.t. the compact KV.
     hidden: (B, S_q, d_model) — final decoder output (post final norm), the
-        target space of the NextLat future-latent loss (C5).
+        target space of the NextLat future-latent loss (NextLat future-latent).
     """
 
     logits: torch.Tensor

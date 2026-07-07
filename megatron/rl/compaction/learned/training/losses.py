@@ -56,7 +56,7 @@ class CompactorLossWeights:
     (the STILL paper objective, zero extra hyperparameters), (2) + one
     ``future_latent`` weight (the direct NextLat form; ``dynamics`` and
     ``future_kv_reconstruction`` are its proxies), (3) decomposed proxies
-    only to diagnose a failure of (2). Terms that lose the C1 sweep get
+    only to diagnose a failure of (2). Terms that lose the objective sweep get
     DELETED, not left as zero-weight options.
     """
 
@@ -71,7 +71,7 @@ class CompactorLossWeights:
     future_kv_reconstruction:  float = 0.0
     dynamics:                  float = 0.0
     future_horizon_kl:         float = 0.0
-    future_latent:             float = 0.0   # C5: match full-KV future hidden states
+    future_latent:             float = 0.0   # NextLat: match full-KV future hidden states
 
     def as_dict(self) -> dict[str, float]:
         return {f.name: getattr(self, f.name) for f in fields(self)}
@@ -97,6 +97,9 @@ def per_token_kl(
         raise ValueError(
             f"logit shapes differ: teacher {tuple(teacher_logits.shape)} vs "
             f"student {tuple(student_logits.shape)}")
+    # Teacher tensors are often stored on CPU (probe memory hygiene); the
+    # student side defines the compute device.
+    teacher_logits = teacher_logits.to(student_logits.device)
     log_p = F.log_softmax(teacher_logits.float() / temperature, dim=-1)
     log_q = F.log_softmax(student_logits.float() / temperature, dim=-1)
     return (log_p.exp() * (log_p - log_q)).sum(dim=-1)
@@ -379,7 +382,7 @@ def future_latent_loss(
     student_hidden: torch.Tensor,     # (B, S_q, d_model) — from the compact-KV forward
     teacher_hidden: torch.Tensor,     # (B, S_q, d_model) — from the full-KV forward
 ) -> torch.Tensor:
-    """C5 NextLat: direct future hidden-state matching (SmoothL1).
+    """NextLat: direct future hidden-state matching (SmoothL1).
 
     The strongest NextLat form: instead of matching the next belief memory
     (dynamics) or answering future queries from old memory (future-KV recon),
@@ -392,6 +395,7 @@ def future_latent_loss(
         raise ValueError(
             f"hidden shape mismatch: student {tuple(student_hidden.shape)} vs "
             f"teacher {tuple(teacher_hidden.shape)}")
+    teacher_hidden = teacher_hidden.to(student_hidden.device)
     return F.smooth_l1_loss(student_hidden.float(), teacher_hidden.detach().float())
 
 

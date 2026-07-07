@@ -5,12 +5,13 @@
 When live compaction evicts a span of KV, the exact tensors move to pinned CPU
 memory and a tiny GPU index of the *evicted* content stays behind — one mean-key
 centroid per contiguous span per layer/KV-group (the "negative cache": an index
-of what is absent from the GPU cache). At decode time a query is scored against
-retained keys and against these centroids with the same attention math; a query
-that scores higher on a centroid than on any retained key is demonstrably
-reaching for dropped content — the trigger — and the winning centroid names the
-span to restore (validated on trained-Nano captures: trigger↔oracle correlation
-+0.77, top-1 span identification 76.6% vs 1.4% chance).
+of what is absent from the GPU cache). At decode time, ``span_alphas`` scores
+each span's centroid attention-mass fraction α̂ — the estimated share of this
+step's attention that WANTS that evicted span, normalized against the retained
+keys' mass. The serving trigger (LiveKVCompactor) fires a span whose α̂ spikes
+above its own running baseline: scale-free, no per-model calibration, and the
+firing span is also the span to restore (identification measured reliable on
+needle captures even under mass eviction).
 
 Entries are keyed by the ENGINE request id (stable across pause/resume slot
 swaps); LiveKVCompactor drops a request's entries when it finishes.

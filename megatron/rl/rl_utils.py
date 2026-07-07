@@ -324,9 +324,9 @@ class RolloutStats:
     kv_cache_staleness: list[list[int]]
     completed_at_steps: list[list[int]]
     num_evictions: list[list[int]]
-    # A1 split-group: per-rollout compaction arm, grouped (None = split off).
+    # split-group: per-rollout compaction arm, grouped (None = split off).
     kv_compact_arms: None | list[list[bool | None]] = None
-    # A2 compaction-bias attribution: inference-vs-train prob gap split by
+    # staleness-bias attribution: inference-vs-train prob gap split by
     # per-token kv_cache_staleness (stale = generated after a compaction).
     mean_inf_train_prob_abs_diff_stale: None | float = None
     mean_inf_train_prob_abs_diff_clean: None | float = None
@@ -436,7 +436,7 @@ def update_staleness_bias_stats(
     (--rl-inference-logprobs-is-correction). NOTE: live COMPACTION does not
     increment this counter — attributing the gap to compaction specifically
     needs a dedicated per-token post-compaction marker (not yet wired); until
-    then the A1 split-group reward gap is the compaction-attribution tool.
+    then the split-group reward gap is the compaction-attribution tool.
     """
     if (mask.shape != old_logprobs.shape
             or staleness.shape != old_logprobs.shape
@@ -1177,13 +1177,13 @@ def maybe_log_training_metrics(
         'min_inf_prob': group_stats.min_inf_prob,
         'max_inf_prob': group_stats.max_inf_prob,
         'mean_inf_prob': group_stats.mean_inf_prob,
-        # A2: compaction-attributable inference/train mismatch.
+        # staleness split: compaction-attributable inference/train mismatch.
         'mean_inf_train_prob_abs_diff_stale': group_stats.mean_inf_train_prob_abs_diff_stale,
         'mean_inf_train_prob_abs_diff_clean': group_stats.mean_inf_train_prob_abs_diff_clean,
         'kv_stale_token_frac': group_stats.kv_stale_token_frac,
     }
 
-    # A1 split-group counterfactual: per-prompt compact-vs-full reward gap,
+    # split-group counterfactual: per-prompt compact-vs-full reward gap,
     # averaged over groups where both arms are present.
     if group_stats.kv_compact_arms is not None:
         gaps = []
@@ -1328,7 +1328,7 @@ def prepare_trajectories(
             else:
                 inference_logprobs.append(None)
             # Per-token KV staleness rides the same alignment as the logprobs
-            # (A2: attribute inference/train mismatch to compaction).
+            # (attribute inference/train mismatch to compaction).
             turn_staleness = rollout.kv_cache_staleness[turn_idx]
             kv_stalenesses.append(
                 torch.tensor(turn_staleness, dtype=torch.float32)

@@ -13,7 +13,7 @@ import time
 
 import torch
 
-from .compressors import (
+from ..compressors import (
     CompactionResult,
     _select_recent_plus_heavy,
     _softmax_attention,

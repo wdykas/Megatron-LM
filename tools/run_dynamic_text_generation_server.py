@@ -140,7 +140,7 @@ if __name__ == "__main__":
         engine = get_dynamic_inference_engine()
 
         if args.kv_compaction_strategy is not None:
-            from megatron.rl.compaction.kv.live import LiveKVCompactor
+            from megatron.rl.compaction.kv.serving.live import LiveKVCompactor
             if not args.decode_only_cuda_graphs and args.kv_compaction_strategy == "snapkv":
                 raise ValueError(
                     "--kv-compaction-strategy snapkv needs eager prefill forwards for "

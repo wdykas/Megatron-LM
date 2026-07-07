@@ -16,8 +16,8 @@ from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_e
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.transformer.transformer_config import TransformerConfig
 
-from megatron.rl.compaction.kv.megatron_hook import MegatronInferenceHook
-from megatron.rl.compaction.kv.rope import delta_rotate_keys
+from megatron.rl.compaction.kv.serving.megatron_hook import MegatronInferenceHook
+from megatron.rl.compaction.kv.serving.rope import delta_rotate_keys
 
 from tests.unit_tests.rl.compaction.test_megatron_hook import _make_context
 
@@ -114,7 +114,7 @@ class _StubEngine:
 
 class TestRopeModeGuards:
     def _build(self, pos_emb, rope_mode=None, rotary=None, strategy="streaming_llm"):
-        from megatron.rl.compaction.kv.live import LiveKVCompactor
+        from megatron.rl.compaction.kv.serving.live import LiveKVCompactor
         return LiveKVCompactor(
             _StubEngine(pos_emb, rotary), strategy=strategy,
             budget_ratio=0.5, rope_mode=rope_mode)
@@ -151,7 +151,7 @@ class TestAlphaCusumTrigger:
     """The α̂/CUSUM retrieval trigger (scale-free, per-span novelty)."""
 
     def _comp(self, **kw):
-        from megatron.rl.compaction.kv.live import LiveKVCompactor
+        from megatron.rl.compaction.kv.serving.live import LiveKVCompactor
         return LiveKVCompactor(
             _StubEngine("none"), strategy="snapkv", budget_ratio=0.5,
             archive=True, **kw)
@@ -196,10 +196,10 @@ class TestAlphaCusumTrigger:
 
 
 class TestBudgetAnneal:
-    """A3: linear budget schedule (RL loop)."""
+    """Budget anneal: linear schedule (RL loop)."""
 
     def _comp(self, **kw):
-        from megatron.rl.compaction.kv.live import LiveKVCompactor
+        from megatron.rl.compaction.kv.serving.live import LiveKVCompactor
         return LiveKVCompactor(_StubEngine("none"), strategy="streaming_llm",
                                budget_ratio=0.8, **kw)
 

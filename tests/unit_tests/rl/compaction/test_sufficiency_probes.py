@@ -107,13 +107,13 @@ class TestSufficiencyKlRealModel:
         Utils.destroy_model_parallel()
 
     def test_eviction_policy_grpo_with_real_reward(self, model_and_data):
-        """B1 v0 end-to-end: GRPO steps with sufficiency-KL reward through the
+        """eviction-policy RL end-to-end: GRPO steps with sufficiency-KL reward through the
         real model — rewards finite, gradients flow, keeping more helps."""
-        from megatron.rl.compaction.kv.eviction_policy import (
+        from megatron.rl.compaction.kv.selectors.eviction_policy import (
             EvictionGRPOConfig, EvictionPolicy, make_sufficiency_reward,
             train_eviction_policy_grpo,
         )
-        from megatron.rl.compaction.kv.oracle import OracleScorerConfig
+        from megatron.rl.compaction.kv.selectors.oracle import OracleScorerConfig
         d = model_and_data
         reward_fn = make_sufficiency_reward(
             d["model"], d["query_tokens"], d["prefix_kv"], d["teacher_logits"])
@@ -137,7 +137,7 @@ class TestSufficiencyKlRealModel:
         assert all(torch.isfinite(torch.tensor(lg["mean_reward"])) for lg in logs)
 
     def test_student_and_teacher_outputs_capture_hidden(self, model_and_data):
-        """C5 plumbing through the real model: hidden capture + gradient flow."""
+        """NextLat future-latent plumbing through the real model: hidden capture + gradient flow."""
         from megatron.rl.compaction.learned.capture.student_forward import (
             student_outputs, teacher_outputs,
         )

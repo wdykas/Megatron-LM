@@ -284,8 +284,8 @@ def _fit_values(
         # fewer queries this is underdetermined and the min-norm solution
         # zeroes weakly-attended values — pass values_init for the residual
         # form, which degrades to the original values instead.
-        C2 = torch.linalg.lstsq(X.float(), Y.float(), driver="gels").solution
-        return C2.to(values_orig.dtype)
+        C_v = torch.linalg.lstsq(X.float(), Y.float(), driver="gels").solution
+        return C_v.to(values_orig.dtype)
     t = X.shape[1]
     X32, Y32 = X.float(), Y.float()
     XtX = X32.T @ X32                                   # (t, t)

@@ -21,7 +21,7 @@ import pytest
 import torch
 
 from megatron.rl.compaction.kv import CompactionResult, KVCompressor
-from megatron.rl.compaction.kv.attention_matching import OMPCompressor, TopKCompressor
+from megatron.rl.compaction.kv.selectors.attention_matching import OMPCompressor, TopKCompressor
 from megatron.rl.compaction.kv.compressors import (
     _attention_output,
     _fit_bias,

@@ -266,7 +266,7 @@ def train_compactor_trajectory(
                         )
                         chunk_loss = chunk_loss + cfg.loss_weights.future_horizon_kl * fh_l
                         future_horizon_kl_vals.append(fh_l.item())
-                    # C5 future-latent: match the full-KV forward's final hidden states.
+                    # NextLat future-latent: match the full-KV forward's final hidden states.
                     if (cfg.loss_weights.future_latent > 0.0
                             and probe.teacher_hidden is not None):
                         fl_l = future_latent_loss(

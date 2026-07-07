@@ -5,7 +5,7 @@ import torch
 
 from megatron.rl.compaction.pomdp.config import PomdpConfig
 from megatron.rl.compaction.pomdp.context_builder import ContextBuilder
-from megatron.rl.compaction.kv.megatron_hook import NullHook
+from megatron.rl.compaction.kv.serving.megatron_hook import NullHook
 from megatron.rl.compaction.pomdp.recorder import PomdpRolloutRecorder
 from megatron.rl.compaction.pomdp.store import JsonlPomdpTraceStore
 from megatron.rl.compaction.learned.models.compactor import PerceiverCompactor, PerceiverConfig

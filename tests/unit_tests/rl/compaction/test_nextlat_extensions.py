@@ -90,11 +90,11 @@ def _make_belief_memory(n_layers=N_LAYERS, B=B, C=C, d=D, *, seed=0):
 
 
 # ---------------------------------------------------------------------------
-# TestFutureLatentLoss (C5)
+# TestFutureLatentLoss (NextLat future-latent)
 # ---------------------------------------------------------------------------
 
 class TestFutureLatentLoss(unittest.TestCase):
-    """C5: the trajectory trainer consumes probe.teacher_hidden."""
+    """NextLat: the trajectory trainer consumes probe.teacher_hidden."""
 
     def _student_fn(self, query_tokens, compact_kv):
         from megatron.rl.compaction.learned.training.data import StudentOutput

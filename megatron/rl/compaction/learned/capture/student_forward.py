@@ -224,8 +224,8 @@ def _forward_outputs(gpt, response_token_ids: torch.Tensor,
                         f"packed_thd_kv_len={packed_thd_kv_len} "
                         f"flash_decode={getattr(gpt.config, 'flash_decode', None)} "
                         f"sequence_parallel={getattr(gpt.config, 'sequence_parallel', None)}. "
-                        "Known-good path: the inference-engine model (SBHD, B1/"
-                        "c_ladder recipe). The TRAINING model's packed/THD attention "
+                        "Known-good path: the inference-engine model (SBHD, the"
+                        " eviction-RL/ladder recipe). The TRAINING model's packed/THD attention "
                         "still rejects injected KV — track shapes at the "
                         "core_attention pre-hook to close this.") from e
                 raise

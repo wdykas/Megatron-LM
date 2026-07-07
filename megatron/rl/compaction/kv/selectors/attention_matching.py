@@ -15,7 +15,7 @@ import time
 
 import torch
 
-from .compressors import (
+from ..compressors import (
     CompactionResult,
     _mass_features,
     _nnls_box,

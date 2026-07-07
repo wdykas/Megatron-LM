@@ -45,7 +45,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from .types import KVMask
+from ..types import KVMask
 
 
 class NullHook:

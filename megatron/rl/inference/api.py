@@ -14,7 +14,7 @@ class InferenceRequest(Request):
     prompt: list[LLMChatMessage]
     tools: list[dict] | None = None
     # Position of this request within its GRPO group (set by group_rollout).
-    # Enables deterministic within-group treatment splits (e.g. the A1
+    # Enables deterministic within-group treatment splits (e.g. the
     # kv_compact arm) instead of per-request Bernoulli draws.
     rollout_index: int | None = None
 
@@ -43,5 +43,5 @@ class InferenceResponse(BaseModel):
     kv_cache_staleness: list[int]
     completed_at_step: int
     num_evictions: int
-    # A1 split-group: which compaction arm this rollout ran on (None = split off).
+    # split-group: which compaction arm this rollout ran on (None = split off).
     kv_compacted: bool | None = None

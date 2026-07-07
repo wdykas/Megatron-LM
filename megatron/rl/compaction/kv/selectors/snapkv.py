@@ -23,7 +23,7 @@ import time
 import torch
 import torch.nn.functional as F
 
-from .compressors import (
+from ..compressors import (
     CompactionResult,
     _select_recent_plus_heavy,
     _softmax_attention,

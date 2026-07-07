@@ -282,7 +282,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Timing and logging variables.
         self.rank = torch.distributed.get_rank()
-        # Optional live KV compactor (megatron.rl.compaction.kv.live); set by
+        # Optional live KV compactor (megatron.rl.compaction.kv.serving.live); set by
         # the serving tool when --kv-compaction-strategy is passed.
         self.kv_compactor = None
 
@@ -1529,7 +1529,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # TODO @TDE: Account for this line when overlapping forward and bookkeep.
         self.is_decode_only = is_decode_only
 
-        # Live KV compaction (megatron.rl.compaction.kv.live.LiveKVCompactor),
+        # Live KV compaction (megatron.rl.compaction.kv.serving.live.LiveKVCompactor),
         # attached by the serving tool. Arms observation-window Q capture before
         # prefill forwards and prunes each just-prefilled request's paged KV to
         # budget right after; both calls are no-ops on decode-only steps.

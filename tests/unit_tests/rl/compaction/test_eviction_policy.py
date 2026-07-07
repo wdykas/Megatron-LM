@@ -1,16 +1,16 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Tests for the GRPO eviction policy (Track B1, offline v0)."""
+"""Tests for the GRPO eviction policy (eviction-policy RL, offline v0)."""
 
 import pytest
 import torch
 
-from megatron.rl.compaction.kv.eviction_policy import (
+from megatron.rl.compaction.kv.selectors.eviction_policy import (
     EvictionGRPOConfig,
     EvictionPolicy,
     train_eviction_policy_grpo,
 )
-from megatron.rl.compaction.kv.oracle import OracleScorerConfig
+from megatron.rl.compaction.kv.selectors.oracle import OracleScorerConfig
 
 L, S, D = 2, 40, 16
 

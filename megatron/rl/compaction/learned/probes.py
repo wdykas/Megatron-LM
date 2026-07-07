@@ -13,8 +13,8 @@ the compacted cache is a sufficient statistic for that prediction; a spike
 localizes exactly where compression lost something the policy needed.
 
 Uses: eval metric for any compressor at matched budget, reward proxy for
-RL-trained eviction (Track B1 v0), and trigger labels for hierarchical-memory
-retrieval (Track D1).
+RL-trained eviction (eviction-policy RL), and trigger labels for hierarchical-memory
+retrieval (the negative-cache trigger).
 """
 
 from __future__ import annotations

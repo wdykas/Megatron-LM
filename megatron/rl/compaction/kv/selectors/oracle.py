@@ -1,11 +1,11 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Learned heavy-hitter oracle (Track C2): predict H2O's score without queries.
+"""Learned heavy-hitter oracle: predict H2O's score without queries.
 
 H2O's true heavy-hitter score — the softmax attention mass a key will
 accumulate over future queries — is unobservable live under flash attention.
 SnapKV proxies it with the last-W real queries; this module goes one step
-further and asks the C2 question: is the oracle largely predictable from the
+further and asks the query-free question: is the oracle largely predictable from the
 KEY VECTOR alone (plus position)? On trained-Nano captures the answer was yes
 (held-out Spearman 0.97 vs 0.82 for SnapKV's proxy at matched budget), which
 makes a query-free live strategy possible: score each prefix key by content,
@@ -40,7 +40,7 @@ from dataclasses import asdict, dataclass
 import torch
 import torch.nn.functional as F
 
-from .compressors import CompactionResult, _validate_budget
+from ..compressors import CompactionResult, _validate_budget
 
 
 def token_level_oracle(
@@ -157,7 +157,7 @@ def fit_oracle_scorer(
 
     Targets are ``log1p(token_level_oracle)`` shared across layers (each
     layer's features regress the same token-level target, exactly like the
-    validated C2 script). Sets the scorer's normalisation buffers from the
+    validated scorer script). Sets the scorer's normalisation buffers from the
     training set. Returns the per-epoch losses.
     """
     if not captures:

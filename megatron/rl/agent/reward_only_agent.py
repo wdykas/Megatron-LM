@@ -146,7 +146,7 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
         )
 
         # Tag each group member with its index so the inference side can make
-        # deterministic within-group treatment splits (e.g. A1 kv_compact arms).
+        # deterministic within-group treatment splits (e.g. split-group kv_compact arms).
         responses = await asyncio.gather(*[
             request.inference_interface.agenerate(
                 inference_request.model_copy(update={"rollout_index": i})

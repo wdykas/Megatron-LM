@@ -51,7 +51,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         # Use the shared, optimized client instead of spinning up a new one
         client = self._openai_client
 
-        # A1 split-group counterfactual: draw this rollout's compaction arm.
+        # split-group counterfactual: draw this rollout's compaction arm.
         # GRPO groups are issued as rollouts_per_group concurrent identical
         # requests, so a per-request Bernoulli split partitions every group into
         # compact and full-cache arms; the arm is recorded on the response.
@@ -149,7 +149,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             args.rl_kv_cache_management_mode
         )
 
-        # The A1 split only means anything when live compaction actually runs;
+        # The split-group counterfactual only means anything when live compaction actually runs;
         # validate UNCONDITIONALLY so a split fraction without --rl-compaction-
         # enabled (or with a non-live mode) hard-fails instead of silently
         # tagging arms that were never compacted — a pure-noise counterfactual.
@@ -169,7 +169,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             # engine prunes (or belief_still-synthesizes) each request's prompt
             # KV right after its prefill, identically to the serving path.
             if args.rl_compaction_mode == "live":
-                from megatron.rl.compaction.kv.live import LiveKVCompactor
+                from megatron.rl.compaction.kv.serving.live import LiveKVCompactor
                 if (args.rl_compaction_strategy == "snapkv"
                         and not args.decode_only_cuda_graphs):
                     raise ValueError(
