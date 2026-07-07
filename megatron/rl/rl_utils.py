@@ -817,6 +817,149 @@ def selective_log_softmax(logits, index):
     return per_token_logps
 
 
+_VP_BIK_WARNED = False
+
+
+def _vp_chunk_tokens(partition_vocab_size: int, target_bytes: int = 512 * 2**20) -> int:
+    """Tokens per chunk so one fp32 [chunk, partition_vocab] buffer stays ~target_bytes."""
+    return max(1, target_bytes // (partition_vocab_size * 4))
+
+
+class _VocabParallelSelectiveLogProbs(torch.autograd.Function):
+    """`selective_log_softmax` over vocab-parallel (TP-sharded) logits.
+
+    Never materializes full-vocab logits, an fp32 logits copy, or a saved
+    softmax: the statistics (max, sum-exp, target logit) are computed in fp32
+    over sequence chunks and combined across the TP group with one MAX and one
+    SUM all-reduce; the backward recomputes the softmax chunk-by-chunk from the
+    (already-live) input logits. At seq 131072 / CP 4 / TP 2 / vocab 131072
+    this replaces the gathered path's ~24 GiB of logit-head transients and
+    saved tensors per rank (8 GiB gathered logits + 8 GiB saved log_softmax
+    output + 8 GiB backward transients) with the 4 GiB sharded logits,
+    ~0.5 GiB chunk buffers, and the unavoidable 4 GiB grad-of-logits.
+    """
+
+    @staticmethod
+    def forward(ctx, vocab_parallel_logits, target, tp_group, chunk_tokens):
+        """See `vocab_parallel_selective_log_softmax` for the contract."""
+        orig_shape = target.shape
+        partition_vocab_size = vocab_parallel_logits.size(-1)
+        logits_2d = vocab_parallel_logits.reshape(-1, partition_vocab_size)
+        target_1d = target.reshape(-1)
+
+        if tp_group is not None and torch.distributed.is_initialized():
+            tp_rank = torch.distributed.get_rank(tp_group)
+            tp_world = torch.distributed.get_world_size(tp_group)
+        else:
+            tp_rank, tp_world = 0, 1
+
+        # Same partition convention as the vocab-parallel output layer
+        # (VocabUtility.vocab_range_from_per_partition_vocab_size).
+        vocab_start = tp_rank * partition_vocab_size
+        vocab_end = vocab_start + partition_vocab_size
+
+        target_mask = (target_1d < vocab_start) | (target_1d >= vocab_end)
+        masked_target = (target_1d - vocab_start).masked_fill(target_mask, 0)
+
+        logits_max = logits_2d.amax(dim=-1).float()
+        if tp_world > 1:
+            torch.distributed.all_reduce(
+                logits_max, op=torch.distributed.ReduceOp.MAX, group=tp_group
+            )
+
+        n = logits_2d.size(0)
+        chunk = chunk_tokens or _vp_chunk_tokens(partition_vocab_size)
+        # Row 0: logit[target] - max (nonzero only on the rank owning the target id).
+        # Row 1: sum(exp(logits - max)) over the local vocab partition.
+        stats = torch.empty(2, n, dtype=torch.float32, device=logits_2d.device)
+        for s in range(0, n, chunk):
+            e = min(s + chunk, n)
+            # copy=True: `.float()` would alias (and the in-place ops corrupt)
+            # the saved logits when the input is already fp32.
+            shifted = logits_2d[s:e].to(torch.float32, copy=True)
+            shifted.sub_(logits_max[s:e].unsqueeze(-1))
+            stats[0, s:e] = shifted.gather(-1, masked_target[s:e].unsqueeze(-1)).squeeze(-1)
+            stats[1, s:e] = shifted.exp_().sum(dim=-1)
+        stats[0].masked_fill_(target_mask, 0.0)
+        if tp_world > 1:
+            torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM, group=tp_group)
+
+        # log p(target) = (logit[target] - max) - log(sum(exp(logits - max)))
+        logprobs = stats[0] - stats[1].log()
+
+        ctx.save_for_backward(
+            vocab_parallel_logits, logits_max, stats[1].clone(), target_mask, masked_target
+        )
+        ctx.vp_chunk = chunk
+        return logprobs.view(orig_shape).to(vocab_parallel_logits.dtype)
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad_output):
+        """d log p(target) / d logit_j = (1 if j == target else 0) - softmax_j."""
+        vocab_parallel_logits, logits_max, sum_exp, target_mask, masked_target = ctx.saved_tensors
+        partition_vocab_size = vocab_parallel_logits.size(-1)
+        logits_2d = vocab_parallel_logits.reshape(-1, partition_vocab_size)
+        n = logits_2d.size(0)
+
+        grad_out_1d = grad_output.reshape(-1).float()
+        grad_input = torch.empty_like(vocab_parallel_logits)
+        grad_2d = grad_input.reshape(-1, partition_vocab_size)
+
+        chunk = ctx.vp_chunk
+        for s in range(0, n, chunk):
+            e = min(s + chunk, n)
+            go = grad_out_1d[s:e]
+            # grad_j = go * delta_{j==target} - go * softmax_j, with
+            # softmax_j = exp(logit_j - max) / sum_exp (sum_exp is TP-global).
+            # Fold -go/sum_exp into one row-scale so the chunk sees a single
+            # multiply after exp.
+            sm = logits_2d[s:e].to(torch.float32, copy=True)
+            sm.sub_(logits_max[s:e].unsqueeze(-1)).exp_()
+            sm.mul_((go / sum_exp[s:e]).neg_().unsqueeze(-1))
+            # One-hot term: only the rank owning the target id contributes.
+            # Vectorized with a fixed-size arange + masked grad (no
+            # torch.nonzero -> no device-host sync, CUDA-graph-capture-safe).
+            arange = torch.arange(e - s, device=sm.device)
+            sm[arange, masked_target[s:e]] += go * (~target_mask[s:e]).to(go.dtype)
+            grad_2d[s:e] = sm.to(grad_input.dtype)
+        return grad_input, None, None, None
+
+
+def vocab_parallel_selective_log_softmax(vocab_parallel_logits, index, tp_group=None, chunk_tokens=None):
+    """Vocab-parallel, sequence-chunked drop-in for `selective_log_softmax`.
+
+    Equivalent to all-gathering the TP-sharded logits to the full vocabulary
+    and calling ``selective_log_softmax(full_logits, index)``, but never
+    materializes the gathered tensor or a saved softmax. Statistics are
+    computed in fp32 regardless of the input dtype, so bf16 inputs get
+    slightly *more* accurate logprobs than the bf16 log_softmax fallback in
+    `selective_log_softmax`. Chunking is deterministic (fixed sequential
+    accumulation order); `is_batch_invariant_mode_enabled` is not consulted.
+
+    Args:
+        vocab_parallel_logits: [..., vocab/tp] logits sharded over ``tp_group``
+            with the output-layer convention (rank r owns rows
+            [r * Vp, (r + 1) * Vp)). Pass unsharded logits with
+            ``tp_group=None`` (or a world-size-1 group).
+        index: [...] target token ids in the FULL vocabulary.
+        tp_group: process group over which the vocab dimension is sharded.
+        chunk_tokens: tokens per fp32 chunk; default sizes chunks to ~512 MiB.
+
+    Note:
+        A sequence-sliced view (e.g. ``logits[:, :-1, :]``) stays reshape-safe
+        (no copy) only when the leading batch dim is 1 — always true in RL
+        training (micro-batch-size 1). With batch > 1 the internal
+        ``reshape`` silently copies the sliced logits (correct, but costs the
+        memory the function exists to save).
+
+    Returns:
+        Log-probabilities with the same shape as ``index`` and the same dtype
+        as ``vocab_parallel_logits``.
+    """
+    return _VocabParallelSelectiveLogProbs.apply(vocab_parallel_logits, index, tp_group, chunk_tokens)
+
+
 def _zigzag_slice(x: torch.Tensor, cp_size: int, cp_rank: int) -> torch.Tensor:
     """Pick chunks ``cp_rank`` and ``2*cp_size - cp_rank - 1`` after viewing
     the sequence dim as ``2*cp_size`` equal chunks, then concatenate.
@@ -1010,6 +1153,31 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             model.config.flash_decode = False
             fp32_output = not (args.fp16 or args.bf16)
 
+            # Vocab-parallel logprobs: keep the output-layer logits TP-sharded
+            # ([*, vocab/tp]) and compute token logprobs without ever gathering
+            # the full vocabulary. The gathered path materializes
+            # [seq/cp, vocab] logits (8 GiB at seq 131072 / CP4 / vocab 128k in
+            # bf16) plus an equal-sized saved log_softmax output and backward
+            # transients — the exact 8 GiB allocations that OOM the GRPO
+            # train-step backward.
+            use_vp_logprobs = bool(getattr(args, 'rl_vocab_parallel_logprobs', False))
+            if use_vp_logprobs and is_batch_invariant_mode_enabled():
+                # The vp path does not route through the batch-invariant
+                # kernels that --batch-invariant-mode patches in (its sum-exp
+                # reduction is shape-dependent), so honor the mode by falling
+                # back to the gathered log-softmax path.
+                global _VP_BIK_WARNED
+                if not _VP_BIK_WARNED:
+                    log_single_rank(
+                        logger,
+                        logging.WARNING,
+                        "--rl-vocab-parallel-logprobs is not batch-invariant; "
+                        "using the gathered logprob path because "
+                        "--batch-invariant-mode is enabled.",
+                    )
+                    _VP_BIK_WARNED = True
+                use_vp_logprobs = False
+
             if cp_size > 1:
                 # Scatter: each rank processes seq_len // cp_size tokens.
                 local_tokens, local_position_ids, cp_packed_seq_params, local_labels = (
@@ -1021,7 +1189,7 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                         local_position_ids,
                         attention_mask_for_forward,
                         packed_seq_params=cp_packed_seq_params,
-                        runtime_gather_output=True,
+                        runtime_gather_output=not use_vp_logprobs,
                         fp32_output=fp32_output,
                     )
             else:
@@ -1031,7 +1199,7 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                         position_ids,
                         attention_mask_for_forward,
                         packed_seq_params=packed_seq_params,
-                        runtime_gather_output=True,
+                        runtime_gather_output=not use_vp_logprobs,
                         fp32_output=fp32_output,
                     )
 
@@ -1044,14 +1212,25 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             return logits_or_hidden_states
 
         logits = logits_or_hidden_states
+        tp_group = pg_collection.tp if use_vp_logprobs else None
         with nvtx_range("rl/log-softmax", time=True):
             if cp_size > 1:
                 # Compute local logprobs then gather the full sequence.
-                local_logprobs = selective_log_softmax(logits, local_labels)
+                if use_vp_logprobs:
+                    local_logprobs = vocab_parallel_selective_log_softmax(
+                        logits, local_labels, tp_group
+                    )
+                else:
+                    local_logprobs = selective_log_softmax(logits, local_labels)
                 logprobs = _gather_logprobs_context_parallel(local_logprobs, no_grad)
             else:
                 # We do not need logprobs for the n+1 token.
-                logprobs = selective_log_softmax(logits[:, :-1, :], tokens[:, 1:])
+                if use_vp_logprobs:
+                    logprobs = vocab_parallel_selective_log_softmax(
+                        logits[:, :-1, :], tokens[:, 1:], tp_group
+                    )
+                else:
+                    logprobs = selective_log_softmax(logits[:, :-1, :], tokens[:, 1:])
         return logprobs
 
 
@@ -2407,6 +2586,86 @@ def calculate_grpo_loss(
     return loss, kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below
 
 
+async def _rollout_keepalive(inference_interface, interval_s, requests_per_tick, stop_event):
+    """Submit tiny dummy generations while the engine sits in inference mode.
+
+    Agentic environments (SWE containers building repos and running test suites)
+    leave the engine with no decode work for tens of minutes, which cluster
+    idle-GPU watchdogs read as an abandoned job. A short burst of generation per
+    interval keeps mean SM utilization above the kill threshold. Must never
+    raise: keepalive is cosmetic and losing it must not affect training.
+    """
+    import asyncio
+
+    from megatron.rl import GenericGenerationArgs
+    from megatron.rl.inference.api import InferenceRequest, LLMChatMessage
+
+    request = InferenceRequest(
+        prompt=[LLMChatMessage(role='user', content='keepalive ping')],
+        generation_args=GenericGenerationArgs(max_tokens=8, temperature=1.0),
+    )
+    consecutive_failures = 0
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval_s)
+        except asyncio.TimeoutError:
+            pass
+        if stop_event.is_set():
+            return
+        try:
+            # requests_per_tick requests so the coordinator's round-robin
+            # reaches every inference DP group, not just one engine.
+            await asyncio.gather(
+                *[inference_interface.agenerate(request) for _ in range(requests_per_tick)]
+            )
+            consecutive_failures = 0
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            consecutive_failures += 1
+            if consecutive_failures == 1:
+                logger.warning("Rollout keepalive generation failed; retrying quietly.", exc_info=True)
+            if consecutive_failures >= 10:
+                logger.warning("Rollout keepalive disabled after 10 consecutive failures.")
+                return
+
+
+def _maybe_start_rollout_keepalive(args, loop, inference_interface):
+    """Start the keepalive task on rank 0 if --rl-rollout-keepalive-interval > 0."""
+    import asyncio
+
+    interval_s = getattr(args, 'rl_rollout_keepalive_interval', 0.0) or 0.0
+    if interval_s <= 0 or torch.distributed.get_rank() != 0:
+        return None, None
+    requests_per_tick = max(1, getattr(args, 'data_parallel_size', 1) or 1)
+    stop_event = asyncio.Event()
+    task = loop.create_task(
+        _rollout_keepalive(inference_interface, interval_s, requests_per_tick, stop_event)
+    )
+    logger.info(
+        f"Rollout keepalive enabled: {requests_per_tick} dummy generation(s) "
+        f"every {interval_s:.0f}s while in inference mode."
+    )
+    return stop_event, task
+
+
+def _stop_rollout_keepalive(loop, stop_event, task):
+    """Stop the keepalive task, letting an in-flight tiny generation drain first."""
+    import asyncio
+
+    if task is None:
+        return
+    stop_event.set()
+    try:
+        loop.run_until_complete(asyncio.wait_for(task, timeout=60))
+    except Exception:
+        task.cancel()
+        try:
+            loop.run_until_complete(asyncio.gather(task, return_exceptions=True))
+        except Exception:
+            pass
+
+
 @contextmanager
 def megatron_rl_inference_mode(
     model: list[LanguageModule],
@@ -2483,8 +2742,15 @@ def megatron_rl_inference_mode(
         inference_interface.set_generation_epoch(get_args().curr_iteration)
         loop.run_until_complete(inference_interface.resume())
 
+        keepalive_stop, keepalive_task = _maybe_start_rollout_keepalive(
+            args, loop, inference_interface
+        )
+
         logger.debug(f"[{dist.get_rank()}] Entered inference mode")
-        yield inference_interface
+        try:
+            yield inference_interface
+        finally:
+            _stop_rollout_keepalive(loop, keepalive_stop, keepalive_task)
 
         with nvtx_range("rl/suspend-engine", time=True):
             loop.run_until_complete(inference_interface.suspend())

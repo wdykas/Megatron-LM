@@ -2369,6 +2369,13 @@ def _add_rl_args(parser):
                         'This evaluation can be very expensive when using environments'
                         'that evaluate pass@k so we default to a lower number.')
     # TODO(rkirby): allow for "complete" evaluation when --rl-prompts-per-eval is set to -1
+    group.add_argument('--rl-rollout-keepalive-interval', type=float, default=0.0,
+                       help='If > 0, rank 0 submits a tiny dummy generation to the inference '
+                            'engine every this many seconds while in inference mode (rollout '
+                            'collection and evaluation). Keeps SM utilization above cluster '
+                            'idle-GPU watchdog thresholds when agentic environments (e.g. SWE '
+                            'containers running test suites) leave the engine legitimately '
+                            'idle for long stretches. 0 disables.')
     group.add_argument('--grpo-prompts-per-step', type=int, default=32,
                        help="Number of GRPO groups (G in the paper).")
     group.add_argument('--grpo-group-size', type=int, default=2,
@@ -2460,6 +2467,13 @@ def _add_rl_args(parser):
                             'to control the degree of staleness.')
     group.add_argument('--rl-inference-logprobs-is-correction', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='If set, use inference logprobs in importance sampling correction of the loss.')
+    group.add_argument('--rl-vocab-parallel-logprobs', action=argparse.BooleanOptionalAction, type=bool, default=True,
+                       help='Compute RL token logprobs directly from vocab-parallel (TP-sharded) '
+                            'logits, chunked over the sequence, instead of all-gathering full-vocab '
+                            'logits. Avoids the [seq/cp, vocab] logits + saved log_softmax + backward '
+                            'transients (3x8 GiB per rank at seq 131072 / CP4 / 128k vocab) that OOM '
+                            'the GRPO train-step backward. --no-rl-vocab-parallel-logprobs restores '
+                            'the gathered path.')
     group.add_argument('--rl-importance-sampling-truncation-coef', type=float, default=None,
                        help="If --inference-logprobs-is-correction is on and this coefficient is set, apply truncation for the IS correction at GRPO loss.")
     group.add_argument('--rl-use-sequence-packing', action=argparse.BooleanOptionalAction, type=bool, default=False,
