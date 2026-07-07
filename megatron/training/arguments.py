@@ -2033,12 +2033,11 @@ def _add_inference_args(parser):
                             'world. Tagging shards role=prefill|decode enables disaggregated '
                             'inference (prefill hands KV to the decode pool); a dp>1 decode shard '
                             'is several independent decode instances.')
-    return parser
-
     group.add_argument('--disagg-kv-transport-backend', type=str, default='nixl',
                        choices=['nixl'],
                        help='KV transfer backend for the disaggregated prefill->decode '
                        'hand-off.')
+    return parser
 
 def _add_network_size_args(parser):
     exclude = [
