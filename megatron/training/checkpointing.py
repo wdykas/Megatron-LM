@@ -236,8 +236,9 @@ def get_load_checkpoint_path_by_args(args, load_arg="load"):
     tracker_filename = 'because load directory is not defined'
     if load_dir is not None:
         tracker_filename = get_checkpoint_tracker_filename(load_dir)
-        if _tracker_isfile(tracker_filename):
-            iteration, release = read_metadata(tracker_filename)
+        exists, tracker_iter, tracker_release = read_tracker_collective(tracker_filename)
+        if exists:
+            iteration, release = tracker_iter, tracker_release
 
     # Allow user to specify the loaded iteration.
     if getattr(args, "ckpt_step", None):
@@ -316,26 +317,9 @@ def checkpoint_exists(checkpoints_path):
     return isfile(path)
 
 
-def _tracker_isfile(tracker_filename):
-    """isfile with retries — a transient lustre miss on ONE rank makes that
-    rank skip read_metadata while others enter its all-reduce, desyncing the
-    collectives (observed as a garbage max-iteration and NCCL aborts when many
-    jobs stat the same tracker simultaneously). Retrying until the ranks agree
-    is cheap; a genuinely absent file just costs a few seconds once."""
-    import time
-    for _ in range(10):
-        if isfile(tracker_filename):
-            return True
-        time.sleep(1.0)
-    return isfile(tracker_filename)
-
-
-def read_metadata(tracker_filename):
-    # Read the tracker file and either set the iteration or
-    # mark it as a release checkpoint.
-    iteration = -1
-    release = False
-
+def _parse_tracker(tracker_filename):
+    """Parse (iteration, release) from the tracker file. No collectives."""
+    iteration, release = -1, False
     with open_file(tracker_filename, 'r') as f:
         metastring = f.read().strip()
         try:
@@ -347,10 +331,42 @@ def read_metadata(tracker_filename):
                     tracker_filename))
                 sys.exit()
             else:
-                # Set iteration to 0 for release checkpoints
                 iteration = 0
     assert iteration > -1 or release, 'error parsing metadata file {}'.format(
         tracker_filename)
+    return iteration, release
+
+
+def read_tracker_collective(tracker_filename):
+    """(exists, iteration, release), decided ONCE by rank 0 and broadcast.
+
+    Per-rank stat/read of the same lustre file can transiently diverge (one
+    rank sees the file, another does not for a few seconds under load). A rank
+    that skips read_metadata while another enters its all-reduce pairs
+    collectives ACROSS code paths — observed as a garbage max-iteration
+    (iter_281440616972288 with the tracker containing '0') and NCCL aborts
+    when several jobs load the same checkpoint simultaneously. Rank 0 is the
+    single source of truth; every rank takes its answer.
+    """
+    if not torch.distributed.is_initialized():
+        if isfile(tracker_filename):
+            return (True,) + _parse_tracker(tracker_filename)
+        return False, -1, False
+    payload = [None]
+    if torch.distributed.get_rank() == 0:
+        if isfile(tracker_filename):
+            it, rel = _parse_tracker(tracker_filename)
+            payload = [(True, it, rel)]
+        else:
+            payload = [(False, -1, False)]
+    torch.distributed.broadcast_object_list(payload, src=0)
+    return tuple(payload[0])
+
+
+def read_metadata(tracker_filename):
+    # Read the tracker file and either set the iteration or
+    # mark it as a release checkpoint.
+    iteration, release = _parse_tracker(tracker_filename)
 
     # Get the max iteration retrieved across the ranks.
     if torch.distributed.is_initialized():
@@ -1119,8 +1135,8 @@ def _get_non_persistent_iteration(non_persistent_global_dir, args, checkpointing
         return -1
     elif args.non_persistent_ckpt_type == "global":
         tracker_filename = get_checkpoint_tracker_filename(non_persistent_global_dir)
-        if _tracker_isfile(tracker_filename):
-            iteration, release = read_metadata(tracker_filename)
+        exists, iteration, release = read_tracker_collective(tracker_filename)
+        if exists:
             if release:
                 raise RuntimeError('Non-persistent checkpoint can\'t be a release checkpoint')
         else:
@@ -1260,8 +1276,9 @@ def _load_base_checkpoint(
     tracker_filename = 'because load directory is not defined'
     if load_dir is not None:
         tracker_filename = get_checkpoint_tracker_filename(load_dir)
-        if _tracker_isfile(tracker_filename):
-            iteration, release = read_metadata(tracker_filename)
+        exists, tracker_iter, tracker_release = read_tracker_collective(tracker_filename)
+        if exists:
+            iteration, release = tracker_iter, tracker_release
 
     # Allow user to specify the loaded iteration.
     if getattr(args, "ckpt_step", None):
