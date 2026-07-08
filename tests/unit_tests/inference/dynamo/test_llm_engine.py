@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+pytest.importorskip("dynamo")
+
 from megatron.inference.integrations.dynamo.args import Config
 from megatron.inference.integrations.dynamo.llm_engine import (
     MegatronLLMEngine,

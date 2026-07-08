@@ -369,6 +369,9 @@ def swap_model_weights(
     else:
         raise TypeError("refit_method must be a str backend name or a CopyService instance")
 
+    # TODO: the pools refit serially, one collective pass each, while all
+    # inference idles; the rank windows are disjoint, so the passes could
+    # overlap or pipeline.
     for pool in range(num_dst_pools):
         target = target_model if pool == dst_pool_index else None
 

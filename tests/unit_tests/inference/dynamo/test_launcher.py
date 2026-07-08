@@ -5,6 +5,8 @@ from unittest.mock import patch
 
 import pytest
 
+pytest.importorskip("dynamo")
+
 from megatron.inference.integrations.dynamo.args import parse_args
 from megatron.inference.integrations.dynamo.llm_engine import MegatronLLMEngine
 from megatron.inference.integrations.dynamo.main import main

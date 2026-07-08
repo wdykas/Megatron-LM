@@ -531,6 +531,7 @@ class InferenceStateHandoffMixin:
         # releases the prefill's pinned blocks and a flow-control slot. In the
         # Dynamo mode the client triggers the release instead.
         if getattr(self, "_disagg_config", None) is not None and self.is_mp_coordinator:
+            assert HAVE_MSGPACK, "the coordinator-native disagg mode requires msgpack"
             self.socket_for_receiving_requests.send(
                 msgpack.packb([Headers.KV_READ_DONE.value, pending.request_id], use_bin_type=True)
             )

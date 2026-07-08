@@ -52,6 +52,11 @@ class DisaggRouting(DisaggRouter):
     """Round-robin 2-hop router: prefill engine -> (KV handoff) -> decode
     engine.
 
+    TODO: replace round-robin with a load- and prefix-aware policy. The KV
+    cache events the engines already publish (stored/removed/cleared) carry
+    the block hashes a prefix-overlap score needs, and GRPO's same-prompt
+    request groups make affinity routing especially valuable.
+
     Engines are identified by their transport identity (bytes for ZMQ; any
     hashable in tests). Decides which engine each hop goes to and remembers
     the per-request pairing so the final reply can be routed home. Selection
