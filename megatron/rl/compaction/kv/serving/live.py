@@ -165,6 +165,10 @@ class LiveKVCompactor:
                     f"got {retrieval_alpha}")
             if retrieval_cusum <= 0.0:
                 raise ValueError(f"retrieval_cusum must be > 0, got {retrieval_cusum}")
+            from ..archive import KVArchive
+            self._archive = KVArchive(flywheel_dir=flywheel_dir,
+                                      transfer=archive_transfer)
+            self._prefetch_stream = torch.cuda.Stream()
         self.rope_mode = rope_mode
         self._inv_freq: torch.Tensor | None = None
         self._rope_interleaved = False

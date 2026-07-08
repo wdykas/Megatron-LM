@@ -302,7 +302,15 @@ def _fit_values(
     t = X.shape[1]
     X32, Y32 = X.float(), Y.float()
     XtX = X32.T @ X32                                   # (t, t)
-    lam = XtX.diagonal().mean().clamp(min=1e-8) * 1e-2
+    # Absolute ridge floor: under the decorrelated protocol, keys beyond the
+    # ref window's causal horizon receive EXACTLY zero attention, so entire
+    # X columns are zero (e.g. streaming's recent window) and a diag-scaled
+    # ridge underflows into a singular system.
+    lam = (XtX.diagonal().mean() * 1e-2).clamp(min=1e-4)
     A = XtX + lam * torch.eye(t, device=X.device, dtype=torch.float32)
-    D = torch.linalg.solve(A, X32.T @ (Y32 - X32 @ values_init.float()))
+    try:
+        D = torch.linalg.solve(A, X32.T @ (Y32 - X32 @ values_init.float()))
+    except torch.linalg.LinAlgError:
+        # Residual form's natural degradation: keep the original values.
+        return values_init.to(values_orig.dtype)
     return (values_init.float() + D).to(values_orig.dtype)  # (t, d)

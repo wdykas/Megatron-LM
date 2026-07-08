@@ -161,6 +161,15 @@ class TestAlphaCusumTrigger:
         assert 0.0 < comp.retrieval_alpha < 1.0
         assert comp.retrieval_cusum > 0.0
 
+    def test_archive_object_constructed(self):
+        """archive=True must build the KVArchive — with it None, every
+        +archive eval silently no-ops (measured: no retrievals key in stats,
+        empty flywheel) while all tests stay green."""
+        comp = self._comp()
+        assert comp._archive is not None
+        assert comp._prefetch_stream is not None
+        assert "retrievals" in comp.stats()
+
     def test_alpha_validation(self):
         import pytest as _pytest
         with _pytest.raises(ValueError, match="retrieval_alpha"):
