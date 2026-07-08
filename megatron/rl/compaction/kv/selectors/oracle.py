@@ -268,7 +268,8 @@ class OracleCompressor:
 
     def compress(self, keys: torch.Tensor, values: torch.Tensor, budget: int,
                  ref_queries: torch.Tensor | None = None,
-                 run_id: str = "", step_id: int = 0) -> CompactionResult:
+                 run_id: str = "", step_id: int = 0,
+                 ref_query_end: int | None = None) -> CompactionResult:
         t0 = time.perf_counter()
         T = keys.shape[0]
         budget = _validate_budget(budget, T)

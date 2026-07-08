@@ -66,6 +66,7 @@ class SnapKVCompressor:
         ref_queries: torch.Tensor | None = None,
         run_id: str = "",
         step_id: int = 0,
+        ref_query_end: int | None = None,
     ) -> CompactionResult:
         if ref_queries is None:
             raise ValueError(
@@ -82,7 +83,8 @@ class SnapKVCompressor:
         # drops the window columns before pooling; pooling across the boundary
         # leaks the window keys' large scores into the last pool_kernel//2
         # prefix positions and silently spends budget there every time.
-        scores = _softmax_attention(ref_queries, keys, causal_tail=True).sum(dim=0)
+        scores = _softmax_attention(ref_queries, keys, causal_tail=True,
+                                    query_end=ref_query_end).sum(dim=0)
         # Official semantics: the observation WINDOW KV is retained
         # unconditionally (window_size tokens), independent of how many query
         # rows the caller supplies; the causal mask handles the query count.

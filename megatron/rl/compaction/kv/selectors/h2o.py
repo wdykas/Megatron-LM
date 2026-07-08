@@ -83,6 +83,7 @@ class H2OAccumulator:
         run_id: str = "",
         step_id: int = 0,
         accumulated_scores: torch.Tensor | None = None,
+        ref_query_end: int | None = None,
     ) -> CompactionResult:
         """Retain the recent window plus the top heavy hitters within ``budget``."""
         scores = accumulated_scores if accumulated_scores is not None else self._accumulated
@@ -97,7 +98,8 @@ class H2OAccumulator:
             # over the queries (the paper's accumulated-attention F_score; the
             # official kernel is causally masked — non-causal scoring leaks mass
             # to future keys and deflates sink/early-token scores).
-            scores = _softmax_attention(ref_queries, keys, causal_tail=True).sum(dim=0)
+            scores = _softmax_attention(ref_queries, keys, causal_tail=True,
+                                        query_end=ref_query_end).sum(dim=0)
 
         t0 = time.perf_counter()
         T = keys.shape[0]

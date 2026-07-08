@@ -118,7 +118,8 @@ def _validate_budget(budget: int, T: int) -> int:
 
 
 def _softmax_attention(queries: torch.Tensor, keys: torch.Tensor,
-                       causal_tail: bool = False) -> torch.Tensor:
+                       causal_tail: bool = False,
+                       query_end: int | None = None) -> torch.Tensor:
     """Normalised softmax attention softmax(q·Kᵀ/√d) of each query row. (n, T).
 
     ``causal_tail=True`` treats the n query rows as the LAST n positions of the
@@ -132,9 +133,10 @@ def _softmax_attention(queries: torch.Tensor, keys: torch.Tensor,
     logits = (queries @ keys.T / math.sqrt(d)).float()
     if causal_tail:
         n, T = logits.shape
+        end = T if query_end is None else query_end
         col = torch.arange(T, device=logits.device)
         row = torch.arange(n, device=logits.device)
-        future = col[None, :] > (T - n + row)[:, None]
+        future = col[None, :] > (end - n + row)[:, None]
         logits = logits.masked_fill(future, float("-inf"))
     return torch.softmax(logits, dim=-1)
 
@@ -159,11 +161,22 @@ def _select_recent_plus_heavy(
     return sorted(set(recent_positions + heavy_positions))
 
 
-def _mass_features(queries: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
+def _mass_features(queries: torch.Tensor, keys: torch.Tensor,
+                   query_end: int | None = None) -> torch.Tensor:
     """Unnormalised attention mass Φ_ij = exp(q_i · K_j^T / sqrt(d)). (n, T).
-    fp32 throughout (official policy: QK matmul in model dtype, exp/solve fp32)."""
+    fp32 throughout (official policy: QK matmul in model dtype, exp/solve fp32).
+    ``query_end`` marks the queries as the last n positions BEFORE that key
+    index and causally masks later keys — for benchmarking with an early
+    query window (the official pipeline's generated queries see everything,
+    so the default is unmasked)."""
     d = keys.shape[1]
     logits = (queries @ keys.T).float() / math.sqrt(d)
+    if query_end is not None:
+        n, T = logits.shape
+        col = torch.arange(T, device=logits.device)
+        row = torch.arange(n, device=logits.device)
+        logits = logits.masked_fill(
+            col[None, :] > (query_end - n + row)[:, None], float("-inf"))
     logits = logits - logits.max(dim=1, keepdim=True).values
     return torch.exp(logits)
 

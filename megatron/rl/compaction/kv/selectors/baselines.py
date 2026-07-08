@@ -43,6 +43,7 @@ class AttentionSumScorer:
         ref_queries: torch.Tensor | None = None,
         run_id: str = "",
         step_id: int = 0,
+        ref_query_end: int | None = None,
     ) -> CompactionResult:
         t0 = time.perf_counter()
         T = keys.shape[0]
@@ -80,6 +81,7 @@ class UniformScorer:
         ref_queries: torch.Tensor | None = None,
         run_id: str = "",
         step_id: int = 0,
+        ref_query_end: int | None = None,
     ) -> CompactionResult:
         t0 = time.perf_counter()
         T = keys.shape[0]

@@ -89,6 +89,7 @@ class KVCompactionBenchmark:
         budget: int,
         run_id: str = "bench",
         step_id: int = 0,
+        ref_query_end: int | None = None,
     ) -> list[CompactionBenchmarkResult]:
         """Run all compressors and return results sorted by output_mse (ascending)."""
         Y_full, mass_full = _attention_output(eval_queries, keys, values)
@@ -96,7 +97,8 @@ class KVCompactionBenchmark:
         results = []
         for name, compressor in compressors.items():
             result = compressor.compress(keys, values, budget, ref_queries=ref_queries,
-                                         run_id=run_id, step_id=step_id)
+                                         run_id=run_id, step_id=step_id,
+                                         ref_query_end=ref_query_end)
             mse = self._output_mse(Y_full, eval_queries, result)
             merr = self._mass_error(mass_full, eval_queries, keys, result)
             results.append(CompactionBenchmarkResult(
