@@ -331,6 +331,8 @@ class RolloutStats:
     mean_inf_train_prob_abs_diff_stale: None | float = None
     mean_inf_train_prob_abs_diff_clean: None | float = None
     kv_stale_token_frac: None | float = None
+    # SWE-1.7 alternating length penalty stats (None = penalty disabled).
+    length_penalty_metrics: None | dict = None
 
 
 # Runtime state container for RL-specific data that shouldn't be checkpointed
@@ -836,6 +838,58 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             return logprobs
 
 
+def apply_alternating_length_penalty(rollouts, args) -> dict | None:
+    """SWE-1.7 alternating length penalty over collected rollouts.
+
+    Training alternates fixed-length phases: in UNCONSTRAINED phases rollouts
+    keep their raw task reward; in BUDGET phases a rollout whose weighted cost
+    (generated tokens + turn_cost per turn beyond the first) exceeds the
+    budget loses weight * max(0, cost/budget - 1) reward. Response length
+    compresses on tasks within the model's ability while long-horizon
+    behavior on hard tasks (which earn their extra segments) is preserved.
+
+    Mutates rollout.reward in place BEFORE advantage calculation and returns
+    a metrics dict (None when the penalty is disabled).
+    """
+    if not args.rl_length_penalty_phase_len:
+        return None
+    if args.rl_length_penalty_budget is None:
+        raise ValueError(
+            "--rl-length-penalty-phase-len requires --rl-length-penalty-budget")
+    budget_phase = (
+        args.curr_iteration // args.rl_length_penalty_phase_len) % 2 == 1
+
+    costs, penalties = [], []
+    for group in rollouts:
+        for rollout in group:
+            if not isinstance(rollout, TokenRollout) or rollout.generation_mask is None:
+                raise ValueError(
+                    "The alternating length penalty needs token rollouts with "
+                    "generation masks to count generated tokens, got "
+                    f"{type(rollout).__name__}.")
+            gen_tokens = sum(sum(mask) for mask in rollout.generation_mask)
+            cost = gen_tokens + args.rl_length_penalty_turn_cost * max(
+                0, len(rollout.trajectory) - 1)
+            costs.append(cost)
+            penalty = 0.0
+            if budget_phase:
+                penalty = args.rl_length_penalty_weight * max(
+                    0.0, cost / args.rl_length_penalty_budget - 1.0)
+                if penalty > 0.0:
+                    assert isinstance(rollout.reward, (int, float)), (
+                        "length penalty expects a scalar rollout reward")
+                    rollout.reward = rollout.reward - penalty
+            penalties.append(penalty)
+
+    return {
+        'length_penalty_phase': int(budget_phase),
+        'mean_rollout_cost': float(np.mean(costs)),
+        'frac_over_budget': float(np.mean(
+            [c > args.rl_length_penalty_budget for c in costs])),
+        'mean_length_penalty': float(np.mean(penalties)),
+    }
+
+
 def calculate_grpo_advantages(
     rewards: list[list[float]],
     num_turns: list[list[int]],
@@ -928,13 +982,16 @@ def compute_group_stats(
         group_num_evictions = []
         for rollout in group:
             if isinstance(rollout, TokenRollout):
-                for turn_traj in rollout.trajectory:
+                for turn_idx, turn_traj in enumerate(rollout.trajectory):
                     detokenized_traj = tokenizer.detokenize(turn_traj)
                     lang_rl_log(
                         f"Rollout: [{rollout.env_id}] [{rollout.reward} : {len(rollout.trajectory)} tokens] {detokenized_traj}"
                     )
+                    # Self-compaction segments cut at the generation cap
+                    # legitimately end without EOD.
+                    truncated = bool(rollout.truncated and rollout.truncated[turn_idx])
                     # TODO(vitalyk): how does multiturn change EOD/EOT?
-                    assert (len(turn_traj) == seq_len) or (
+                    assert (len(turn_traj) == seq_len) or truncated or (
                         turn_traj[-1] == tokenizer.eod
                     ), f"Rollout is not the correct length: {len(turn_traj)} {turn_traj[-1]}\n{detokenized_traj}"
             else:
@@ -1196,6 +1253,10 @@ def maybe_log_training_metrics(
         if gaps:
             metrics['kv_compact_reward_gap'] = float(np.mean(gaps))
 
+    # SWE-1.7 alternating length penalty: phase, rollout cost, penalty size.
+    if group_stats.length_penalty_metrics is not None:
+        metrics |= group_stats.length_penalty_metrics
+
     traj_lens = group_stats.traj_lens
     turn_lens = group_stats.turn_lens
     rewards = group_stats.rewards
@@ -1310,7 +1371,10 @@ def prepare_trajectories(
             length = len(trajectory)
             assert length <= seq_length, "Rollout too long, how did this happen?"
             if len(trajectory) < seq_length:
-                assert (
+                truncated = bool(
+                    isinstance(rollout, TokenRollout)
+                    and rollout.truncated and rollout.truncated[turn_idx])
+                assert truncated or (
                     trajectory[-1] == tokenizer.eod
                 ), "Trajectories under a seq_length limit should have eod token at the end."
 
@@ -1493,7 +1557,10 @@ def prepare_data_for_update(
 
     with nvtx_range("prepare-data-for-update"):
         with nvtx_range("compute-group-stats"):
+            # Reward shaping must precede advantage calculation.
+            length_penalty_metrics = apply_alternating_length_penalty(rollouts, args)
             group_stats = compute_group_stats(rollouts, tokenizer, args.seq_length)
+            group_stats.length_penalty_metrics = length_penalty_metrics
             # TODO(vitalyk): why do we need global_advantages here? go inside packing
             advantages = global_advantages = torch.tensor(group_stats.advantages, dtype=dtype).cuda()
 

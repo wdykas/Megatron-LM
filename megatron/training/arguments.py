@@ -2411,6 +2411,22 @@ def _add_rl_args(parser):
     group.add_argument('--rl-compaction-compactor-merged-chunk-prob', type=float, default=0.0,
                        help='Probability per chunk of adding a merged-chunk consistency loss: the sequential '
                             'belief must agree with compressing the merged (prev+current) chunk in one pass.')
+    # SWE-1.7-style alternating length penalty for self-compaction training.
+    group.add_argument('--rl-length-penalty-phase-len', type=int, default=0,
+                       help='Alternating length penalty (SWE-1.7): iterations per phase. '
+                            'Phases alternate unconstrained (task reward only) and budget '
+                            '(reward penalized when the weighted rollout cost exceeds '
+                            '--rl-length-penalty-budget). 0 disables the penalty.')
+    group.add_argument('--rl-length-penalty-budget', type=int, default=None,
+                       help='Rollout cost budget (in generated tokens) for budget phases. '
+                            'Cost = generated tokens + turn-cost * extra turns. Required '
+                            'when --rl-length-penalty-phase-len is set.')
+    group.add_argument('--rl-length-penalty-turn-cost', type=float, default=0.0,
+                       help='Token-equivalent cost per turn beyond the first (charges '
+                            'self-compaction restarts into the length penalty).')
+    group.add_argument('--rl-length-penalty-weight', type=float, default=1.0,
+                       help='Penalty per unit of relative budget overshoot: reward -= '
+                            'weight * max(0, cost/budget - 1) in budget phases.')
     return parser
 
 def _add_training_args(parser):

@@ -8,6 +8,13 @@ from ..__init__ import Request
 class LLMChatMessage(BaseModel):
     role: str
     content: str
+    # Exact serving tokens of the generation this assistant message came from.
+    # The chat endpoint's prevent-retokenization patch REQUIRES them on the
+    # last assistant message: it splices these tokens into the prompt instead
+    # of retokenizing, preserving prefix-cache hits and token identity
+    # (self-compaction summary requests use this).
+    prompt_token_ids: list[int] | None = None
+    generation_token_ids: list[int] | None = None
 
 
 class InferenceRequest(Request):
@@ -45,3 +52,7 @@ class InferenceResponse(BaseModel):
     num_evictions: int
     # split-group: which compaction arm this rollout ran on (None = split off).
     kv_compacted: bool | None = None
+    # 'length' when generation stopped at the token cap (drives self-compaction
+    # segmentation), 'stop' on a natural finish. None for interfaces that
+    # don't report it.
+    finish_reason: str | None = None

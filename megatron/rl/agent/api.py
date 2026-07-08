@@ -71,6 +71,9 @@ class TokenRollout(AgentBaseModel):
     num_evictions: list[int]
     # split-group: per-turn compaction arm (None when the split is off).
     kv_compacted: list[bool | None] | None = None
+    # self-compaction: per-turn flag for segments cut at the generation cap
+    # (finish_reason 'length'). Truncated turns legitimately end without EOD.
+    truncated: list[bool] | None = None
 
 
 class ContrastiveRollout(AgentBaseModel):

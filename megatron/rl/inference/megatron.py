@@ -77,11 +77,15 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         # - Skip prompt logprobs
         response = await client.chat.completions.create(
             model="",
-            messages=[message.model_dump() for message in request.prompt],
+            # exclude_none: plain messages must NOT carry null token-id keys —
+            # the endpoint checks key membership before splicing them.
+            messages=[message.model_dump(exclude_none=True) for message in request.prompt],
             temperature=request.generation_args.temperature or 1.0,
             top_p=request.generation_args.top_p or 0.0,
             n=1,
             logprobs=True,
+            **({} if request.generation_args.max_tokens is None
+               else {"max_tokens": request.generation_args.max_tokens}),
             extra_body={
                 "skip_prompt_log_probs": True,
                 "add_BOS": (not args.rl_skip_bos_token and tokenizer.bos is not None),
@@ -103,6 +107,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             completed_at_step=args.curr_iteration,
             num_evictions=getattr(choice, 'num_evictions', 0),
             kv_compacted=kv_compacted,
+            finish_reason=choice.finish_reason,
         )
 
     @classmethod
