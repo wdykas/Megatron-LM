@@ -66,13 +66,6 @@ products:
       - environment: [dev]
         scope: [mr, mr-github]
         platforms: [dgx_h100]
-  - test_case: [gpt_grpo_disagg_nixl]
-    products:
-      - environment: [dev]
-        # Enable once the CI image ships the nixl package; the backend raises
-        # at setup without it.
-        scope: [mr-broken, mr-github-broken]
-        platforms: [dgx_h100]
   - test_case: [gpt_grpo_tp4_pp1_dp2_8b_throughput]
     products:
       - environment: [dev]
