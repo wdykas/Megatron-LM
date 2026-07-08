@@ -122,6 +122,44 @@ class TestFitBias:
         err_fitted  = float(((m - m_fitted) ** 2).mean().item())
         assert err_fitted <= err_uniform + 1e-9
 
+    def test_nnls_box_zero_column_finite(self):
+        # Regression: CUDA gels returns NaN WITHOUT raising on rank-deficient
+        # A (all-zero columns from keys beyond the causal ref horizon), and
+        # clamp propagates the NaN. The finite guard must fall back to the
+        # ridge solve and return finite weights.
+        from megatron.rl.compaction.kv.compressors import _nnls_box
+        torch.manual_seed(0)
+        A = torch.rand(16, 8).abs()
+        A[:, 3] = 0.0
+        A[:, 6] = 0.0
+        b = torch.rand(16)
+        w = _nnls_box(A, b, lower=1e-12, upper=math.exp(7.0))
+        assert torch.isfinite(w).all(), "weights must be finite on rank-deficient A"
+        assert (w >= 1e-12).all()
+
+    def test_omp_causal_horizon_zero_columns_finite(self):
+        # End-to-end regression for the decorrelated-protocol NaN: keys past
+        # ref_query_end have exp(-inf)=0 mass for every ref query; with budget
+        # above the scoreable-key count OMP selects those zero columns and the
+        # weight solve must stay finite (bias, values, and benchmark MSE).
+        torch.manual_seed(1)
+        T, d, n = 64, 16, 8
+        K = torch.randn(T, d)
+        V = torch.randn(T, d)
+        Q_ref = torch.randn(n, d)
+        Q_eval = torch.randn(n, d)
+        # ref queries end at key 32 → keys ~32..63 are fully masked; budget 48
+        # forces selection of zero-mass columns.
+        res = OMPCompressor().compress(K, V, budget=48, ref_queries=Q_ref,
+                                       ref_query_end=32)
+        assert not torch.isnan(res.bias).any(), "OMP bias must be finite"
+        assert not torch.isnan(res.compacted_values).any()
+        bench = KVCompactionBenchmark().run(
+            {"omp": OMPCompressor()}, K, V, Q_ref, Q_eval, budget=48,
+            ref_query_end=32,
+        )[0]
+        assert bench.output_mse == bench.output_mse, "MSE must not be NaN"
+
     def test_fit_bias_low_compact_logits_no_nan(self):
         # Regression for bug where compact logits << full-key max caused
         # Phi_c ≈ 0 → NNLS zeros → log(w) = -inf → NaN bias.

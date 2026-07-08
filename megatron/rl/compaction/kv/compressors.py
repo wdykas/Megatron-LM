@@ -212,7 +212,11 @@ def _nnls_box(A: torch.Tensor, b: torch.Tensor, lower: float = 1e-12,
     try:
         w = torch.linalg.lstsq(A32, b32.unsqueeze(1), driver="gels").solution.squeeze(1)
     except Exception:
-        # official fallback: tiny-ridge Cholesky
+        w = None
+    if w is None or not torch.isfinite(w).all():
+        # gels (QR, no pivoting) returns NaN WITHOUT raising when A is
+        # rank-deficient — e.g. all-zero columns from keys beyond the causal
+        # ref horizon (exp(-inf) mass). Tiny-ridge normal equations handle it.
         AtA = A32.T @ A32
         lam = 1e-6 * AtA.diagonal().mean().clamp(min=1e-12)
         w = torch.linalg.solve(AtA + lam * torch.eye(A32.shape[1], device=A32.device), A32.T @ b32)
