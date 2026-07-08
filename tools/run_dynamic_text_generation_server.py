@@ -73,6 +73,17 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
              "accumulated (alpha - own EMA baseline - drift) crosses h — "
              "novel persistent reaches fire, chronically hot spans don't.")
     parser.add_argument(
+        "--kv-compaction-flywheel-dir", type=str, default=None,
+        help="Log restored/unused span labels per finished request (the "
+             "retrieval flywheel's self-labeling training data).",
+    )
+    parser.add_argument(
+        "--kv-compaction-archive-transfer", type=str, default="pinned",
+        choices=["pinned", "nixl"],
+        help="Span-store backend: pinned host memory (on-node default) or "
+             "NIXL for a remote/disaggregated archive tier.",
+    )
+    parser.add_argument(
         "--kv-compaction-rope-mode", type=str, default=None,
         choices=["logical", "renumber"],
         help="Required for RoPE models. 'logical': keep original positions of "
