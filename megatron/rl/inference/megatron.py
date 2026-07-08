@@ -102,17 +102,11 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         args.return_log_probs = True
         args.skip_prompt_log_probs = True
 
-        from megatron.rl.inference.disagg import configure_disagg_engine, is_disagg_rollout
-
         if is_disagg_rollout(args):
             # Disaggregated rollouts: `model` is this rank's prefill/decode
             # shard model, kept fresh by the per-pool refit. Build the engine
             # with the hand-off behavior composed in, tag its role, and spawn
             # the shared 2-hop coordinator; the colocated path is unchanged.
-            from megatron.core.inference.disaggregation.engine import (
-                DisaggDynamicInferenceEngine,
-            )
-
             inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(
                 model=model, engine_class=DisaggDynamicInferenceEngine
             )
@@ -124,7 +118,9 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         )
 
         if dist.get_rank() == 0:
-            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import start_text_gen_server
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
+                start_text_gen_server,
+            )
 
             client = InferenceClient(inference_coordinator_address=dp_addr)
             client.start()
@@ -188,7 +184,9 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             self._client.stop()
 
         if dist.get_rank() == 0:
-            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import stop_text_gen_server
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
+                stop_text_gen_server,
+            )
             stop_text_gen_server()
 
     def set_generation_epoch(self, generation_epoch: int):

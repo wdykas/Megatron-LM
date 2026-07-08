@@ -8,7 +8,7 @@ Backends are selected explicitly by the launcher configuration (e.g.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Optional
 
 import torch
@@ -179,8 +179,6 @@ def compute_buffer_geometry(
 
 def export_geometry_meta(geometry: BufferGeometry, mamba_layout=None) -> dict:
     """The wire schema shared by every backend's export_meta."""
-    from dataclasses import asdict
-
     meta = {
         "base_addr": geometry.buf_ptr,
         "outer_stride_bytes": geometry.outer_stride_bytes,
@@ -210,7 +208,5 @@ def export_geometry_meta(geometry: BufferGeometry, mamba_layout=None) -> dict:
             }
         )
     if mamba_layout is not None:
-        from dataclasses import asdict as _asdict
-
-        meta["mamba_layout"] = _asdict(mamba_layout)
+        meta["mamba_layout"] = asdict(mamba_layout)
     return meta

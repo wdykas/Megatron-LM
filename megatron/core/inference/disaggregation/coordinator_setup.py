@@ -17,6 +17,7 @@ from megatron.core.inference.shards_spec import (
     parse_inference_shards_spec,
     spec_declares_disaggregation,
 )
+from megatron.core.utils import get_pg_rank
 
 PREFILL = "prefill"
 DECODE = "decode"
@@ -109,8 +110,6 @@ def configure_prebuilt_disagg_engine(
 
     # Unique per instance (shard index + dp replica), so each prefill/decode
     # replica gets a distinct ZMQ identity.
-    from megatron.core.utils import get_pg_rank
-
     dp_rank = get_pg_rank(engine.pg_collection.dp)
     engine.set_disaggregation_config(
         role=my_spec.role,

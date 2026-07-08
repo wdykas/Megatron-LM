@@ -6,9 +6,8 @@
 Each rank registers its paged KV buffer once, exports NIXL peer metadata, and
 the decode side pulls source block ranges directly into its local KV blocks.
 
-Backend selection belongs in ``transfer_backends.base``. A future NCCL backend
-can be registered there and selected by launcher config, e.g.
-``MEGATRON_KV_TRANSFER_BACKEND=nccl``, without changing this NIXL backend.
+Backend selection belongs in ``transfer_backends.base`` and is explicit
+launcher configuration (``--disagg-kv-transport-backend``).
 """
 
 from __future__ import annotations
@@ -27,6 +26,7 @@ from megatron.core.inference.disaggregation.mamba_reshard import (
     MambaShardLayout,
     plan_mamba_reshard,
 )
+from megatron.core.inference.disaggregation.transfer_backends.base import compute_buffer_geometry
 from megatron.core.inference.disaggregation.utils import transfer_peer_records
 
 logger = logging.getLogger(__name__)
@@ -143,10 +143,6 @@ class NixlTransferBackend:
         self._memory_buffer = memory_buffer
 
         # Addressing geometry shared with the other backends.
-        from megatron.core.inference.disaggregation.transfer_backends.base import (
-            compute_buffer_geometry,
-        )
-
         geometry = compute_buffer_geometry(
             memory_buffer,
             expected_num_blocks,

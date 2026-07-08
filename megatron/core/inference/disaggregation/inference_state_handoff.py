@@ -9,13 +9,18 @@ import logging
 from collections import deque
 from typing import Any, Dict, Optional
 
+import msgpack
 import torch
 
 from megatron.core.inference.disaggregation.pending_handoff_imports import (
     PendingKvImport,
     PendingMambaImport,
 )
+from megatron.core.inference.disaggregation.transfer_backends.base import (
+    construct_kv_transfer_backend_class,
+)
 from megatron.core.inference.disaggregation.utils import transfer_block_count
+from megatron.core.inference.headers import Headers
 from megatron.core.utils import get_pg_rank, get_pg_size
 
 _MAMBA_STATE_KINDS = ("conv", "ssm")
@@ -71,10 +76,6 @@ class InferenceStateHandoffMixin:
             backend: transfer backend name, resolved through the explicit
                 registry ("nixl"; "nccl" selects the two-sided push family).
         """
-        from megatron.core.inference.disaggregation.transfer_backends.base import (
-            construct_kv_transfer_backend_class,
-        )
-
         backend_cls = construct_kv_transfer_backend_class(backend)
 
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -530,10 +531,6 @@ class InferenceStateHandoffMixin:
         # releases the prefill's pinned blocks and a flow-control slot. In the
         # Dynamo mode the client triggers the release instead.
         if getattr(self, "_disagg_config", None) is not None and self.is_mp_coordinator:
-            import msgpack
-
-            from megatron.core.inference.headers import Headers
-
             self.socket_for_receiving_requests.send(
                 msgpack.packb([Headers.KV_READ_DONE.value, pending.request_id], use_bin_type=True)
             )
