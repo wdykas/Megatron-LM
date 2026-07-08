@@ -54,6 +54,7 @@ class TopKCompressor:
         ref_queries: torch.Tensor | None = None,
         run_id: str = "",
         step_id: int = 0,
+        ref_query_end: int | None = None,
     ) -> CompactionResult:
         t0 = time.perf_counter()
         T = keys.shape[0]
@@ -62,7 +63,7 @@ class TopKCompressor:
         if ref_queries is None:
             raise ValueError("TopKCompressor requires ref_queries for scoring.")
 
-        Phi = _mass_features(ref_queries, keys)                     # (n, T)
+        Phi = _mass_features(ref_queries, keys, query_end=ref_query_end)  # (n, T)
         norm = Phi / Phi.sum(dim=1, keepdim=True)                   # softmax (n, T)
         rms_scores = (norm ** 2).mean(dim=0).sqrt()                 # (T,)
         positions = sorted(rms_scores.topk(budget).indices.tolist())
@@ -152,6 +153,7 @@ class OMPCompressor:
         ref_queries: torch.Tensor | None = None,
         run_id: str = "",
         step_id: int = 0,
+        ref_query_end: int | None = None,
     ) -> CompactionResult:
         t0 = time.perf_counter()
         T = keys.shape[0]
@@ -160,7 +162,7 @@ class OMPCompressor:
         if ref_queries is None:
             raise ValueError("OMPCompressor requires ref_queries for scoring.")
 
-        positions, w = self._omp(keys, ref_queries, budget)
+        positions, w = self._omp(keys, ref_queries, budget, ref_query_end)
         w = w[:len(positions)]
 
         sort_idx = torch.argsort(torch.tensor(positions, dtype=torch.long))
@@ -184,9 +186,10 @@ class OMPCompressor:
         )
 
     def _omp(
-        self, keys: torch.Tensor, ref_queries: torch.Tensor, budget: int
+        self, keys: torch.Tensor, ref_queries: torch.Tensor, budget: int,
+        ref_query_end: int | None = None,
     ) -> tuple[list[int], torch.Tensor]:
-        Phi = _mass_features(ref_queries, keys)      # (n, T) fp32
+        Phi = _mass_features(ref_queries, keys, query_end=ref_query_end)  # (n, T) fp32
         m = Phi.sum(dim=1)                           # (n,) target mass
         UPPER = math.exp(7.0)                        # official paper weight cap
 
