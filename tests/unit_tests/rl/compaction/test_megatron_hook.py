@@ -405,6 +405,25 @@ class TestApplyBeliefMemory:
         assert ctx.request_kv_block_counts[1].item() == 1
         assert ctx.request_last_kv_block_offset[1].item() == 3
 
+    def test_replace_kv_for_request_memory_plus_tail(self):
+        """belief_still serving format: [C synthetic || raw tail] installs with
+        the right length and the tail bytes surviving verbatim."""
+        ctx = _make_context(n_layers=2, n_heads=1, d_head=4, block_size=4, seq_len=10)
+        hook = MegatronInferenceHook(ctx)
+        k0, v0 = hook.get_kv_for_request(0)              # (L, 10, 1, 4)
+        L = k0.shape[0]
+        mem_k = torch.full((L, 3, 4), 5.0)               # C=3 synthetic slots
+        mem_v = torch.full((L, 3, 4), 6.0)
+        tail_k = k0[:, -2:].reshape(L, 2, 4)             # keep=2 raw tokens
+        tail_v = v0[:, -2:].reshape(L, 2, 4)
+        hook.replace_kv_for_request(0, torch.cat([mem_k, tail_k], 1),
+                                    torch.cat([mem_v, tail_v], 1))
+        k1, v1 = hook.get_kv_for_request(0)
+        assert k1.shape[1] == 5                          # C + keep
+        assert torch.allclose(k1[:, :3].reshape(L, 3, 4), mem_k)
+        assert torch.allclose(k1[:, 3:].reshape(L, 2, 4), tail_k)
+        assert torch.allclose(v1[:, 3:].reshape(L, 2, 4), tail_v)
+
     def test_for_request_raises_out_of_range(self):
         ctx = _make_context(seq_len=4)
         hook = MegatronInferenceHook(ctx)

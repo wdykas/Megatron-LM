@@ -583,3 +583,24 @@ class MegatronInferenceHook:
         self._inject_compact_request(
             ctx, buf, b_global, memory.keys[:, 0], memory.values[:, 0]
         )
+
+    def replace_kv_for_request(self, b_local: int, keys: torch.Tensor,
+                               values: torch.Tensor) -> None:
+        """Replace one request's paged KV with arbitrary tensors.
+
+        ``keys``/``values``: (n_layers, T_new, d_model). Used by belief_still
+        to install [compact memory ‖ raw recent tail] — the memory summarizes
+        the context, the tail keeps the question/instruction tokens verbatim
+        (the training format: student sees memory + raw query tokens).
+        """
+        got = self._context_kv()
+        if got is None:
+            raise RuntimeError(
+                "replace_kv_for_request: no live KV cache (engine not "
+                "allocated or no active requests).")
+        ctx, buf, n_active = got
+        if b_local >= n_active:
+            raise RuntimeError(
+                f"replace_kv_for_request: b_local={b_local} >= n_active={n_active}")
+        b_global = ctx.paused_request_count + b_local
+        self._inject_compact_request(ctx, buf, b_global, keys, values)

@@ -58,6 +58,11 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
         help="Synthetic memory slots for belief_still.",
     )
     parser.add_argument(
+        "--kv-compaction-belief-keep-recent", type=int, default=64,
+        help="belief_still: keep this many raw recent prompt tokens after the "
+             "memory (the question region — the training format).",
+    )
+    parser.add_argument(
         "--kv-compaction-archive", action="store_true", default=False,
         help="Demote evicted KV spans to a CPU archive and restore them on demand "
              "via the negative-cache trigger. Needs fully eager decoding "
@@ -166,6 +171,7 @@ if __name__ == "__main__":
                 compactor_checkpoint=args.kv_compaction_compactor_checkpoint,
                 oracle_checkpoint=args.kv_compaction_oracle_checkpoint,
                 n_compress=args.kv_compaction_n_compress,
+                belief_keep_recent=args.kv_compaction_belief_keep_recent,
                 archive=args.kv_compaction_archive,
                 retrieval_alpha=args.kv_compaction_retrieval_alpha,
                 retrieval_cusum=args.kv_compaction_retrieval_cusum,

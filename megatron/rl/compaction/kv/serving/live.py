@@ -73,6 +73,7 @@ class LiveKVCompactor:
         compactor_checkpoint: str | None = None,
         oracle_checkpoint: str | None = None,
         n_compress: int = 64,
+        belief_keep_recent: int = 64,
         archive: bool = False,
         retrieval_alpha: float = 0.2,
         retrieval_cusum: float = 0.4,
@@ -120,6 +121,10 @@ class LiveKVCompactor:
         self.compactor_checkpoint = compactor_checkpoint
         self.oracle_checkpoint = oracle_checkpoint
         self.n_compress = n_compress
+        # belief_still serving format: [C memory slots || raw recent tail].
+        # The tail preserves the question/instruction verbatim, matching the
+        # training format (student = memory + raw query tokens).
+        self.belief_keep_recent = belief_keep_recent
         self._updater = None   # lazy: belief_still builds/loads on first request
         self._oracle = None    # lazy: learned_oracle builds/loads on first request
         # CPU archive + negative-cache retrieval (archive). Evicted spans are
@@ -552,26 +557,39 @@ class LiveKVCompactor:
 
     def _compact_with_updater(self, b_local: int, b_global: int,
                               k: torch.Tensor, v: torch.Tensor) -> None:
-        """belief_still: replace the request's prompt KV with the learned
-        compactor's C synthetic tokens (Perceiver/gated-updater initial_compress),
-        injected via apply_belief_memory_for_request. k/v: (L, S, H, D) TP-local."""
+        """belief_still: replace the request's CONTEXT KV with the learned
+        compactor's C synthetic tokens, KEEPING the last ``belief_keep_recent``
+        prompt tokens raw. Mirrors the training format — the student always
+        sees [compact memory ‖ raw query tokens]; compacting the question away
+        leaves the model answering blind (measured: EM 0.00, fluent
+        "what number?" generations). k/v: (L, S, H, D) TP-local."""
         ctx = self._ctx
         L, S, H, D = k.shape
+        keep = min(self.belief_keep_recent, max(0, S - 1))
+        ctx_len = S - keep
         if self._updater is None:
             self._init_updater(n_attn_layers=L, d_kv=H * D)
-        keys_pl = [k[li].reshape(1, S, H * D).to(torch.bfloat16) for li in range(L)]
-        vals_pl = [v[li].reshape(1, S, H * D).to(torch.bfloat16) for li in range(L)]
+        if ctx_len <= self.n_compress:
+            return  # context already smaller than the memory — nothing to gain
+        keys_pl = [k[li, :ctx_len].reshape(1, ctx_len, H * D).to(torch.bfloat16)
+                   for li in range(L)]
+        vals_pl = [v[li, :ctx_len].reshape(1, ctx_len, H * D).to(torch.bfloat16)
+                   for li in range(L)]
         with torch.no_grad():
             memory = self._updater.initial_compress(keys_pl, vals_pl)
         C = memory.keys.shape[2]
-        self._hook.apply_belief_memory_for_request(b_local, memory)
-        self._repoint_pending_token(b_local, b_global, C)
-        ctx.request_output_lengths[b_global] -= S - C
+        tail_k = k[:, ctx_len:].reshape(L, keep, H * D)
+        tail_v = v[:, ctx_len:].reshape(L, keep, H * D)
+        new_k = torch.cat([memory.keys[:, 0].to(tail_k.dtype), tail_k], dim=1)
+        new_v = torch.cat([memory.values[:, 0].to(tail_v.dtype), tail_v], dim=1)
+        self._hook.replace_kv_for_request(b_local, new_k, new_v)
+        self._repoint_pending_token(b_local, b_global, C + keep)
+        ctx.request_output_lengths[b_global] -= S - (C + keep)
         self.compacted_requests += 1
-        self.tokens_evicted += S - C
+        self.tokens_evicted += S - (C + keep)
         logger.info(
-            "[kv-compaction] request b_local=%d: %d -> %d synthetic tokens (belief_still)",
-            b_local, S, C,
+            "[kv-compaction] request b_local=%d: %d -> %d synthetic + %d raw tail "
+            "tokens (belief_still)", b_local, S, C, keep,
         )
         logger.info("[kv-compaction-stats] %s", json.dumps(self.stats()))
 
