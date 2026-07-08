@@ -21,18 +21,11 @@ def make_submit_request_with_kv_message(
 
 
 def parse_submit_request_with_kv_fields(fields: Sequence[Any]) -> Tuple[Any, ...]:
-    """Validate and unpack fields following ``SUBMIT_REQUEST_WITH_KV``.
+    """Validate and unpack fields following ``SUBMIT_REQUEST_WITH_KV``."""
 
-    Six fields are accepted for compatibility with the deprecated trailing
-    ``first_token`` field; it is intentionally ignored.
-    """
-
-    if len(fields) not in (5, 6):
-        raise ValueError(
-            "SUBMIT_REQUEST_WITH_KV payload must have 5 fields "
-            f"(or 6 with deprecated first_token), got {len(fields)}"
-        )
-    return tuple(fields[:5])
+    if len(fields) != 5:
+        raise ValueError(f"SUBMIT_REQUEST_WITH_KV payload must have 5 fields, got {len(fields)}")
+    return tuple(fields)
 
 
 def make_release_kv_message(header_value: int, request_id: int) -> list:

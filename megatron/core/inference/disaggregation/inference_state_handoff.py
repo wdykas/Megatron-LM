@@ -7,10 +7,17 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import deque
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
-import msgpack
 import torch
+
+try:
+    import msgpack
+
+    HAVE_MSGPACK = True
+except ImportError:
+    msgpack = None
+    HAVE_MSGPACK = False
 
 from megatron.core.inference.disaggregation.pending_handoff_imports import (
     PendingKvImport,
@@ -22,6 +29,10 @@ from megatron.core.inference.disaggregation.transfer_backends.base import (
 from megatron.core.inference.disaggregation.utils import transfer_block_count
 from megatron.core.inference.headers import Headers
 from megatron.core.utils import get_pg_rank, get_pg_size
+
+if TYPE_CHECKING:
+    from megatron.core.inference.inference_request import DynamicInferenceRequest
+    from megatron.core.inference.sampling_params import SamplingParams
 
 _MAMBA_STATE_KINDS = ("conv", "ssm")
 
@@ -77,6 +88,17 @@ class InferenceStateHandoffMixin:
                 registry ("nixl"; "nccl" selects the two-sided push family).
         """
         backend_cls = construct_kv_transfer_backend_class(backend)
+
+        # Pinned hand-off blocks are held as prefix-cache references. Without
+        # prefix caching, a context reset (e.g. the EP idle dummy forward)
+        # returns pinned blocks to the free pool while a peer may still read
+        # them, and the decode side cannot admit imports at all.
+        allocator = self.context.kv_block_allocator
+        assert allocator.enable_prefix_caching, (
+            "KV handoff requires prefix caching on both prefill and decode "
+            "engines (--inference-dynamic-batching-prefix-caching)."
+        )
+        allocator.enable_handoff_pinning = True
 
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
@@ -486,9 +508,6 @@ class InferenceStateHandoffMixin:
         )
         self._loop.call_soon_threadsafe(self._loop.create_task, self._notify_cond_for_new_request())
         return future
-
-    def _kv_import_done(self, pending: PendingKvImport) -> bool:
-        return all(handle.poll() for handle in self._pending_transfer_handles(pending))
 
     @staticmethod
     def _pending_transfer_handles(pending: PendingKvImport) -> list:

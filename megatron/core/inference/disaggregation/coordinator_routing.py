@@ -105,8 +105,9 @@ class DisaggRouting(DisaggRouter):
     def route_prefill_done(self, request_id: int) -> Tuple[object, object]:
         """Hop 2: a request finished prefill; pick its decode engine.
 
-        Returns (prefill_identity, decode_identity): the coordinator sends
-        SEND_KV to the prefill engine and RECV_KV to the decode engine.
+        Returns (prefill_identity, decode_identity): the coordinator re-submits
+        the request to the decode engine as SUBMIT_REQUEST_WITH_KV (and, on
+        push transports, tells the prefill engine via SEND_KV).
         """
         if not self.decode_engines:
             raise RuntimeError("no decode engines registered")

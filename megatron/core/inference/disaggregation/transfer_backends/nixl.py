@@ -46,11 +46,6 @@ _POLL_INTERVAL_S = 0.0005  # 0.5 ms
 _POLL_TIMEOUT_S = 30.0
 
 
-def have_nixl() -> bool:
-    """Whether the nixl Python package is importable."""
-    return _HAVE_NIXL
-
-
 @dataclass
 class NixlPullHandle:
     """Pollable handle for one logical pull made of one or more NIXL transfers."""

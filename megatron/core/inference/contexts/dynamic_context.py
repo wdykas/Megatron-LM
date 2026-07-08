@@ -3056,10 +3056,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.kv_block_allocator.register_kv_block_hashes(
                     block_ids_to_hash, block_hashes_slice
                 )
-                token_start = start * self.block_size_tokens
-                token_end = end * self.block_size_tokens
-                token_ids = req.prompt_tokens[token_start:token_end].tolist()
                 if self._kv_event_listeners:
+                    token_start = start * self.block_size_tokens
+                    token_end = end * self.block_size_tokens
+                    token_ids = req.prompt_tokens[token_start:token_end].tolist()
                     self._pending_kv_stored_events.append(
                         {
                             "block_hashes": list(block_hashes_slice),

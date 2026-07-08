@@ -43,6 +43,10 @@ class KVBlockAllocator:
         self._blocks_deregistered_observers: list[Callable] = []
 
         # Handoff blocks remain pinned until decode finishes pulling them.
+        # Pinning at request finish only happens on engines with KV transfer
+        # configured (setup_kv_transfer flips this on); other engines have no
+        # release path for the pins.
+        self.enable_handoff_pinning = False
         self.pinned_blocks: Dict[int, int] = {}
 
         self.total_count = total_count

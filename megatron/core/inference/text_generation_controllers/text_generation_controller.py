@@ -1801,8 +1801,8 @@ class TextGenerationController:
                     finished_routing_block_ids[req_id] = valid
 
         finished_handoff_block_ids = {}
-        if finished_idxs.numel() > 0:
-            allocator = context.kv_block_allocator
+        allocator = context.kv_block_allocator
+        if allocator.enable_handoff_pinning and finished_idxs.numel() > 0:
             for fidx in finished_idxs.tolist():
                 req_id = int(context.request_ids[fidx].item())
                 blocks = context.request_to_kv_block_ids[fidx]

@@ -2,13 +2,13 @@
 
 """Disaggregated (prefill/decode) rollouts for RL.
 
-Hooks the coordinator-native prefill/decode split into RL's existing separate-
-inference-model lifecycle: build this rank's shard model on its shard groups
-(``build_disagg_inference_model``) and configure the shared coordinator on the
-engine that wraps it (``configure_disagg_engine``). Refit into the shard pools
-goes through the core ``swap_model_weights`` (one pass per pool, driven by
-``disagg_refit_pools``). All gated on ``--inference-shards`` declaring ``role=``
-tags; off otherwise."""
+Connects the coordinator-native prefill/decode split to RL's existing
+separate-inference-model lifecycle: build this rank's shard model on its shard
+groups (``build_disagg_inference_model``) and configure the shared coordinator
+on the engine that wraps it (``configure_disagg_engine``). Refit into the
+shard pools goes through the core ``swap_model_weights`` (one pass per pool,
+driven by ``disagg_refit_pools``). All gated on ``--inference-shards``
+declaring ``role=`` tags; off otherwise."""
 
 import copy
 from contextlib import nullcontext
@@ -18,16 +18,16 @@ import torch.distributed as dist
 from megatron.core.inference.disaggregation.coordinator_setup import (
     configure_prebuilt_disagg_engine,
 )
+from megatron.core.inference.shards import build_inference_pg_collection
 from megatron.core.inference.shards_spec import (
     parse_inference_shards_spec,
     spec_declares_disaggregation,
 )
-from megatron.core.inference.shards import build_inference_pg_collection
 
 
 def is_disagg_rollout(args) -> bool:
     """Whether RL rollouts should run through a prefill/decode split."""
-    spec = getattr(args, "inference_shards", None)
+    spec = args.inference_shards
     return bool(spec) and spec_declares_disaggregation(spec)
 
 
@@ -37,7 +37,7 @@ def _specs(args):
 
 def _iter_shard_windows(specs, rank):
     """Yield ``(offset, spec, is_mine)`` for each contiguous shard window, in
-    order -- the same windowing ``configure_prebuilt_disagg_engine`` uses."""
+    the same order ``configure_prebuilt_disagg_engine`` walks them."""
     offset = 0
     for s in specs:
         yield offset, s, (offset <= rank < offset + s.world_size)
@@ -50,8 +50,8 @@ def build_disagg_inference_model(
     """Build this rank's prefill/decode shard inference model (or ``None`` if
     ``--inference-shards`` doesn't declare disaggregation).
 
-    Every rank builds *every* shard's process groups -- ``new_group`` is
-    collective, so non-members must call it too -- but instantiates the model
+    Every rank builds every shard's process groups, since ``new_group`` is
+    collective and non-members must call it too, but instantiates the model
     only on its own shard's groups, at that shard's parallelism. The result is
     the refit target (``swap_model_weights`` driven by ``disagg_refit_pools``)
     and what the engine wraps (see :func:`configure_disagg_engine`); placing it
@@ -106,9 +106,8 @@ def build_disagg_inference_model(
     return model
 
 
-def configure_disagg_engine(engine, inference_model, *, disagg_router="round_robin"):
-    """Set the disagg role on `engine` (which wraps `inference_model`) and
-    spawn the shared coordinator."""
+def configure_disagg_engine(engine, *, disagg_router="round_robin"):
+    """Set the disagg role on `engine` and spawn the shared coordinator."""
     from megatron.training.global_vars import get_args
 
     args = get_args()

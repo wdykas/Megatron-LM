@@ -636,6 +636,13 @@ def get_environment_rollouts(
             model, inference_model, args.refit_method,
             num_dst_pools=num_dst_pools, dst_pool_index=dst_pool_index,
         )
+        if args.rl_verify_model_weights_swap and num_dst_pools > 1:
+            # verify_model_weights_swap compares against the full inference
+            # model; with per-pool refit each rank only holds its shard.
+            print_rank_0(
+                "WARNING: --rl-verify-model-weights-swap is skipped for "
+                "disaggregated (multi-pool) refits."
+            )
         if args.rl_verify_model_weights_swap and num_dst_pools == 1:
             verify_model_weights_swap(
                 train_model=model,
