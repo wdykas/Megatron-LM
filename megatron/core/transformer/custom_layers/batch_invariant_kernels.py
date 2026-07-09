@@ -525,6 +525,7 @@ _TE_RMSNORM_ORIG_FWD = None
 _MEG_TE_GENERAL_GEMM_ORIG = None
 _TE_RMSNORM_FUNC_ORIGS: Dict[str, Any] = {}
 _TE_GEMM_FUNC_ORIGS: Dict[str, Any] = {}
+_TE_APPLY_NORM_ORIGS: Dict[str, Any] = {}
 
 
 def _import_module_if_available(name: str):
@@ -617,6 +618,34 @@ def _te_patch_for_batch_invariant():
             _TE_RMSNORM_FUNC_ORIGS[name] = orig
             setattr(te_layernorm_mod, name, _make_rmsnorm_patched(orig))
 
+    # Patch the fused-module normalization entry (`apply_normalization`). TE's
+    # fused LayerNormLinear / LayerNormMLP call this instead of RMSNorm.forward,
+    # so without this patch their internal RMSNorm runs TE's tex kernel, whose
+    # within-row reduction strategy depends on the total row count — i.e. it is
+    # NOT batch-invariant (observed: same rows, different output at 928 vs 2274
+    # rows on GB200, 1 bf16 ulp per layer, amplifying across depth).
+    import transformer_engine.pytorch.module._common as te_common
+
+    for mod_name, mod in (
+        ("module._common", te_common),
+        (
+            "module.layernorm_linear",
+            _import_module_if_available("transformer_engine.pytorch.module.layernorm_linear"),
+        ),
+        (
+            "module.layernorm_mlp",
+            _import_module_if_available("transformer_engine.pytorch.module.layernorm_mlp"),
+        ),
+    ):
+        key = f"{mod_name}.apply_normalization"
+        if (
+            mod is not None
+            and hasattr(mod, "apply_normalization")
+            and key not in _TE_APPLY_NORM_ORIGS
+        ):
+            _TE_APPLY_NORM_ORIGS[key] = mod.apply_normalization
+            mod.apply_normalization = _te_apply_normalization_patched
+
 
 def _te_unpatch_for_batch_invariant():
     """Restore original Transformer Engine functions if they were patched."""
@@ -651,6 +680,14 @@ def _te_unpatch_for_batch_invariant():
         _MEG_TE_GENERAL_GEMM_ORIG = None
     elif meg_te is None:
         _MEG_TE_GENERAL_GEMM_ORIG = None
+
+    # Restore fused-module apply_normalization entries
+    for key, orig in list(_TE_APPLY_NORM_ORIGS.items()):
+        mod_name = key.rsplit(".apply_normalization", 1)[0]
+        mod = _import_module_if_available(f"transformer_engine.pytorch.{mod_name}")
+        if mod is not None and hasattr(mod, "apply_normalization"):
+            mod.apply_normalization = orig
+        _TE_APPLY_NORM_ORIGS.pop(key, None)
 
     # Restore TE module-level RMSNorm functions
     te_layernorm_mod = _import_module_if_available("transformer_engine.pytorch.module.layernorm")
@@ -825,6 +862,66 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
             dbias = None
 
         return dA, dB, dbias, None, None
+
+
+def _te_apply_normalization_patched(
+    inputmat,
+    ln_out,
+    ln_weight,
+    ln_bias,
+    eps,
+    output_quantizer,
+    output_dtype,
+    normalization,
+    fwd_ln_sm_margin,
+    zero_centered_gamma,
+):
+    """Batch-invariant replacement for TE's fused-module `apply_normalization`.
+
+    Routes RMSNorm through the batch-invariant implementation (fp32 stats via
+    `mean_dim`, deterministic within-row reduction independent of row count).
+    Falls back to the original TE kernel for configurations the BI path does
+    not cover (LayerNorm, fp8 quantized output).
+
+    Returns `(ln_out, mu, rsigma)` like TE: `mu` is None for RMSNorm and
+    `rsigma` is fp32 with shape [rows], which TE's rmsnorm backward consumes.
+    """
+    orig = _TE_APPLY_NORM_ORIGS.get("module._common.apply_normalization")
+    if (
+        not is_batch_invariant_mode_enabled()
+        or normalization != "RMSNorm"
+        or output_quantizer is not None
+        or ln_bias is not None
+    ):
+        assert orig is not None, "TE apply_normalization original not captured"
+        return orig(
+            inputmat,
+            ln_out,
+            ln_weight,
+            ln_bias,
+            eps,
+            output_quantizer,
+            output_dtype,
+            normalization,
+            fwd_ln_sm_margin,
+            zero_centered_gamma,
+        )
+
+    x_fp32 = inputmat.float()
+    w_fp32 = ln_weight.float()
+    if zero_centered_gamma:
+        w_fp32 = w_fp32 + 1.0
+    ms = mean_dim(x_fp32 * x_fp32, dim=-1, keepdim=True)
+    rsigma = torch.rsqrt(ms + eps)
+    out_fp32 = (x_fp32 * rsigma) * w_fp32
+
+    out_dtype = output_dtype if isinstance(output_dtype, torch.dtype) else inputmat.dtype
+    out = out_fp32.to(out_dtype)
+    if ln_out is not None:
+        ln_out.copy_(out)
+    else:
+        ln_out = out
+    return ln_out, None, rsigma.squeeze(-1)
 
 
 def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
