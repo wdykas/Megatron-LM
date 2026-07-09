@@ -1664,6 +1664,10 @@ def enable_batch_invariant_mode(backend: str = "deepgemm"):
     _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)
     # Also patch Transformer Engine kernels when available
     _te_patch_for_batch_invariant()
+    # Pin the Mamba chunked-scan autotuners so rollout and training processes
+    # cannot pick different tile configs (different fp32 reduction groupings →
+    # silent bitwise divergence) via autotune timing noise.
+    _pin_mamba_autotuners()
 
 
 def disable_batch_invariant_mode():
@@ -1675,6 +1679,134 @@ def disable_batch_invariant_mode():
     _batch_invariant_LIB = None
     # Restore Transformer Engine kernels if previously patched
     _te_unpatch_for_batch_invariant()
+    _unpin_mamba_autotuners()
+
+
+# (autotuner, original configs list) pairs saved by _pin_mamba_autotuners.
+_PINNED_AUTOTUNERS: list = []
+
+# Preferred tile config per Mamba forward kernel: the empirically-fastest
+# autotune winners for nemotron-scale dims (nheads=128, headdim=64,
+# dstate=128, chunk_size=128) on GB200. Hardcoding beats live benchmarking
+# here because parity requires the SAME choice in every process; on other
+# hardware these remain correct (possibly suboptimal — retune and update).
+_PREFERRED_MAMBA_CONFIGS = {
+    # bmm M=64 / scan M=32 deliberately favor smaller M-blocks than the pure
+    # training-shape optimum (bmm M=128 / scan M=64): the decode path's
+    # row-gating computes one M-block per chunk, so smaller M-blocks cut its
+    # work directly. Measured on GB200 at nemotron dims: training scan is
+    # unchanged (0.60 vs 0.60 ms) while gated decode improves 17%.
+    "_bmm_chunk_fwd_kernel": {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32},
+    "_chunk_scan_fwd_kernel": {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32},
+    "_chunk_state_fwd_kernel": {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32},
+    "_chunk_cumsum_fwd_kernel": {"BLOCK_SIZE_H": 8},
+    "_state_passing_fwd_kernel": {"BLOCK_SIZE": 1024},
+}
+
+
+def _autotune_config_cost(cfg):
+    """Deterministic config ranking: block footprint * stages, warps tiebreak.
+
+    Mirrors megatron.core.ssm.ops.determinism._estimate_config_cost so the
+    repo and package kernels (identical config lists — the repo is a port)
+    resolve to the same tile config.
+    """
+    block_product = 1
+    for key, val in cfg.kwargs.items():
+        if key.startswith("BLOCK") and isinstance(val, int):
+            block_product *= val
+    stages = getattr(cfg, "num_stages", 1) or 1
+    warps = getattr(cfg, "num_warps", 1) or 1
+    return (block_product * stages, warps)
+
+
+def _choose_pinned_config(kernel_name, configs):
+    """Pick the config to pin: the preferred table entry when present in the
+    kernel's config list, else the deterministic cheapest-cost fallback."""
+    preferred = _PREFERRED_MAMBA_CONFIGS.get(kernel_name)
+    if preferred is not None:
+        for cfg in configs:
+            if all(cfg.kwargs.get(k) == v for k, v in preferred.items()):
+                return cfg
+    return min(configs, key=_autotune_config_cost)
+
+
+def _pin_mamba_autotuners():
+    """Pin Mamba chunked-scan forward kernels to one deterministic tile config.
+
+    Bitwise rollout==train parity requires the inference process (repo ssd_*
+    kernels) and the training process (mamba_ssm package ssd_* kernels) to use
+    the same tile decomposition: BLOCK sizes determine the fp32 reduction
+    grouping inside tl.dot loops. By default Triton's autotuner re-benchmarks
+    per process, so timing noise can pick different configs in different
+    processes — an observed, non-theoretical failure mode. Pinning both sides
+    with the same cost rule over their (identical) config lists makes the
+    tiling agree by construction.
+
+    Only the five forward kernels that feed log-prob parity are pinned;
+    backward kernels affect gradients, not parity.
+    """
+    global _PINNED_AUTOTUNERS
+    try:
+        from triton.runtime.autotuner import Autotuner
+    except ImportError:
+        return
+
+    kernels = []
+    try:
+        from megatron.core.ssm.ops import (
+            ssd_bmm as r_bmm,
+            ssd_chunk_scan as r_scan,
+            ssd_chunk_state as r_state,
+            ssd_state_passing as r_pass,
+        )
+
+        kernels += [
+            r_bmm._bmm_chunk_fwd_kernel,
+            r_scan._chunk_scan_fwd_kernel,
+            r_state._chunk_cumsum_fwd_kernel,
+            r_state._chunk_state_fwd_kernel,
+            r_pass._state_passing_fwd_kernel,
+        ]
+    except ImportError:
+        pass
+    try:
+        from mamba_ssm.ops.triton import (
+            ssd_bmm as p_bmm,
+            ssd_chunk_scan as p_scan,
+            ssd_chunk_state as p_state,
+            ssd_state_passing as p_pass,
+        )
+
+        kernels += [
+            p_bmm._bmm_chunk_fwd_kernel,
+            p_scan._chunk_scan_fwd_kernel,
+            p_state._chunk_cumsum_fwd_kernel,
+            p_state._chunk_state_fwd_kernel,
+            p_pass._state_passing_fwd_kernel,
+        ]
+    except (ImportError, AttributeError):
+        pass
+
+    for kernel in kernels:
+        if not isinstance(kernel, Autotuner) or len(kernel.configs) <= 1:
+            continue
+        name = getattr(getattr(kernel, "fn", None), "__name__", "")
+        chosen = _choose_pinned_config(name, kernel.configs)
+        _PINNED_AUTOTUNERS.append((kernel, kernel.configs))
+        kernel.configs = [chosen]
+        if hasattr(kernel, "cache"):
+            kernel.cache.clear()
+
+
+def _unpin_mamba_autotuners():
+    """Restore the original autotune config lists saved by _pin_mamba_autotuners."""
+    global _PINNED_AUTOTUNERS
+    for kernel, original in _PINNED_AUTOTUNERS:
+        kernel.configs = original
+        if hasattr(kernel, "cache"):
+            kernel.cache.clear()
+    _PINNED_AUTOTUNERS = []
 
 
 @contextlib.contextmanager

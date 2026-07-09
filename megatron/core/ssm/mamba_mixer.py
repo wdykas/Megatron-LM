@@ -1080,7 +1080,7 @@ class MambaMixer(MegatronModule):
             max_batch, nh, p, ng, n, x.device,
             x.dtype, dt.dtype, B.dtype, C.dtype, z.dtype,
         )
-        seed_bik_decode_buffers(bufs, x, dt, B, C, z, cu_seqlens, batch_indices)
+        seed_bik_decode_buffers(bufs, x, dt, B, C, z, cu_seqlens, batch_indices, ssm_state)
 
     def _bik_decode_buffered_scan(self, x, dt, B, C, z, batch_indices, ssm_state):
         """Thin wrapper around ops/bik_decode.bik_decode_buffered_scan: rearrange

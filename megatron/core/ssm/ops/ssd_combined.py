@@ -160,6 +160,131 @@ def _mamba_chunk_scan_combined_fwd(
         return final_states
 
 
+def mamba_chunk_scan_decode_rows(
+    x,
+    dt,
+    A,
+    B,
+    C,
+    chunk_size,
+    cu_chunk_seqlens,
+    seq_idx,
+    target_rows,
+    chunk_flags,
+    initial_states,
+    out,
+    D=None,
+    z=None,
+    dt_bias=None,
+    dt_softplus=False,
+    dt_limit=(0.0, float("inf")),
+    states_workspace=None,
+    state_dtype=None,
+    dst_states=None,
+    dst_indices=None,
+):
+    """Row-gated chunk scan for batch-invariant single-token decode.
+
+    Runs the same 5-kernel pipeline as the full varlen scan over a dense
+    per-slot buffer laid out as `nseq` independent chunks (one chunk per
+    decode slot, each exactly `chunk_size` long, each its own sequence), but
+    gates the expensive kernels down to what a decode step actually consumes:
+
+      * `_bmm_chunk_fwd` computes only the CB M-block containing
+        `target_rows[c]` (and N-blocks up to it) per chunk.
+      * `_chunk_scan_fwd` computes only the output M-block containing
+        `target_rows[c]` per chunk.
+      * `_chunk_state_fwd` computes a chunk's state matmul only where
+        `chunk_flags[c] != 0` (the slot crosses its chunk boundary this
+        step — the only step on which the state is consumed).
+
+    The surviving blocks execute the exact same instructions as the ungated
+    kernels, so the consumed outputs are bitwise-identical to a full scan.
+    All shapes are static per (nseq, chunk_size) — CUDA-graph capturable.
+
+    Args:
+        x/dt/B/C: flattened dense buffers, shape (nseq * chunk_size, ...).
+        cu_chunk_seqlens: (nseq + 1,) = arange(nseq + 1) * chunk_size.
+        seq_idx: (nseq,) = arange(nseq) — every chunk starts a new sequence,
+            so the scan reads `initial_states` directly.
+        target_rows: (nseq,) int32 — this step's write-cursor per slot; the
+            only output row read per chunk.
+        chunk_flags: (nseq,) — nonzero where the slot crosses the boundary.
+        initial_states: (nseq, nheads, headdim, dstate) — per-slot SSM state
+            at the last chunk boundary.
+        out: (nseq, nheads, headdim) preallocated compact output — the scan
+            stores each chunk's target row here directly.
+        states_workspace: optional persistent (nseq, nheads, headdim, dstate)
+            fp32 buffer reused across steps so skipped chunks keep finite
+            stale values instead of uninitialized memory.
+        dst_states/dst_indices: optional fused state snapshot — for chunks
+            where chunk_flags is set, the boundary state is stored directly
+            to dst_states[dst_indices[c]] (e.g. the engine's ssm_state cache,
+            flattened to (max_batch, nheads, headdim * dstate)), converted to
+            the cache dtype by the store. Skips the separate gather/where/
+            scatter pass the caller would otherwise need.
+
+    Returns:
+        boundary_states: (nseq, nheads, headdim, dstate) — valid only at
+            chunks where chunk_flags is set.
+    """
+    dA_cumsum, dt = _chunk_cumsum_fwd(
+        dt,
+        A,
+        chunk_size,
+        cu_chunk_seqlens,
+        dt_bias=dt_bias,
+        dt_softplus=dt_softplus,
+        dt_limit=dt_limit,
+    )
+    states = _chunk_state_fwd(
+        B,
+        x,
+        dt,
+        dA_cumsum,
+        cu_chunk_seqlens,
+        states=states_workspace,
+        states_in_fp32=True,
+        chunk_flags=chunk_flags,
+    )
+    dstate = B.shape[-1]
+    boundary_states = _state_passing_fwd(
+        states.flatten(-2),
+        dA_cumsum,
+        cu_chunk_seqlens,
+        initial_states=initial_states.flatten(-2),
+        seq_idx=seq_idx,
+        out_dtype=state_dtype if state_dtype is not None else C.dtype,
+        dst_states=dst_states,
+        dst_indices=dst_indices,
+        dst_flags=chunk_flags if dst_states is not None else None,
+    ).unflatten(-1, (-1, dstate))
+    CB = _bmm_chunk_fwd(
+        C,
+        B,
+        chunk_size,
+        cu_chunk_seqlens,
+        output_dtype=torch.float32,
+        target_rows=target_rows,
+    )
+    _chunk_scan_fwd(
+        CB,
+        x,
+        dt,
+        dA_cumsum,
+        C,
+        boundary_states,
+        cu_chunk_seqlens,
+        out,
+        seq_idx,
+        D=D,
+        z=z,
+        initial_states=initial_states,
+        target_rows=target_rows,
+    )
+    return boundary_states
+
+
 def mamba_chunk_scan_combined_varlen(
     x,
     dt,

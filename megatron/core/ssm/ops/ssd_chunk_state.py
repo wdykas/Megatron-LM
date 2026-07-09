@@ -180,6 +180,7 @@ def _chunk_state_fwd_kernel(
     dt_ptr,
     dA_cumsum_ptr,
     cu_chunk_seqlens_ptr,
+    chunk_flags_ptr,
     # Matrix dimensions
     hdim: tl.constexpr,
     dstate: tl.constexpr,
@@ -204,6 +205,7 @@ def _chunk_state_fwd_kernel(
     stride_dA_cs_chunk: tl.int64,
     stride_dA_cs_csize: tl.constexpr,
     # Meta-parameters
+    HAS_CHUNK_FLAGS: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -213,6 +215,13 @@ def _chunk_state_fwd_kernel(
     num_pid_n = tl.cdiv(dstate, BLOCK_SIZE_N)
     pid_m = tl.program_id(axis=0) // num_pid_n
     pid_n = tl.program_id(axis=0) % num_pid_n
+    if HAS_CHUNK_FLAGS:
+        # Decode mode: this chunk's state is only consumed when the slot
+        # crosses its chunk boundary this step. Skip the (expensive) state
+        # matmul for all other chunks; their `states` rows keep stale-but-
+        # finite values that downstream never reads.
+        if tl.load(chunk_flags_ptr + pid_c) == 0:
+            return
     chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)
     chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
     b_ptr += chunk_seqlen_start * stride_b_seqlen + (pid_h // nheads_ngroups_ratio) * stride_b_head
@@ -316,7 +325,9 @@ def _chunk_cumsum_fwd(
     return dA_cumsum, dt_out
 
 
-def _chunk_state_fwd(B, x, dt, dA_cumsum, cu_chunk_seqlens, states=None, states_in_fp32=True):
+def _chunk_state_fwd(
+    B, x, dt, dA_cumsum, cu_chunk_seqlens, states=None, states_in_fp32=True, chunk_flags=None
+):
     seqlen, nheads, headdim = x.shape
     _, nchunks, chunk_size = dt.shape
     _, ngroups, dstate = B.shape
@@ -346,6 +357,7 @@ def _chunk_state_fwd(B, x, dt, dA_cumsum, cu_chunk_seqlens, states=None, states_
             dt_ptr=dt,
             dA_cumsum_ptr=dA_cumsum,
             cu_chunk_seqlens_ptr=cu_chunk_seqlens,
+            chunk_flags_ptr=chunk_flags,
             hdim=headdim,
             dstate=dstate,
             chunk_size=chunk_size,
@@ -367,6 +379,7 @@ def _chunk_state_fwd(B, x, dt, dA_cumsum, cu_chunk_seqlens, states=None, states_
             stride_dA_cs_head=dA_cumsum.stride(0),
             stride_dA_cs_chunk=dA_cumsum.stride(1),
             stride_dA_cs_csize=dA_cumsum.stride(2),
+            HAS_CHUNK_FLAGS=chunk_flags is not None,
         )
     return states
 

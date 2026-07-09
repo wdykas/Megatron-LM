@@ -89,6 +89,7 @@ def _chunk_scan_fwd_kernel(
     D_ptr,
     initstates_ptr,
     cu_chunk_seqlens_ptr,
+    target_rows_ptr,
     # Matrix dimensions
     chunk_size: tl.constexpr,
     hdim: tl.constexpr,
@@ -133,6 +134,7 @@ def _chunk_scan_fwd_kernel(
     HAS_D: tl.constexpr,
     D_HAS_HDIM: tl.constexpr,
     HAS_Z: tl.constexpr,
+    HAS_TARGET_ROWS: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -145,6 +147,13 @@ def _chunk_scan_fwd_kernel(
     num_pid_n = tl.cdiv(hdim, BLOCK_SIZE_N)
     pid_m = tl.program_id(axis=0) // num_pid_n
     pid_n = tl.program_id(axis=0) % num_pid_n
+    if HAS_TARGET_ROWS:
+        # Decode-row mode: only row `target_rows[pid_c]` of this chunk's
+        # output is consumed. Skip every M-block that doesn't contain it.
+        # The surviving block executes the exact same instructions as the
+        # ungated kernel — bitwise-identical output for that block.
+        if pid_m != tl.load(target_rows_ptr + pid_c) // BLOCK_SIZE_M:
+            return
     cb_ptr += pid_c * stride_cb_chunk + (pid_h // nheads_ngroups_ratio) * stride_cb_head
     chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)
     chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
@@ -305,13 +314,33 @@ def _chunk_scan_fwd_kernel(
         ).to(tl.float32)
         acc *= z * tl.sigmoid(z)
 
-    out_ptr += chunk_seqlen_start * stride_out_seqlen + pid_h * stride_out_head
-    out_ptrs = out_ptr + (
-        stride_out_seqlen * offs_out_m[:, None] + offs_out_n[None, :] * stride_out_hdim
-    )
-    tl.store(
-        out_ptrs, acc, mask=(offs_out_m[:, None] < chunk_size_limit) & (offs_out_n[None, :] < hdim)
-    )
+    if HAS_TARGET_ROWS:
+        # Compact store: only the target row is consumed downstream, so write
+        # it (alone) to a dense (nchunks, nheads, hdim) output instead of the
+        # full per-token layout. Same acc values as the full store — just a
+        # narrower mask — so bitwise-identical for the consumed row.
+        tr = tl.load(target_rows_ptr + pid_c)
+        out_ptr += pid_c * stride_out_seqlen + pid_h * stride_out_head
+        # All M-lanes alias the same output row (row-stride 0); the mask keeps
+        # only lane `tr`, so exactly one lane stores per column.
+        out_ptrs = out_ptr + (
+            offs_out_m[:, None] * 0 + offs_out_n[None, :] * stride_out_hdim
+        )
+        tl.store(
+            out_ptrs,
+            acc,
+            mask=(offs_out_m[:, None] == tr) & (offs_out_n[None, :] < hdim),
+        )
+    else:
+        out_ptr += chunk_seqlen_start * stride_out_seqlen + pid_h * stride_out_head
+        out_ptrs = out_ptr + (
+            stride_out_seqlen * offs_out_m[:, None] + offs_out_n[None, :] * stride_out_hdim
+        )
+        tl.store(
+            out_ptrs,
+            acc,
+            mask=(offs_out_m[:, None] < chunk_size_limit) & (offs_out_n[None, :] < hdim),
+        )
 
 
 def _chunk_scan_fwd(
@@ -327,6 +356,7 @@ def _chunk_scan_fwd(
     D=None,
     z=None,
     initial_states=None,
+    target_rows=None,
 ):
     assert seq_idx is not None, "this implementation requires seq_idx"
 
@@ -376,6 +406,7 @@ def _chunk_scan_fwd(
         D_ptr=D,
         initstates_ptr=initial_states,
         cu_chunk_seqlens_ptr=cu_chunk_seqlens,
+        target_rows_ptr=target_rows,
         chunk_size=chunk_size,
         hdim=headdim,
         dstate=dstate,
@@ -417,6 +448,7 @@ def _chunk_scan_fwd(
         HAS_D=D is not None,
         D_HAS_HDIM=D.dim() == 2 if D is not None else True,
         HAS_Z=z is not None,
+        HAS_TARGET_ROWS=target_rows is not None,
         BLOCK_SIZE_DSTATE=max(triton.next_power_of_2(dstate), 16),
         IS_TRITON_22=TRITON_22,
         HAS_INITSTATES=initial_states is not None,

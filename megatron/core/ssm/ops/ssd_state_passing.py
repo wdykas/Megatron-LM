@@ -32,6 +32,9 @@ def _state_passing_fwd_kernel(
     initstates_ptr,
     seq_idx_ptr,
     cu_chunk_seqlens_ptr,
+    dst_states_ptr,
+    dst_indices_ptr,
+    dst_flags_ptr,
     # Matrix dimensions
     dim: tl.constexpr,
     nchunks,
@@ -51,8 +54,12 @@ def _state_passing_fwd_kernel(
     stride_initstates_head: tl.int64,
     stride_initstates_dim: tl.constexpr,
     stride_seq_idx_chunk: tl.constexpr,
+    stride_dst_batch: tl.int64,
+    stride_dst_head: tl.int64,
+    stride_dst_dim: tl.constexpr,
     # Meta-parameters
     HAS_INITSTATES: tl.constexpr,
+    HAS_DST_STATES: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid_h = tl.program_id(axis=1)
@@ -97,14 +104,45 @@ def _state_passing_fwd_kernel(
         states = tl.exp(dA_cs) * states + new_states
         tl.store(out_ptrs, states, mask=offs_m < dim)
 
+        if HAS_DST_STATES:
+            # Decode mode: when this chunk's slot crosses its boundary this
+            # step, persist the boundary state straight into the state cache
+            # (dst_states[dst_indices[c]]). Same fp32 value as `out`; the
+            # store converts to the cache dtype exactly like a .to() cast.
+            # Each crossing chunk writes its own slot — no duplicate indices.
+            if tl.load(dst_flags_ptr + c) != 0:
+                dst_idx = tl.load(dst_indices_ptr + c).to(tl.int64)
+                dst_ptrs = (
+                    dst_states_ptr
+                    + dst_idx * stride_dst_batch
+                    + pid_h * stride_dst_head
+                    + offs_m * stride_dst_dim
+                )
+                tl.store(dst_ptrs, states, mask=offs_m < dim)
+
         states_ptrs += stride_states_chunk
         dA_cs_ptr += stride_dA_cs_chunk
         out_ptrs += stride_out_chunk
 
 
 def _state_passing_fwd(
-    states, dA_cumsum, cu_chunk_seqlens, seq_idx, initial_states=None, out_dtype=None
+    states,
+    dA_cumsum,
+    cu_chunk_seqlens,
+    seq_idx,
+    initial_states=None,
+    out_dtype=None,
+    dst_states=None,
+    dst_indices=None,
+    dst_flags=None,
 ):
+    """
+    dst_states/dst_indices/dst_flags (all-or-none): decode-mode fused state
+    snapshot. For each chunk c where dst_flags[c] != 0, the computed boundary
+    state is additionally stored to dst_states[dst_indices[c]] (converted to
+    dst_states' dtype by the store). Lets the decode path persist crossing
+    slots' boundary states without a separate gather/where/scatter pass.
+    """
     nchunks, nheads, dim = states.shape
     chunk_size = dA_cumsum.shape[-1]
     assert dA_cumsum.shape == (nheads, nchunks, chunk_size)
@@ -117,6 +155,15 @@ def _state_passing_fwd(
         if initial_states is not None
         else (0, 0, 0)
     )
+    has_dst = dst_states is not None
+    if has_dst:
+        assert dst_indices is not None and dst_flags is not None
+        assert dst_states.shape[1] == nheads and dst_states.shape[2] == dim
+    dst_strides = (
+        (dst_states.stride(0), dst_states.stride(1), dst_states.stride(2))
+        if has_dst
+        else (0, 0, 0)
+    )
 
     grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE"]), nheads)
     with torch.cuda.device(states.device.index):
@@ -127,6 +174,9 @@ def _state_passing_fwd(
             initstates_ptr=initial_states,
             seq_idx_ptr=seq_idx,
             cu_chunk_seqlens_ptr=cu_chunk_seqlens,
+            dst_states_ptr=dst_states,
+            dst_indices_ptr=dst_indices,
+            dst_flags_ptr=dst_flags,
             dim=dim,
             nchunks=nchunks,
             seqlen=seqlen if seq_idx is not None else 0,
@@ -144,6 +194,10 @@ def _state_passing_fwd(
             stride_initstates_head=initial_states_strides[1],
             stride_initstates_dim=initial_states_strides[2],
             stride_seq_idx_chunk=seq_idx.stride(0),
+            stride_dst_batch=dst_strides[0],
+            stride_dst_head=dst_strides[1],
+            stride_dst_dim=dst_strides[2],
             HAS_INITSTATES=initial_states is not None,
+            HAS_DST_STATES=has_dst,
         )
     return out

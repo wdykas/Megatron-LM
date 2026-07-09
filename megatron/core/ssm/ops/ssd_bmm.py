@@ -68,6 +68,7 @@ def _bmm_chunk_fwd_kernel(
     b_ptr,
     out_ptr,
     cu_chunk_seqlens_ptr,
+    target_rows_ptr,
     # Matrix dimensions
     seqlen,
     chunk_size: tl.constexpr,
@@ -85,6 +86,7 @@ def _bmm_chunk_fwd_kernel(
     stride_outn: tl.constexpr,
     # Meta-parameters
     IS_CAUSAL: tl.constexpr,
+    HAS_TARGET_ROWS: tl.constexpr,
     dot_dtype: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -98,6 +100,18 @@ def _bmm_chunk_fwd_kernel(
     pid_n = tl.program_id(axis=0) % num_pid_n
     if IS_CAUSAL:
         if pid_n * BLOCK_SIZE_N >= (pid_m + 1) * BLOCK_SIZE_M:
+            return
+    if HAS_TARGET_ROWS:
+        # Decode-row mode: only one output row per chunk is consumed
+        # (row `target_rows[pid_c]` of the chunk-scan). Skip every M-block
+        # that doesn't contain it, and every N-block strictly past it (the
+        # scan causally zeroes CB columns > target row, so their values are
+        # never used). The computed block runs the exact same instructions
+        # as the ungated kernel — bitwise-identical output for that block.
+        tr = tl.load(target_rows_ptr + pid_c)
+        if pid_m != tr // BLOCK_SIZE_M:
+            return
+        if pid_n * BLOCK_SIZE_N > tr:
             return
 
     chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)
@@ -140,7 +154,9 @@ def _bmm_chunk_fwd_kernel(
     tl.store(out_ptrs, out, mask=(offs_m[:, None] < chunk_size) & (offs_n[None, :] < chunk_size))
 
 
-def _bmm_chunk_fwd(a, b, chunk_size, cu_chunk_seqlens, causal=False, output_dtype=None):
+def _bmm_chunk_fwd(
+    a, b, chunk_size, cu_chunk_seqlens, causal=False, output_dtype=None, target_rows=None
+):
     """
     Argument:
         a: (seqlen, ngroups, k)
@@ -149,6 +165,10 @@ def _bmm_chunk_fwd(a, b, chunk_size, cu_chunk_seqlens, causal=False, output_dtyp
         cu_chunk_seq_lens: (nchunks+1,)
         causal: if True, then out[i, j] for i > j will be arbitrary, only out[i, j] for i <= j are
             guaranteed to be correct.
+        target_rows: optional (nchunks,) int32 — decode-row mode. Only the M-block
+            containing target_rows[c] (and N-blocks up to it) is computed per chunk;
+            all other output entries are left uninitialized. Bitwise-identical to the
+            full kernel for the computed block.
     Return:
         out: (nchunks, ngroups, chunk_size, chunk_size)
     """
@@ -179,6 +199,7 @@ def _bmm_chunk_fwd(a, b, chunk_size, cu_chunk_seqlens, causal=False, output_dtyp
             b_ptr=b,
             out_ptr=out,
             cu_chunk_seqlens_ptr=cu_chunk_seqlens,
+            target_rows_ptr=target_rows,
             seqlen=seqlen,
             chunk_size=chunk_size,
             K=k,
@@ -194,6 +215,7 @@ def _bmm_chunk_fwd(a, b, chunk_size, cu_chunk_seqlens, causal=False, output_dtyp
             stride_outm=out.stride(-2),
             stride_outn=out.stride(-1),
             IS_CAUSAL=causal,
+            HAS_TARGET_ROWS=target_rows is not None,
             dot_dtype=dot_dtype,
         )
     return out

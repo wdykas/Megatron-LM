@@ -42,6 +42,17 @@ def _full_scan(x, dt, A, B, C, D, dt_bias, chunk_size, initial_states=None):
 class TestBikDecodeBufferedScan(unittest.TestCase):
     """Verify the batch-invariant decode scan matches a full-sequence scan bitwise."""
 
+    @classmethod
+    def setUpClass(cls):
+        # Pin the Mamba autotuners exactly like enable_batch_invariant_mode
+        # does in production: without pinning, autotune timing noise can pick
+        # different tile configs per process and flake the bitwise asserts.
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            _pin_mamba_autotuners,
+        )
+
+        _pin_mamba_autotuners()
+
     def setUp(self):
         torch.manual_seed(0)
         # No global flags: bik_decode_buffered_scan is a pure tensor-ops function
@@ -87,7 +98,10 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
     def _seed_from_prefill(self, bufs, x, dt, B, C, prefill_len, slot, max_batch):
         """Run the prefill through the reference scan, store its ssm_state at
         the slot, and seed the batch-invariant buffer with the partial-chunk tail."""
-        ssm_state = torch.zeros(
+        # Fill with garbage: like production, ssm_state may hold a stale value
+        # (the prefill kernel writes prompt-end state even for prefills shorter
+        # than a chunk). Seeding is responsible for zeroing it in that case.
+        ssm_state = torch.randn(
             max_batch, self.nh, self.headdim, self.dstate,
             device=self.device, dtype=self.dtype,
         )
@@ -113,7 +127,7 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
             B[0, :prefill_len],
             C[0, :prefill_len],
             torch.zeros_like(x[0, :prefill_len]),  # z unused
-            cu, batch_indices,
+            cu, batch_indices, ssm_state,
         )
         return ssm_state
 
@@ -162,7 +176,7 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
                 )
 
     def test_short_prefill_zero_state_path(self):
-        """prefill_len < chunk_size: state_is_zero path, no boundary state."""
+        """prefill_len < chunk_size: no boundary state — seeding must zero the cache."""
         max_batch, slot = 2, 0
         for prefill_len in [1, 7, 16, 31]:
             with self.subTest(prefill_len=prefill_len):
@@ -175,8 +189,9 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
                 ssm_state = self._seed_from_prefill(
                     bufs, x, dt, B, C, prefill_len, slot, max_batch,
                 )
-                # Sanity: state_is_zero should be True here.
-                self.assertTrue(bool(bufs.state_is_zero[slot].item()))
+                # Sanity: seeding must have zeroed the (garbage) state cache
+                # for this slot, since no chunk boundary was crossed.
+                self.assertEqual(ssm_state[slot].abs().max().item(), 0.0)
                 y_bik = self._decode_one_step(
                     bufs, x, dt, B, C, prefill_len, slot, ssm_state,
                 )
@@ -268,6 +283,50 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
                 y_bik[i, 0], y_refs[i],
                 f"multi-slot slot={slots[i]} prefill_len={plen}",
             )
+
+    def test_inactive_padding_lanes(self):
+        """batch_indices mixing -1 padding lanes with active slot 0 (the CUDA-
+        graph padding pattern). Padding lanes must not perturb slot 0's buffer
+        or output — they are redirected to the buffers' trash row."""
+        max_batch, slot = 2, 0
+        prefill_len = 50
+        n_decode = 8
+        total = prefill_len + n_decode
+        x, dt, B, C = self._make_seq(total)
+        y_full, _ = _full_scan(
+            x, dt, self.A, B, C, self.D, self.dt_bias, self.chunk_size,
+        )
+
+        bufs = self._make_bufs(max_batch)
+        ssm_state = self._seed_from_prefill(
+            bufs, x, dt, B, C, prefill_len, slot, max_batch,
+        )
+        batch_indices = torch.tensor([slot, -1, -1], dtype=torch.int32, device=self.device)
+        for k in range(n_decode):
+            pos = prefill_len + k
+            # Lane 0 carries the real token; padding lanes carry garbage.
+            def pad3(t):
+                junk = torch.randn(
+                    2, *t.shape[1:], device=t.device, dtype=t.dtype
+                )
+                return torch.cat([t, junk], dim=0)
+
+            y_bik = bik_decode_buffered_scan(
+                bufs,
+                pad3(x[:, pos : pos + 1]),
+                pad3(dt[:, pos : pos + 1]),
+                pad3(B[:, pos : pos + 1]),
+                pad3(C[:, pos : pos + 1]),
+                None,
+                self.A, self.D, self.dt_bias,
+                batch_indices,
+                ssm_state,
+            )
+            self._assert_bitwise(
+                y_bik[0, 0], y_full[0, pos], f"padded step k={k}"
+            )
+            # Padding lanes must return zeros.
+            self.assertEqual(y_bik[1:].abs().max().item(), 0.0)
 
     def test_deterministic_across_calls(self):
         """Same inputs → bitwise-identical output across repeated invocations."""
