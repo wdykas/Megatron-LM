@@ -190,6 +190,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
                     oracle_checkpoint=args.rl_compaction_oracle_checkpoint,
                     budget_final=args.rl_compaction_budget_final,
                     budget_anneal_iters=args.rl_compaction_budget_anneal_iters,
+                    score_weighting=args.rl_compaction_score_weighting,
                 )
                 log_single_rank(logger, logging.INFO,
                                 f"[kv-compaction] live rollout compaction: "

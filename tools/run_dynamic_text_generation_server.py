@@ -45,6 +45,12 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
         help="Skip live compaction for prompts shorter than this.",
     )
     parser.add_argument(
+        "--kv-compaction-score-weighting", choices=["none", "value_norm"],
+        default="none",
+        help="Weight snapkv selection scores by per-token value norms "
+             "(VATP-style attention x ||v|| output contribution).",
+    )
+    parser.add_argument(
         "--kv-compaction-compactor-checkpoint", type=str, default=None,
         help="Trained compactor checkpoint for --kv-compaction-strategy belief_still.",
     )
@@ -178,6 +184,7 @@ if __name__ == "__main__":
                 rope_mode=args.kv_compaction_rope_mode,
                 flywheel_dir=args.kv_compaction_flywheel_dir,
                 archive_transfer=args.kv_compaction_archive_transfer,
+                score_weighting=args.kv_compaction_score_weighting,
             )
             print(f"[kv-compaction] live compaction enabled: "
                   f"{args.kv_compaction_strategy} @ {args.kv_compaction_budget_ratio}")

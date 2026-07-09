@@ -2355,6 +2355,10 @@ def _add_rl_args(parser):
                             'request runs with live compaction (kv_compact arm); the '
                             'rest decode over the full cache as the control arm. None '
                             '= compact every rollout. Requires --rl-compaction-mode live.')
+    group.add_argument('--rl-compaction-score-weighting', type=str, default='none',
+                       choices=['none', 'value_norm'],
+                       help='Weight snapkv selection scores by per-token value norms '
+                            '(VATP-style attention x ||v|| output contribution).')
     group.add_argument('--rl-compaction-n-compress', type=int, default=64,
                        help='Number of synthetic memory slots C for Still/Belief-Still.')
     group.add_argument('--rl-compaction-chunk-size', type=int, default=256,

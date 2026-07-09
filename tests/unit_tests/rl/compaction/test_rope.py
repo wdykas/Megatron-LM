@@ -248,3 +248,43 @@ class TestOverwriteKeys:
         hook = MegatronInferenceHook(ctx)
         with pytest.raises(RuntimeError, match="KV length"):
             hook.overwrite_keys_for_request(0, torch.zeros(1, 3, 1, 1))
+
+
+class TestScoreWeighting:
+    """Value-norm (VATP) weighting of the snapkv joint selection scores."""
+
+    def _compactor(self, weighting="none"):
+        from megatron.rl.compaction.kv.serving.live import LiveKVCompactor
+        return LiveKVCompactor(
+            _StubEngine("none"), strategy="streaming_llm", budget_ratio=0.5,
+            score_weighting=weighting)
+
+    def test_invalid_weighting_rejected(self):
+        import pytest
+        with pytest.raises(ValueError, match="score_weighting"):
+            self._compactor("bogus")
+
+    def test_value_norm_reorders_selection(self):
+        # Two prefix keys with identical attention mass; the one with the
+        # much larger value vector must win under value_norm and the scores
+        # must be unchanged under 'none'.
+        torch.manual_seed(0)
+        L, S, Hkv, D = 2, 12, 1, 16
+        keys = torch.randn(L, S, Hkv, D, device="cuda") * 0.01  # near-flat attn
+        values = torch.ones(L, S, Hkv, D, device="cuda")
+        values[:, 3] *= 50.0                                    # heavy value at pos 3
+        q_rows = [torch.randn(4, Hkv, D, device="cuda") * 0.01 for _ in range(L)]
+
+        base = self._compactor("none")
+        weighted = self._compactor("value_norm")
+        s_none = base._aggregate_snapkv_scores(keys, q_rows, values=values)
+        s_vn = weighted._aggregate_snapkv_scores(keys, q_rows, values=values)
+        assert s_none.shape == s_vn.shape == (S,)
+        # 'none' ignores values entirely (same result with/without them).
+        s_none2 = base._aggregate_snapkv_scores(keys, q_rows, values=None)
+        assert torch.allclose(s_none, s_none2)
+        # value_norm boosts the heavy-value position; max-pooling (kernel 7)
+        # plateaus the boost across positions within kernel//2 of pos 3, so
+        # compare against a prefix position OUTSIDE the pool window.
+        assert (s_vn[3] / s_none[3]) > 10.0
+        assert s_vn[3] > 5.0 * s_vn[7]

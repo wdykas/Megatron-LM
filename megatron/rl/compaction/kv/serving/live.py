@@ -83,6 +83,7 @@ class LiveKVCompactor:
         archive_transfer: str = "pinned",
         budget_final: float | None = None,
         budget_anneal_iters: int | None = None,
+        score_weighting: str = "none",
     ) -> None:
         if strategy not in _LIVE_STRATEGIES:
             # Route through the factory for the canonical error (h2o explains
@@ -114,6 +115,15 @@ class LiveKVCompactor:
             if budget_anneal_iters < 1:
                 raise ValueError(
                     f"budget_anneal_iters must be >= 1, got {budget_anneal_iters}")
+        if score_weighting not in ("none", "value_norm"):
+            raise ValueError(
+                f"score_weighting must be 'none' or 'value_norm', got {score_weighting!r}")
+        # value_norm (VATP-style): weight each key's attention mass by its
+        # value vector's norm before aggregating across layers — attention x
+        # ||v|| approximates the key's actual contribution to the output.
+        # Offline captures: -13% tail MSE at keep 0.2, mixed at 0.1; task
+        # evals arbitrate (grid arm 'snapkv+vnorm').
+        self.score_weighting = score_weighting
         self.obs_window = obs_window
         self.pool_kernel = pool_kernel
         self.n_sink = n_sink
@@ -507,7 +517,7 @@ class LiveKVCompactor:
 
             if self.strategy == "snapkv":
                 q_rows = self._request_q(q0, q1)            # per layer (Tq, Hq, D)
-                scores = self._aggregate_snapkv_scores(k, q_rows)
+                scores = self._aggregate_snapkv_scores(k, q_rows, values=v)
                 positions = _select_recent_plus_heavy(
                     scores, S, budget, n_recent=min(self.obs_window, budget)
                 )
@@ -726,14 +736,18 @@ class LiveKVCompactor:
         return out
 
     def _aggregate_snapkv_scores(
-        self, keys: torch.Tensor, q_rows: list[torch.Tensor]
+        self, keys: torch.Tensor, q_rows: list[torch.Tensor],
+        values: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Token-level SnapKV score: window attention summed over layers, KV heads,
-        and their grouped query heads. keys (L, S, Hkv, D); q_rows[l] (Tq, Hq, D)."""
+        and their grouped query heads. keys (L, S, Hkv, D); q_rows[l] (Tq, Hq, D).
+        With score_weighting 'value_norm', each layer's mass is multiplied by
+        the per-token value norm (attention x ||v|| = output contribution)."""
         L, S, Hkv, D = keys.shape
         scores = torch.zeros(S, device=keys.device, dtype=torch.float32)
         scale = 1.0 / math.sqrt(D)
         Tq = q_rows[0].shape[0]
+        use_vnorm = self.score_weighting == "value_norm" and values is not None
         # CAUSAL mask for the observation window (official SnapKV): window
         # query i (the (S - Tq + i)-th token) must not attend to later keys.
         col = torch.arange(S, device=keys.device)
@@ -750,7 +764,11 @@ class LiveKVCompactor:
             logits = qb @ kb.transpose(1, 2) * scale            # (Hkv, Tq*grp, S)
             mask = future.repeat_interleave(group, dim=0)       # (Tq*grp, S)
             attn = torch.softmax(logits.masked_fill(mask, float("-inf")), dim=-1)
-            scores += attn.sum(dim=(0, 1))
+            layer_mass = attn.sum(dim=(0, 1))                   # (S,)
+            if use_vnorm:
+                # values (L, S, Hkv, Dv) -> per-token norm over heads+dims.
+                layer_mass = layer_mass * values[l].float().reshape(S, -1).norm(dim=1)
+            scores += layer_mass
         # Pool over PREFIX scores only (official drops the window columns
         # before pooling): pooling across the boundary leaks the window keys'
         # large scores into the last pool_kernel//2 prefix positions.
