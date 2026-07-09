@@ -70,6 +70,9 @@ class KVArchive:
         self._staged_key: tuple[int, int] | None = None
         self._staged: tuple[torch.Tensor, torch.Tensor, torch.cuda.Event] | None = None
         self.prefetch_hits = 0
+        # Overlapped trigger engine: per-request epoch state (see
+        # build_trigger_epoch/launch_score/poll_verdict).
+        self._trigger_epochs: dict[int, KVArchive._TriggerEpoch] = {}
 
     # ------------------------------------------------------------------
     # Store (called at prune time)
@@ -165,6 +168,161 @@ class KVArchive:
                 best = torch.maximum(best, alphas)
         return best, [e.span_id for e in entries]
 
+    # ------------------------------------------------------------------
+    # Overlapped trigger engine (CUDA-graph-era serving path)
+    #
+    # The eager per-step path (span_alphas + host EMA/CUSUM) costs a device
+    # sync, a full retained-KV gather, and an L*H Python matmul loop on the
+    # decode critical path EVERY step. The overlapped engine removes all
+    # three: per-request state is cached per EPOCH (rebuilt only on
+    # compaction/retrieval events or every refresh interval), scoring runs
+    # batched on a SIDE stream reading a snapshot of the step's Q, EMA/CUSUM
+    # update on-device, and only a 6-scalar verdict crosses to pinned host
+    # memory asynchronously. The verdict is consumed ONE STEP LATE — the
+    # CUSUM already integrates evidence across steps, so a one-token delay
+    # is semantically free. The main stream waits only on the tiny Q-row
+    # snapshot, so heavy scoring fully overlaps the next decode step.
+    # ------------------------------------------------------------------
+
+    class _TriggerEpoch:
+        __slots__ = ("span_ids", "centroids", "counts", "retained", "ema",
+                     "cusum", "seeded", "q_scratch", "verdict_dev",
+                     "verdict_host", "event", "launched", "age")
+
+    def build_trigger_epoch(self, request_id: int,
+                            retained_keys: torch.Tensor) -> None:
+        """(Re)build cached trigger state for one request.
+
+        retained_keys (L, C, H, D) is gathered ONCE here — not per step.
+        EMA/CUSUM state survives the rebuild for surviving span_ids (the
+        chronic-heat suppression must not reset every epoch)."""
+        rid = int(request_id)
+        entries = self._spans.get(rid)
+        if not entries:
+            self._trigger_epochs.pop(rid, None)
+            return
+        dev = retained_keys.device
+        ep = KVArchive._TriggerEpoch()
+        ep.span_ids = [e.span_id for e in entries]
+        # (L, H, n, D) stacked centroids; counts (n,)
+        ep.centroids = torch.stack([e.centroids for e in entries], dim=2).float()
+        ep.counts = torch.tensor([len(e.positions) for e in entries],
+                                 device=dev, dtype=torch.float32)
+        ep.retained = retained_keys.float()
+        n = len(entries)
+        ep.ema = torch.zeros(n, device=dev)
+        ep.cusum = torch.zeros(n, device=dev)
+        ep.seeded = False
+        prev = self._trigger_epochs.get(rid)
+        if prev is not None and prev.seeded:
+            # carry state for surviving spans (matched by span_id)
+            old = {sid: i for i, sid in enumerate(prev.span_ids)}
+            keep = [(j, old[sid]) for j, sid in enumerate(ep.span_ids)
+                    if sid in old]
+            if keep:
+                jj = torch.tensor([j for j, _ in keep], device=dev)
+                oo = torch.tensor([o for _, o in keep], device=dev)
+                ep.ema[jj] = prev.ema[oo]
+                ep.cusum[jj] = prev.cusum[oo]
+                ep.seeded = True
+        ep.q_scratch = None      # (L, Hq, D) allocated on first launch
+        # verdict: [fire_idx, fire_alpha, best_idx, best_cusum, alpha_max, n]
+        ep.verdict_dev = torch.zeros(6, device=dev)
+        ep.verdict_host = torch.zeros(6, device="cpu", pin_memory=True)
+        ep.event = torch.cuda.Event()
+        ep.launched = False
+        ep.age = 0
+        self._trigger_epochs[rid] = ep
+
+    def trigger_epoch_valid(self, request_id: int, refresh_every: int = 32) -> bool:
+        ep = self._trigger_epochs.get(int(request_id))
+        return ep is not None and ep.age < refresh_every
+
+    def invalidate_trigger_epoch(self, request_id: int) -> None:
+        self._trigger_epochs.pop(int(request_id), None)
+
+    def launch_score(self, request_id: int, q_rows: list[torch.Tensor],
+                     stream: torch.cuda.Stream, alpha_thr: float,
+                     cusum_thr: float, ema_decay: float,
+                     cusum_drift: float) -> None:
+        """Enqueue this step's trigger scoring on `stream` (no sync).
+
+        q_rows: per-layer (Hq, D) views of THIS step's Q (static buffers under
+        graphed decode). The main stream is made to wait only on the tiny
+        Q snapshot; everything downstream overlaps the next decode step."""
+        rid = int(request_id)
+        ep = self._trigger_epochs.get(rid)
+        if ep is None:
+            return
+        main = torch.cuda.current_stream()
+        L, C, H, D = ep.retained.shape
+        with torch.cuda.stream(stream):
+            stream.wait_stream(main)                    # replay wrote Q
+            q = torch.stack([r.float() for r in q_rows])   # snapshot (L,Hq,D)
+            if ep.q_scratch is None:
+                ep.q_scratch = torch.empty_like(q)
+            ep.q_scratch.copy_(q)
+            snap_done = torch.cuda.Event()
+            snap_done.record(stream)
+            Hq = ep.q_scratch.shape[1]
+            group = Hq // H
+            qg = ep.q_scratch.view(L, H, group, D).mean(dim=2)   # (L, H, D)
+            scale = 1.0 / math.sqrt(D)
+            # retained logits (L, C, H) and centroid logits (L, H, n)
+            lr = torch.einsum("lchd,lhd->lch", ep.retained, qg) * scale
+            le = torch.einsum("lhnd,lhd->lhn", ep.centroids, qg) * scale
+            mx = torch.maximum(lr.amax(dim=1),                  # (L, H)
+                               le.amax(dim=2))
+            denom_r = torch.exp(lr - mx[:, None, :]).sum(dim=1)     # (L, H)
+            mass = ep.counts[None, None, :] * torch.exp(le - mx[..., None])
+            alphas = (mass / (denom_r[..., None] + mass.sum(dim=2, keepdim=True)))
+            a = alphas.amax(dim=(0, 1))                          # (n,)
+            if not ep.seeded:
+                ep.ema.copy_(a)                                  # seed = first alpha
+                ep.seeded = True
+            ep.cusum.copy_(torch.clamp(ep.cusum + a - ep.ema - cusum_drift,
+                                       min=0.0))
+            ep.ema.mul_(ema_decay).add_(a, alpha=1.0 - ema_decay)
+            fired = (a >= alpha_thr) | (ep.cusum >= cusum_thr)
+            fire_alpha = torch.where(fired, a, torch.zeros_like(a))
+            v = ep.verdict_dev
+            v[0] = torch.where(fired.any(), fire_alpha.argmax().float(),
+                               torch.tensor(-1.0, device=a.device))
+            v[1] = fire_alpha.max()
+            v[2] = ep.cusum.argmax().float()
+            v[3] = ep.cusum.max()
+            v[4] = a.max()
+            v[5] = float(len(ep.span_ids))
+            ep.verdict_host.copy_(v, non_blocking=True)
+            ep.event.record(stream)
+        # Next replay may overwrite the Q buffers only after the snapshot.
+        main.wait_event(snap_done)
+        ep.launched = True
+        ep.age += 1
+
+    def poll_verdict(self, request_id: int):
+        """Non-blocking read of the LAST launched verdict.
+
+        Returns (fire_span_id | None, fire_alpha, best_span_id, best_cusum,
+        alpha_max, n_spans) or None when nothing is ready. Never syncs."""
+        ep = self._trigger_epochs.get(int(request_id))
+        if ep is None or not ep.launched or not ep.event.query():
+            return None
+        v = ep.verdict_host
+        fire_i = int(v[0].item())
+        n = len(ep.span_ids)
+        best_i = min(max(int(v[2].item()), 0), n - 1)
+        return (ep.span_ids[fire_i] if 0 <= fire_i < n else None,
+                float(v[1]), ep.span_ids[best_i], float(v[3]),
+                float(v[4]), n)
+
+    def span_index(self, request_id: int, span_id: int) -> int | None:
+        entries = self._spans.get(int(request_id), [])
+        for i, e in enumerate(entries):
+            if e.span_id == span_id:
+                return i
+        return None
+
     def prefetch(self, request_id: int, span_idx: int, stream: torch.cuda.Stream) -> None:
         """Start the CPU→GPU copy of one span on a side stream (speculative).
 
@@ -255,6 +413,7 @@ class KVArchive:
         for sp in (remaining or []):
             self._store.drop(sp.span_id)
         self._flush_flywheel(request_id, remaining)
+        self._trigger_epochs.pop(int(request_id), None)
         if self._staged_key is not None and self._staged_key[0] == int(request_id):
             self._staged_key = None
             self._staged = None
@@ -266,6 +425,8 @@ class KVArchive:
             for sp in dead:
                 self._store.drop(sp.span_id)
             self._flush_flywheel(rid, dead)
+        for rid in [r for r in self._trigger_epochs if r not in live_ids]:
+            del self._trigger_epochs[rid]
         for rid in [r for r in self._restored if r not in live_ids]:
             self._flush_flywheel(rid, None)
         if self._staged_key is not None and self._staged_key[0] not in live_ids:

@@ -213,3 +213,78 @@ class TestKVArchive:
         arch.prefetch(5, 0, torch.cuda.Stream())
         arch.drop_all_except(set())
         assert arch.empty and arch._staged_key is None
+
+
+class TestOverlappedTriggerEngine:
+    """The overlapped engine (epoch cache + side-stream batched scoring +
+    device EMA/CUSUM + async verdict) must match the reference eager math
+    (span_alphas + host EMA/CUSUM) step for step."""
+
+    def _setup(self, S=48, L=2, H=1, D=8, seed=3):
+        g = torch.Generator(device="cuda").manual_seed(seed)
+        k = torch.randn(L, S, H, D, device="cuda", generator=g)
+        v = torch.randn(L, S, H, D, device="cuda", generator=g)
+        u = torch.randn(L, H, D, device="cuda", generator=g)
+        u = 5.0 * u / u.norm(dim=-1, keepdim=True)
+        k[:, 36:40] += u.unsqueeze(1)                 # needle span
+        arch = KVArchive(max_span=4)
+        retained = list(range(24))
+        arch.store_evicted(5, k, v, retained)
+        return arch, k[:, retained], u, k
+
+    def test_alpha_parity_and_verdict(self):
+        arch, retained_k, u, k = self._setup()
+        L, _, H, D = k.shape
+        alpha_thr, cusum_thr, decay, drift = 0.2, 0.4, 0.9, 0.02
+        stream = torch.cuda.Stream()
+        # Hq == H (group of 1); Q per layer = the planted direction
+        q_rows = [u[li] for li in range(L)]
+
+        # reference eager: alphas + host EMA/CUSUM over 3 identical steps
+        state = {}
+        ref_fire = []
+        for _ in range(3):
+            alphas, span_ids = arch.span_alphas(5, q_rows, retained_k)
+            fired_any = False
+            for a, sid in zip(alphas.tolist(), span_ids):
+                b, Sc = state.get(sid, (a, 0.0))
+                Sc = max(0.0, Sc + a - b - drift)
+                b = decay * b + (1.0 - decay) * a
+                state[sid] = (b, Sc)
+                fired_any |= (a >= alpha_thr or Sc >= cusum_thr)
+            ref_fire.append(fired_any)
+
+        # overlapped engine on the same inputs
+        arch.build_trigger_epoch(5, retained_k)
+        got_fire = []
+        for _ in range(3):
+            arch.launch_score(5, q_rows, stream, alpha_thr, cusum_thr,
+                              decay, drift)
+            torch.cuda.synchronize()                  # deterministic test only
+            verdict = arch.poll_verdict(5)
+            assert verdict is not None
+            fire_sid, fire_alpha, best_sid, best_S, a_max, n = verdict
+            got_fire.append(fire_sid is not None)
+        assert got_fire == ref_fire
+        # the needle span dominates: engine's alpha_max matches eager alphas
+        alphas, span_ids = arch.span_alphas(5, q_rows, retained_k)
+        assert abs(a_max - float(alphas.max())) < 1e-4
+        assert fire_sid == span_ids[int(alphas.argmax())]
+
+    def test_epoch_state_survives_rebuild(self):
+        arch, retained_k, u, k = self._setup()
+        L = k.shape[0]
+        stream = torch.cuda.Stream()
+        q_rows = [u[li] for li in range(L)]
+        arch.build_trigger_epoch(5, retained_k)
+        arch.launch_score(5, q_rows, stream, 0.9, 9.9, 0.9, 0.02)
+        torch.cuda.synchronize()
+        ema_before = arch._trigger_epochs[5].ema.clone()
+        arch.build_trigger_epoch(5, retained_k)      # same span set
+        assert torch.allclose(arch._trigger_epochs[5].ema, ema_before)
+
+    def test_epoch_gc_on_drop(self):
+        arch, retained_k, u, k = self._setup()
+        arch.build_trigger_epoch(5, retained_k)
+        arch.drop(5)
+        assert 5 not in arch._trigger_epochs

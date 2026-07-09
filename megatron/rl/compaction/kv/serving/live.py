@@ -154,9 +154,10 @@ class LiveKVCompactor:
         self.max_retrievals_per_request = max_retrievals_per_request
         self._archive = None
         self._retrieval_counts: dict[int, int] = {}
-        # rid -> span_id -> [ema_baseline, cusum_S]
-        self._trigger_state: dict[int, dict[int, list[float]]] = {}
         self._prefetch_stream: torch.cuda.Stream | None = None
+        # Side stream for the overlapped trigger: scoring for step t runs
+        # concurrently with step t+1's decode; verdicts are polled next step.
+        self._trigger_stream: torch.cuda.Stream | None = None
         if archive:
             if strategy == "belief_still":
                 raise ValueError(
@@ -179,6 +180,7 @@ class LiveKVCompactor:
             self._archive = KVArchive(flywheel_dir=flywheel_dir,
                                       transfer=archive_transfer)
             self._prefetch_stream = torch.cuda.Stream()
+            self._trigger_stream = torch.cuda.Stream()
         self.rope_mode = rope_mode
         self._inv_freq: torch.Tensor | None = None
         self._rope_interleaved = False
@@ -224,7 +226,11 @@ class LiveKVCompactor:
 
         self._ctx = engine.context
         self._hook = MegatronInferenceHook(self._ctx)
-        self._capturing = False
+        # Archive mode captures Q on EVERY step — and must already be armed
+        # when the engine captures its decode CUDA graphs at startup (before
+        # any begin_step), or the wrapper's static-buffer copy_ never gets
+        # baked into the graphs and the trigger sees stale Q forever.
+        self._capturing = bool(archive)
         self._prefill_rids: list[tuple[int, int, int]] = []
         self._q_per_layer: list[torch.Tensor] = []
         if strategy == "snapkv" or archive:
@@ -274,11 +280,32 @@ class LiveKVCompactor:
                     # (S, B, Hq, D) with B=1 → packed (T, Hq, D); THD stays as-is.
                     if qq.dim() == 4:
                         qq = qq.transpose(0, 1).reshape(-1, qq.shape[-2], qq.shape[-1])
+                    # Eager path (prefill selection windows, eager decode):
+                    # a Python reference to this step's packed Q.
                     self._q_per_layer[idx] = qq.detach()
+                    # CUDA-graph path: a fixed-shape copy_ into OUR static
+                    # buffer. Baked into the decode graph at capture, it
+                    # refreshes the buffer on every replay even though this
+                    # Python wrapper never re-runs — the trigger reads the
+                    # buffer between steps. Rows are active-slice order (one
+                    # token per request on decode steps); prefill calls with
+                    # more rows than the buffer skip (branch re-evaluated
+                    # eagerly; under capture the decode shape is what bakes).
+                    buf = self._q_static[idx]
+                    if buf is None and not torch.cuda.is_current_stream_capturing():
+                        # Allocated on the first EAGER call (warmup precedes
+                        # graph capture) — allocating during capture is illegal.
+                        buf = self._q_static[idx] = torch.empty(
+                            self._max_requests, qq.shape[-2], qq.shape[-1],
+                            device=qq.device, dtype=qq.dtype)
+                    if buf is not None and qq.shape[0] <= buf.shape[0]:
+                        buf[: qq.shape[0]].copy_(qq)
                 return orig(q, k, v, *args, **kwargs)
             return wrapped
 
         self._q_per_layer = [None] * len(attns)  # type: ignore[list-item]
+        self._q_static: list[torch.Tensor | None] = [None] * len(attns)
+        self._max_requests = int(getattr(engine.context, "max_requests", 512) or 512)
         for i, attn in enumerate(attns):
             attn.flash_decode_and_prefill = _wrap(i, attn.flash_decode_and_prefill)
 
@@ -385,20 +412,31 @@ class LiveKVCompactor:
             del self._logical_pos[rid]
 
     def retrieve_for_decoding_requests(self) -> None:
-        """Negative-cache retrieval: restore archived spans the decode queries ask for.
+        """Negative-cache retrieval, fully overlapped with decode.
 
-        Runs post-bookkeep on decode-only steps. Uses this step's captured Q
-        (one token per active request, active-slice order under eager decode).
+        Two passes per decode step, both between forwards (host code — legal
+        under graphed decode):
+          CONSUME — poll LAST step's verdict (event query, never syncs); on a
+          fire, restore the span and invalidate the request's trigger epoch.
+          LAUNCH  — enqueue THIS step's scoring on a side stream reading a
+          snapshot of the step's Q (static buffers under CUDA graphs); the
+          main stream waits only on the tiny snapshot, so the heavy math
+          overlaps the next decode step. Verdicts land one step late — the
+          CUSUM integrates across steps, so the delay is semantically free.
         """
         ctx = self._ctx
         n_active = ctx.total_request_count - ctx.paused_request_count
         if n_active <= 0 or self._archive.empty:
             return
         if any(q is None for q in self._q_per_layer):
-            raise RuntimeError(
-                "archive mode: no Q captured this decode step — decode ran under a "
-                "CUDA graph. Archive retrieval needs fully eager decoding: launch "
-                "with --cuda-graph-impl none.")
+            if any(b is None for b in self._q_static):
+                raise RuntimeError(
+                    "archive mode: no decode Q available — the static Q buffers "
+                    "were never allocated (no eager warmup call before graph "
+                    "capture?).")
+            q_rows = self._q_static
+        else:
+            q_rows = self._q_per_layer
         live_ids = set()
         for b_local in range(n_active):
             b_global = ctx.paused_request_count + b_local
@@ -408,64 +446,45 @@ class LiveKVCompactor:
                 continue
             if self._retrieval_counts.get(rid, 0) >= self.max_retrievals_per_request:
                 continue
-            k, v = self._hook.get_kv_for_request(b_local)      # (L, C, H, D)
-            q_step = [q[b_local] for q in self._q_per_layer]   # per layer (Hq, D)
-            scored = self._archive.span_alphas(rid, q_step, k)
-            if scored is None:
-                continue
-            alphas, span_ids = scored
-            state = self._trigger_state.setdefault(rid, {})
-            fire_idx, fire_alpha, best_S, best_idx = -1, 0.0, 0.0, -1
-            for i, (a, sid) in enumerate(zip(alphas.tolist(), span_ids)):
-                b, S = state.get(sid, (a, 0.0))     # EMA seeds at first sight
-                S = max(0.0, S + a - b - self.cusum_drift)
-                b = self.ema_decay * b + (1.0 - self.ema_decay) * a
-                state[sid] = [b, S]
-                if S > best_S:
-                    best_S, best_idx = S, i
-                fired = a >= self.retrieval_alpha or S >= self.retrieval_cusum
-                if fired and a > fire_alpha:
-                    fire_idx, fire_alpha = i, a
-            if os.environ.get("KV_COMPACTION_DEBUG"):
-                logger.info(
-                    "[kv-retrieval] request id=%d: alpha max %.3f (fast %.2f) "
-                    "cusum max %.3f (h %.2f) spans=%d",
-                    rid, float(alphas.max()), self.retrieval_alpha,
-                    best_S, self.retrieval_cusum, len(span_ids))
-            if fire_idx < 0:
-                # Speculative staging: the leading CUSUM candidate is warming
-                # up toward the firing threshold — start its PCIe copy early.
-                if best_idx >= 0 and (best_S >= self.retrieval_cusum / 2
-                                      or float(alphas[best_idx]) >= self.retrieval_alpha / 2):
-                    self._archive.prefetch(rid, best_idx, self._prefetch_stream)
-                continue
-            span_idx = fire_idx
-            state.pop(span_ids[span_idx], None)
-            ak, av, apos = self._archive.take(rid, span_idx)  # staged GPU or pinned CPU
-            was_staged = ak.is_cuda
-            ak, av = ak.cuda(), av.cuda()
-            if self.rope_mode == "renumber":
-                from .rope import delta_rotate_keys
-                start = int(ctx.request_kv_length_offsets[b_global].item())
-                old_pos = torch.tensor(apos, device=ak.device, dtype=torch.long)
-                new_pos = torch.arange(start, start + ak.shape[1], device=ak.device)
-                ak = delta_rotate_keys(
-                    ak, old_pos, new_pos, self._inv_freq, self._rope_interleaved)
-            self._hook.append_kv_to_request(b_local, ak, av)
-            self._repoint_pending_token(
-                b_local, b_global, int(ctx.request_kv_length_offsets[b_global]))
-            ctx.request_output_lengths[b_global] += ak.shape[1]
-            self._retrieval_counts[rid] = self._retrieval_counts.get(rid, 0) + 1
-            logger.info(
-                "[kv-retrieval] request id=%d: restored %d tokens (alpha %.3f, "
-                "%d spans left, %s)", rid, ak.shape[1], fire_alpha,
-                len(self._archive._spans.get(rid, [])),
-                "prefetched" if was_staged else "sync copy")
+
+            # -------- CONSUME: last step's verdict (never syncs) --------
+            verdict = self._archive.poll_verdict(rid)
+            if verdict is not None:
+                fire_sid, fire_alpha, best_sid, best_S, alpha_max, n_spans = verdict
+                if os.environ.get("KV_COMPACTION_DEBUG"):
+                    logger.info(
+                        "[kv-retrieval] request id=%d: alpha max %.3f (fast %.2f) "
+                        "cusum max %.3f (h %.2f) spans=%d",
+                        rid, alpha_max, self.retrieval_alpha,
+                        best_S, self.retrieval_cusum, n_spans)
+                if fire_sid is not None:
+                    span_idx = self._archive.span_index(rid, fire_sid)
+                    if span_idx is not None:
+                        self._restore_span(b_local, b_global, rid, span_idx,
+                                           fire_alpha)
+                        # span set changed: rebuild the epoch before scoring
+                        self._archive.invalidate_trigger_epoch(rid)
+                elif (best_S >= self.retrieval_cusum / 2
+                      or alpha_max >= self.retrieval_alpha / 2):
+                    # Speculative staging: the leading candidate is warming
+                    # toward the threshold — start its PCIe copy early.
+                    idx = self._archive.span_index(rid, best_sid)
+                    if idx is not None:
+                        self._archive.prefetch(rid, idx, self._prefetch_stream)
+
+            # -------- LAUNCH: this step's scoring (side stream) --------
+            if not self._archive.trigger_epoch_valid(rid):
+                k, _ = self._hook.get_kv_for_request(b_local)   # once per epoch
+                self._archive.build_trigger_epoch(rid, k)
+            self._archive.launch_score(
+                rid, [q[b_local] for q in q_rows], self._trigger_stream,
+                self.retrieval_alpha, self.retrieval_cusum,
+                self.ema_decay, self.cusum_drift)
+
         self._archive.drop_all_except(live_ids)
         for rid in [r for r in self._retrieval_counts if r not in live_ids]:
             del self._retrieval_counts[rid]
-        for rid in [r for r in self._trigger_state if r not in live_ids]:
-            del self._trigger_state[rid]
+
 
     def compact_prefilled_requests(self, is_decode_only: bool) -> None:
         """Prune the paged KV of every request whose prefill just completed.
@@ -680,6 +699,31 @@ class LiveKVCompactor:
             self._updater = GatedRecurrentUpdater(
                 cfg, params_dtype=torch.bfloat16, pg_collection=pgc,
             ).cuda().to(torch.bfloat16).eval()
+
+    def _restore_span(self, b_local: int, b_global: int, rid: int,
+                      span_idx: int, fire_alpha: float) -> None:
+        """Restore one archived span into the request's live cache."""
+        ctx = self._ctx
+        ak, av, apos = self._archive.take(rid, span_idx)  # staged GPU or pinned CPU
+        was_staged = ak.is_cuda
+        ak, av = ak.cuda(), av.cuda()
+        if self.rope_mode == "renumber":
+            from .rope import delta_rotate_keys
+            start = int(ctx.request_kv_length_offsets[b_global].item())
+            old_pos = torch.tensor(apos, device=ak.device, dtype=torch.long)
+            new_pos = torch.arange(start, start + ak.shape[1], device=ak.device)
+            ak = delta_rotate_keys(
+                ak, old_pos, new_pos, self._inv_freq, self._rope_interleaved)
+        self._hook.append_kv_to_request(b_local, ak, av)
+        self._repoint_pending_token(
+            b_local, b_global, int(ctx.request_kv_length_offsets[b_global]))
+        ctx.request_output_lengths[b_global] += ak.shape[1]
+        self._retrieval_counts[rid] = self._retrieval_counts.get(rid, 0) + 1
+        logger.info(
+            "[kv-retrieval] request id=%d: restored %d tokens (alpha %.3f, "
+            "%d spans left, %s)", rid, ak.shape[1], fire_alpha,
+            len(self._archive._spans.get(rid, [])),
+            "prefetched" if was_staged else "sync copy")
 
     def _debug_dump(self) -> None:
         ctx = self._ctx

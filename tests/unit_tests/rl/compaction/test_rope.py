@@ -288,3 +288,53 @@ class TestScoreWeighting:
         # compare against a prefix position OUTSIDE the pool window.
         assert (s_vn[3] / s_none[3]) > 10.0
         assert s_vn[3] > 5.0 * s_vn[7]
+
+
+class TestGraphSafeQCapture:
+    """Archive Q capture must work under CUDA graphs: the wrapper writes a
+    fixed-shape copy_ into static per-layer buffers (baked into the decode
+    graph at capture) alongside the eager Python-reference path."""
+
+    def _build(self):
+        from megatron.rl.compaction.kv.serving.live import LiveKVCompactor
+        engine = _StubEngine("none")
+        comp = LiveKVCompactor(engine, strategy="streaming_llm",
+                               budget_ratio=0.5, archive=True)
+        attn = engine.controller.inference_wrapped_model.model.decoder.layers[0].self_attention
+        return comp, attn
+
+    def test_capturing_armed_at_construction(self):
+        # Graph capture happens at engine startup, before any begin_step —
+        # the wrapper must already be armed or the copy_ never gets baked.
+        comp, _ = self._build()
+        assert comp._capturing is True
+
+    def test_wrapper_writes_list_and_static_buffer(self):
+        comp, attn = self._build()
+        assert comp._q_static == [None]
+        q = torch.randn(1, 3, 2, 8, device="cuda")   # (S=1, B=3, Hq=2, D=8)
+        attn.flash_decode_and_prefill(q, None, None)
+        # Eager reference path: packed (B, Hq, D).
+        assert comp._q_per_layer[0].shape == (3, 2, 8)
+        # Static buffer allocated (max_requests rows) and rows [0:B) filled.
+        buf = comp._q_static[0]
+        assert buf is not None and buf.shape[1:] == (2, 8)
+        assert torch.equal(buf[:3], comp._q_per_layer[0])
+        # Next step refreshes in place — same buffer object (stable address,
+        # the property graph replay depends on).
+        q2 = torch.randn(1, 2, 2, 8, device="cuda")
+        attn.flash_decode_and_prefill(q2, None, None)
+        assert comp._q_static[0] is buf
+        assert torch.equal(buf[:2], q2[0])
+
+    def test_oversized_prefill_skips_buffer(self):
+        comp, attn = self._build()
+        small = torch.randn(1, 2, 2, 8, device="cuda")
+        attn.flash_decode_and_prefill(small, None, None)
+        # Compare only written rows: torch.empty tails hold garbage (NaN != NaN).
+        buf_before = comp._q_static[0][:2].clone()
+        # Packed prefill with more rows than the buffer: list path only.
+        big = torch.randn(comp._max_requests + 7, 2, 8, device="cuda")
+        attn.flash_decode_and_prefill(big, None, None)
+        assert comp._q_per_layer[0].shape[0] == comp._max_requests + 7
+        assert torch.equal(comp._q_static[0][:2], buf_before)
