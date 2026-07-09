@@ -526,6 +526,7 @@ class LiveKVCompactor:
             # this request — the control arm of a compact-vs-full comparison.
             if not bool(ctx.request_metadata["kv_compact"][b_global].item()):
                 continue
+            t_gather0 = time.perf_counter()
             k, v = self._hook.get_kv_for_request(b_local)   # (L, S, H, D)
             S = k.shape[1]
             if S < self.min_tokens:
@@ -540,6 +541,7 @@ class LiveKVCompactor:
             if budget >= S:
                 continue
 
+            t_score0 = time.perf_counter()
             if self.strategy == "snapkv":
                 q_rows = self._request_q(q0, q1)            # per layer (Tq, Hq, D)
                 scores = self._aggregate_snapkv_scores(k, q_rows, values=v)
@@ -562,9 +564,11 @@ class LiveKVCompactor:
                 recent_start = max(n_sink, S - (budget - n_sink))
                 positions = sorted(set(sinks + list(range(recent_start, S))))
 
+            t_select1 = time.perf_counter()
             if self._archive is not None:
                 rid = int(ctx.request_ids[b_global].item())
                 self._archive.store_evicted(rid, k, v, positions)
+            t_store1 = time.perf_counter()
             rotated_keys = None
             if self.rope_mode == "renumber":
                 from .rope import delta_rotate_keys
@@ -587,9 +591,19 @@ class LiveKVCompactor:
             ctx.request_output_lengths[b_global] -= S - len(positions)
             self.compacted_requests += 1
             self.tokens_evicted += S - len(positions)
+            torch.cuda.synchronize()
+            t_end = time.perf_counter()
             logger.info(
                 "[kv-compaction] request b_local=%d: %d -> %d tokens (%s, ratio %.2f)",
                 b_local, S, len(positions), self.strategy, self.budget_ratio,
+            )
+            logger.info(
+                "[kv-compaction-timing] gather=%.0fms score+select=%.0fms "
+                "store=%.0fms surgery=%.0fms",
+                (t_score0 - t_gather0) * 1e3,
+                (t_select1 - t_score0) * 1e3,
+                (t_store1 - t_select1) * 1e3,
+                (t_end - t_store1) * 1e3,
             )
             logger.info("[kv-compaction-stats] %s", json.dumps(self.stats()))
         self._prefill_rids = []
