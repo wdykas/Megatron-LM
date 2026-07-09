@@ -103,14 +103,27 @@ class KVArchive:
         if cur:
             spans.append(cur)
 
+        # One gather + one pinned slab + one async D2H for the whole request
+        # (the per-span path costs 2 synchronous pinned allocations per span).
+        all_idx = torch.tensor([p for sp in spans for p in sp],
+                               device=keys.device)
+        bounds = [0]
+        for sp in spans:
+            bounds.append(bounds[-1] + len(sp))
+        k_all = keys[:, all_idx]                               # (L, T_evicted, H, D)
+        v_all = values[:, all_idx]
+        span_ids = list(range(self._next_span_id,
+                              self._next_span_id + len(spans)))
+        self._next_span_id += len(spans)
+        if hasattr(self._store, "put_bulk"):
+            self._store.put_bulk(span_ids, k_all, v_all, bounds)
+        else:                                                  # nixl tier
+            for i, sid in enumerate(span_ids):
+                self._store.put(sid, k_all[:, bounds[i]:bounds[i + 1]],
+                                v_all[:, bounds[i]:bounds[i + 1]])
         entries = []
-        for span in spans:
-            idx = torch.tensor(span, device=keys.device)
-            k = keys[:, idx]                                   # (L, T, H, D)
-            v = values[:, idx]
-            sid = self._next_span_id
-            self._next_span_id += 1
-            self._store.put(sid, k, v)
+        for i, (span, sid) in enumerate(zip(spans, span_ids)):
+            k = k_all[:, bounds[i]:bounds[i + 1]]
             entries.append(_Span(
                 positions=span,
                 span_id=sid,
@@ -315,6 +328,31 @@ class KVArchive:
         return (ep.span_ids[fire_i] if 0 <= fire_i < n else None,
                 float(v[1]), ep.span_ids[best_i], float(v[3]),
                 float(v[4]), n)
+
+    def remove_span_from_epoch(self, request_id: int, span_id: int) -> None:
+        """Drop one span's rows from the cached trigger epoch in place.
+
+        A retrieval removes the span from the archive; rebuilding the whole
+        epoch (retained-KV regather + centroid restack + state carry) per
+        fire is the expensive path — dropping one column is O(n_spans).
+        The retained set also grew by the restored tokens; the denominator
+        drift is bounded by the epoch refresh interval."""
+        rid = int(request_id)
+        ep = self._trigger_epochs.get(rid)
+        if ep is None or span_id not in ep.span_ids:
+            return
+        j = ep.span_ids.index(span_id)
+        if len(ep.span_ids) == 1:
+            self._trigger_epochs.pop(rid, None)
+            return
+        keep = torch.tensor([i for i in range(len(ep.span_ids)) if i != j],
+                            device=ep.counts.device)
+        ep.span_ids.pop(j)
+        ep.centroids = ep.centroids[:, :, keep]
+        ep.counts = ep.counts[keep]
+        ep.ema = ep.ema[keep]
+        ep.cusum = ep.cusum[keep]
+        ep.launched = False   # verdict indices are stale for the new layout
 
     def span_index(self, request_id: int, span_id: int) -> int | None:
         entries = self._spans.get(int(request_id), [])

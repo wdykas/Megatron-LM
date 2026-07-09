@@ -438,9 +438,13 @@ class LiveKVCompactor:
         else:
             q_rows = self._q_per_layer
         live_ids = set()
+        # ONE host sync for the whole active slice instead of one .item()
+        # sync per request per step.
+        rids = ctx.request_ids[
+            ctx.paused_request_count:ctx.total_request_count].tolist()
         for b_local in range(n_active):
             b_global = ctx.paused_request_count + b_local
-            rid = int(ctx.request_ids[b_global].item())
+            rid = int(rids[b_local])
             live_ids.add(rid)
             if not self._archive.has(rid):
                 continue
@@ -462,8 +466,10 @@ class LiveKVCompactor:
                     if span_idx is not None:
                         self._restore_span(b_local, b_global, rid, span_idx,
                                            fire_alpha)
-                        # span set changed: rebuild the epoch before scoring
-                        self._archive.invalidate_trigger_epoch(rid)
+                        # O(n_spans) in-place drop — a full epoch rebuild
+                        # (retained regather + restack) per fire was the
+                        # dominant retrieval-path cost.
+                        self._archive.remove_span_from_epoch(rid, fire_sid)
                 elif (best_S >= self.retrieval_cusum / 2
                       or alpha_max >= self.retrieval_alpha / 2):
                     # Speculative staging: the leading candidate is warming

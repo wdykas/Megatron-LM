@@ -288,3 +288,50 @@ class TestOverlappedTriggerEngine:
         arch.build_trigger_epoch(5, retained_k)
         arch.drop(5)
         assert 5 not in arch._trigger_epochs
+
+
+class TestBulkStoreAndIncrementalEpoch:
+    def _setup(self, S=48, L=2, H=1, D=8, seed=3):
+        g = torch.Generator(device="cuda").manual_seed(seed)
+        k = torch.randn(L, S, H, D, device="cuda", generator=g)
+        v = torch.randn(L, S, H, D, device="cuda", generator=g)
+        arch = KVArchive(max_span=4)
+        retained = list(range(24))
+        arch.store_evicted(9, k, v, retained)
+        return arch, k, v, retained
+
+    def test_bulk_store_round_trips_exact_bytes(self):
+        arch, k, v, retained = self._setup()
+        for sp in list(arch._spans[9]):
+            gk, gv = arch._store.get(sp.span_id)
+            torch.cuda.synchronize()
+            idx = torch.tensor(sp.positions, device=k.device)
+            assert torch.equal(gk, k[:, idx])
+            assert torch.equal(gv, v[:, idx])
+
+    def test_incremental_epoch_drop_matches_rebuild(self):
+        arch, k, v, retained = self._setup()
+        arch.build_trigger_epoch(9, k[:, retained])
+        spans = arch._spans[9]
+        victim = spans[2].span_id
+        arch.remove_span_from_epoch(9, victim)
+        ep = arch._trigger_epochs[9]
+        assert victim not in ep.span_ids
+        assert ep.centroids.shape[2] == len(ep.span_ids)
+        assert ep.counts.shape[0] == ep.ema.shape[0] == ep.cusum.shape[0] \
+            == len(ep.span_ids)
+        # surviving centroids identical to a fresh rebuild's
+        fresh_ids = [sp.span_id for sp in spans if sp.span_id != victim]
+        cents = torch.stack(
+            [sp.centroids for sp in spans if sp.span_id != victim], dim=2)
+        keep_rows = [i for i, sid in enumerate(ep.span_ids) if sid in fresh_ids]
+        assert torch.allclose(ep.centroids[:, :, keep_rows].float(), cents.float())
+        # verdicts for the old layout must not be consumable
+        assert ep.launched is False
+
+    def test_drop_last_span_removes_epoch(self):
+        arch, k, v, retained = self._setup()
+        arch.build_trigger_epoch(9, k[:, retained])
+        for sp in list(arch._spans[9]):
+            arch.remove_span_from_epoch(9, sp.span_id)
+        assert 9 not in arch._trigger_epochs

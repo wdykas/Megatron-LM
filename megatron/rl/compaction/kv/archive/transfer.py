@@ -27,6 +27,9 @@ class PinnedCpuStore:
 
     def __init__(self) -> None:
         self._data: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        # span_id -> D2H-complete event for slab-stored spans; readers wait
+        # on it so a retrieval can never observe a half-copied slab.
+        self._ready: dict[int, torch.cuda.Event] = {}
 
     def put(self, span_id: int, keys: torch.Tensor, values: torch.Tensor) -> None:
         """keys/values: (L, T, H, D) GPU tensors; stored pinned host-side."""
@@ -35,12 +38,44 @@ class PinnedCpuStore:
             values.to("cpu", non_blocking=True).pin_memory(),
         )
 
+    def put_bulk(self, span_ids: list[int], keys: torch.Tensor,
+                 values: torch.Tensor, bounds: list[int]) -> None:
+        """Store many spans with ONE pinned slab and ONE async D2H per tensor.
+
+        keys/values: (L, T_total, H, D) GPU tensors holding all spans
+        back-to-back along dim 1; bounds: len(span_ids)+1 cumulative offsets.
+        The per-span put() costs two synchronous pinned allocations per span
+        (~500 for a keep-0.05 4k prompt) — the slab is one allocation and one
+        overlappable copy; stored spans are views into it."""
+        slab_k = torch.empty(keys.shape, dtype=keys.dtype, device="cpu",
+                             pin_memory=True)
+        slab_v = torch.empty(values.shape, dtype=values.dtype, device="cpu",
+                             pin_memory=True)
+        slab_k.copy_(keys, non_blocking=True)
+        slab_v.copy_(values, non_blocking=True)
+        # The views are handed out before the async D2H completes; consumers
+        # (take/get_async) copy back on a stream that syncs with the default
+        # stream, so ordering holds. A device-wide sync here would serialize
+        # against decode for no benefit.
+        evt = torch.cuda.Event()
+        evt.record()
+        for i, sid in enumerate(span_ids):
+            self._data[sid] = (slab_k[:, bounds[i]:bounds[i + 1]],
+                               slab_v[:, bounds[i]:bounds[i + 1]])
+            self._ready[sid] = evt
+
     def get(self, span_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+        evt = self._ready.get(span_id)
+        if evt is not None:
+            evt.synchronize()
         k, v = self._data[span_id]
         return k.to("cuda", non_blocking=True), v.to("cuda", non_blocking=True)
 
     def get_async(self, span_id: int, stream: torch.cuda.Stream,
                   ) -> tuple[torch.Tensor, torch.Tensor, torch.cuda.Event]:
+        evt = self._ready.get(span_id)
+        if evt is not None:
+            evt.synchronize()   # D2H long complete by retrieval time; no-op
         k, v = self._data[span_id]
         with torch.cuda.stream(stream):
             gk = k.to("cuda", non_blocking=True)
@@ -51,6 +86,7 @@ class PinnedCpuStore:
 
     def drop(self, span_id: int) -> None:
         self._data.pop(span_id, None)
+        self._ready.pop(span_id, None)
 
 
 class NixlStore:
