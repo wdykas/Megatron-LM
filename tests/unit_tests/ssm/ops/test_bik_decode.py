@@ -74,10 +74,14 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
         )
 
     def _make_bufs(self, max_batch):
+        # has_z=False: every test here runs the rmsnorm-style path (z=None in
+        # the scan), which is also what nemotron uses — pins the z-less
+        # allocation and the gathered dense scan together.
         return make_bik_decode_buffers(
             max_batch, self.chunk_size,
             self.nh, self.headdim, self.ngroups, self.dstate,
             self.device, self.dtype, self.dtype, self.dtype, self.dtype, self.dtype,
+            has_z=False,
         )
 
     def _seed_from_prefill(self, bufs, x, dt, B, C, prefill_len, slot, max_batch):

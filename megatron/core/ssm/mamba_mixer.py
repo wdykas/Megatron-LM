@@ -1062,6 +1062,10 @@ class MambaMixer(MegatronModule):
             self._bik_decode_bufs = make_bik_decode_buffers(
                 max_batch, self.chunk_size, nh, p, ng, n, device,
                 x_dtype, dt_dtype, B_dtype, C_dtype, z_dtype,
+                # With rmsnorm the gate is applied outside the scan
+                # (RMSNormGated); the scan never sees z, so skip the z buffer
+                # (it is the largest allocation, same size as the x buffer).
+                has_z=not self.rmsnorm,
             )
         return self._bik_decode_bufs
 
