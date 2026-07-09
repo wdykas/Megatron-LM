@@ -195,6 +195,10 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
                 log_single_rank(logger, logging.INFO,
                                 f"[kv-compaction] live rollout compaction: "
                                 f"{args.rl_compaction_strategy}")
+                # NOTE: if archive mode ever lands in training, the engine
+                # must capture its decode graphs AFTER the compactor wraps
+                # the attention (see run_dynamic_text_generation_server.py
+                # defer_capture) — a post-hoc re-capture doubles graph pools.
 
         concurrency_limit = args.grpo_prompts_per_step * args.grpo_group_size * args.rl_parallel_generation_tasks
         custom_limits = httpx.Limits(

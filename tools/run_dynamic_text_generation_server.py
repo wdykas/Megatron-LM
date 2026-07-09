@@ -163,7 +163,26 @@ if __name__ == "__main__":
         args = get_args()
         args.return_log_probs = True
 
-        engine = get_dynamic_inference_engine()
+        # Archive mode must install its attention wrapper BEFORE the decode
+        # CUDA graphs are captured (the trigger's Q copy_ has to be baked
+        # into the graphs), and a delete+re-capture doubles graph memory
+        # (the first capture's pools are not reclaimed -> OOM). Defer the
+        # engine's init-time capture and run it exactly once, after install.
+        defer_capture = (args.kv_compaction_strategy is not None
+                         and args.kv_compaction_archive)
+        if defer_capture:
+            from megatron.core.inference.engines.dynamic_engine import (
+                DynamicInferenceEngine,
+            )
+            _orig_create = DynamicInferenceEngine.create_cuda_graphs
+            DynamicInferenceEngine.create_cuda_graphs = (
+                lambda self, reset_context=True: None)
+            try:
+                engine = get_dynamic_inference_engine()
+            finally:
+                DynamicInferenceEngine.create_cuda_graphs = _orig_create
+        else:
+            engine = get_dynamic_inference_engine()
 
         if args.kv_compaction_strategy is not None:
             from megatron.rl.compaction.kv.serving.live import LiveKVCompactor
@@ -193,6 +212,10 @@ if __name__ == "__main__":
             )
             print(f"[kv-compaction] live compaction enabled: "
                   f"{args.kv_compaction_strategy} @ {args.kv_compaction_budget_ratio}")
+            if defer_capture:
+                print("[kv-compaction] capturing decode CUDA graphs with the "
+                      "archive Q hook baked in ...", flush=True)
+                engine.create_cuda_graphs()
 
         try:
             asyncio.run(
