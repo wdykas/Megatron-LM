@@ -45,6 +45,10 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
         help="Skip live compaction for prompts shorter than this.",
     )
     parser.add_argument(
+        "--kv-compaction-max-retrievals", type=int, default=4,
+        help="Archive retrievals allowed per request (cap on trigger fires).",
+    )
+    parser.add_argument(
         "--kv-compaction-score-weighting", choices=["none", "value_norm"],
         default="none",
         help="Weight snapkv selection scores by per-token value norms "
@@ -185,6 +189,7 @@ if __name__ == "__main__":
                 flywheel_dir=args.kv_compaction_flywheel_dir,
                 archive_transfer=args.kv_compaction_archive_transfer,
                 score_weighting=args.kv_compaction_score_weighting,
+                max_retrievals_per_request=args.kv_compaction_max_retrievals,
             )
             print(f"[kv-compaction] live compaction enabled: "
                   f"{args.kv_compaction_strategy} @ {args.kv_compaction_budget_ratio}")
