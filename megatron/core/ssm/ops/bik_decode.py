@@ -121,7 +121,6 @@ def seed_bik_decode_buffers(
     are never consumed — the scan is causal and `count` marks the valid
     prefix.
     """
-    z_flat = z.squeeze(0) if z.dim() == 4 else z
     chunk = bufs.chunk_size
     device = x.device
     nseq = cu_seqlens.numel() - 1
@@ -153,6 +152,7 @@ def seed_bik_decode_buffers(
     bufs.B[slots] = B[idx]
     bufs.C[slots] = C[idx]
     if bufs.z is not None:
+        z_flat = z.squeeze(0) if z.dim() == 4 else z
         bufs.z[slots] = z_flat[idx]
 
     # Trash-row count pinned to 0 (identical duplicate writes are benign).
@@ -320,15 +320,14 @@ def bik_decode_buffered_scan(
     y = y_per_batch.unsqueeze(1)                                # (B_dec, 1, nh, p)
 
     # --- Per-slot count update ---
-    # A slot "crosses" the chunk boundary on this step iff count+1==chunk_size.
-    # Crossed: reset count to 0 (the boundary state was already persisted
-    # in-kernel by the fused snapshot). Uncrossed: count+=1.
+    # A slot "crosses" the chunk boundary on this step iff count+1==chunk_size
+    # (== `crossing` above). Crossed: reset count to 0 (the boundary state was
+    # already persisted in-kernel by the fused snapshot). Uncrossed: count+=1.
     # Inactive lanes write 0 to the trash row — identical values, so the
     # duplicate indices are benign, and the trash row's cursor stays pinned
     # at 0 (keeping its unconditional buffer writes in bounds).
-    crossed_per_batch = (count_per_batch + 1 == chunk) & is_active  # (B_dec,)
     new_count_per_batch = torch.where(
-        crossed_per_batch | ~is_active,
+        crossing.bool() | ~is_active,
         torch.zeros_like(count_per_batch),
         count_per_batch + 1,
     )
