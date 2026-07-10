@@ -178,7 +178,6 @@ def mamba_chunk_scan_decode_rows(
     dt_bias=None,
     dt_softplus=False,
     dt_limit=(0.0, float("inf")),
-    states_workspace=None,
     state_dtype=None,
     dst_states=None,
     dst_indices=None,
@@ -214,9 +213,6 @@ def mamba_chunk_scan_decode_rows(
             at the last chunk boundary.
         out: (nseq, nheads, headdim) preallocated compact output — the scan
             stores each chunk's target row here directly.
-        states_workspace: optional persistent (nseq, nheads, headdim, dstate)
-            fp32 buffer reused across steps so skipped chunks keep finite
-            stale values instead of uninitialized memory.
         dst_states/dst_indices: optional fused state snapshot — for chunks
             where chunk_flags is set, the boundary state is stored directly
             to dst_states[dst_indices[c]] (e.g. the engine's ssm_state cache,
@@ -237,15 +233,12 @@ def mamba_chunk_scan_decode_rows(
         dt_softplus=dt_softplus,
         dt_limit=dt_limit,
     )
+    # Skipped (non-crossing) chunks leave uninitialized rows in `states`;
+    # they are never consumed: state passing restarts from initial_states at
+    # every chunk (each is its own sequence), so garbage never propagates,
+    # and only flagged chunks' outputs are read.
     states = _chunk_state_fwd(
-        B,
-        x,
-        dt,
-        dA_cumsum,
-        cu_chunk_seqlens,
-        states=states_workspace,
-        states_in_fp32=True,
-        chunk_flags=chunk_flags,
+        B, x, dt, dA_cumsum, cu_chunk_seqlens, states_in_fp32=True, chunk_flags=chunk_flags
     )
     dstate = B.shape[-1]
     boundary_states = _state_passing_fwd(

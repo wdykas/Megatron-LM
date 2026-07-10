@@ -218,8 +218,8 @@ def _chunk_state_fwd_kernel(
     if HAS_CHUNK_FLAGS:
         # Decode mode: this chunk's state is only consumed when the slot
         # crosses its chunk boundary this step. Skip the (expensive) state
-        # matmul for all other chunks; their `states` rows keep stale-but-
-        # finite values that downstream never reads.
+        # matmul for all other chunks; their `states` rows stay uninitialized
+        # and downstream never reads them.
         if tl.load(chunk_flags_ptr + pid_c) == 0:
             return
     chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)

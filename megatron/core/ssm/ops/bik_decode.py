@@ -15,8 +15,8 @@ ungated kernels, so outputs stay bitwise-identical to a full scan.
 See `bik_decode_buffered_scan` for the algorithm.
 """
 
-from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import Optional
 
 import torch
 
@@ -32,18 +32,21 @@ class BikDecodeBuffers:
     """
 
     chunk_size: int
-    x: torch.Tensor          # (max_batch, chunk_size, nh, p)
-    dt: torch.Tensor         # (max_batch, chunk_size, nh)
-    B: torch.Tensor          # (max_batch, chunk_size, ng, n)
-    C: torch.Tensor          # (max_batch, chunk_size, ng, n)
-    z: Optional[torch.Tensor]  # (max_batch, chunk_size, nh, p); None when the
-    #   model applies gating outside the scan (rmsnorm=True) — the scan never
-    #   reads z then, so the buffer would be pure memory waste.
-    count: torch.Tensor      # (max_batch,) int32 — write cursor per slot
-    # Per-decode-batch-size scratch (cu_chunk_seqlens, seq_idx, out, states
-    # workspace), lazily created and cached so repeated steps (and CUDA-graph
-    # capture) reuse fixed storage.
-    scratch: Dict[int, Tuple[torch.Tensor, ...]] = field(default_factory=dict)
+    x: torch.Tensor          # (max_batch + 1, chunk_size, nh, p)
+    dt: torch.Tensor         # (max_batch + 1, chunk_size, nh)
+    B: torch.Tensor          # (max_batch + 1, chunk_size, ng, n)
+    C: torch.Tensor          # (max_batch + 1, chunk_size, ng, n)
+    z: Optional[torch.Tensor]  # (max_batch + 1, chunk_size, nh, p); None when
+    #   the model applies gating outside the scan (rmsnorm=True) — the scan
+    #   never reads z then, so the buffer would be pure memory waste.
+    count: torch.Tensor      # (max_batch + 1,) int32 — write cursor per slot
+    # Static chunk-layout metadata and the compact output, allocated once;
+    # each decode step slices the leading B_dec entries. Sized max_batch + 1
+    # (+2 for cu) so a decode batch fully padded up to max_batch + 1 lanes
+    # still fits.
+    cu: torch.Tensor         # (max_batch + 2,) int32 — arange * chunk_size
+    seq_idx: torch.Tensor    # (max_batch + 1,) int32 — arange
+    out: torch.Tensor        # (max_batch + 1, nh, p) — per-lane target-row output
 
 
 def make_bik_decode_buffers(
@@ -54,11 +57,7 @@ def make_bik_decode_buffers(
     ng: int,
     n: int,
     device: torch.device,
-    x_dtype: torch.dtype,
-    dt_dtype: torch.dtype,
-    B_dtype: torch.dtype,
-    C_dtype: torch.dtype,
-    z_dtype: torch.dtype,
+    dtype: torch.dtype,
     has_z: bool = True,
 ) -> BikDecodeBuffers:
     """Allocate the per-slot decode-side scan buffers.
@@ -80,16 +79,19 @@ def make_bik_decode_buffers(
     rows = max_batch + 1
     return BikDecodeBuffers(
         chunk_size=chunk_size,
-        x=torch.zeros(rows, chunk_size, nh, p, device=device, dtype=x_dtype),
-        dt=torch.zeros(rows, chunk_size, nh, device=device, dtype=dt_dtype),
-        B=torch.zeros(rows, chunk_size, ng, n, device=device, dtype=B_dtype),
-        C=torch.zeros(rows, chunk_size, ng, n, device=device, dtype=C_dtype),
+        x=torch.zeros(rows, chunk_size, nh, p, device=device, dtype=dtype),
+        dt=torch.zeros(rows, chunk_size, nh, device=device, dtype=dtype),
+        B=torch.zeros(rows, chunk_size, ng, n, device=device, dtype=dtype),
+        C=torch.zeros(rows, chunk_size, ng, n, device=device, dtype=dtype),
         z=(
-            torch.zeros(rows, chunk_size, nh, p, device=device, dtype=z_dtype)
+            torch.zeros(rows, chunk_size, nh, p, device=device, dtype=dtype)
             if has_z
             else None
         ),
         count=torch.zeros(rows, device=device, dtype=torch.int32),
+        cu=torch.arange(rows + 1, device=device, dtype=torch.int32) * chunk_size,
+        seq_idx=torch.arange(rows, device=device, dtype=torch.int32),
+        out=torch.empty(rows, nh, p, device=device, dtype=dtype),
     )
 
 
@@ -169,20 +171,6 @@ def seed_bik_decode_buffers(
     ssm_state[zero_slots] = 0
 
 
-def _get_scratch(bufs, B_dec, nh, p, n, device, x_dtype):
-    """Fixed per-(B_dec) scratch: chunk layout metadata + output/state buffers."""
-    key = B_dec
-    if key not in bufs.scratch:
-        chunk = bufs.chunk_size
-        bufs.scratch[key] = (
-            torch.arange(B_dec + 1, device=device, dtype=torch.int32) * chunk,
-            torch.arange(B_dec, device=device, dtype=torch.int32),
-            torch.empty(B_dec, nh, p, device=device, dtype=x_dtype),
-            torch.zeros(B_dec, nh, p, n, device=device, dtype=torch.float32),
-        )
-    return bufs.scratch[key]
-
-
 def bik_decode_buffered_scan(
     bufs: BikDecodeBuffers,
     x: torch.Tensor,           # (B_dec, 1, nh, p)
@@ -235,6 +223,10 @@ def bik_decode_buffered_scan(
         "batch-invariant Mamba decode assumes one new token per request "
         "per call (no speculative decoding)."
     )
+    assert B_dec < bufs.out.shape[0] + 1, (
+        f"decode batch of {B_dec} lanes exceeds the preallocated scratch "
+        f"({bufs.out.shape[0]} lanes = max_batch + 1); increase max_batch."
+    )
 
     # --- Slot indices + active mask ---
     # Inactive lanes (batch_indices < 0) are redirected to the trash row
@@ -282,7 +274,7 @@ def bik_decode_buffered_scan(
     )
     init_g = ssm_state[state_slots]
 
-    cu, seq_idx, out, states_ws = _get_scratch(bufs, B_dec, nh, p, n, dev, x_g.dtype)
+    out = bufs.out[:B_dec]
 
     target_rows = count_per_batch.to(torch.int32)
     crossing = ((count_per_batch + 1 == chunk) & is_active).to(torch.int32)
@@ -297,8 +289,8 @@ def bik_decode_buffered_scan(
         B_g,
         C_g,
         chunk,
-        cu,
-        seq_idx,
+        bufs.cu[: B_dec + 1],
+        bufs.seq_idx[:B_dec],
         target_rows,
         crossing,
         init_g,
@@ -307,7 +299,6 @@ def bik_decode_buffered_scan(
         z=z_g,
         dt_bias=dt_bias,
         dt_softplus=True,
-        states_workspace=states_ws,
         state_dtype=ssm_state.dtype,
         # view (not flatten) so a non-viewable cache fails loudly instead of
         # silently copying — the in-kernel snapshot writes must hit the cache.

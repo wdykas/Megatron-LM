@@ -1054,14 +1054,11 @@ class MambaMixer(MegatronModule):
             self._A_neg_exp_cache_stale = False
         return self._A_neg_exp_cache.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
 
-    def _bik_get_decode_buffers(
-        self, max_batch, nh, p, ng, n, device, x_dtype, dt_dtype, B_dtype, C_dtype, z_dtype,
-    ):
+    def _bik_get_decode_buffers(self, max_batch, nh, p, ng, n, device, dtype):
         """Lazily allocate (once) and return the per-slot batch-invariant decode buffers."""
         if not hasattr(self, "_bik_decode_bufs"):
             self._bik_decode_bufs = make_bik_decode_buffers(
-                max_batch, self.chunk_size, nh, p, ng, n, device,
-                x_dtype, dt_dtype, B_dtype, C_dtype, z_dtype,
+                max_batch, self.chunk_size, nh, p, ng, n, device, dtype,
                 # With rmsnorm the gate is applied outside the scan
                 # (RMSNormGated); the scan never sees z, so skip the z buffer
                 # (it is the largest allocation, same size as the x buffer).
@@ -1076,10 +1073,7 @@ class MambaMixer(MegatronModule):
         max_batch = ssm_state.shape[0]
         nh, p = x.shape[-2], x.shape[-1]
         ng, n = B.shape[-2], B.shape[-1]
-        bufs = self._bik_get_decode_buffers(
-            max_batch, nh, p, ng, n, x.device,
-            x.dtype, dt.dtype, B.dtype, C.dtype, z.dtype,
-        )
+        bufs = self._bik_get_decode_buffers(max_batch, nh, p, ng, n, x.device, x.dtype)
         seed_bik_decode_buffers(bufs, x, dt, B, C, z, cu_seqlens, batch_indices, ssm_state)
 
     def _bik_decode_buffered_scan(self, x, dt, B, C, z, batch_indices, ssm_state):
@@ -1106,11 +1100,7 @@ class MambaMixer(MegatronModule):
         max_batch = ssm_state.shape[0]
         nh, p = x.shape[-2], x.shape[-1]
         ng, n = B.shape[-2], B.shape[-1]
-        bufs = self._bik_get_decode_buffers(
-            max_batch, nh, p, ng, n, x.device,
-            x.dtype, dt.dtype, B.dtype, C.dtype,
-            z.dtype if z is not None else x.dtype,
-        )
+        bufs = self._bik_get_decode_buffers(max_batch, nh, p, ng, n, x.device, x.dtype)
 
         y = bik_decode_buffered_scan(
             bufs, x, dt, B, C, z, A, D, dt_bias, batch_indices, ssm_state,

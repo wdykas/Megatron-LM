@@ -91,7 +91,7 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
         return make_bik_decode_buffers(
             max_batch, self.chunk_size,
             self.nh, self.headdim, self.ngroups, self.dstate,
-            self.device, self.dtype, self.dtype, self.dtype, self.dtype, self.dtype,
+            self.device, self.dtype,
             has_z=False,
         )
 
