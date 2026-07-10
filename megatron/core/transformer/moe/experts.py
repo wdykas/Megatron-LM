@@ -10,6 +10,7 @@ from math import ceil
 from typing import Optional, Protocol, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
@@ -36,6 +37,9 @@ from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
     skip_routed_expert_padding,
+)
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    deterministic_index_add,
 )
 from megatron.core.transformer.moe.token_dispatcher_inference import (
     InferenceAllGatherDispatcherBase,
@@ -1072,11 +1076,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
         dispatcher's batch-invariant token_combine branch is a pass-through;
         no further cross-rank reduction is needed.
         """
-        import torch.distributed as dist
-        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-            deterministic_index_add,
-        )
-
         ep_size = self.ep_group.size()
         max_tokens = hidden_states.shape[0]
         H = hidden_states.shape[-1]

@@ -40,6 +40,9 @@ from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    is_batch_invariant_mode_enabled,
+)
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.moe.token_dispatcher import MoEAllGatherTokenDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -151,9 +154,6 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         device = torch.cuda.current_device()
 
         if cls._use_allgather_v:
-            from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-                is_batch_invariant_mode_enabled,
-            )
             assert not is_batch_invariant_mode_enabled(), (
                 "batch_invariant_mode is incompatible with NCCLAllGatherDispatcher's "
                 "non-CG AllGatherV path: the batch-invariant _bik_global_unpermute "
@@ -302,9 +302,6 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         if self.ep_size == 1:
             return hidden_states.to(torch.bfloat16)
 
-        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-            is_batch_invariant_mode_enabled,
-        )
         if is_batch_invariant_mode_enabled():
             # Pass-through: the batch-invariant path replaces ReduceScatter
             # with AllToAll + local deterministic_index_add inside
@@ -653,9 +650,6 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         if self.ep_size == 1:
             return hidden_states.to(torch.bfloat16)
 
-        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-            is_batch_invariant_mode_enabled,
-        )
         if is_batch_invariant_mode_enabled():
             # Pass-through: the cross-rank reduction already happened in
             # InferenceGroupedMLP._bik_global_unpermute (AllToAll-padded combine
