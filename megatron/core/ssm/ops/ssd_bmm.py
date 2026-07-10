@@ -87,6 +87,7 @@ def _bmm_chunk_fwd_kernel(
     # Meta-parameters
     IS_CAUSAL: tl.constexpr,
     HAS_TARGET_ROWS: tl.constexpr,
+    HAS_CHUNK_STARTS: tl.constexpr,
     dot_dtype: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -115,7 +116,11 @@ def _bmm_chunk_fwd_kernel(
             return
 
     chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)
-    chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
+    if HAS_CHUNK_STARTS:
+        # Decode mode: fixed-length windows at caller-given buffer offsets.
+        chunk_seqlen_end = chunk_seqlen_start + chunk_size
+    else:
+        chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
 
     a_ptr += chunk_seqlen_start * stride_a_seqlen + pid_h * stride_a_head
     b_ptr += chunk_seqlen_start * stride_b_seqlen + pid_h * stride_b_head
@@ -155,8 +160,17 @@ def _bmm_chunk_fwd_kernel(
 
 
 def _bmm_chunk_fwd(
-    a, b, chunk_size, cu_chunk_seqlens, causal=False, output_dtype=None, target_rows=None
+    a,
+    b,
+    chunk_size,
+    cu_chunk_seqlens,
+    causal=False,
+    output_dtype=None,
+    target_rows=None,
+    chunk_starts=None,
 ):
+    if chunk_starts is not None:
+        cu_chunk_seqlens = chunk_starts
     """
     Argument:
         a: (seqlen, ngroups, k)
@@ -179,7 +193,7 @@ def _bmm_chunk_fwd(
     if b.stride(-1) != 1 and b.stride(0) != 1:
         b = b.contiguous()
 
-    nchunks = len(cu_chunk_seqlens) - 1
+    nchunks = len(cu_chunk_seqlens) - (0 if chunk_starts is not None else 1)
     # Allocates output.
     out_dtype = a.dtype if output_dtype is None else output_dtype
     out = torch.empty((nchunks, ngroups, chunk_size, chunk_size), device=a.device, dtype=out_dtype)
@@ -216,6 +230,7 @@ def _bmm_chunk_fwd(
             stride_outn=out.stride(-1),
             IS_CAUSAL=causal,
             HAS_TARGET_ROWS=target_rows is not None,
+            HAS_CHUNK_STARTS=chunk_starts is not None,
             dot_dtype=dot_dtype,
         )
     return out

@@ -135,6 +135,7 @@ def _chunk_scan_fwd_kernel(
     D_HAS_HDIM: tl.constexpr,
     HAS_Z: tl.constexpr,
     HAS_TARGET_ROWS: tl.constexpr,
+    HAS_CHUNK_STARTS: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -156,7 +157,11 @@ def _chunk_scan_fwd_kernel(
             return
     cb_ptr += pid_c * stride_cb_chunk + (pid_h // nheads_ngroups_ratio) * stride_cb_head
     chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)
-    chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
+    if HAS_CHUNK_STARTS:
+        # Decode mode: fixed-length windows at caller-given buffer offsets.
+        chunk_seqlen_end = chunk_seqlen_start + chunk_size
+    else:
+        chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
     x_ptr += chunk_seqlen_start * stride_x_seqlen + pid_h * stride_x_head
     dt_ptr += pid_c * stride_dt_chunk + pid_h * stride_dt_head
     dA_cumsum_ptr += pid_c * stride_dA_cs_chunk + pid_h * stride_dA_cs_head
@@ -168,7 +173,15 @@ def _chunk_scan_fwd_kernel(
 
     seq_idx_ptr += pid_c * stride_seq_idx_chunk
     seq_idx = tl.load(seq_idx_ptr)
-    seq_idx_prev = tl.load(seq_idx_ptr - stride_seq_idx_chunk, mask=pid_c >= 1, other=-1)
+    if HAS_CHUNK_STARTS:
+        # Decode mode: every chunk is unconditionally its own sequence, and
+        # seq_idx carries the slot id used to index initial_states (which may
+        # be the engine's state cache directly). Forcing "sequence changed"
+        # also makes duplicate-adjacent padding lanes harmless: they can
+        # never alias a real chunk's carried state.
+        seq_idx_prev = -1
+    else:
+        seq_idx_prev = tl.load(seq_idx_ptr - stride_seq_idx_chunk, mask=pid_c >= 1, other=-1)
 
     if HAS_INITSTATES and (seq_idx != seq_idx_prev):
         prev_states_ptr = (
@@ -357,8 +370,11 @@ def _chunk_scan_fwd(
     z=None,
     initial_states=None,
     target_rows=None,
+    chunk_starts=None,
 ):
     assert seq_idx is not None, "this implementation requires seq_idx"
+    if chunk_starts is not None:
+        cu_chunk_seqlens = chunk_starts
 
     seqlen, nheads, headdim = x.shape
     _, nchunks, chunk_size = dt.shape
@@ -449,6 +465,7 @@ def _chunk_scan_fwd(
         D_HAS_HDIM=D.dim() == 2 if D is not None else True,
         HAS_Z=z is not None,
         HAS_TARGET_ROWS=target_rows is not None,
+        HAS_CHUNK_STARTS=chunk_starts is not None,
         BLOCK_SIZE_DSTATE=max(triton.next_power_of_2(dstate), 16),
         IS_TRITON_22=TRITON_22,
         HAS_INITSTATES=initial_states is not None,

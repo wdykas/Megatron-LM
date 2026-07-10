@@ -60,6 +60,7 @@ def _state_passing_fwd_kernel(
     # Meta-parameters
     HAS_INITSTATES: tl.constexpr,
     HAS_DST_STATES: tl.constexpr,
+    ALWAYS_NEW_SEQ: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid_h = tl.program_id(axis=1)
@@ -87,8 +88,14 @@ def _state_passing_fwd_kernel(
         new_states = tl.load(states_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
         dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
         seq_idx = tl.load(seq_idx_ptr + c * stride_seq_idx_chunk)
+        is_new_seq = prev_seq_idx != seq_idx
+        if ALWAYS_NEW_SEQ:
+            # Decode mode: every chunk is its own sequence; seq_idx carries
+            # slot ids (which may repeat on adjacent padding lanes), so the
+            # change-detection heuristic must not be trusted.
+            is_new_seq = True
         # we have started a new sequence
-        if prev_seq_idx != seq_idx:
+        if is_new_seq:
             if HAS_INITSTATES:
                 initstates_ptrs = (
                     initstates_ptr
@@ -135,6 +142,7 @@ def _state_passing_fwd(
     dst_states=None,
     dst_indices=None,
     dst_flags=None,
+    always_new_seq=False,
 ):
     """
     dst_states/dst_indices/dst_flags (all-or-none): decode-mode fused state
@@ -199,5 +207,6 @@ def _state_passing_fwd(
             stride_dst_dim=dst_strides[2],
             HAS_INITSTATES=initial_states is not None,
             HAS_DST_STATES=has_dst,
+            ALWAYS_NEW_SEQ=always_new_seq,
         )
     return out

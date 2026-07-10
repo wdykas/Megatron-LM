@@ -56,6 +56,7 @@ def _chunk_cumsum_fwd_kernel(
     seqlen,
     nheads: tl.constexpr,
     chunk_size: tl.constexpr,
+    HAS_CHUNK_STARTS: tl.constexpr,
     dt_min: tl.constexpr,
     dt_max: tl.constexpr,
     # Strides
@@ -81,7 +82,13 @@ def _chunk_cumsum_fwd_kernel(
     pid_h = tl.program_id(axis=1)
 
     chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)
-    chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
+    if HAS_CHUNK_STARTS:
+        # Decode mode: chunks are fixed-length windows at caller-given offsets
+        # into a persistent buffer (one per slot), not adjacent [cu[c], cu[c+1])
+        # spans of a packed sequence.
+        chunk_seqlen_end = chunk_seqlen_start + chunk_size
+    else:
+        chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
 
     dt_ptr += chunk_seqlen_start * stride_dt_seqlen
     dt_out_ptr += pid_c * stride_dt_out_chunk
@@ -206,6 +213,7 @@ def _chunk_state_fwd_kernel(
     stride_dA_cs_csize: tl.constexpr,
     # Meta-parameters
     HAS_CHUNK_FLAGS: tl.constexpr,
+    HAS_CHUNK_STARTS: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -223,7 +231,11 @@ def _chunk_state_fwd_kernel(
         if tl.load(chunk_flags_ptr + pid_c) == 0:
             return
     chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)
-    chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
+    if HAS_CHUNK_STARTS:
+        # Decode mode: fixed-length windows at caller-given buffer offsets.
+        chunk_seqlen_end = chunk_seqlen_start + chunk_size
+    else:
+        chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
     b_ptr += chunk_seqlen_start * stride_b_seqlen + (pid_h // nheads_ngroups_ratio) * stride_b_head
     x_ptr += chunk_seqlen_start * stride_x_seqlen + pid_h * stride_x_head
     dt_ptr += pid_c * stride_dt_chunk + pid_h * stride_dt_head
@@ -286,12 +298,18 @@ def _chunk_cumsum_fwd(
     dt_bias=None,
     dt_softplus=False,
     dt_limit=(0.0, float("inf")),
+    chunk_starts=None,
 ):
     seqlen, nheads = dt.shape
     assert A.shape == (nheads,)
     if dt_bias is not None:
         assert dt_bias.shape == (nheads,)
-    nchunks = cu_chunk_seqlens.shape[0] - 1
+    if chunk_starts is not None:
+        # Decode mode: fixed-length windows at the given buffer offsets.
+        cu_chunk_seqlens = chunk_starts
+        nchunks = chunk_starts.shape[0]
+    else:
+        nchunks = cu_chunk_seqlens.shape[0] - 1
     dt_out = torch.empty(nheads, nchunks, chunk_size, device=dt.device, dtype=torch.float32)
     dA_cumsum = torch.empty(nheads, nchunks, chunk_size, device=dt.device, dtype=torch.float32)
     grid_chunk_cs = lambda META: (nchunks, triton.cdiv(nheads, META["BLOCK_SIZE_H"]))
@@ -318,6 +336,7 @@ def _chunk_cumsum_fwd(
             stride_dA_cs_head=dA_cumsum.stride(0),
             stride_dA_cs_chunk=dA_cumsum.stride(1),
             stride_dA_cs_csize=dA_cumsum.stride(2),
+            HAS_CHUNK_STARTS=chunk_starts is not None,
             DT_SOFTPLUS=dt_softplus,
             HAS_DT_BIAS=dt_bias is not None,
             BLOCK_SIZE_CHUNK=triton.next_power_of_2(chunk_size),
@@ -326,8 +345,18 @@ def _chunk_cumsum_fwd(
 
 
 def _chunk_state_fwd(
-    B, x, dt, dA_cumsum, cu_chunk_seqlens, states=None, states_in_fp32=True, chunk_flags=None
+    B,
+    x,
+    dt,
+    dA_cumsum,
+    cu_chunk_seqlens,
+    states=None,
+    states_in_fp32=True,
+    chunk_flags=None,
+    chunk_starts=None,
 ):
+    if chunk_starts is not None:
+        cu_chunk_seqlens = chunk_starts
     seqlen, nheads, headdim = x.shape
     _, nchunks, chunk_size = dt.shape
     _, ngroups, dstate = B.shape
@@ -380,6 +409,7 @@ def _chunk_state_fwd(
             stride_dA_cs_chunk=dA_cumsum.stride(1),
             stride_dA_cs_csize=dA_cumsum.stride(2),
             HAS_CHUNK_FLAGS=chunk_flags is not None,
+            HAS_CHUNK_STARTS=chunk_starts is not None,
         )
     return states
 

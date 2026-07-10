@@ -40,12 +40,9 @@ class BikDecodeBuffers:
     #   the model applies gating outside the scan (rmsnorm=True) — the scan
     #   never reads z then, so the buffer would be pure memory waste.
     count: torch.Tensor      # (max_batch + 1,) int32 — write cursor per slot
-    # Static chunk-layout metadata and the compact output, allocated once;
-    # each decode step slices the leading B_dec entries. Sized max_batch + 1
-    # (+2 for cu) so a decode batch fully padded up to max_batch + 1 lanes
+    # Compact per-lane output, allocated once and sliced per step. Sized
+    # max_batch + 1 so a decode batch fully padded up to max_batch + 1 lanes
     # still fits.
-    cu: torch.Tensor         # (max_batch + 2,) int32 — arange * chunk_size
-    seq_idx: torch.Tensor    # (max_batch + 1,) int32 — arange
     out: torch.Tensor        # (max_batch + 1, nh, p) — per-lane target-row output
 
 
@@ -89,8 +86,6 @@ def make_bik_decode_buffers(
             else None
         ),
         count=torch.zeros(rows, device=device, dtype=torch.int32),
-        cu=torch.arange(rows + 1, device=device, dtype=torch.int32) * chunk_size,
-        seq_idx=torch.arange(rows, device=device, dtype=torch.int32),
         out=torch.empty(rows, nh, p, device=device, dtype=dtype),
     )
 
@@ -202,14 +197,15 @@ def bik_decode_buffered_scan(
     output. When the buffer fills to `chunk_size`, we snapshot the returned
     state as the new ssm_state and reset the buffer.
 
-    Execution: the active slots' buffers are gathered into a dense
-    (B_dec, chunk_size, ...) layout and run through the row-gated repo
-    kernel pipeline (`mamba_chunk_scan_decode_rows`) — only the output row
-    each slot consumes this step is computed, and the chunk-state matmul
-    runs only for slots crossing their boundary. O(B_dec · BLOCK_M) work
-    instead of O(max_batch · chunk_size). Bitwise-identical because the
-    surviving kernel blocks execute the exact same instructions as the
-    ungated kernels.
+    Execution: the row-gated repo kernel pipeline
+    (`mamba_chunk_scan_decode_rows`) reads the persistent buffers and the
+    ssm_state cache in place (each lane's chunk is a fixed window at
+    slot * chunk_size; no gathers) — only the output row each slot consumes
+    this step is computed, and the chunk-state matmul runs only for slots
+    crossing their boundary. O(B_dec · BLOCK_M) work instead of
+    O(max_batch · chunk_size). Bitwise-identical because the surviving
+    kernel blocks execute the exact same instructions as the ungated
+    kernels.
 
     No host syncs → CG-capturable (all shapes fixed per decode batch size).
 
@@ -257,23 +253,16 @@ def bik_decode_buffered_scan(
     if z is not None and bufs.z is not None:
         bufs.z[slots, count_per_batch] = z[:, 0]
 
-    # --- Gather active slots' buffers into a dense flattened layout ---
-    # Each gathered buffer row becomes one fixed-size chunk that is its own
-    # sequence (seq_idx = arange), so the scan reads `initial_states`
-    # directly. `ssm_state[slot]` is guaranteed valid here: it is either a
-    # chunk-boundary snapshot or the zeros written by seeding for prefills
-    # shorter than a chunk.
-    x_g = bufs.x[slots].reshape(B_dec * chunk, nh, p)
-    dt_g = bufs.dt[slots].reshape(B_dec * chunk, nh)
-    B_g = bufs.B[slots].reshape(B_dec * chunk, -1, n)
-    C_g = bufs.C[slots].reshape(B_dec * chunk, -1, n)
-    z_g = (
-        bufs.z[slots].reshape(B_dec * chunk, nh, p)
-        if (z is not None and bufs.z is not None)
-        else None
-    )
-    init_g = ssm_state[state_slots]
-
+    # --- Run the gated pipeline directly over the persistent buffers ---
+    # No gathers: each lane's chunk is a fixed window at slot * chunk_size in
+    # the flattened buffers, and its incoming state is read straight from
+    # `ssm_state[slot]` (guaranteed valid: either a boundary snapshot or the
+    # zeros written by seeding for prefills shorter than a chunk). Padding
+    # lanes point at the trash-row window / a clamped state row; every chunk
+    # is unconditionally its own sequence, so their (possibly duplicate) slot
+    # ids can never alias a real chunk's carried state.
+    chunk_starts = (slots * chunk).to(torch.int32)
+    state_slots_i32 = state_slots.to(torch.int32)
     out = bufs.out[:B_dec]
 
     target_rows = count_per_batch.to(torch.int32)
@@ -283,27 +272,30 @@ def bik_decode_buffered_scan(
     # states straight into the ssm_state cache (each crossing chunk writes
     # its own slot — no duplicate indices, no separate scatter pass).
     mamba_chunk_scan_decode_rows(
-        x_g,
-        dt_g,
+        bufs.x.view(-1, nh, p),
+        bufs.dt.view(-1, nh),
         A,
-        B_g,
-        C_g,
+        bufs.B.view(-1, bufs.B.shape[-2], n),
+        bufs.C.view(-1, bufs.C.shape[-2], n),
         chunk,
-        bufs.cu[: B_dec + 1],
-        bufs.seq_idx[:B_dec],
+        chunk_starts,
+        state_slots_i32,
         target_rows,
         crossing,
-        init_g,
+        ssm_state,
         out,
         D=D,
-        z=z_g,
+        z=(
+            bufs.z.view(-1, nh, p)
+            if (z is not None and bufs.z is not None)
+            else None
+        ),
         dt_bias=dt_bias,
         dt_softplus=True,
         state_dtype=ssm_state.dtype,
         # view (not flatten) so a non-viewable cache fails loudly instead of
         # silently copying — the in-kernel snapshot writes must hit the cache.
         dst_states=ssm_state.view(ssm_state.shape[0], ssm_state.shape[1], -1),
-        dst_indices=state_slots.to(torch.int32),
     )
 
     # --- y: the scan stored each chunk's target row compactly at out[i] ---
