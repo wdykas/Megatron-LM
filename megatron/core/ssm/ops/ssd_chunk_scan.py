@@ -176,25 +176,34 @@ def _chunk_scan_fwd_kernel(
     if HAS_CHUNK_STARTS:
         # Decode mode: every chunk is unconditionally its own sequence, and
         # seq_idx carries the slot id used to index initial_states (which may
-        # be the engine's state cache directly). Forcing "sequence changed"
-        # also makes duplicate-adjacent padding lanes harmless: they can
-        # never alias a real chunk's carried state.
+        # be the engine's state cache directly). Reading initial_states
+        # unconditionally (constexpr branch) also makes duplicate-adjacent
+        # padding lanes harmless: they can never alias a real chunk's
+        # carried state — and the carried-states pointer (a shape-valid
+        # dummy here) is never typed into the program.
         seq_idx_prev = -1
-    else:
-        seq_idx_prev = tl.load(seq_idx_ptr - stride_seq_idx_chunk, mask=pid_c >= 1, other=-1)
-
-    if HAS_INITSTATES and (seq_idx != seq_idx_prev):
         prev_states_ptr = (
             initstates_ptr + seq_idx * stride_init_states_batch + pid_h * stride_init_states_head
         )
         prev_states_hdim = stride_init_states_hdim
         prev_states_dstate = stride_init_states_dstate
     else:
-        prev_states_ptr = (
-            states_ptr + (pid_c - 1) * stride_states_chunk + pid_h * stride_states_head
-        )
-        prev_states_hdim = stride_states_hdim
-        prev_states_dstate = stride_states_dstate
+        seq_idx_prev = tl.load(seq_idx_ptr - stride_seq_idx_chunk, mask=pid_c >= 1, other=-1)
+
+        if HAS_INITSTATES and (seq_idx != seq_idx_prev):
+            prev_states_ptr = (
+                initstates_ptr
+                + seq_idx * stride_init_states_batch
+                + pid_h * stride_init_states_head
+            )
+            prev_states_hdim = stride_init_states_hdim
+            prev_states_dstate = stride_init_states_dstate
+        else:
+            prev_states_ptr = (
+                states_ptr + (pid_c - 1) * stride_states_chunk + pid_h * stride_states_head
+            )
+            prev_states_hdim = stride_states_hdim
+            prev_states_dstate = stride_states_dstate
 
     chunk_size_limit = chunk_seqlen_end - chunk_seqlen_start
 

@@ -328,6 +328,50 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
             # Padding lanes must return zeros.
             self.assertEqual(y_bik[1:].abs().max().item(), 0.0)
 
+    def test_crossing_with_dominant_carried_state(self):
+        """Boundary crossing where the carried state dominates the output
+        (weak decay: A ~ -0.01 → exp(dA_cs) ≈ 1). Guards the pipeline
+        ordering: the scan must consume the PRE-step boundary state, not the
+        one the fused snapshot writes during the same call — with strong
+        decay that corruption can round away in bf16 and hide."""
+        max_batch, slot = 2, 0
+        prefill_len = 20
+        n_decode = self.chunk_size + 5
+        total = prefill_len + n_decode
+        x, dt, B, C = self._make_seq(total)
+
+        weak_A = self.A * 0.01
+        y_full, _ = mamba_chunk_scan_combined(
+            x, dt, weak_A, B, C, self.chunk_size,
+            D=self.D, z=None, dt_bias=self.dt_bias, dt_softplus=True,
+            initial_states=None, return_final_states=True,
+        )
+
+        bufs = self._make_bufs(max_batch)
+        ssm_state = torch.zeros(
+            max_batch, self.nh, self.headdim, self.dstate,
+            device=self.device, dtype=self.dtype,
+        )
+        cu = torch.tensor([0, prefill_len], dtype=torch.int32, device=self.device)
+        batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
+        seed_bik_decode_buffers(
+            bufs, x[0, :prefill_len], dt[0, :prefill_len],
+            B[0, :prefill_len], C[0, :prefill_len],
+            torch.zeros_like(x[0, :prefill_len]), cu, batch_indices, ssm_state,
+        )
+        for k in range(n_decode):
+            pos = prefill_len + k
+            y_bik = bik_decode_buffered_scan(
+                bufs,
+                x[:, pos : pos + 1], dt[:, pos : pos + 1],
+                B[:, pos : pos + 1], C[:, pos : pos + 1],
+                None, weak_A, self.D, self.dt_bias,
+                batch_indices, ssm_state,
+            )
+            self._assert_bitwise(
+                y_bik[0, 0], y_full[0, pos], f"weak-decay step k={k}"
+            )
+
     def test_deterministic_across_calls(self):
         """Same inputs → bitwise-identical output across repeated invocations."""
         max_batch, slot = 2, 0

@@ -249,6 +249,37 @@ def mamba_chunk_scan_decode_rows(
         chunk_flags=chunk_flags,
         chunk_starts=chunk_starts,
     )
+    CB = _bmm_chunk_fwd(
+        C,
+        B,
+        chunk_size,
+        None,
+        output_dtype=torch.float32,
+        target_rows=target_rows,
+        chunk_starts=chunk_starts,
+    )
+    # The scan must run BEFORE state passing: when initial_states is the
+    # ssm_state cache read in place, the fused snapshot below overwrites
+    # crossing slots' rows — the scan has to consume the pre-step state.
+    # In decode mode the scan never reads state passing's output (every
+    # chunk is its own sequence), so `states` here is only a shape-valid
+    # dummy for the unused carried-state pointer.
+    _chunk_scan_fwd(
+        CB,
+        x,
+        dt,
+        dA_cumsum,
+        C,
+        states,
+        None,
+        out,
+        slots,
+        D=D,
+        z=z,
+        initial_states=initial_states,
+        target_rows=target_rows,
+        chunk_starts=chunk_starts,
+    )
     dstate = B.shape[-1]
     boundary_states = _state_passing_fwd(
         states.flatten(-2),
@@ -262,31 +293,6 @@ def mamba_chunk_scan_decode_rows(
         dst_flags=chunk_flags if dst_states is not None else None,
         always_new_seq=True,
     ).unflatten(-1, (-1, dstate))
-    CB = _bmm_chunk_fwd(
-        C,
-        B,
-        chunk_size,
-        None,
-        output_dtype=torch.float32,
-        target_rows=target_rows,
-        chunk_starts=chunk_starts,
-    )
-    _chunk_scan_fwd(
-        CB,
-        x,
-        dt,
-        dA_cumsum,
-        C,
-        boundary_states,
-        None,
-        out,
-        slots,
-        D=D,
-        z=z,
-        initial_states=initial_states,
-        target_rows=target_rows,
-        chunk_starts=chunk_starts,
-    )
     return boundary_states
 
 
