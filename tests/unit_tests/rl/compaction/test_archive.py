@@ -176,6 +176,11 @@ class TestKVArchive:
         torch.testing.assert_close(tv.cuda(), v[:, idx])
 
     def test_nixl_backend_absent_raises_with_guidance(self):
+        try:
+            import nixl  # noqa: F401
+            pytest.skip("nixl installed in this image (e.g. dynamo container)")
+        except ImportError:
+            pass
         with pytest.raises(ImportError, match="nixl"):
             KVArchive(max_span=4, transfer="nixl")
 
