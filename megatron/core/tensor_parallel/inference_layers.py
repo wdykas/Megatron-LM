@@ -421,9 +421,6 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         # vs training (which uses NCCL RS under sequence parallelism). NCCL
         # RS is deterministic for a fixed topology and matches training
         # bitwise.
-        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-            is_batch_invariant_mode_enabled,
-        )
         can_use_nvls = (
             self.triton_nvls_kernels_allowed
             and x.dtype == torch.bfloat16
@@ -555,9 +552,6 @@ def inference_reduce_scatter_to_sequence_parallel_region(
     # Under batch-invariant mode, drop the NVLS multimem path: its
     # cross-rank reduction order differs from NCCL's ring traversal, so it
     # drifts vs training (which uses NCCL RS under sequence parallelism).
-    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-        is_batch_invariant_mode_enabled,
-    )
     if (
         triton_nvls_kernels_allowed
         and SymmetricMemoryManager.is_initialized("tp")
