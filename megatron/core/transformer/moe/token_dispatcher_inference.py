@@ -263,8 +263,10 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         contribution to its home rank and runs one local
         deterministic_index_add there. That matches training's single
         reduction tree; ReduceScatter would add a second tree on top of the
-        per-rank sums and diverge in bf16 (at equal bandwidth, about
-        (ep_size - 1) / ep_size * N_local * H bytes per rank either way).
+        per-rank sums and diverge in bf16. The cost is comm volume: the
+        AllToAll ships per-contribution fp32 rows, roughly topk * 2 the
+        bytes of the bf16 per-token ReduceScatter (fp32 transport is needed
+        because training forms the prob-weighted product in fp32).
         hidden_states arrives here as the final [local_tokens, H] bf16
         result, so this is a pass-through; a ReduceScatter would sum other
         ranks' garbage into an already-final answer.
