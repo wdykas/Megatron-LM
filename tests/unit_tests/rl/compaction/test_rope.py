@@ -338,3 +338,22 @@ class TestGraphSafeQCapture:
         attn.flash_decode_and_prefill(big, None, None)
         assert comp._q_per_layer[0].shape[0] == comp._max_requests + 7
         assert torch.equal(comp._q_static[0][:2], buf_before)
+
+
+class TestStrideBlend:
+    def test_budget_preserved_and_coverage(self):
+        from megatron.rl.compaction.kv.serving.live import _blend_stride
+        S, budget = 1000, 100
+        topk = list(range(900, 1000))          # all-recent selection
+        out = _blend_stride(topk, S, budget, 0.5)
+        assert len(out) <= budget
+        assert len(out) >= budget - 1
+        # coverage: stride points span the whole context
+        assert min(out) < 100
+        gaps = [b - a for a, b in zip(out, out[1:])]
+        assert max(gaps[: len(gaps) // 2]) <= S // int(budget * 0.5) + 1
+
+    def test_zero_frac_identity(self):
+        from megatron.rl.compaction.kv.serving.live import _blend_stride
+        pos = [1, 5, 9]
+        assert _blend_stride(pos, 100, 10, 0.0) == pos

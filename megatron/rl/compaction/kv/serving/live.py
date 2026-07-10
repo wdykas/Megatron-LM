@@ -43,6 +43,30 @@ logger = logging.getLogger(__name__)
 _LIVE_STRATEGIES = ("snapkv", "streaming_llm", "belief_still", "learned_oracle")
 
 
+def _blend_stride(positions: list[int], S: int, budget: int,
+                  stride_frac: float) -> list[int]:
+    """Replace the lowest-priority selected positions with uniform-stride
+    positions. Keeps the SAME total budget: n_stride = floor(budget * frac)
+    evenly-spaced tokens are unioned in; topk positions fill the rest
+    (selection order in `positions` is position-sorted, so the drop set is
+    chosen from the non-recent prefix picks arbitrarily — the stride grid
+    itself usually overlaps many of them)."""
+    n_stride = int(budget * stride_frac)
+    if n_stride <= 0:
+        return positions
+    stride_pos = [int(i) for i in
+                  range(0, S, max(1, S // n_stride))][:n_stride]
+    merged = sorted(set(stride_pos) | set(positions))
+    if len(merged) <= budget:
+        return merged
+    # over budget: drop non-stride topk picks, earliest positions first
+    # (nearby stride points cover them); never the last 16 (the question).
+    stride_set = set(stride_pos)
+    droppable = [p for p in merged if p not in stride_set and p < S - 16]
+    to_drop = set(droppable[: len(merged) - budget])
+    return [p for p in merged if p not in to_drop]
+
+
 class LiveKVCompactor:
     """Compacts each request's prompt KV right after its prefill forward.
 
@@ -86,6 +110,7 @@ class LiveKVCompactor:
         budget_anneal_iters: int | None = None,
         score_weighting: str = "none",
         recompact_hwm: int = 0,
+        stride_frac: float = 0.0,
     ) -> None:
         if strategy not in _LIVE_STRATEGIES:
             # Route through the factory for the canonical error (h2o explains
@@ -137,6 +162,16 @@ class LiveKVCompactor:
                 f"queries or positional streaming_llm), got {strategy!r}")
         self.recompact_hwm = int(recompact_hwm or 0)
         self.recompactions = 0
+        # Coverage-vs-relevance budget split: this fraction of the keep
+        # budget is spent on UNIFORM-STRIDE positions (every k-th token)
+        # instead of attention-topk. Aggregation tasks (count/frequency)
+        # collapse under pure relevance selection and retrieval cannot help
+        # (counting emits no span-specific demand for the trigger — measured:
+        # cwe baseline 1.0 -> 0.0 with 10 retrievals) — a uniform subsample
+        # preserves relative frequencies.
+        if not 0.0 <= stride_frac < 1.0:
+            raise ValueError(f"stride_frac must be in [0, 1), got {stride_frac}")
+        self.stride_frac = stride_frac
         self.obs_window = obs_window
         self.pool_kernel = pool_kernel
         self.n_sink = n_sink
@@ -588,6 +623,9 @@ class LiveKVCompactor:
                 positions = _select_recent_plus_heavy(
                     scores, S, budget, n_recent=min(self.obs_window, budget)
                 )
+                if self.stride_frac > 0.0:
+                    positions = _blend_stride(positions, S, budget,
+                                              self.stride_frac)
             elif self.strategy == "learned_oracle":
                 # Query-free: the scorer predicts each key's future attention
                 # mass from content + position alone — no Q capture, so this
