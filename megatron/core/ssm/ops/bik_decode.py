@@ -265,3 +265,60 @@ def bik_decode_buffered_scan(
     )
 
     return y
+
+
+class MambaBikDecode:
+    """Adapter between a MambaMixer and the buffered decode.
+
+    Owns the decode buffers and translates the mixer's conventions (flat
+    layouts, context-parallel projections, config flags) into the tensor-op
+    API above, so the mixer itself only carries two call sites. Uses the
+    mixer by duck typing; the import direction stays mixer -> bik_decode.
+    """
+
+    def __init__(self, mixer):
+        # The gate is applied outside the scan (RMSNormGated), so the
+        # buffers carry no z. Enforced here because the decode path would
+        # otherwise silently drop it.
+        assert mixer.rmsnorm, "batch_invariant_mode requires rmsnorm=True"
+        self.mixer = mixer
+        self.bufs: Optional[BikDecodeBuffers] = None
+
+    def _get_bufs(self, max_batch, nh, p, ng, n, device, dtype) -> BikDecodeBuffers:
+        if self.bufs is None:
+            self.bufs = make_bik_decode_buffers(
+                max_batch, self.mixer.chunk_size, nh, p, ng, n, device, dtype
+            )
+        return self.bufs
+
+    def seed(self, x, dt, B, C, cu_seqlens, batch_indices, ssm_state) -> None:
+        """Seed from the prefill tail. x: (total, nh, p); B/C: (total, ng, n)."""
+        nh, p = x.shape[-2], x.shape[-1]
+        ng, n = B.shape[-2], B.shape[-1]
+        bufs = self._get_bufs(ssm_state.shape[0], nh, p, ng, n, x.device, x.dtype)
+        seed_bik_decode_buffers(bufs, x, dt, B, C, cu_seqlens, batch_indices)
+
+    def step(self, x, dt, B, C, batch_indices, ssm_state) -> torch.Tensor:
+        """One decode step. Inputs in the mixer's flat layout:
+        x (b, 1, nh*p), dt (b, 1, nh), B/C (b, 1, ng*n). Returns (b, 1, nh*p).
+        """
+        m = self.mixer
+        b = x.shape[0]
+        x = x.view(b, 1, -1, m.headdim)
+        B = B.view(b, 1, m.ngroups_local_tp, -1)
+        C = C.view(b, 1, m.ngroups_local_tp, -1)
+
+        A = -torch.exp(m.cp.get_A_log().float())
+        D = m.cp.get_D()
+        if m.D_has_hdim:
+            D = D.float().view(-1, m.headdim)
+        dt_bias = m.cp.get_dt_bias().float()
+
+        nh, p = x.shape[-2], x.shape[-1]
+        ng, n = B.shape[-2], B.shape[-1]
+        bufs = self._get_bufs(ssm_state.shape[0], nh, p, ng, n, x.device, x.dtype)
+
+        y = bik_decode_buffered_scan(
+            bufs, x, dt, B, C, A, D, dt_bias, batch_indices, ssm_state
+        )
+        return y.reshape(b, 1, -1)

@@ -26,11 +26,7 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.ops.bik_decode import (
-    bik_decode_buffered_scan,
-    make_bik_decode_buffers,
-    seed_bik_decode_buffers,
-)
+from megatron.core.ssm.ops.bik_decode import MambaBikDecode
 from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ssm.ops.mamba_ssm import selective_state_update
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
@@ -979,7 +975,7 @@ class MambaMixer(MegatronModule):
             tensor_masked_update(ssm_state, batch_indices, ssm_varlen_states)
 
             if self.config.batch_invariant_mode and cu_seqlens is not None:
-                self._bik_seed_decode_buffers(x, dt, B, C, cu_seqlens, batch_indices, ssm_state)
+                self._bik().seed(x, dt, B, C, cu_seqlens, batch_indices, ssm_state)
 
             # Write intermediate states to pre-allocated output buffers
             # All tensor ops, no Python loops, fully CUDA graph compatible.
@@ -1054,52 +1050,11 @@ class MambaMixer(MegatronModule):
             self._A_neg_exp_cache_stale = False
         return self._A_neg_exp_cache.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
 
-    def _bik_get_decode_buffers(self, max_batch, nh, p, ng, n, device, dtype):
-        """Lazily allocate (once) and return the per-slot batch-invariant decode buffers."""
-        if not hasattr(self, "_bik_decode_bufs"):
-            # The gate is applied outside the scan (RMSNormGated), so the
-            # buffers carry no z. Enforced here because the decode path
-            # silently drops z otherwise.
-            assert self.rmsnorm, "batch_invariant_mode requires rmsnorm=True"
-            self._bik_decode_bufs = make_bik_decode_buffers(
-                max_batch, self.chunk_size, nh, p, ng, n, device, dtype
-            )
-        return self._bik_decode_bufs
-
-    def _bik_seed_decode_buffers(
-        self, x, dt, B, C, cu_seqlens, batch_indices, ssm_state,
-    ) -> None:
-        """Seed each request's decode buffer with its prefill's partial-chunk tail."""
-        max_batch = ssm_state.shape[0]
-        nh, p = x.shape[-2], x.shape[-1]
-        ng, n = B.shape[-2], B.shape[-1]
-        bufs = self._bik_get_decode_buffers(max_batch, nh, p, ng, n, x.device, x.dtype)
-        seed_bik_decode_buffers(bufs, x, dt, B, C, cu_seqlens, batch_indices)
-
-    def _bik_decode_buffered_scan(self, x, dt, B, C, batch_indices, ssm_state):
-        """Rearrange from the mixer's flat layout, pull A/D/dt_bias from the
-        context-parallel projections, and run the buffered scan."""
-        B = rearrange(B, "b s (g n) -> b s g n", g=self.ngroups_local_tp)
-        C = rearrange(C, "b s (g n) -> b s g n", g=self.ngroups_local_tp)
-        x = rearrange(x, "b s (h p) -> b s h p", p=self.headdim)
-
-        A = -torch.exp(self.cp.get_A_log().float())
-        D = (
-            rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
-            if self.D_has_hdim
-            else self.cp.get_D()
-        )
-        dt_bias = self.cp.get_dt_bias().float()
-
-        max_batch = ssm_state.shape[0]
-        nh, p = x.shape[-2], x.shape[-1]
-        ng, n = B.shape[-2], B.shape[-1]
-        bufs = self._bik_get_decode_buffers(max_batch, nh, p, ng, n, x.device, x.dtype)
-
-        y = bik_decode_buffered_scan(
-            bufs, x, dt, B, C, A, D, dt_bias, batch_indices, ssm_state,
-        )
-        return rearrange(y, "b s h p -> b s (h p)")
+    def _bik(self) -> MambaBikDecode:
+        """Batch-invariant decode adapter, created on first use."""
+        if not hasattr(self, "_bik_decode"):
+            self._bik_decode = MambaBikDecode(self)
+        return self._bik_decode
 
     def train(self, mode: bool = True):
         """Mark the decode cache stale; weights may have updated."""
@@ -1248,7 +1203,7 @@ class MambaMixer(MegatronModule):
 
             y = y.unsqueeze(1)  # Restore seq dimension
         elif self.config.batch_invariant_mode:
-            y = self._bik_decode_buffered_scan(x, dt, B, C, batch_indices, ssm_state)
+            y = self._bik().step(x, dt, B, C, batch_indices, ssm_state)
         else:
             A = self._get_decode_A_neg_exp()
 
