@@ -38,13 +38,16 @@ except ImportError:
 
 try:
     # Blackwell (e.g. GB200) ships FlashAttention-4 instead of FA3; the batch-invariant
-    # attention paths (Attention.flash_decode_and_prefill and the TE wrapper's
-    # _batch_invariant_fa4_forward) use it, so these tests run there too.
+    # attention paths honor config.flash_attention_version, so these tests run there too.
     from flash_attn.cute import flash_attn_varlen_func as _fa4_varlen_func  # noqa: F401
 
     HAVE_FA4 = True
 except ImportError:
     HAVE_FA4 = False
+
+# Batch-invariant mode requires an explicit FlashAttention version; pick the newest
+# one available so training and inference run the same kernel.
+_BIK_FA_VERSION = 4 if HAVE_FA4 else (3 if HAVE_FA3 else None)
 
 
 class DummyTokenizer:
@@ -96,6 +99,7 @@ def _build_flash_attn_bik_model(seq_len: int, vocab_size: int, hidden_size: int 
         hidden_dropout=0.0,
         attention_dropout=0.0,
         batch_invariant_mode=True,
+        flash_attention_version=_BIK_FA_VERSION,
         normalization="RMSNorm",
         params_dtype=torch.bfloat16,
         attention_backend=AttnBackend.flash,
@@ -216,9 +220,7 @@ class TestGPTModelBatchInvariant:
         wrapper = GPTInferenceWrapper(inference_model, ctx)
         tokenizer = DummyTokenizer(vocab_size=vocab_size, bos=None, eod=vocab_size - 1, pad=0)
         controller = TextGenerationController(wrapper, tokenizer)
-        engine = DynamicInferenceEngine(
-            controller=controller, context=ctx
-        )
+        engine = DynamicInferenceEngine(controller=controller, context=ctx)
 
         base_vals = [3, 15, 27, 39]
         lengths = [18, 11, 23, 13]
@@ -294,9 +296,7 @@ class TestGPTModelBatchInvariant:
             wrapper = GPTInferenceWrapper(inference_model, ctx)
             tokenizer = DummyTokenizer(vocab_size=vocab_size, bos=None, eod=vocab_size - 1, pad=0)
             controller = TextGenerationController(wrapper, tokenizer)
-            engine = DynamicInferenceEngine(
-                controller=controller, context=ctx
-            )
+            engine = DynamicInferenceEngine(controller=controller, context=ctx)
 
             base_vals = [3, 15, 27, 39]
             lengths = [18, 11, 23, 13]

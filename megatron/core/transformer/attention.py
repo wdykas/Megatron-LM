@@ -305,6 +305,7 @@ class Attention(MegatronModule, ABC):
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
         self.batch_invariant_mode = config.batch_invariant_mode
+        self.flash_attention_version = config.flash_attention_version
 
         assert self.config.kv_channels is not None
         assert self.config.num_query_groups is not None
@@ -832,6 +833,29 @@ class Attention(MegatronModule, ABC):
 
         return output_total
 
+    def _resolve_flash_version(self) -> Tuple[bool, bool]:
+        """Resolve which FlashAttention generation this attention should run.
+
+        Honors ``config.flash_attention_version`` when pinned, otherwise falls back
+        to the auto preference order (FA4 > FA3 > FA2). Returns ``(use_fa4, use_fa3)``;
+        when both are False the FA2 kernel is used.
+        """
+        pinned = self.flash_attention_version
+        if pinned == 4:
+            assert (
+                HAVE_FA4
+            ), "flash_attention_version=4 requested but FlashAttention-4 is not installed"
+            return True, False
+        if pinned == 3:
+            assert (
+                HAVE_FA3
+            ), "flash_attention_version=3 requested but FlashAttention-3 is not installed"
+            return False, True
+        if pinned == 2:
+            return False, False
+        # Auto: prefer the newest available generation.
+        return HAVE_FA4, (HAVE_FA3 and not HAVE_FA4)
+
     def flash_decode_and_prefill(
         self,
         q: Tensor,
@@ -865,6 +889,8 @@ class Attention(MegatronModule, ABC):
         assert not self.training
         assert block_table is not None
 
+        use_fa4, use_fa3 = self._resolve_flash_version()
+
         # Flash attn kernel.
         if not is_decode_only:
             q = q.squeeze(1)
@@ -872,7 +898,7 @@ class Attention(MegatronModule, ABC):
                 softmax_scale = self.softmax_scale
             else:
                 softmax_scale = q.shape[-1] ** -0.5
-            if HAVE_FA4:
+            if use_fa4:
                 output_total, _ = flash_attn4_varlen_func(
                     q,
                     k,
@@ -886,7 +912,7 @@ class Attention(MegatronModule, ABC):
                     causal=True,
                     num_splits=1,
                 )
-            elif HAVE_FA3:
+            elif use_fa3:
                 # TODO(ksanthanam): Replace with call to flash_attn_varlen_func once
                 # it accepts block_table
                 output_total = self._flash_attention_3_forward_wrapper(
@@ -956,7 +982,7 @@ class Attention(MegatronModule, ABC):
                     causal=True,
                 )
             else:
-                if HAVE_FA4:
+                if use_fa4:
                     if getattr(self, "softmax_scale", None) is not None:
                         softmax_scale = self.softmax_scale
                     else:
@@ -987,10 +1013,10 @@ class Attention(MegatronModule, ABC):
                         "v_cache": v,
                         "cache_seqlens": seqlens_k,
                         "causal": True,
-                        "page_table" if HAVE_FA3 else "block_table": block_table,
+                        "page_table" if use_fa3 else "block_table": block_table,
                         "num_splits": 0 if not self.batch_invariant_mode else 1,
                     }
-                    if HAVE_FA3:
+                    if use_fa3:
                         output_total = flash_attn3_with_kvcache(**flash_attn_args)
                     else:
                         assert (

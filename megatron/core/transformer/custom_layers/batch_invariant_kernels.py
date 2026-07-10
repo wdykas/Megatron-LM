@@ -529,7 +529,11 @@ _TE_APPLY_NORM_ORIGS: Dict[str, Any] = {}
 
 
 def _import_module_if_available(name: str):
-    spec = importlib.util.find_spec(name)
+    try:
+        spec = importlib.util.find_spec(name)
+    except ModuleNotFoundError:
+        # find_spec on a submodule raises when the parent package is absent.
+        return None
     if spec is None:
         return None
     return importlib.import_module(name)
