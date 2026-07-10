@@ -54,8 +54,14 @@ def _blend_stride(positions: list[int], S: int, budget: int,
     n_stride = int(budget * stride_frac)
     if n_stride <= 0:
         return positions
-    stride_pos = [int(i) for i in
-                  range(0, S, max(1, S // n_stride))][:n_stride]
+    # CHUNK stride: contiguous 8-token blocks, not isolated tokens — token-
+    # level stride keeps word FRAGMENTS and measured 0.0 on cwe/fwe (worse
+    # than no stride); countable units must stay legible.
+    block = 8
+    n_blocks = max(1, n_stride // block)
+    step = max(block, S // n_blocks)
+    stride_pos = [p for start in range(0, S, step)
+                  for p in range(start, min(start + block, S))][:n_stride]
     merged = sorted(set(stride_pos) | set(positions))
     if len(merged) <= budget:
         return merged

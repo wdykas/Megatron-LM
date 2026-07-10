@@ -348,10 +348,12 @@ class TestStrideBlend:
         out = _blend_stride(topk, S, budget, 0.5)
         assert len(out) <= budget
         assert len(out) >= budget - 1
-        # coverage: stride points span the whole context
+        # coverage: stride BLOCKS span the whole context (8-token chunks)
         assert min(out) < 100
-        gaps = [b - a for a, b in zip(out, out[1:])]
-        assert max(gaps[: len(gaps) // 2]) <= S // int(budget * 0.5) + 1
+        prefix = [p for p in out if p < 800]
+        gaps = [b - a for a, b in zip(prefix, prefix[1:])]
+        # between-block gaps bounded by the stride step
+        assert max(gaps) <= S // max(1, int(budget * 0.5) // 8) + 8
 
     def test_zero_frac_identity(self):
         from megatron.rl.compaction.kv.serving.live import _blend_stride
