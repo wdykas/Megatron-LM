@@ -131,7 +131,11 @@ class KVArchive:
                 cpu_keys=(k.detach().cpu() if self.flywheel_dir is not None
                           else None),
             ))
-        self._spans[int(request_id)] = entries
+        # APPEND across compaction rounds (recursive compaction re-evicts
+        # from a cache that already has archived spans); positions from later
+        # rounds are indices into the THEN-current compacted cache, which is
+        # fine — positions are only used for RoPE renumbering at restore.
+        self._spans.setdefault(int(request_id), []).extend(entries)
 
     # ------------------------------------------------------------------
     # Trigger + retrieval (called per decode step)

@@ -85,6 +85,7 @@ class LiveKVCompactor:
         budget_final: float | None = None,
         budget_anneal_iters: int | None = None,
         score_weighting: str = "none",
+        recompact_hwm: int = 0,
     ) -> None:
         if strategy not in _LIVE_STRATEGIES:
             # Route through the factory for the canonical error (h2o explains
@@ -125,6 +126,16 @@ class LiveKVCompactor:
         # Offline captures: -13% tail MSE at keep 0.2, mixed at 0.1; task
         # evals arbitrate (grid arm 'snapkv+vnorm').
         self.score_weighting = score_weighting
+        # Recursive compaction: when a request's live cache length reaches
+        # this high-water mark (tokens), re-compact it to
+        # budget_ratio * recompact_hwm using the last obs_window decode
+        # queries from the in-graph Q ring. 0 = off (one-shot post-prefill
+        # compaction only).
+        if recompact_hwm and strategy not in ("snapkv", "streaming_llm"):
+            raise ValueError(
+                "recompact_hwm needs a re-scorable strategy (snapkv ring "
+                f"queries or positional streaming_llm), got {strategy!r}")
+        self.recompact_hwm = int(recompact_hwm or 0)
         self.obs_window = obs_window
         self.pool_kernel = pool_kernel
         self.n_sink = n_sink
@@ -299,13 +310,38 @@ class LiveKVCompactor:
                         buf = self._q_static[idx] = torch.empty(
                             self._max_requests, qq.shape[-2], qq.shape[-1],
                             device=qq.device, dtype=qq.dtype)
+                        if self.recompact_hwm and self._q_ring_counter is None:
+                            self._q_ring_counter = torch.zeros(
+                                1, device=qq.device, dtype=torch.long)
+                        if self.recompact_hwm:
+                            # Recursive compaction: ring of the last W decode
+                            # steps' Q per layer. Slot index is a DEVICE
+                            # tensor, so the scatter and the counter increment
+                            # bake into the decode graph and advance on every
+                            # replay.
+                            self._q_ring[idx] = torch.zeros(
+                                self.obs_window, self._max_requests,
+                                qq.shape[-2], qq.shape[-1],
+                                device=qq.device, dtype=qq.dtype)
                     if buf is not None and qq.shape[0] <= buf.shape[0]:
                         buf[: qq.shape[0]].copy_(qq)
+                        ring = self._q_ring[idx] if self.recompact_hwm else None
+                        if ring is not None:
+                            # All layers of one step use the same slot; the
+                            # LAST hooked layer advances the counter.
+                            slot = torch.remainder(
+                                self._q_ring_counter, self.obs_window)
+                            ring.index_copy_(0, slot, buf.unsqueeze(0))
+                            if idx == self._n_hooked - 1:
+                                self._q_ring_counter.add_(1)
                 return orig(q, k, v, *args, **kwargs)
             return wrapped
 
         self._q_per_layer = [None] * len(attns)  # type: ignore[list-item]
         self._q_static: list[torch.Tensor | None] = [None] * len(attns)
+        self._q_ring: list[torch.Tensor | None] = [None] * len(attns)
+        self._q_ring_counter: torch.Tensor | None = None
+        self._n_hooked = len(attns)
         self._max_requests = int(getattr(engine.context, "max_requests", 512) or 512)
         for i, attn in enumerate(attns):
             attn.flash_decode_and_prefill = _wrap(i, attn.flash_decode_and_prefill)
