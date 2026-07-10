@@ -174,7 +174,6 @@ def mamba_chunk_scan_decode_rows(
     initial_states,
     out,
     D=None,
-    z=None,
     dt_bias=None,
     dt_softplus=False,
     dt_limit=(0.0, float("inf")),
@@ -184,51 +183,37 @@ def mamba_chunk_scan_decode_rows(
 ):
     """Row-gated chunk scan for batch-invariant single-token decode.
 
-    Runs the same 5-kernel pipeline as the full varlen scan directly over the
-    persistent per-slot buffers (no gather): each of the `nseq` chunks is a
-    fixed `chunk_size`-length window at `chunk_starts[c]`, and every chunk is
-    unconditionally its own sequence with `initial_states[slots[c]]` as its
-    incoming state. The expensive kernels are gated down to what a decode
-    step actually consumes:
-
-      * `_bmm_chunk_fwd` computes only the CB M-block containing
-        `target_rows[c]` (and N-blocks up to it) per chunk.
-      * `_chunk_scan_fwd` computes only the output M-block containing
-        `target_rows[c]` per chunk.
-      * `_chunk_state_fwd` computes a chunk's state matmul only where
-        `chunk_flags[c] != 0` (the slot crosses its chunk boundary this
-        step — the only step on which the state is consumed).
-
-    The surviving blocks execute the exact same instructions as the ungated
-    kernels, so the consumed outputs are bitwise-identical to a full scan.
-    All shapes are static per (nseq, chunk_size) — CUDA-graph capturable.
+    Same 5-kernel pipeline as the full varlen scan, run directly over the
+    persistent per-slot buffers: chunk c is the fixed chunk_size window at
+    chunk_starts[c], and every chunk is its own sequence starting from
+    initial_states[slots[c]]. The kernels are gated to what a decode step
+    actually consumes: bmm and the scan compute only the block containing
+    target_rows[c], and the chunk-state matmul runs only where chunk_flags
+    is set (the slot crosses its boundary, the one step its state is read).
+    The blocks that do run execute the same instructions as the ungated
+    kernels, so the outputs match a full scan bitwise.
 
     Args:
-        x/dt/B/C: flattened persistent buffers, shape (num_rows * chunk_size, ...).
-        chunk_starts: (nseq,) int32 — offset of each chunk's window
+        x/dt/B/C: flattened persistent buffers, (num_rows * chunk_size, ...).
+        chunk_starts: (nseq,) int32, window offset per chunk
             (slot * chunk_size for per-slot buffers).
-        slots: (nseq,) int32 — row of `initial_states` (and `dst_states`)
-            holding each chunk's incoming state; may repeat on padding lanes.
-        target_rows: (nseq,) int32 — this step's write-cursor per slot; the
-            only output row read per chunk.
-        chunk_flags: (nseq,) — nonzero where the slot crosses the boundary.
-        initial_states: (num_states, nheads, headdim, dstate) — typically the
-            engine's ssm_state cache itself, indexed in place by `slots`.
-        out: (nseq, nheads, headdim) preallocated compact output — the scan
-            stores each chunk's target row here directly.
-        init_scale: optional (num_states,) fp32 of 1.0/0.0 — multiplied into
-            each chunk's loaded initial state (0.0 for slots whose prefill
-            never crossed a chunk boundary, whose cached state must not be
-            used). Multiplying by 1.0/0.0 is bitwise-exact.
-        dst_states: optional fused state snapshot — for chunks where
-            chunk_flags is set, the boundary state is stored directly to
-            dst_states[slots[c]] (e.g. the ssm_state cache flattened to
-            (num_states, nheads, headdim * dstate)), converted to the cache
-            dtype by the store. Skips a separate gather/where/scatter pass.
+        slots: (nseq,) int32, row of initial_states/dst_states with each
+            chunk's incoming state. May repeat on padding lanes.
+        target_rows: (nseq,) int32, the only output row read per chunk.
+        chunk_flags: (nseq,), nonzero where the slot crosses its boundary.
+        initial_states: (num_states, nheads, headdim, dstate), typically the
+            engine's ssm_state cache indexed in place.
+        out: (nseq, nheads, headdim), receives each chunk's target row.
+        init_scale: optional (num_states,) fp32 of 1.0/0.0, multiplied into
+            the loaded initial state. 0.0 marks slots whose cached state is
+            stale (prefill never crossed a boundary). Exact either way.
+        dst_states: optional (num_states, nheads, headdim * dstate). Flagged
+            chunks' boundary states are stored here at dst_states[slots[c]],
+            converted to its dtype by the store. Saves a scatter pass.
 
     Returns:
-        boundary_states: (nseq, nheads, headdim, dstate) — valid only at
-            chunks where chunk_flags is set.
+        boundary_states: (nseq, nheads, headdim, dstate), valid only at
+            flagged chunks.
     """
     dA_cumsum, dt = _chunk_cumsum_fwd(
         dt,
@@ -240,10 +225,9 @@ def mamba_chunk_scan_decode_rows(
         dt_limit=dt_limit,
         chunk_starts=chunk_starts,
     )
-    # Skipped (non-crossing) chunks leave uninitialized rows in `states`;
-    # they are never consumed: state passing restarts from initial_states at
-    # every chunk (each is its own sequence), so garbage never propagates,
-    # and only flagged chunks' outputs are read.
+    # Non-crossing chunks leave uninitialized rows in `states`. That's fine:
+    # state passing restarts from initial_states at every chunk, so garbage
+    # never propagates, and only flagged chunks' outputs are read.
     states = _chunk_state_fwd(
         B,
         x,
@@ -263,12 +247,11 @@ def mamba_chunk_scan_decode_rows(
         target_rows=target_rows,
         chunk_starts=chunk_starts,
     )
-    # The scan must run BEFORE state passing: when initial_states is the
-    # ssm_state cache read in place, the fused snapshot below overwrites
-    # crossing slots' rows — the scan has to consume the pre-step state.
-    # In decode mode the scan never reads state passing's output (every
-    # chunk is its own sequence), so `states` here is only a shape-valid
-    # dummy for the unused carried-state pointer.
+    # The scan must run before state passing: the snapshot below overwrites
+    # crossing slots' rows in ssm_state, and the scan reads initial_states
+    # from that same cache. The scan never reads state passing's output in
+    # decode mode (every chunk is its own sequence), so `states` is just a
+    # shape-valid placeholder for the unused carried-state pointer.
     _chunk_scan_fwd(
         CB,
         x,
@@ -280,7 +263,6 @@ def mamba_chunk_scan_decode_rows(
         out,
         slots,
         D=D,
-        z=z,
         initial_states=initial_states,
         target_rows=target_rows,
         chunk_starts=chunk_starts,

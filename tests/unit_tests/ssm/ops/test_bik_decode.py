@@ -85,14 +85,10 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
         )
 
     def _make_bufs(self, max_batch):
-        # has_z=False: every test here runs the rmsnorm-style path (z=None in
-        # the scan), which is also what nemotron uses — pins the z-less
-        # allocation and the gathered dense scan together.
         return make_bik_decode_buffers(
             max_batch, self.chunk_size,
             self.nh, self.headdim, self.ngroups, self.dstate,
             self.device, self.dtype,
-            has_z=False,
         )
 
     def _seed_from_prefill(self, bufs, x, dt, B, C, prefill_len, slot, max_batch):
@@ -126,7 +122,6 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
             dt[0, :prefill_len],
             B[0, :prefill_len],
             C[0, :prefill_len],
-            torch.zeros_like(x[0, :prefill_len]),  # z unused
             cu, batch_indices,
         )
         return ssm_state
@@ -140,7 +135,6 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
             dt[:, pos : pos + 1],
             B[:, pos : pos + 1],
             C[:, pos : pos + 1],
-            None,
             self.A, self.D, self.dt_bias,
             batch_indices,
             ssm_state,
@@ -275,7 +269,7 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
         )
         batch_indices = torch.tensor(slots, dtype=torch.int32, device=self.device)
         y_bik = bik_decode_buffered_scan(
-            bufs, x_step, dt_step, B_step, C_step, None,
+            bufs, x_step, dt_step, B_step, C_step,
             self.A, self.D, self.dt_bias, batch_indices, ssm_state,
         )
         for i, plen in enumerate(prefill_lens):
@@ -317,7 +311,6 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
                 pad3(dt[:, pos : pos + 1]),
                 pad3(B[:, pos : pos + 1]),
                 pad3(C[:, pos : pos + 1]),
-                None,
                 self.A, self.D, self.dt_bias,
                 batch_indices,
                 ssm_state,
@@ -356,8 +349,7 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
         batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
         seed_bik_decode_buffers(
             bufs, x[0, :prefill_len], dt[0, :prefill_len],
-            B[0, :prefill_len], C[0, :prefill_len],
-            torch.zeros_like(x[0, :prefill_len]), cu, batch_indices,
+            B[0, :prefill_len], C[0, :prefill_len], cu, batch_indices,
         )
         for k in range(n_decode):
             pos = prefill_len + k
@@ -365,7 +357,7 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
                 bufs,
                 x[:, pos : pos + 1], dt[:, pos : pos + 1],
                 B[:, pos : pos + 1], C[:, pos : pos + 1],
-                None, weak_A, self.D, self.dt_bias,
+                weak_A, self.D, self.dt_bias,
                 batch_indices, ssm_state,
             )
             self._assert_bitwise(

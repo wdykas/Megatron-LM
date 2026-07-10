@@ -1664,9 +1664,9 @@ def enable_batch_invariant_mode(backend: str = "deepgemm"):
     _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)
     # Also patch Transformer Engine kernels when available
     _te_patch_for_batch_invariant()
-    # Pin the Mamba chunked-scan autotuners so rollout and training processes
-    # cannot pick different tile configs (different fp32 reduction groupings →
-    # silent bitwise divergence) via autotune timing noise.
+    # Pin the Mamba autotuners so rollout and training processes can't end
+    # up on different tile configs (and therefore different fp32 reduction
+    # orders) through autotune timing noise.
     _pin_mamba_autotuners()
 
 
@@ -1685,17 +1685,16 @@ def disable_batch_invariant_mode():
 # (autotuner, original configs list) pairs saved by _pin_mamba_autotuners.
 _PINNED_AUTOTUNERS: list = []
 
-# Preferred tile config per Mamba forward kernel: the empirically-fastest
-# autotune winners for nemotron-scale dims (nheads=128, headdim=64,
-# dstate=128, chunk_size=128) on GB200. Hardcoding beats live benchmarking
-# here because parity requires the SAME choice in every process; on other
-# hardware these remain correct (possibly suboptimal — retune and update).
+# Pinned tile config per Mamba forward kernel. Hardcoded rather than
+# autotuned because parity needs the same choice in every process; measured
+# on GB200 at nemotron dims (nheads=128, headdim=64, dstate=128, chunk=128).
+# Other hardware stays correct, possibly suboptimal - retune there and
+# update.
 _PREFERRED_MAMBA_CONFIGS = {
-    # bmm M=64 / scan M=32 deliberately favor smaller M-blocks than the pure
-    # training-shape optimum (bmm M=128 / scan M=64): the decode path's
-    # row-gating computes one M-block per chunk, so smaller M-blocks cut its
-    # work directly. Measured on GB200 at nemotron dims: training scan is
-    # unchanged (0.60 vs 0.60 ms) while gated decode improves 17%.
+    # bmm M=64 / scan M=32 favor smaller M-blocks than the pure training
+    # optimum (M=128 / M=64): decode's row gating computes one M-block per
+    # chunk, so smaller blocks cut its work. Training scan time is unchanged
+    # while gated decode improves 17%.
     "_bmm_chunk_fwd_kernel": {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32},
     "_chunk_scan_fwd_kernel": {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32},
     "_chunk_state_fwd_kernel": {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32},
@@ -1708,8 +1707,8 @@ def _autotune_config_cost(cfg):
     """Deterministic config ranking: block footprint * stages, warps tiebreak.
 
     Mirrors megatron.core.ssm.ops.determinism._estimate_config_cost so the
-    repo and package kernels (identical config lists — the repo is a port)
-    resolve to the same tile config.
+    repo and package kernels (identical config lists; the repo is a port)
+    resolve to the same config.
     """
     block_product = 1
     for key, val in cfg.kwargs.items():
@@ -1732,19 +1731,17 @@ def _choose_pinned_config(kernel_name, configs):
 
 
 def _pin_mamba_autotuners():
-    """Pin Mamba chunked-scan forward kernels to one deterministic tile config.
+    """Pin the Mamba chunked-scan forward kernels to fixed tile configs.
 
-    Bitwise rollout==train parity requires the inference process (repo ssd_*
-    kernels) and the training process (mamba_ssm package ssd_* kernels) to use
-    the same tile decomposition: BLOCK sizes determine the fp32 reduction
-    grouping inside tl.dot loops. By default Triton's autotuner re-benchmarks
-    per process, so timing noise can pick different configs in different
-    processes — an observed, non-theoretical failure mode. Pinning both sides
-    with the same cost rule over their (identical) config lists makes the
-    tiling agree by construction.
+    BLOCK sizes determine the fp32 reduction grouping inside tl.dot loops,
+    so rollout/train parity needs the inference process (repo ssd_* kernels)
+    and the training process (mamba_ssm package kernels) to pick the same
+    config. Triton's autotuner re-benchmarks per process and timing noise
+    can flip the winner; we've seen that break parity in practice. Pinning
+    both sides to the same config removes the benchmark from the loop.
 
-    Only the five forward kernels that feed log-prob parity are pinned;
-    backward kernels affect gradients, not parity.
+    Only the five forward kernels matter for parity; backward kernels only
+    affect gradients.
     """
     global _PINNED_AUTOTUNERS
     try:

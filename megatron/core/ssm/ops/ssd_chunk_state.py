@@ -83,9 +83,8 @@ def _chunk_cumsum_fwd_kernel(
 
     chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)
     if HAS_CHUNK_STARTS:
-        # Decode mode: chunks are fixed-length windows at caller-given offsets
-        # into a persistent buffer (one per slot), not adjacent [cu[c], cu[c+1])
-        # spans of a packed sequence.
+        # Decode mode: fixed-length windows at caller-given buffer offsets
+        # rather than adjacent [cu[c], cu[c+1]) spans.
         chunk_seqlen_end = chunk_seqlen_start + chunk_size
     else:
         chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
@@ -224,15 +223,13 @@ def _chunk_state_fwd_kernel(
     pid_m = tl.program_id(axis=0) // num_pid_n
     pid_n = tl.program_id(axis=0) % num_pid_n
     if HAS_CHUNK_FLAGS:
-        # Decode mode: this chunk's state is only consumed when the slot
-        # crosses its chunk boundary this step. Skip the (expensive) state
-        # matmul for all other chunks; their `states` rows stay uninitialized
-        # and downstream never reads them.
+        # Decode mode: a chunk's state is only consumed when its slot
+        # crosses the boundary this step. Skip the matmul otherwise; the
+        # uninitialized rows are never read downstream.
         if tl.load(chunk_flags_ptr + pid_c) == 0:
             return
     chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)
     if HAS_CHUNK_STARTS:
-        # Decode mode: fixed-length windows at caller-given buffer offsets.
         chunk_seqlen_end = chunk_seqlen_start + chunk_size
     else:
         chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
@@ -305,7 +302,6 @@ def _chunk_cumsum_fwd(
     if dt_bias is not None:
         assert dt_bias.shape == (nheads,)
     if chunk_starts is not None:
-        # Decode mode: fixed-length windows at the given buffer offsets.
         cu_chunk_seqlens = chunk_starts
         nchunks = chunk_starts.shape[0]
     else:

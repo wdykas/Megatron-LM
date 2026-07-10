@@ -997,13 +997,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
         """Torch grouped_mm fused MoE forward via mcore_fused_moe.
 
-        batch-invariant + EP > 1 path: skip mcore_fused_moe's internal
-        unpermute, AllToAll-route raw per-contribution expert outputs to
-        their home ranks, and run a single local `deterministic_index_add`
-        on each rank. This makes the topk reduction order identical to
-        training's local unpermute (which sums all K contribs in sorted-
-        index order). The dispatcher's token_combine then becomes a
-        pass-through (the cross-rank work has already happened).
+        With batch_invariant_mode and EP > 1, skip mcore_fused_moe's
+        internal unpermute and run the cross-EP combine in
+        _bik_global_unpermute instead, so the topk reduction order matches
+        training. The dispatcher's token_combine then passes the result
+        through.
         """
         local_expert_start = self.ep_group.rank() * self.num_local_experts
         ep_size = self.ep_group.size()
@@ -1048,33 +1046,22 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _bik_global_unpermute(
         self, fc2_output, permuted_probs, permutation_map, n_used, hidden_states
     ):
-        """AllToAll-padded cross-EP deterministic unpermute (batch-invariant + EP > 1).
+        """Cross-EP deterministic unpermute for batch_invariant_mode, EP > 1.
 
-        Each rank's contribs (fc2_output * permuted_probs in fp32) are routed
-        directly to the rank that owns their destination token: one fixed-shape
-        AllToAll-single instead of broadcast. Each rank then runs a *local*
-        deterministic_index_add over the received contribs, producing the same
-        result training would.
+        Routes each raw contribution (fc2_output * permuted_probs, fp32) to
+        the rank owning its destination token with one fixed-shape
+        AllToAll-single, then runs a single local deterministic_index_add on
+        the receiving side. That reproduces training's reduction: the stable
+        argsort by dest rank keeps same-destination contribs in expert-sorted
+        order, AllToAll packs the receive buffer source-rank-major, and
+        deterministic_index_add sorts by (token, position) — the same order
+        training sums in, so the bf16 result matches bitwise.
 
-        Versus AllGather + global unpermute:
-          * Bandwidth: each contrib travels exactly once instead of ep_size
-            times → ~ep_size× less data crosses the network.
-          * Memory: send/recv buffers are O(N_local) per rank instead of
-            O(ep_size · N_local) → ~ep_size/2× smaller.
+        All shapes are static (bincount with minlength, equal AllToAll
+        chunks), so this captures into CUDA graphs.
 
-        Per-token K-contrib sum order matches training because:
-          1. stable argsort by dest_rank groups same-dest contribs in their
-             original (expert-sorted) order within each src→dest bucket;
-          2. AllToAll-single packs receive buffer in source-rank-major order;
-          3. deterministic_index_add sorts by (token_id, position) — same
-             secondary key (source-rank major) the training combine produces.
-
-        CG-compat: all shapes are static (bincount uses minlength=ep_size+1;
-        AllToAll-single uses equal chunks per rank).
-
-        Returns [local_tokens, H] bf16 — the final per-rank output. The
-        dispatcher's batch-invariant token_combine branch is a pass-through;
-        no further cross-rank reduction is needed.
+        Returns [local_tokens, H] bf16, the final per-rank output; the
+        dispatcher's token_combine passes it through.
         """
         ep_size = self.ep_group.size()
         max_tokens = hidden_states.shape[0]

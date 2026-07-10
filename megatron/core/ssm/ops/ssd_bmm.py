@@ -103,12 +103,11 @@ def _bmm_chunk_fwd_kernel(
         if pid_n * BLOCK_SIZE_N >= (pid_m + 1) * BLOCK_SIZE_M:
             return
     if HAS_TARGET_ROWS:
-        # Decode-row mode: only one output row per chunk is consumed
-        # (row `target_rows[pid_c]` of the chunk-scan). Skip every M-block
-        # that doesn't contain it, and every N-block strictly past it (the
-        # scan causally zeroes CB columns > target row, so their values are
-        # never used). The computed block runs the exact same instructions
-        # as the ungated kernel — bitwise-identical output for that block.
+        # Decode mode: only row target_rows[pid_c] of the chunk scan is
+        # consumed. Skip M-blocks that don't contain it and N-blocks past it
+        # (the scan causally zeroes CB columns beyond the target row anyway).
+        # The surviving block runs the same instructions as the ungated
+        # kernel, so its output is unchanged.
         tr = tl.load(target_rows_ptr + pid_c)
         if pid_m != tr // BLOCK_SIZE_M:
             return
@@ -169,8 +168,6 @@ def _bmm_chunk_fwd(
     target_rows=None,
     chunk_starts=None,
 ):
-    if chunk_starts is not None:
-        cu_chunk_seqlens = chunk_starts
     """
     Argument:
         a: (seqlen, ngroups, k)
@@ -179,13 +176,14 @@ def _bmm_chunk_fwd(
         cu_chunk_seq_lens: (nchunks+1,)
         causal: if True, then out[i, j] for i > j will be arbitrary, only out[i, j] for i <= j are
             guaranteed to be correct.
-        target_rows: optional (nchunks,) int32 — decode-row mode. Only the M-block
-            containing target_rows[c] (and N-blocks up to it) is computed per chunk;
-            all other output entries are left uninitialized. Bitwise-identical to the
-            full kernel for the computed block.
+        target_rows: optional (nchunks,) int32. Decode mode: compute only the
+            M-block containing target_rows[c] (and N-blocks up to it); other
+            output entries are left uninitialized.
     Return:
         out: (nchunks, ngroups, chunk_size, chunk_size)
     """
+    if chunk_starts is not None:
+        cu_chunk_seqlens = chunk_starts
     seqlen, ngroups, k = a.shape
     assert b.shape == a.shape
     if a.stride(-1) != 1 and a.stride(0) != 1:

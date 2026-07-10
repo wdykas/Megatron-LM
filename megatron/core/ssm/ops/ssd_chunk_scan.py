@@ -151,10 +151,9 @@ def _chunk_scan_fwd_kernel(
     pid_m = tl.program_id(axis=0) // num_pid_n
     pid_n = tl.program_id(axis=0) % num_pid_n
     if HAS_TARGET_ROWS:
-        # Decode-row mode: only row `target_rows[pid_c]` of this chunk's
-        # output is consumed. Skip every M-block that doesn't contain it.
-        # The surviving block executes the exact same instructions as the
-        # ungated kernel — bitwise-identical output for that block.
+        # Decode mode: only row target_rows[pid_c] of this chunk's output is
+        # consumed, so skip every M-block that doesn't contain it. The
+        # surviving block runs the same instructions as the ungated kernel.
         if pid_m != tl.load(target_rows_ptr + pid_c) // BLOCK_SIZE_M:
             return
     cb_ptr += pid_c * stride_cb_chunk + (pid_h // nheads_ngroups_ratio) * stride_cb_head
@@ -176,13 +175,12 @@ def _chunk_scan_fwd_kernel(
     seq_idx_ptr += pid_c * stride_seq_idx_chunk
     seq_idx = tl.load(seq_idx_ptr)
     if HAS_CHUNK_STARTS:
-        # Decode mode: every chunk is unconditionally its own sequence, and
-        # seq_idx carries the slot id used to index initial_states (which may
-        # be the engine's state cache directly). Reading initial_states
-        # unconditionally (constexpr branch) also makes duplicate-adjacent
-        # padding lanes harmless: they can never alias a real chunk's
-        # carried state — and the carried-states pointer (a shape-valid
-        # dummy here) is never typed into the program.
+        # Decode mode: every chunk is its own sequence and seq_idx carries
+        # the slot id into initial_states (which may be the engine's state
+        # cache). Reading initial_states unconditionally means padding lanes
+        # with duplicate slot ids can never pick up another chunk's carried
+        # state, and the (dummy) carried-states pointer is never typed into
+        # the program.
         seq_idx_prev = -1
         prev_states_ptr = (
             initstates_ptr + seq_idx * stride_init_states_batch + pid_h * stride_init_states_head
@@ -247,8 +245,8 @@ def _chunk_scan_fwd_kernel(
                 other=0.0,
             )
             if HAS_INIT_SCALE:
-                # Decode mode: 0.0 for slots whose prefill never crossed a
-                # chunk boundary, 1.0 otherwise. Exact either way.
+                # 0.0 marks slots with no valid boundary state yet; the
+                # multiply is exact for both 0.0 and 1.0.
                 prev_states = prev_states * tl.load(init_scale_ptr + seq_idx).to(
                     prev_states.dtype
                 )
@@ -349,14 +347,13 @@ def _chunk_scan_fwd_kernel(
         acc *= z * tl.sigmoid(z)
 
     if HAS_TARGET_ROWS:
-        # Compact store: only the target row is consumed downstream, so write
-        # it (alone) to a dense (nchunks, nheads, hdim) output instead of the
-        # full per-token layout. Same acc values as the full store — just a
-        # narrower mask — so bitwise-identical for the consumed row.
+        # Store just the target row to a compact (nchunks, nheads, hdim)
+        # output; nothing else is consumed downstream. Same acc values as
+        # the full store, only the mask is narrower.
         tr = tl.load(target_rows_ptr + pid_c)
         out_ptr += pid_c * stride_out_seqlen + pid_h * stride_out_head
-        # All M-lanes alias the same output row (row-stride 0); the mask keeps
-        # only lane `tr`, so exactly one lane stores per column.
+        # All M-lanes alias the same output row (row stride 0); the mask
+        # keeps only lane tr, so one lane stores per column.
         out_ptrs = out_ptr + (
             offs_out_m[:, None] * 0 + offs_out_n[None, :] * stride_out_hdim
         )

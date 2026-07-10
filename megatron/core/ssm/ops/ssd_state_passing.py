@@ -92,9 +92,9 @@ def _state_passing_fwd_kernel(
         seq_idx = tl.load(seq_idx_ptr + c * stride_seq_idx_chunk)
         is_new_seq = prev_seq_idx != seq_idx
         if ALWAYS_NEW_SEQ:
-            # Decode mode: every chunk is its own sequence; seq_idx carries
-            # slot ids (which may repeat on adjacent padding lanes), so the
-            # change-detection heuristic must not be trusted.
+            # Decode mode: every chunk is its own sequence. seq_idx carries
+            # slot ids that can repeat on padding lanes, so change detection
+            # can't be trusted.
             is_new_seq = True
         # we have started a new sequence
         if is_new_seq:
@@ -107,9 +107,8 @@ def _state_passing_fwd_kernel(
                 )
                 states = tl.load(initstates_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
                 if HAS_INIT_SCALE:
-                    # Decode mode: 0.0 for slots whose prefill never crossed a
-                    # chunk boundary (their cached state must not be used),
-                    # 1.0 otherwise. Multiplying by 1.0/0.0 is bitwise-exact.
+                    # 0.0 marks slots with no valid boundary state yet; the
+                    # multiply is exact for both 0.0 and 1.0.
                     states = states * tl.load(init_scale_ptr + seq_idx).to(tl.float32)
             else:
                 states = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
@@ -119,11 +118,10 @@ def _state_passing_fwd_kernel(
         tl.store(out_ptrs, states, mask=offs_m < dim)
 
         if HAS_DST_STATES:
-            # Decode mode: when this chunk's slot crosses its boundary this
-            # step, persist the boundary state straight into the state cache
-            # (dst_states[dst_indices[c]]). Same fp32 value as `out`; the
-            # store converts to the cache dtype exactly like a .to() cast.
-            # Each crossing chunk writes its own slot — no duplicate indices.
+            # Decode mode: persist crossing slots' boundary states straight
+            # into the state cache. Same fp32 value as `out`; the store
+            # converts to the cache dtype. Each crossing chunk writes its own
+            # slot, so there are no duplicate indices.
             if tl.load(dst_flags_ptr + c) != 0:
                 dst_idx = tl.load(dst_indices_ptr + c).to(tl.int64)
                 dst_ptrs = (
@@ -153,11 +151,10 @@ def _state_passing_fwd(
     init_scale=None,
 ):
     """
-    dst_states/dst_indices/dst_flags (all-or-none): decode-mode fused state
-    snapshot. For each chunk c where dst_flags[c] != 0, the computed boundary
-    state is additionally stored to dst_states[dst_indices[c]] (converted to
-    dst_states' dtype by the store). Lets the decode path persist crossing
-    slots' boundary states without a separate gather/where/scatter pass.
+    dst_states/dst_indices/dst_flags (all-or-none): for each chunk with
+    dst_flags[c] != 0, also store the computed boundary state to
+    dst_states[dst_indices[c]], converted to its dtype. Saves the decode
+    path a separate scatter pass.
     """
     nchunks, nheads, dim = states.shape
     chunk_size = dA_cumsum.shape[-1]
