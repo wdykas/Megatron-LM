@@ -242,9 +242,6 @@ def batch_invariant_decode_buffered_scan(
         dt_bias=dt_bias,
         dt_softplus=True,
         state_dtype=ssm_state.dtype,
-        # view, not flatten: the in-kernel snapshot must write the cache
-        # itself. view fails loudly if the cache isn't viewable; flatten
-        # would silently copy.
         dst_states=ssm_state.view(ssm_state.shape[0], ssm_state.shape[1], -1),
         init_scale=bufs.state_scale,
     )
