@@ -35,6 +35,7 @@ def _state_passing_fwd_kernel(
     dst_states_ptr,
     dst_indices_ptr,
     dst_flags_ptr,
+    init_scale_ptr,
     # Matrix dimensions
     dim: tl.constexpr,
     nchunks,
@@ -61,6 +62,7 @@ def _state_passing_fwd_kernel(
     HAS_INITSTATES: tl.constexpr,
     HAS_DST_STATES: tl.constexpr,
     ALWAYS_NEW_SEQ: tl.constexpr,
+    HAS_INIT_SCALE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid_h = tl.program_id(axis=1)
@@ -104,6 +106,11 @@ def _state_passing_fwd_kernel(
                     + offs_m * stride_initstates_dim
                 )
                 states = tl.load(initstates_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+                if HAS_INIT_SCALE:
+                    # Decode mode: 0.0 for slots whose prefill never crossed a
+                    # chunk boundary (their cached state must not be used),
+                    # 1.0 otherwise. Multiplying by 1.0/0.0 is bitwise-exact.
+                    states = states * tl.load(init_scale_ptr + seq_idx).to(tl.float32)
             else:
                 states = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
 
@@ -143,6 +150,7 @@ def _state_passing_fwd(
     dst_indices=None,
     dst_flags=None,
     always_new_seq=False,
+    init_scale=None,
 ):
     """
     dst_states/dst_indices/dst_flags (all-or-none): decode-mode fused state
@@ -185,6 +193,7 @@ def _state_passing_fwd(
             dst_states_ptr=dst_states,
             dst_indices_ptr=dst_indices,
             dst_flags_ptr=dst_flags,
+            init_scale_ptr=init_scale,
             dim=dim,
             nchunks=nchunks,
             seqlen=seqlen if seq_idx is not None else 0,
@@ -208,5 +217,6 @@ def _state_passing_fwd(
             HAS_INITSTATES=initial_states is not None,
             HAS_DST_STATES=has_dst,
             ALWAYS_NEW_SEQ=always_new_seq,
+            HAS_INIT_SCALE=init_scale is not None,
         )
     return out

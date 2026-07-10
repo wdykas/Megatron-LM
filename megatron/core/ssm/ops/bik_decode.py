@@ -40,6 +40,12 @@ class BikDecodeBuffers:
     #   the model applies gating outside the scan (rmsnorm=True) — the scan
     #   never reads z then, so the buffer would be pure memory waste.
     count: torch.Tensor      # (max_batch + 1,) int32 — write cursor per slot
+    # 1.0 normally; 0.0 while a slot's prefill has not yet crossed a chunk
+    # boundary (its cached ssm state must not be used). Consumed by the
+    # kernels as a multiplier on the loaded initial state — replaces writing
+    # zeros into the engine's cache, which required either a host sync or an
+    # aliasing-prone scatter. Trash row absorbs inactive lanes.
+    state_scale: torch.Tensor  # (max_batch + 1,) fp32
     # Compact per-lane output, allocated once and sliced per step. Sized
     # max_batch + 1 so a decode batch fully padded up to max_batch + 1 lanes
     # still fits.
@@ -86,6 +92,7 @@ def make_bik_decode_buffers(
             else None
         ),
         count=torch.zeros(rows, device=device, dtype=torch.int32),
+        state_scale=torch.ones(rows, device=device, dtype=torch.float32),
         out=torch.empty(rows, nh, p, device=device, dtype=dtype),
     )
 
@@ -99,7 +106,6 @@ def seed_bik_decode_buffers(
     z: torch.Tensor,
     cu_seqlens: torch.Tensor,
     batch_indices: Optional[torch.Tensor],
-    ssm_state: torch.Tensor,
 ) -> None:
     """Seed each request's decode buffer with its prefill's partial-chunk tail.
 
@@ -108,10 +114,11 @@ def seed_bik_decode_buffers(
     makes the decode output bitwise-equal to a full prefill+decode_token scan.
 
     When prefill_len < chunk_size, the whole prefill goes into the buffer and
-    `ssm_state[slot]` is zeroed: no chunk boundary was crossed, so the state
-    the prefill kernel wrote there (state at prompt end) must not be used —
-    the buffer replays the sequence from position 0 with a zero initial
-    state, exactly like the full scan.
+    `state_scale[slot]` is set to 0.0: no chunk boundary was crossed, so the
+    state the prefill kernel wrote into the cache (state at prompt end) must
+    not be used — the kernels multiply the loaded initial state by this
+    scale, replaying the sequence from position 0 with a zero initial state,
+    exactly like the full scan.
 
     Fully vectorized: no host syncs, no per-request Python loop. Buffer
     positions past each tail are filled with a duplicated (finite) row; they
@@ -158,12 +165,16 @@ def seed_bik_decode_buffers(
     ).to(torch.int32)
 
     # No boundary was crossed for prefills shorter than a chunk: decode must
-    # start from a zero state, so overwrite whatever the prefill kernel left
-    # in the cache for those slots. Boolean compression gives unique real
-    # slot indices (no aliasing); seeding runs on the prefill path, outside
-    # CUDA-graph capture, so the data-dependent shape is fine.
-    zero_slots = slots_raw[(plens < chunk) & active]
-    ssm_state[zero_slots] = 0
+    # not use whatever the prefill kernel left in the cache for those slots.
+    # Instead of writing zeros into the engine's cache (host-sync or aliasing
+    # scatter), set the per-slot init scale the kernels multiply into the
+    # loaded state (0.0 == zero init, bitwise-exact). Fixed shapes, no host
+    # syncs — the engine captures prefill steps into CUDA graphs too.
+    bufs.state_scale[slots] = torch.where(
+        active & (plens < chunk),
+        torch.zeros_like(plens, dtype=torch.float32),
+        torch.ones_like(plens, dtype=torch.float32),
+    )
 
 
 def bik_decode_buffered_scan(
@@ -296,6 +307,7 @@ def bik_decode_buffered_scan(
         # view (not flatten) so a non-viewable cache fails loudly instead of
         # silently copying — the in-kernel snapshot writes must hit the cache.
         dst_states=ssm_state.view(ssm_state.shape[0], ssm_state.shape[1], -1),
+        init_scale=bufs.state_scale,
     )
 
     # --- y: the scan stored each chunk's target row compactly at out[i] ---
@@ -315,5 +327,13 @@ def bik_decode_buffered_scan(
         count_per_batch + 1,
     )
     bufs.count[slots] = new_count_per_batch.to(torch.int32)
+
+    # A crossing slot now has a valid boundary state in the cache (written by
+    # the fused snapshot) — restore its init scale to 1.0. Non-crossing and
+    # inactive lanes rewrite their current value (identical duplicates only).
+    old_scale = bufs.state_scale[slots]
+    bufs.state_scale[slots] = torch.where(
+        crossing.bool(), torch.ones_like(old_scale), old_scale
+    )
 
     return y

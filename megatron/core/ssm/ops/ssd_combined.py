@@ -180,6 +180,7 @@ def mamba_chunk_scan_decode_rows(
     dt_limit=(0.0, float("inf")),
     state_dtype=None,
     dst_states=None,
+    init_scale=None,
 ):
     """Row-gated chunk scan for batch-invariant single-token decode.
 
@@ -215,6 +216,10 @@ def mamba_chunk_scan_decode_rows(
             engine's ssm_state cache itself, indexed in place by `slots`.
         out: (nseq, nheads, headdim) preallocated compact output — the scan
             stores each chunk's target row here directly.
+        init_scale: optional (num_states,) fp32 of 1.0/0.0 — multiplied into
+            each chunk's loaded initial state (0.0 for slots whose prefill
+            never crossed a chunk boundary, whose cached state must not be
+            used). Multiplying by 1.0/0.0 is bitwise-exact.
         dst_states: optional fused state snapshot — for chunks where
             chunk_flags is set, the boundary state is stored directly to
             dst_states[slots[c]] (e.g. the ssm_state cache flattened to
@@ -279,6 +284,7 @@ def mamba_chunk_scan_decode_rows(
         initial_states=initial_states,
         target_rows=target_rows,
         chunk_starts=chunk_starts,
+        init_scale=init_scale,
     )
     dstate = B.shape[-1]
     boundary_states = _state_passing_fwd(
@@ -292,6 +298,7 @@ def mamba_chunk_scan_decode_rows(
         dst_indices=slots,
         dst_flags=chunk_flags if dst_states is not None else None,
         always_new_seq=True,
+        init_scale=init_scale,
     ).unflatten(-1, (-1, dstate))
     return boundary_states
 

@@ -127,7 +127,7 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
             B[0, :prefill_len],
             C[0, :prefill_len],
             torch.zeros_like(x[0, :prefill_len]),  # z unused
-            cu, batch_indices, ssm_state,
+            cu, batch_indices,
         )
         return ssm_state
 
@@ -189,9 +189,9 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
                 ssm_state = self._seed_from_prefill(
                     bufs, x, dt, B, C, prefill_len, slot, max_batch,
                 )
-                # Sanity: seeding must have zeroed the (garbage) state cache
-                # for this slot, since no chunk boundary was crossed.
-                self.assertEqual(ssm_state[slot].abs().max().item(), 0.0)
+                # Sanity: no boundary crossed → the kernels must be told to
+                # ignore the (garbage) cached state via a zero init scale.
+                self.assertEqual(bufs.state_scale[slot].item(), 0.0)
                 y_bik = self._decode_one_step(
                     bufs, x, dt, B, C, prefill_len, slot, ssm_state,
                 )
@@ -357,7 +357,7 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
         seed_bik_decode_buffers(
             bufs, x[0, :prefill_len], dt[0, :prefill_len],
             B[0, :prefill_len], C[0, :prefill_len],
-            torch.zeros_like(x[0, :prefill_len]), cu, batch_indices, ssm_state,
+            torch.zeros_like(x[0, :prefill_len]), cu, batch_indices,
         )
         for k in range(n_decode):
             pos = prefill_len + k
