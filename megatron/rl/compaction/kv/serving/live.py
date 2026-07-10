@@ -136,6 +136,7 @@ class LiveKVCompactor:
                 "recompact_hwm needs a re-scorable strategy (snapkv ring "
                 f"queries or positional streaming_llm), got {strategy!r}")
         self.recompact_hwm = int(recompact_hwm or 0)
+        self.recompactions = 0
         self.obs_window = obs_window
         self.pool_kernel = pool_kernel
         self.n_sink = n_sink
@@ -539,6 +540,8 @@ class LiveKVCompactor:
         skipped — its prompt is still streaming in.
         """
         if is_decode_only:
+            if self.recompact_hwm:
+                self._recompact_decoding_requests()
             if self.archive_enabled:
                 self.retrieve_for_decoding_requests()
             return
@@ -606,34 +609,24 @@ class LiveKVCompactor:
                 rid = int(ctx.request_ids[b_global].item())
                 self._archive.store_evicted(rid, k, v, positions)
             t_store1 = time.perf_counter()
-            rotated_keys = None
-            if self.rope_mode == "renumber":
-                from .rope import delta_rotate_keys
-                old_pos = torch.tensor(positions, device=k.device, dtype=torch.long)
-                new_pos = torch.arange(len(positions), device=k.device)
-                rotated_keys = delta_rotate_keys(
-                    k[:, positions], old_pos, new_pos,
-                    self._inv_freq, self._rope_interleaved)
-            self._hook.apply_mask_for_request(b_local, positions)
-            if rotated_keys is not None:
-                self._hook.overwrite_keys_for_request(b_local, rotated_keys)
-            if self.rope_mode == "logical":
-                # The pending decode token's original position is S (prompt
-                # length); begin_step patches it in before the next forward.
-                self._logical_pos[int(ctx.request_ids[b_global].item())] = S
-            self._repoint_pending_token(b_local, b_global, len(positions))
-            # Termination compares current length against request_output_lengths
-            # (prompt + num_tokens_to_generate, absolute) — shift it down by the
-            # evicted count or the request over-generates past its token budget.
-            ctx.request_output_lengths[b_global] -= S - len(positions)
-            self.compacted_requests += 1
-            self.tokens_evicted += S - len(positions)
+            self._apply_eviction(b_local, b_global, k, positions, S)
             torch.cuda.synchronize()
             t_end = time.perf_counter()
             logger.info(
                 "[kv-compaction] request b_local=%d: %d -> %d tokens (%s, ratio %.2f)",
                 b_local, S, len(positions), self.strategy, self.budget_ratio,
             )
+            if os.environ.get("KV_COMPACTION_DEBUG"):
+                # Failure attribution: which ORIGINAL positions survived.
+                # Compressed ranges keep the line readable at 4k prompts.
+                rid_dbg = int(ctx.request_ids[b_global].item())
+                runs, start = [], positions[0]
+                for a, b in zip(positions, positions[1:] + [None]):
+                    if b != a + 1:
+                        runs.append(f"{start}-{a}" if start != a else f"{a}")
+                        start = b
+                logger.info("[kv-retained] rid=%d ranges=%s",
+                            rid_dbg, ",".join(runs))
             logger.info(
                 "[kv-compaction-timing] gather=%.0fms score+select=%.0fms "
                 "store=%.0fms surgery=%.0fms",
@@ -757,6 +750,90 @@ class LiveKVCompactor:
                 cfg, params_dtype=torch.bfloat16, pg_collection=pgc,
             ).cuda().to(torch.bfloat16).eval()
 
+    def _apply_eviction(self, b_local: int, b_global: int, k: torch.Tensor,
+                        positions: list[int], S: int) -> None:
+        """Shared cache surgery for post-prefill compaction AND decode-time
+        re-compaction: RoPE fixup, paged-cache mask, pending-token repoint,
+        termination-length shift, counters."""
+        ctx = self._ctx
+        rotated_keys = None
+        if self.rope_mode == "renumber":
+            from .rope import delta_rotate_keys
+            old_pos = torch.tensor(positions, device=k.device, dtype=torch.long)
+            new_pos = torch.arange(len(positions), device=k.device)
+            rotated_keys = delta_rotate_keys(
+                k[:, positions], old_pos, new_pos,
+                self._inv_freq, self._rope_interleaved)
+        self._hook.apply_mask_for_request(b_local, positions)
+        if rotated_keys is not None:
+            self._hook.overwrite_keys_for_request(b_local, rotated_keys)
+        if self.rope_mode == "logical":
+            # The pending decode token's original position is S; begin_step
+            # patches it in before the next forward.
+            self._logical_pos[int(ctx.request_ids[b_global].item())] = S
+        self._repoint_pending_token(b_local, b_global, len(positions))
+        # Termination compares current length against request_output_lengths
+        # (prompt + num_tokens_to_generate, absolute) — shift it down by the
+        # evicted count or the request over-generates past its token budget.
+        ctx.request_output_lengths[b_global] -= S - len(positions)
+        self.compacted_requests += 1
+        self.tokens_evicted += S - len(positions)
+
+    def _ring_query_rows(self, b_local: int) -> list[torch.Tensor] | None:
+        """Chronologically-ordered ring Q for one request, per layer
+        (T, Hq, D) with T = filled steps. None until the ring has data."""
+        if self._q_ring_counter is None or any(r is None for r in self._q_ring):
+            return None
+        c = int(self._q_ring_counter.item())      # rare event: sync is fine
+        if c == 0:
+            return None
+        take = min(c, self.obs_window)
+        rows = [(c - take + i) % self.obs_window for i in range(take)]
+        idx = torch.tensor(rows, device=self._q_ring[0].device)
+        return [ring[idx][:, b_local] for ring in self._q_ring]
+
+    def _recompact_decoding_requests(self) -> None:
+        """Recursive compaction: when a request's live cache reaches the
+        high-water mark, re-evict down to budget_ratio * recompact_hwm using
+        the last obs_window decode queries (snapkv) or positions
+        (streaming_llm). Evicted spans APPEND to the archive, so earlier
+        rounds' spans stay retrievable."""
+        ctx = self._ctx
+        n_active = ctx.total_request_count - ctx.paused_request_count
+        if n_active <= 0:
+            return
+        for b_local in range(n_active):
+            b_global = ctx.paused_request_count + b_local
+            cur = int(ctx.request_kv_length_offsets[b_global].item())
+            if cur < self.recompact_hwm:
+                continue
+            k, v = self._hook.get_kv_for_request(b_local)   # (L, S, H, D)
+            S = k.shape[1]
+            budget = max(1, int(self.recompact_hwm * self.budget_ratio))
+            if budget >= S:
+                continue
+            if self.strategy == "snapkv":
+                q_rows = self._ring_query_rows(b_local)
+                if q_rows is None:
+                    continue                     # ring not warm yet
+                scores = self._aggregate_snapkv_scores(k, q_rows, values=v)
+                positions = _select_recent_plus_heavy(
+                    scores, S, budget, n_recent=min(self.obs_window, budget))
+            else:                                # streaming_llm
+                n_sink = min(self.n_sink, budget)
+                recent_start = max(n_sink, S - (budget - n_sink))
+                positions = sorted(set(
+                    list(range(n_sink)) + list(range(recent_start, S))))
+            rid = int(ctx.request_ids[b_global].item())
+            if self._archive is not None:
+                self._archive.store_evicted(rid, k, v, positions)
+                self._archive.invalidate_trigger_epoch(rid)
+            self._apply_eviction(b_local, b_global, k, positions, S)
+            self.recompactions += 1
+            logger.info(
+                "[kv-recompact] request rid=%d: %d -> %d tokens (round total %d)",
+                rid, S, len(positions), self.recompactions)
+
     def _restore_span(self, b_local: int, b_global: int, rid: int,
                       span_idx: int, fire_alpha: float) -> None:
         """Restore one archived span into the request's live cache."""
@@ -781,6 +858,9 @@ class LiveKVCompactor:
             "%d spans left, %s)", rid, ak.shape[1], fire_alpha,
             len(self._archive._spans.get(rid, [])),
             "prefetched" if was_staged else "sync copy")
+        if os.environ.get("KV_COMPACTION_DEBUG"):
+            logger.info("[kv-restored] rid=%d positions=%s", rid,
+                        ",".join(str(p) for p in apos))
 
     def _debug_dump(self) -> None:
         ctx = self._ctx
