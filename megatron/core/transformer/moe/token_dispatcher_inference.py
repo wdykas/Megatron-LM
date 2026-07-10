@@ -156,7 +156,7 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         if cls._use_allgather_v:
             assert not is_batch_invariant_mode_enabled(), (
                 "batch_invariant_mode is incompatible with NCCLAllGatherDispatcher's "
-                "non-CG AllGatherV path: the batch-invariant _bik_global_unpermute "
+                "non-CG AllGatherV path: the batch-invariant _batch_invariant_global_unpermute "
                 "assumes uniform [ep_size * local_tokens, H] partitioning, but the "
                 "AllGatherV path produces a compact [sum(per-rank tokens), H] layout "
                 "where per-rank blocks are not aligned at rank * local_tokens "
@@ -259,7 +259,7 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         truncate.
 
         Batch-invariant path: the cross-rank combine already happened in
-        InferenceGroupedMLP._bik_global_unpermute, which AllToAlls each raw
+        InferenceGroupedMLP._batch_invariant_global_unpermute, which AllToAlls each raw
         contribution to its home rank and runs one local
         deterministic_index_add there. That matches training's single
         reduction tree; ReduceScatter would add a second tree on top of the
@@ -282,7 +282,7 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
             return hidden_states.to(torch.bfloat16)
 
         if is_batch_invariant_mode_enabled():
-            # The combine already happened in _bik_global_unpermute;
+            # The combine already happened in _batch_invariant_global_unpermute;
             # hidden_states is this rank's final [local_tokens, H] result.
             return hidden_states
 
@@ -605,7 +605,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
 
         if is_batch_invariant_mode_enabled():
             # Pass-through: the cross-rank reduction already happened in
-            # InferenceGroupedMLP._bik_global_unpermute (AllToAll-padded combine
+            # InferenceGroupedMLP._batch_invariant_global_unpermute (AllToAll-padded combine
             # + local deterministic_index_add), so hidden_states is already
             # this rank's final [local_tokens, H] bf16 result.
             return hidden_states

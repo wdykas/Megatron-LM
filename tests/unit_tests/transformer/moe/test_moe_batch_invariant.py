@@ -185,9 +185,9 @@ def test_inference_bf16_grouped_mm_routes_when_enabled():
     offs = torch.tensor([(i + 1) * per_expert for i in range(E)], dtype=torch.int32, device="cuda")
 
     with set_batch_invariant_mode(True):
-        y_bik = _bf16_grouped_mm(x, w, offs)
+        y_batch_invariant = _bf16_grouped_mm(x, w, offs)
     y_direct = grouped_gemm_batch_invariant(x, w, offs=offs, m_total=M)
-    assert torch.equal(y_bik, y_direct)
+    assert torch.equal(y_batch_invariant, y_direct)
 
 
 # ---------------------------------------------------------------------------

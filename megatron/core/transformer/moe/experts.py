@@ -295,8 +295,8 @@ class TEGroupedMLP(MegatronModule):
         each weight{i}.data to a view into it. Idempotent.
         """
         for linear, buf_name in (
-            (self.linear_fc1, '_bik_fc1_weight'),
-            (self.linear_fc2, '_bik_fc2_weight'),
+            (self.linear_fc1, '_batch_invariant_fc1_weight'),
+            (self.linear_fc2, '_batch_invariant_fc2_weight'),
         ):
             if getattr(self, buf_name, None) is not None:
                 continue
@@ -999,7 +999,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         With batch_invariant_mode and EP > 1, skip mcore_fused_moe's
         internal unpermute and run the cross-EP combine in
-        _bik_global_unpermute instead, so the topk reduction order matches
+        _batch_invariant_global_unpermute instead, so the topk reduction order matches
         training. The dispatcher's token_combine then passes the result
         through.
         """
@@ -1023,7 +1023,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 disable_fused_quant_kernels=self.config.inference_moe_disable_fused_quant_kernels,
                 return_pre_unpermute=True,
             )
-            output = self._bik_global_unpermute(
+            output = self._batch_invariant_global_unpermute(
                 fc2_output, permuted_probs, permutation_map, n_used, hidden_states
             )
             return output, None
@@ -1043,7 +1043,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         )
         return output, None
 
-    def _bik_global_unpermute(
+    def _batch_invariant_global_unpermute(
         self, fc2_output, permuted_probs, permutation_map, n_used, hidden_states
     ):
         """Cross-EP deterministic unpermute for batch_invariant_mode, EP > 1.

@@ -26,7 +26,7 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.ops.bik_decode import MambaBikDecode
+from megatron.core.ssm.ops.batch_invariant_decode import MambaBatchInvariantDecode
 from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ssm.ops.mamba_ssm import selective_state_update
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
@@ -975,7 +975,7 @@ class MambaMixer(MegatronModule):
             tensor_masked_update(ssm_state, batch_indices, ssm_varlen_states)
 
             if self.config.batch_invariant_mode and cu_seqlens is not None:
-                self._bik().seed(x, dt, B, C, cu_seqlens, batch_indices, ssm_state)
+                self._batch_invariant_decode().seed(x, dt, B, C, cu_seqlens, batch_indices, ssm_state)
 
             # Write intermediate states to pre-allocated output buffers
             # All tensor ops, no Python loops, fully CUDA graph compatible.
@@ -1050,11 +1050,11 @@ class MambaMixer(MegatronModule):
             self._A_neg_exp_cache_stale = False
         return self._A_neg_exp_cache.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
 
-    def _bik(self) -> MambaBikDecode:
+    def _batch_invariant_decode(self) -> MambaBatchInvariantDecode:
         """Batch-invariant decode adapter, created on first use."""
-        if not hasattr(self, "_bik_decode"):
-            self._bik_decode = MambaBikDecode(self)
-        return self._bik_decode
+        if not hasattr(self, "_batch_invariant_decoder"):
+            self._batch_invariant_decoder = MambaBatchInvariantDecode(self)
+        return self._batch_invariant_decoder
 
     def train(self, mode: bool = True):
         """Mark the decode cache stale; weights may have updated."""
@@ -1203,7 +1203,7 @@ class MambaMixer(MegatronModule):
 
             y = y.unsqueeze(1)  # Restore seq dimension
         elif self.config.batch_invariant_mode:
-            y = self._bik().step(x, dt, B, C, batch_indices, ssm_state)
+            y = self._batch_invariant_decode().step(x, dt, B, C, batch_indices, ssm_state)
         else:
             A = self._get_decode_A_neg_exp()
 

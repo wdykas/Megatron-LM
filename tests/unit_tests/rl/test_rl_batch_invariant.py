@@ -22,12 +22,12 @@ def test_selective_log_softmax_batch_invariant():
     perm = torch.randperm(B, device=device)
 
     with set_batch_invariant_mode(True):
-        bik_logps = selective_log_softmax(logits, labels)  # [B, S]
-        bik_logps_perm = selective_log_softmax(
+        batch_invariant_logps = selective_log_softmax(logits, labels)  # [B, S]
+        batch_invariant_logps_perm = selective_log_softmax(
             logits[perm], labels[perm]
         )  # [B, S] corresponding to permuted batch
 
     # Undo the permutation on the permuted outputs and compare elementwise.
     # If the kernel is batch invariant, each example's output should not depend
     # on its position in the batch.
-    assert torch.equal(bik_logps, bik_logps_perm[perm.argsort()])
+    assert torch.equal(batch_invariant_logps, batch_invariant_logps_perm[perm.argsort()])

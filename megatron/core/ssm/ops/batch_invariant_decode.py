@@ -22,7 +22,7 @@ from megatron.core.ssm.ops.ssd_combined import mamba_chunk_scan_decode_rows
 
 
 @dataclass
-class BikDecodeBuffers:
+class BatchInvariantDecodeBuffers:
     """Per-slot persistent state for the buffered decode scan."""
 
     chunk_size: int
@@ -49,7 +49,7 @@ class BikDecodeBuffers:
         return self.count.shape[0]
 
 
-def make_bik_decode_buffers(
+def make_batch_invariant_decode_buffers(
     max_batch: int,
     chunk_size: int,
     nh: int,
@@ -58,7 +58,7 @@ def make_bik_decode_buffers(
     n: int,
     device: torch.device,
     dtype: torch.dtype,
-) -> BikDecodeBuffers:
+) -> BatchInvariantDecodeBuffers:
     """Allocate the per-slot decode buffers.
 
     No z buffer: batch-invariant mode only supports rmsnorm models, where
@@ -71,7 +71,7 @@ def make_bik_decode_buffers(
     write-order race.
     """
     rows = max_batch + 1
-    return BikDecodeBuffers(
+    return BatchInvariantDecodeBuffers(
         chunk_size=chunk_size,
         x=torch.zeros(rows, chunk_size, nh, p, device=device, dtype=dtype),
         dt=torch.zeros(rows, chunk_size, nh, device=device, dtype=dtype),
@@ -83,8 +83,8 @@ def make_bik_decode_buffers(
     )
 
 
-def seed_bik_decode_buffers(
-    bufs: BikDecodeBuffers,
+def seed_batch_invariant_decode_buffers(
+    bufs: BatchInvariantDecodeBuffers,
     x: torch.Tensor,
     dt: torch.Tensor,
     B: torch.Tensor,
@@ -153,8 +153,8 @@ def seed_bik_decode_buffers(
     )
 
 
-def bik_decode_buffered_scan(
-    bufs: BikDecodeBuffers,
+def batch_invariant_decode_buffered_scan(
+    bufs: BatchInvariantDecodeBuffers,
     x: torch.Tensor,           # (B_dec, 1, nh, p)
     dt: torch.Tensor,          # (B_dec, 1, nh)
     B: torch.Tensor,            # (B_dec, 1, ng, n)
@@ -267,13 +267,13 @@ def bik_decode_buffered_scan(
     return y
 
 
-class MambaBikDecode:
+class MambaBatchInvariantDecode:
     """Adapter between a MambaMixer and the buffered decode.
 
     Owns the decode buffers and translates the mixer's conventions (flat
     layouts, context-parallel projections, config flags) into the tensor-op
     API above, so the mixer itself only carries two call sites. Uses the
-    mixer by duck typing; the import direction stays mixer -> bik_decode.
+    mixer by duck typing; the import direction stays mixer -> batch_invariant_decode.
     """
 
     def __init__(self, mixer):
@@ -282,11 +282,11 @@ class MambaBikDecode:
         # otherwise silently drop it.
         assert mixer.rmsnorm, "batch_invariant_mode requires rmsnorm=True"
         self.mixer = mixer
-        self.bufs: Optional[BikDecodeBuffers] = None
+        self.bufs: Optional[BatchInvariantDecodeBuffers] = None
 
-    def _get_bufs(self, max_batch, nh, p, ng, n, device, dtype) -> BikDecodeBuffers:
+    def _get_bufs(self, max_batch, nh, p, ng, n, device, dtype) -> BatchInvariantDecodeBuffers:
         if self.bufs is None:
-            self.bufs = make_bik_decode_buffers(
+            self.bufs = make_batch_invariant_decode_buffers(
                 max_batch, self.mixer.chunk_size, nh, p, ng, n, device, dtype
             )
         return self.bufs
@@ -296,7 +296,7 @@ class MambaBikDecode:
         nh, p = x.shape[-2], x.shape[-1]
         ng, n = B.shape[-2], B.shape[-1]
         bufs = self._get_bufs(ssm_state.shape[0], nh, p, ng, n, x.device, x.dtype)
-        seed_bik_decode_buffers(bufs, x, dt, B, C, cu_seqlens, batch_indices)
+        seed_batch_invariant_decode_buffers(bufs, x, dt, B, C, cu_seqlens, batch_indices)
 
     def step(self, x, dt, B, C, batch_indices, ssm_state) -> torch.Tensor:
         """One decode step. Inputs in the mixer's flat layout:
@@ -318,7 +318,7 @@ class MambaBikDecode:
         ng, n = B.shape[-2], B.shape[-1]
         bufs = self._get_bufs(ssm_state.shape[0], nh, p, ng, n, x.device, x.dtype)
 
-        y = bik_decode_buffered_scan(
+        y = batch_invariant_decode_buffered_scan(
             bufs, x, dt, B, C, A, D, dt_bias, batch_indices, ssm_state
         )
         return y.reshape(b, 1, -1)

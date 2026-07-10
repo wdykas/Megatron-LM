@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Numerical correctness tests for the batch-invariant SSM decode kernel.
 
-`bik_decode_buffered_scan` claims that its single-token output is bitwise
+`batch_invariant_decode_buffered_scan` claims that its single-token output is bitwise
 identical to running `mamba_chunk_scan_combined` over the full
 (prefill + decode_token) sequence — that's what makes batch-invariant RL
 rollout log-probs match the training-side recompute. These tests verify
@@ -16,15 +16,15 @@ import torch
 try:
     from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
-    from megatron.core.ssm.ops.bik_decode import (
-        bik_decode_buffered_scan,
-        make_bik_decode_buffers,
-        seed_bik_decode_buffers,
+    from megatron.core.ssm.ops.batch_invariant_decode import (
+        batch_invariant_decode_buffered_scan,
+        make_batch_invariant_decode_buffers,
+        seed_batch_invariant_decode_buffers,
     )
 
-    HAVE_BIK_DECODE = True
+    HAVE_BATCH_INVARIANT_DECODE = True
 except (ImportError, Exception):
-    HAVE_BIK_DECODE = False
+    HAVE_BATCH_INVARIANT_DECODE = False
 
 
 def _full_scan(x, dt, A, B, C, D, dt_bias, chunk_size, initial_states=None):
@@ -37,9 +37,9 @@ def _full_scan(x, dt, A, B, C, D, dt_bias, chunk_size, initial_states=None):
     return y, final
 
 
-@unittest.skipIf(not HAVE_BIK_DECODE, "mamba_ssm / bik_decode unavailable")
+@unittest.skipIf(not HAVE_BATCH_INVARIANT_DECODE, "mamba_ssm / batch_invariant_decode unavailable")
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
-class TestBikDecodeBufferedScan(unittest.TestCase):
+class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
     """Verify the batch-invariant decode scan matches a full-sequence scan bitwise."""
 
     @classmethod
@@ -55,7 +55,7 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
 
     def setUp(self):
         torch.manual_seed(0)
-        # No global flags: bik_decode_buffered_scan is a pure tensor-ops function
+        # No global flags: batch_invariant_decode_buffered_scan is a pure tensor-ops function
         # and batch-invariant mode by design does not require
         # torch.use_deterministic_algorithms.
         self.device = torch.device("cuda")
@@ -85,7 +85,7 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
         )
 
     def _make_bufs(self, max_batch):
-        return make_bik_decode_buffers(
+        return make_batch_invariant_decode_buffers(
             max_batch, self.chunk_size,
             self.nh, self.headdim, self.ngroups, self.dstate,
             self.device, self.dtype,
@@ -113,10 +113,10 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
 
         cu = torch.tensor([0, prefill_len], dtype=torch.int32, device=self.device)
         batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
-        # seed_bik_decode_buffers expects the squeeze-batch layout
+        # seed_batch_invariant_decode_buffers expects the squeeze-batch layout
         # (the flat (total, nh, p) form used inside the mixer's prefill path).
         # Here total == prefill_len since we have 1 sequence.
-        seed_bik_decode_buffers(
+        seed_batch_invariant_decode_buffers(
             bufs,
             x[0, :prefill_len],
             dt[0, :prefill_len],
@@ -127,9 +127,9 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
         return ssm_state
 
     def _decode_one_step(self, bufs, x, dt, B, C, pos, slot, ssm_state):
-        """Call bik_decode_buffered_scan for the single token at index `pos`."""
+        """Call batch_invariant_decode_buffered_scan for the single token at index `pos`."""
         batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
-        return bik_decode_buffered_scan(
+        return batch_invariant_decode_buffered_scan(
             bufs,
             x[:, pos : pos + 1],
             dt[:, pos : pos + 1],
@@ -161,11 +161,11 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
                 ssm_state = self._seed_from_prefill(
                     bufs, x, dt, B, C, prefill_len, slot, max_batch,
                 )
-                y_bik = self._decode_one_step(
+                y_batch_invariant = self._decode_one_step(
                     bufs, x, dt, B, C, prefill_len, slot, ssm_state,
                 )
                 self._assert_bitwise(
-                    y_bik[0, 0], y_full[0, prefill_len],
+                    y_batch_invariant[0, 0], y_full[0, prefill_len],
                     f"prefill_len={prefill_len}",
                 )
 
@@ -186,11 +186,11 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
                 # Sanity: no boundary crossed → the kernels must be told to
                 # ignore the (garbage) cached state via a zero init scale.
                 self.assertEqual(bufs.state_scale[slot].item(), 0.0)
-                y_bik = self._decode_one_step(
+                y_batch_invariant = self._decode_one_step(
                     bufs, x, dt, B, C, prefill_len, slot, ssm_state,
                 )
                 self._assert_bitwise(
-                    y_bik[0, 0], y_full[0, prefill_len],
+                    y_batch_invariant[0, 0], y_full[0, prefill_len],
                     f"prefill_len={prefill_len}",
                 )
 
@@ -213,9 +213,9 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
 
         for k in range(n_decode):
             pos = prefill_len + k
-            y_bik = self._decode_one_step(bufs, x, dt, B, C, pos, slot, ssm_state)
+            y_batch_invariant = self._decode_one_step(bufs, x, dt, B, C, pos, slot, ssm_state)
             self._assert_bitwise(
-                y_bik[0, 0], y_full[0, pos],
+                y_batch_invariant[0, 0], y_full[0, pos],
                 f"step k={k} (pos={pos}, buf_count_before={bufs.count[slot].item()})",
             )
 
@@ -268,13 +268,13 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
             dim=0,
         )
         batch_indices = torch.tensor(slots, dtype=torch.int32, device=self.device)
-        y_bik = bik_decode_buffered_scan(
+        y_batch_invariant = batch_invariant_decode_buffered_scan(
             bufs, x_step, dt_step, B_step, C_step,
             self.A, self.D, self.dt_bias, batch_indices, ssm_state,
         )
         for i, plen in enumerate(prefill_lens):
             self._assert_bitwise(
-                y_bik[i, 0], y_refs[i],
+                y_batch_invariant[i, 0], y_refs[i],
                 f"multi-slot slot={slots[i]} prefill_len={plen}",
             )
 
@@ -305,7 +305,7 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
                 )
                 return torch.cat([t, junk], dim=0)
 
-            y_bik = bik_decode_buffered_scan(
+            y_batch_invariant = batch_invariant_decode_buffered_scan(
                 bufs,
                 pad3(x[:, pos : pos + 1]),
                 pad3(dt[:, pos : pos + 1]),
@@ -316,10 +316,10 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
                 ssm_state,
             )
             self._assert_bitwise(
-                y_bik[0, 0], y_full[0, pos], f"padded step k={k}"
+                y_batch_invariant[0, 0], y_full[0, pos], f"padded step k={k}"
             )
             # Padding lanes must return zeros.
-            self.assertEqual(y_bik[1:].abs().max().item(), 0.0)
+            self.assertEqual(y_batch_invariant[1:].abs().max().item(), 0.0)
 
     def test_crossing_with_dominant_carried_state(self):
         """Boundary crossing where the carried state dominates the output
@@ -347,13 +347,13 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
         )
         cu = torch.tensor([0, prefill_len], dtype=torch.int32, device=self.device)
         batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
-        seed_bik_decode_buffers(
+        seed_batch_invariant_decode_buffers(
             bufs, x[0, :prefill_len], dt[0, :prefill_len],
             B[0, :prefill_len], C[0, :prefill_len], cu, batch_indices,
         )
         for k in range(n_decode):
             pos = prefill_len + k
-            y_bik = bik_decode_buffered_scan(
+            y_batch_invariant = batch_invariant_decode_buffered_scan(
                 bufs,
                 x[:, pos : pos + 1], dt[:, pos : pos + 1],
                 B[:, pos : pos + 1], C[:, pos : pos + 1],
@@ -361,7 +361,7 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
                 batch_indices, ssm_state,
             )
             self._assert_bitwise(
-                y_bik[0, 0], y_full[0, pos], f"weak-decay step k={k}"
+                y_batch_invariant[0, 0], y_full[0, pos], f"weak-decay step k={k}"
             )
 
     def test_deterministic_across_calls(self):

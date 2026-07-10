@@ -556,8 +556,8 @@ def deterministic_index_add(
 #       `torch.mm`. Requires bf16 CUDA inputs on Hopper/Blackwell.
 #   "triton": batch-invariant Triton `matmul_persistent` — works on any CUDA
 #       device with bf16/fp16/fp32. Has small rounding drift vs `torch.mm`.
-_BIK_BACKENDS = ("deepgemm", "triton")
-_BIK_BACKEND: str = "deepgemm"
+_BATCH_INVARIANT_BACKENDS = ("deepgemm", "triton")
+_BATCH_INVARIANT_BACKEND: str = "deepgemm"
 
 
 def _mm_deepgemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -580,14 +580,14 @@ def _mm_deepgemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 def mm_batch_invariant(a, b):
     """Batch-invariant replacement for `aten::mm`."""
-    if _BIK_BACKEND == "deepgemm":
+    if _BATCH_INVARIANT_BACKEND == "deepgemm":
         return _mm_deepgemm(a, b)
     return matmul_persistent(a, b)
 
 
 def addmm_batch_invariant(bias, a, b):
     """Batch-invariant replacement for `aten::addmm`."""
-    if _BIK_BACKEND == "deepgemm":
+    if _BATCH_INVARIANT_BACKEND == "deepgemm":
         out = _mm_deepgemm(a, b)
         if bias is not None:
             out = out + bias
@@ -867,11 +867,11 @@ def _te_general_grouped_gemm_patched(
     #   dgrad    -> layout="NN", single_output=True,  grad=True   (A=weights, B=grad_y)
     #   wgrad    -> layout="NT", single_output=False, grad=True   (A=inputmats, B=grad_y)
     if single_output and layout == "TN" and not grad:
-        return _bik_te_grouped_forward(A, B, out, m_splits, bias, use_bias, accumulate)
+        return _batch_invariant_te_grouped_forward(A, B, out, m_splits, bias, use_bias, accumulate)
     if single_output and layout == "NN" and grad:
-        return _bik_te_grouped_dgrad(A, B, out, m_splits, accumulate)
+        return _batch_invariant_te_grouped_dgrad(A, B, out, m_splits, accumulate)
     if (not single_output) and layout == "NT" and grad:
-        return _bik_te_grouped_wgrad(A, B, out, m_splits, use_bias, accumulate)
+        return _batch_invariant_te_grouped_wgrad(A, B, out, m_splits, use_bias, accumulate)
     # Unknown TE call shape — defer to the original.
     orig = _TE_GROUPED_GEMM_FUNC_ORIGS.get("module.grouped_linear.general_grouped_gemm")
     return orig(
@@ -917,7 +917,7 @@ def _stack_weights_for_deepgemm(weights: List[torch.Tensor]) -> torch.Tensor:
     return torch.stack([w.contiguous() for w in weights], dim=0)
 
 
-def _bik_te_grouped_forward(A, B, out, m_splits, bias, use_bias, accumulate):
+def _batch_invariant_te_grouped_forward(A, B, out, m_splits, bias, use_bias, accumulate):
     """TE forward: Y = X @ W^T per expert, then optional bias.
 
     A = weights:   List[Tensor[N, K]]
@@ -950,7 +950,7 @@ def _bik_te_grouped_forward(A, B, out, m_splits, bias, use_bias, accumulate):
     return out, bias if use_bias else [None] * len(A), None
 
 
-def _bik_te_grouped_dgrad(A, B, out, m_splits, accumulate):
+def _batch_invariant_te_grouped_dgrad(A, B, out, m_splits, accumulate):
     """TE dgrad: dX = dY @ W per expert.
 
     A = weights:    List[Tensor[N, K]]
@@ -973,7 +973,7 @@ def _bik_te_grouped_dgrad(A, B, out, m_splits, accumulate):
     return out, [None] * len(A), None
 
 
-def _bik_te_grouped_wgrad(A, B, out, m_splits, use_bias, accumulate):
+def _batch_invariant_te_grouped_wgrad(A, B, out, m_splits, use_bias, accumulate):
     """TE wgrad: dW[g] = dY[g]^T @ X[g], plus optional dbias[g] = sum(dY[g], dim=0).
 
     A = inputmats: List[Tensor[m_i, K]]
@@ -1099,7 +1099,7 @@ def _extract_te_gemm_args(args: tuple, kwargs: Dict[str, Any]):
     return A, B, out_dtype, layout, out, bias, grad
 
 
-def _is_supported_dtype_for_bik(t: torch.dtype) -> bool:
+def _is_supported_dtype_for_batch_invariant(t: torch.dtype) -> bool:
     return t in {torch.float16, torch.bfloat16, torch.float32}
 
 
@@ -1241,7 +1241,7 @@ def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
         raise ValueError("Batch-invariant GEMM requires A and B tensors.")
     if (not A.is_cuda) or (not B.is_cuda):
         raise RuntimeError("Batch-invariant GEMM requires CUDA tensors.")
-    if not _is_supported_dtype_for_bik(A.dtype) or not _is_supported_dtype_for_bik(B.dtype):
+    if not _is_supported_dtype_for_batch_invariant(A.dtype) or not _is_supported_dtype_for_batch_invariant(B.dtype):
         raise RuntimeError(f"Unsupported dtype for batch-invariant GEMM: {A.dtype}, {B.dtype}")
 
     # Disallow GEMM-comm overlap in batch-invariant mode
@@ -1279,7 +1279,7 @@ class BatchInvariantRMSNormFn(torch.autograd.Function):
         """
         if not x.is_cuda:
             raise RuntimeError("Batch-invariant RMSNorm requires CUDA tensors.")
-        if not _is_supported_dtype_for_bik(x.dtype):
+        if not _is_supported_dtype_for_batch_invariant(x.dtype):
             raise RuntimeError(f"Unsupported dtype for batch-invariant RMSNorm: {x.dtype}")
         weight_eff = weight + 1.0 if zero_centered_gamma else weight
 
@@ -1641,20 +1641,20 @@ def enable_batch_invariant_mode(backend: str = "deepgemm"):
             Triton `matmul_persistent` kernel (works for bf16/fp16/fp32 and
             on any CUDA device). Grouped GEMM always uses DeepGEMM regardless.
     """
-    global _batch_invariant_MODE, _batch_invariant_LIB, _BIK_BACKEND
+    global _batch_invariant_MODE, _batch_invariant_LIB, _BATCH_INVARIANT_BACKEND
     if _batch_invariant_MODE:
         return
-    if backend not in _BIK_BACKENDS:
+    if backend not in _BATCH_INVARIANT_BACKENDS:
         raise ValueError(
             f"Unknown batch_invariant_kernel_backend={backend!r}; "
-            f"expected one of {_BIK_BACKENDS}."
+            f"expected one of {_BATCH_INVARIANT_BACKENDS}."
         )
     if backend == "deepgemm" and not HAVE_DEEPGEMM_BF16:
         raise RuntimeError(
             "batch_invariant_kernel_backend='deepgemm' requires DeepGEMM with "
             "bf16 bindings. Install DeepGEMM or use backend='triton'."
         )
-    _BIK_BACKEND = backend
+    _BATCH_INVARIANT_BACKEND = backend
     dispatch_key = getattr(torch.accelerator.current_accelerator(), "type", "cpu").upper()
     _batch_invariant_MODE = True
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
