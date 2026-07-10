@@ -38,6 +38,16 @@ class BikDecodeBuffers:
     # Per-lane target-row output, allocated once and sliced per step.
     out: torch.Tensor        # (max_batch + 1, nh, p)
 
+    @property
+    def trash_row(self) -> int:
+        """Write sink for inactive lanes (the buffers' extra last row)."""
+        return self.count.shape[0] - 1
+
+    @property
+    def max_lanes(self) -> int:
+        """Largest decode batch the preallocated buffers support."""
+        return self.count.shape[0]
+
 
 def make_bik_decode_buffers(
     max_batch: int,
@@ -108,13 +118,14 @@ def seed_bik_decode_buffers(
 
     # Redirect inactive lanes (batch_indices < 0) to the trash row so all
     # writes below are unconditional.
-    trash = bufs.count.shape[0] - 1
     if batch_indices is not None:
-        slots_raw = batch_indices[:nseq].to(torch.long)
+        requested = batch_indices[:nseq].to(torch.long)
     else:
-        slots_raw = torch.arange(nseq, device=device, dtype=torch.long)
-    active = slots_raw >= 0
-    slots = torch.where(active, slots_raw, torch.full_like(slots_raw, trash))
+        requested = torch.arange(nseq, device=device, dtype=torch.long)
+    active = requested >= 0
+    slots = torch.where(
+        active, requested, torch.full_like(requested, bufs.trash_row)
+    )
 
     # Row-gather indices for each sequence's tail, (nseq, chunk). Positions
     # past the tail alias trailing rows; clamped and never consumed.
@@ -175,46 +186,41 @@ def bik_decode_buffered_scan(
     """
     B_dec, S_dec, nh, p = x.shape
     n = B.shape[-1]
-    dev = x.device
     chunk = bufs.chunk_size
     assert S_dec == 1, (
         "batch-invariant Mamba decode assumes one new token per request "
         "per call (no speculative decoding)."
     )
-    assert B_dec < bufs.out.shape[0] + 1, (
-        f"decode batch of {B_dec} lanes exceeds the preallocated scratch "
-        f"({bufs.out.shape[0]} lanes = max_batch + 1); increase max_batch."
+    assert B_dec <= bufs.max_lanes, (
+        f"decode batch of {B_dec} lanes exceeds the preallocated buffers "
+        f"({bufs.max_lanes} lanes); increase max_batch."
     )
 
     # Redirect inactive lanes (batch_indices < 0) to the trash row so the
     # buffer writes below are unconditional.
-    trash = bufs.count.shape[0] - 1
     if batch_indices is not None:
-        slots_raw = batch_indices.to(torch.long)
+        requested = batch_indices.to(torch.long)
     else:
-        slots_raw = torch.arange(B_dec, device=dev, dtype=torch.long)
-    is_active = slots_raw >= 0                          # (B_dec,)
-    slots = torch.where(is_active, slots_raw, torch.full_like(slots_raw, trash))
-    # ssm_state is engine-owned and has no trash row: clamp for reads, and
-    # writes only happen for crossing slots (in-kernel), which never alias.
-    state_slots = slots.clamp(max=trash - 1)
+        requested = torch.arange(B_dec, device=x.device, dtype=torch.long)
+    is_active = requested >= 0
+    slots = torch.where(is_active, requested, torch.full_like(requested, bufs.trash_row))
+    # ssm_state is engine-owned and has no trash row: clamp for reads. Its
+    # only writes happen in-kernel for crossing slots, which never alias.
+    state_slots = slots.clamp(max=bufs.trash_row - 1)
 
-    count_per_batch = bufs.count[slots].to(torch.long)  # (B_dec,)
+    # Write the new token at each slot's cursor.
+    counts = bufs.count[slots].to(torch.long)
+    bufs.x[slots, counts] = x[:, 0]
+    bufs.dt[slots, counts] = dt[:, 0]
+    bufs.B[slots, counts] = B[:, 0]
+    bufs.C[slots, counts] = C[:, 0]
 
-    # Write the new token at (slot, count).
-    bufs.x[slots, count_per_batch] = x[:, 0]
-    bufs.dt[slots, count_per_batch] = dt[:, 0]
-    bufs.B[slots, count_per_batch] = B[:, 0]
-    bufs.C[slots, count_per_batch] = C[:, 0]
-
-    chunk_starts = (slots * chunk).to(torch.int32)
-    state_slots_i32 = state_slots.to(torch.int32)
+    # A slot crosses its chunk boundary when this token fills the buffer.
+    crossed = (counts + 1 == chunk) & is_active
     out = bufs.out[:B_dec]
 
-    target_rows = count_per_batch.to(torch.int32)
-    crossing = ((count_per_batch + 1 == chunk) & is_active).to(torch.int32)
-
-    # State passing writes crossing slots' boundary states straight into
+    # Run the gated pipeline over the buffers and ssm_state in place. State
+    # passing writes crossing slots' boundary states straight into
     # ssm_state, so no scatter is needed afterwards.
     mamba_chunk_scan_decode_rows(
         bufs.x.view(-1, nh, p),
@@ -223,43 +229,39 @@ def bik_decode_buffered_scan(
         bufs.B.view(-1, bufs.B.shape[-2], n),
         bufs.C.view(-1, bufs.C.shape[-2], n),
         chunk,
-        chunk_starts,
-        state_slots_i32,
-        target_rows,
-        crossing,
-        ssm_state,
-        out,
+        chunk_starts=(slots * chunk).to(torch.int32),
+        slots=state_slots.to(torch.int32),
+        target_rows=counts.to(torch.int32),
+        chunk_flags=crossed.to(torch.int32),
+        initial_states=ssm_state,
+        out=out,
         D=D,
         dt_bias=dt_bias,
         dt_softplus=True,
         state_dtype=ssm_state.dtype,
         # view, not flatten: the in-kernel snapshot must write the cache
-        # itself, and view fails loudly if the cache isn't viewable while
-        # flatten would silently copy.
+        # itself. view fails loudly if the cache isn't viewable; flatten
+        # would silently copy.
         dst_states=ssm_state.view(ssm_state.shape[0], ssm_state.shape[1], -1),
         init_scale=bufs.state_scale,
     )
 
     # The scan stored each lane's target row at out[i]; padding lanes
     # return zeros.
-    y_per_batch = out * is_active.view(-1, 1, 1).to(out.dtype)  # (B_dec, nh, p)
-    y = y_per_batch.unsqueeze(1)                                # (B_dec, 1, nh, p)
+    y = (out * is_active.view(-1, 1, 1).to(out.dtype)).unsqueeze(1)
 
     # Crossed slots restart their buffer; the rest advance. Inactive lanes
     # write 0 to the trash row, keeping its cursor pinned in bounds.
-    new_count_per_batch = torch.where(
-        crossing.bool() | ~is_active,
-        torch.zeros_like(count_per_batch),
-        count_per_batch + 1,
-    )
-    bufs.count[slots] = new_count_per_batch.to(torch.int32)
+    bufs.count[slots] = torch.where(
+        crossed | ~is_active, torch.zeros_like(counts), counts + 1
+    ).to(torch.int32)
 
     # Crossed slots now have a valid boundary state in the cache, so their
     # init scale goes back to 1.0. Everyone else rewrites their current
     # value.
     old_scale = bufs.state_scale[slots]
     bufs.state_scale[slots] = torch.where(
-        crossing.bool(), torch.ones_like(old_scale), old_scale
+        crossed, torch.ones_like(old_scale), old_scale
     )
 
     return y
