@@ -45,6 +45,11 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
         help="Skip live compaction for prompts shorter than this.",
     )
     parser.add_argument(
+        "--kv-compaction-recompact-hwm", type=int, default=0,
+        help="Recursive compaction: re-evict a request to budget_ratio*hwm "
+             "whenever its live cache reaches this many tokens (0 = off).",
+    )
+    parser.add_argument(
         "--kv-compaction-max-retrievals", type=int, default=4,
         help="Archive retrievals allowed per request (cap on trigger fires).",
     )
@@ -209,6 +214,7 @@ if __name__ == "__main__":
                 archive_transfer=args.kv_compaction_archive_transfer,
                 score_weighting=args.kv_compaction_score_weighting,
                 max_retrievals_per_request=args.kv_compaction_max_retrievals,
+                recompact_hwm=args.kv_compaction_recompact_hwm,
             )
             print(f"[kv-compaction] live compaction enabled: "
                   f"{args.kv_compaction_strategy} @ {args.kv_compaction_budget_ratio}")
