@@ -216,7 +216,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
             y_batch_invariant = self._decode_one_step(bufs, x, dt, B, C, pos, slot, ssm_state)
             self._assert_bitwise(
                 y_batch_invariant[0, 0], y_full[0, pos],
-                f"step k={k} (pos={pos}, buf_count_before={bufs.count[slot].item()})",
+                f"step k={k} (pos={pos}, num_buffered_before={bufs.num_buffered[slot].item()})",
             )
 
     def test_multi_slot_independent_streams(self):
