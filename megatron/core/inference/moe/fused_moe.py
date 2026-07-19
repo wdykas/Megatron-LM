@@ -21,6 +21,7 @@ from megatron.core.inference.moe.permute import (
 )
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    grouped_gemm_batch_invariant_alignment,
     grouped_gemm_batch_invariant,
     is_batch_invariant_mode_enabled,
 )
@@ -61,7 +62,11 @@ def _bf16_grouped_mm(
     if is_batch_invariant_mode_enabled():
         # weight is [E, N, K], which is the layout DeepGEMM's NT call expects directly.
         return grouped_gemm_batch_invariant(
-            x_bf16, weight, offs=offs.to(torch.int32), m_total=x_bf16.shape[0]
+            x_bf16,
+            weight,
+            offs=offs.to(torch.int32),
+            m_total=x_bf16.shape[0],
+            already_aligned=True,
         )
     return grouped_mm(x_bf16, weight.transpose(1, 2), offs=offs)
 
@@ -105,7 +110,6 @@ def mcore_fused_moe(
     routing_map: torch.Tensor,
     disable_fused_quant_kernels: bool = False,
     out: torch.Tensor = None,
-    return_pre_unpermute: bool = False,
 ) -> torch.Tensor:
     """Fused MoE: permute -> pad -> FC1 -> activation -> FC2 -> unpad -> unpermute.
 
@@ -154,10 +158,6 @@ def mcore_fused_moe(
             "batch_invariant_mode requires the bf16 grouped GEMM path; got "
             "MXFP8 weights. Disable mxfp8 or batch_invariant_mode."
         )
-        assert HAVE_GROUPED_MM, (
-            "batch_invariant_mode requires torch.nn.functional.grouped_mm "
-            "(PyTorch 2.10+). Upgrade torch or disable batch_invariant_mode."
-        )
 
     if use_mxfp8:
         assert (
@@ -169,11 +169,14 @@ def mcore_fused_moe(
         # satisfy both constraints.
         expert_alignment = 128
     else:
-        assert (
-            HAVE_GROUPED_MM
-        ), "torch.nn.functional.grouped_mm not available. Install PyTorch 2.10+."
         mm_fn = _bf16_grouped_mm
-        expert_alignment = 16
+        if is_batch_invariant_mode_enabled():
+            expert_alignment = grouped_gemm_batch_invariant_alignment()
+        else:
+            assert (
+                HAVE_GROUPED_MM
+            ), "torch.nn.functional.grouped_mm not available. Install PyTorch 2.10+."
+            expert_alignment = 16
 
     activation_func = _get_activation_func(activation_type, fused_quant=use_fused_quant)
 
@@ -217,13 +220,6 @@ def mcore_fused_moe(
         activation_out = MXFP8Tensor.from_bf16(activation_out, backend="triton")
     fc2_output = mm_fn(activation_out, fc2_weight, offs)
 
-    # --- Post-processing: unpermute ---
-    if return_pre_unpermute:
-        # Caller wants to do the unpermute itself (e.g. the EP > 1
-        # batch-invariant path needs to AllToAll-route raw contribs to
-        # their home ranks and run a single local deterministic_index_add
-        # to match training's reduction tree).
-        return fc2_output, permuted_probs, permutation_map, n_used
     return unpermute_tokens(
         fc2_output, permuted_probs, permutation_map, max_tokens, n_used, valid_tokens, out=out
     )

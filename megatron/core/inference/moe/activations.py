@@ -1,8 +1,9 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Padding-aware activation kernels for fused MoE.
 
-These kernels skip padding rows (where permutation_map == -1) to avoid
-wasted computation on aligned-but-empty expert slots.
+These kernels write deterministic zeros for padding rows (where
+permutation_map == -1). The second grouped GEMM still reads rows inside aligned
+expert blocks, so padding rows cannot be left uninitialized.
 """
 
 from unittest.mock import MagicMock
@@ -40,7 +41,7 @@ def _squared_relu_kernel(
     BLOCK_N: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,  # grid size (fixed for CG)
 ):
-    """Squared ReLU that skips rows beyond n_used and alignment-padding rows (perm_map == -1).
+    """Squared ReLU that gates rows beyond n_used and zeros alignment padding.
 
     Grid: fixed NUM_BLOCKS CTAs, each iterating over multiple rows.
     n_used_ptr gates how many rows are processed — required for CUDA graph compatibility.
@@ -51,13 +52,14 @@ def _squared_relu_kernel(
         return
     for row in tl.range(pid, max_rows, NUM_BLOCKS):
         if row < n_used:
-            if tl.load(src_idx_ptr + row) >= 0:
-                for n in tl.range(0, N, BLOCK_N):
-                    o = n + tl.arange(0, BLOCK_N)
-                    m = o < N
-                    x = tl.load(input_ptr + row * N + o, mask=m).to(tl.float32)
-                    r = tl.maximum(x, 0.0)
-                    tl.store(output_ptr + row * N + o, (r * r).to(tl.bfloat16), mask=m)
+            valid_row = tl.load(src_idx_ptr + row) >= 0
+            for n in tl.range(0, N, BLOCK_N):
+                o = n + tl.arange(0, BLOCK_N)
+                m = o < N
+                x = tl.load(input_ptr + row * N + o, mask=m, other=0.0).to(tl.float32)
+                r = tl.maximum(x, 0.0)
+                y = tl.where(valid_row, r * r, 0.0)
+                tl.store(output_ptr + row * N + o, y.to(tl.bfloat16), mask=m)
 
 
 def padded_squared_relu(
@@ -98,7 +100,7 @@ def _squared_relu_quantize_kernel(
     """Fused squared ReLU + MXFP8 quantize + swizzle in one kernel.
 
     Grid: fixed NUM_BLOCKS CTAs, each iterating over multiple rows.
-    Rows beyond n_used and alignment-padding rows (perm_map == -1) are skipped.
+    Rows beyond n_used are gated; alignment-padding rows are written as zeros.
     """
     pid = tl.program_id(0)
     n_used = tl.load(n_used_ptr)
@@ -106,47 +108,47 @@ def _squared_relu_quantize_kernel(
         return
     for row in tl.range(pid, max_rows, NUM_BLOCKS):
         if row < n_used:
-            if tl.load(src_idx_ptr + row) >= 0:
-                offs = tl.arange(0, BLOCK_K)
-                mask = offs < K
+            valid_row = tl.load(src_idx_ptr + row) >= 0
+            offs = tl.arange(0, BLOCK_K)
+            mask = offs < K
 
-                # Load and apply squared ReLU
-                x = tl.load(input_ptr + row * K + offs, mask=mask, other=0.0).to(tl.float32)
-                relu = tl.maximum(x, 0.0)
-                activated = relu * relu
+            # Load and apply squared ReLU
+            x = tl.load(input_ptr + row * K + offs, mask=mask, other=0.0).to(tl.float32)
+            relu = tl.maximum(x, 0.0)
+            activated = tl.where(valid_row, relu * relu, 0.0)
 
-                # Per-group-of-32 quantization
-                x_grouped = tl.reshape(activated, [BLOCK_GROUPS, 32])
-                abs_grouped = tl.abs(x_grouped)
-                max_vals = tl.max(abs_grouped, axis=1)
+            # Per-group-of-32 quantization
+            x_grouped = tl.reshape(activated, [BLOCK_GROUPS, 32])
+            abs_grouped = tl.abs(x_grouped)
+            max_vals = tl.max(abs_grouped, axis=1)
 
-                dequant_scale = max_vals / 448.0
-                dequant_exp = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
-                dequant_rounded = dequant_exp.to(tl.float32, bitcast=True)
-                quant_scale = tl.where(dequant_rounded == 0, 0.0, 1.0 / dequant_rounded)
+            dequant_scale = max_vals / 448.0
+            dequant_exp = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
+            dequant_rounded = dequant_exp.to(tl.float32, bitcast=True)
+            quant_scale = tl.where(dequant_rounded == 0, 0.0, 1.0 / dequant_rounded)
 
-                quantized = x_grouped * quant_scale[:, None]
-                quantized_flat = tl.reshape(quantized, [BLOCK_K])
-                out_fp8 = quantized_flat.to(tl.float8e4nv)
+            quantized = x_grouped * quant_scale[:, None]
+            quantized_flat = tl.reshape(quantized, [BLOCK_K])
+            out_fp8 = quantized_flat.to(tl.float8e4nv)
 
-                # Store FP8 data
-                tl.store(out_fp8_ptr + row * K + offs, out_fp8, mask=mask)
+            # Store FP8 data
+            tl.store(out_fp8_ptr + row * K + offs, out_fp8, mask=mask)
 
-                # Store swizzled scales
-                scale_exp = (dequant_exp >> 23).to(tl.uint8)
-                col_offs = tl.arange(0, BLOCK_GROUPS)
-                col_mask = col_offs < REAL_GROUPS
+            # Store swizzled scales
+            scale_exp = (dequant_exp >> 23).to(tl.uint8)
+            col_offs = tl.arange(0, BLOCK_GROUPS)
+            col_mask = col_offs < REAL_GROUPS
 
-                macro_row_block = row // 128
-                macro_col_block = col_offs // 4
-                local_row = row % 128
-                local_col = col_offs % 4
-                group = local_row // 32
-                sub_row = local_row % 32
-                tile_idx = macro_row_block * n_col_blocks + macro_col_block
-                swizzled_offs = tile_idx * 512 + sub_row * 16 + group * 4 + local_col
+            macro_row_block = row // 128
+            macro_col_block = col_offs // 4
+            local_row = row % 128
+            local_col = col_offs % 4
+            group = local_row // 32
+            sub_row = local_row % 32
+            tile_idx = macro_row_block * n_col_blocks + macro_col_block
+            swizzled_offs = tile_idx * 512 + sub_row * 16 + group * 4 + local_col
 
-                tl.store(out_scale_ptr + swizzled_offs, scale_exp, mask=col_mask)
+            tl.store(out_scale_ptr + swizzled_offs, scale_exp, mask=col_mask)
 
 
 def squared_relu_and_quantize_mxfp8(

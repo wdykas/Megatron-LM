@@ -21,6 +21,7 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     _m_splits_to_m_indices,
     _offs_to_m_indices,
     grouped_gemm_batch_invariant,
+    grouped_gemm_batch_invariant_alignment,
     set_batch_invariant_mode,
 )
 
@@ -178,7 +179,7 @@ def test_inference_bf16_grouped_mm_routes_when_enabled():
 
     torch.manual_seed(4)
     E, K, N = 4, 64, 48
-    per_expert = 16
+    per_expert = grouped_gemm_batch_invariant_alignment()
     M = per_expert * E
     x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(E, N, K, device="cuda", dtype=torch.bfloat16)
@@ -186,8 +187,40 @@ def test_inference_bf16_grouped_mm_routes_when_enabled():
 
     with set_batch_invariant_mode(True):
         y_batch_invariant = _bf16_grouped_mm(x, w, offs)
-    y_direct = grouped_gemm_batch_invariant(x, w, offs=offs, m_total=M)
+    y_direct = grouped_gemm_batch_invariant(x, w, offs=offs, m_total=M, already_aligned=True)
     assert torch.equal(y_batch_invariant, y_direct)
+
+
+def test_padded_squared_relu_zeros_aligned_padding_rows():
+    """Aligned padding rows are still inside grouped-GEMM expert blocks.
+
+    They must be deterministic zeros, not uninitialized data, because the
+    following grouped GEMM reads every aligned row in the block.
+    """
+    from megatron.core.inference.moe.activations import padded_squared_relu
+
+    x = torch.tensor(
+        [
+            [-2.0, 3.0, 0.5, -0.5],
+            [float("nan"), float("nan"), float("nan"), float("nan")],
+            [1.5, -4.0, 2.0, 0.0],
+            [float("nan"), float("nan"), float("nan"), float("nan")],
+        ],
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    permutation_map = torch.tensor([0, -1, 1, -1], device="cuda", dtype=torch.int32)
+    n_used = torch.tensor([3], device="cuda", dtype=torch.int32)
+
+    y = padded_squared_relu(x, permutation_map, n_used)
+    torch.cuda.synchronize()
+
+    expected0 = torch.tensor([0.0, 9.0, 0.25, 0.0], device="cuda", dtype=torch.bfloat16)
+    expected2 = torch.tensor([2.25, 0.0, 4.0, 0.0], device="cuda", dtype=torch.bfloat16)
+    assert torch.equal(y[0], expected0)
+    assert torch.equal(y[1], torch.zeros_like(y[1]))
+    assert torch.equal(y[2], expected2)
+    assert torch.isfinite(y[:3]).all()
 
 
 # ---------------------------------------------------------------------------

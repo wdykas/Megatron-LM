@@ -10,7 +10,6 @@ from math import ceil
 from typing import Optional, Protocol, Tuple
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
@@ -37,9 +36,6 @@ from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
     skip_routed_expert_padding,
-)
-from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-    deterministic_index_add,
 )
 from megatron.core.transformer.moe.token_dispatcher_inference import (
     InferenceAllGatherDispatcherBase,
@@ -857,6 +853,13 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 f"only wired into the TORCH backend); got "
                 f"{self.inference_grouped_gemm_backend}."
             )
+            assert (
+                config.expert_model_parallel_size == 1 or self._nvls_dispatcher
+            ), (
+                "batch_invariant_mode with inference-optimized MoE and expert parallelism "
+                "requires inference_moe_token_dispatcher_type='nvls'. The NCCL raw-contribution "
+                "AllToAll BIK path is intentionally not supported on this branch."
+            )
 
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
@@ -997,37 +1000,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
         """Torch grouped_mm fused MoE forward via mcore_fused_moe.
 
-        With batch_invariant_mode and EP > 1, skip mcore_fused_moe's
-        internal unpermute and run the cross-EP combine in
-        _batch_invariant_global_unpermute instead, so the topk reduction order matches
-        training. The dispatcher's token_combine then passes the result
-        through.
+        With the NVLS dispatcher, mcore_fused_moe writes the local deterministic
+        unpermute directly into the symmetric RSV buffer and token_combine runs
+        NVLS ReduceScatterV to combine rank partials.
         """
         local_expert_start = self.ep_group.rank() * self.num_local_experts
-        ep_size = self.ep_group.size()
-        use_batch_invariant_global_unpermute = (
-            getattr(self.config, "batch_invariant_mode", False) and ep_size > 1
-        )
-
-        if use_batch_invariant_global_unpermute:
-            fc2_output, permuted_probs, permutation_map, n_used = mcore_fused_moe(
-                hidden_states,
-                probs,
-                self._fc1_weight,
-                self._fc2_weight,
-                activation_type=self._mcore_activation_type,
-                num_local_experts=self.num_local_experts,
-                local_expert_start=local_expert_start,
-                valid_tokens=InferenceAllGatherDispatcherBase._valid_tokens(),
-                routing_map=routing_map,
-                disable_fused_quant_kernels=self.config.inference_moe_disable_fused_quant_kernels,
-                return_pre_unpermute=True,
-            )
-            output = self._batch_invariant_global_unpermute(
-                fc2_output, permuted_probs, permutation_map, n_used, hidden_states
-            )
-            return output, None
-
         output = mcore_fused_moe(
             hidden_states,
             probs,
@@ -1042,120 +1019,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
         )
         return output, None
-
-    def _batch_invariant_global_unpermute(
-        self, fc2_output, permuted_probs, permutation_map, n_used, hidden_states
-    ):
-        """Cross-EP deterministic unpermute for batch_invariant_mode, EP > 1.
-
-        Routes each raw contribution (fc2_output * permuted_probs, fp32) to
-        the rank owning its destination token with one fixed-shape
-        AllToAll-single, then runs a single local deterministic_index_add on
-        the receiving side. That reproduces training's reduction: the stable
-        argsort by dest rank keeps same-destination contribs in expert-sorted
-        order, AllToAll packs the receive buffer source-rank-major, and
-        deterministic_index_add sorts by (token, position) — the same order
-        training sums in, so the bf16 result matches bitwise.
-
-        All shapes are static (bincount with minlength, equal AllToAll
-        chunks), so this captures into CUDA graphs.
-
-        Returns [local_tokens, H] bf16, the final per-rank output; the
-        dispatcher's token_combine passes it through.
-        """
-        ep_size = self.ep_group.size()
-        max_tokens = hidden_states.shape[0]
-        H = hidden_states.shape[-1]
-        N_local = fc2_output.shape[0]
-        local_tokens = max_tokens // ep_size
-        device = fc2_output.device
-
-        # Per-destination bucket size: in balanced routing each src→dest pair
-        # carries at most N_local/ep_size contribs. Slack for per-expert
-        # alignment padding (16-aligned blocks).
-        max_per_dest = (N_local + ep_size - 1) // ep_size + self.num_local_experts * 32
-
-        # fp32 weighted contribution (matches training accumulator dtype).
-        weighted = (fc2_output.to(torch.float32) *
-                    permuted_probs.to(torch.float32).unsqueeze(-1))
-
-        # dest_rank[i] = home rank of contrib i's destination token; ep_size = drop.
-        perm_long = permutation_map.to(torch.long)
-        dest_rank = torch.where(
-            perm_long < 0,
-            torch.full_like(perm_long, ep_size),
-            perm_long // local_tokens,
-        )
-        pos_idx = torch.arange(N_local, device=device, dtype=torch.long)
-        # Rows past n_used are alignment padding — mark them as drop too.
-        dest_rank = torch.where(
-            pos_idx < n_used.to(torch.long),
-            dest_rank,
-            torch.full_like(dest_rank, ep_size),
-        )
-        local_token_id = torch.where(
-            perm_long < 0,
-            torch.zeros_like(perm_long),
-            perm_long % local_tokens,
-        ).to(torch.float32)
-
-        # Stable sort by dest_rank groups same-dest contribs while preserving
-        # their original (expert-sorted) order — this is the secondary sort
-        # key that lets us match training bitwise.
-        sort_idx = torch.argsort(dest_rank, stable=True)
-        sorted_dest = dest_rank[sort_idx]
-        sorted_weighted = weighted[sort_idx]
-        sorted_local_id = local_token_id[sort_idx]
-
-        # Position within bucket: sorted-order index minus its bucket's start.
-        counts = torch.bincount(dest_rank, minlength=ep_size + 1)
-        offsets = torch.cat([
-            torch.zeros(1, device=device, dtype=counts.dtype),
-            counts.cumsum(0)[:-1],
-        ])
-        position_in_bucket = pos_idx - offsets[sorted_dest]
-
-        # Any contrib that would exceed max_per_dest is redirected to the
-        # ep_size (drop) bucket and dropped by the AllToAll send slice.
-        in_bounds = position_in_bucket < max_per_dest
-        safe_dest = torch.where(in_bounds, sorted_dest,
-                                torch.full_like(sorted_dest, ep_size))
-        safe_pos = position_in_bucket.clamp(max=max_per_dest - 1)
-
-        # Pack contribs into [ep_size+1, max_per_dest, H+1]. Last column carries
-        # the destination's local_token_id; -1 marks an empty slot.
-        send_buf = torch.zeros(
-            ep_size + 1, max_per_dest, H + 1, device=device, dtype=torch.float32,
-        )
-        send_buf[..., H] = -1.0
-        send_buf[safe_dest, safe_pos, :H] = sorted_weighted
-        send_buf[safe_dest, safe_pos, H] = sorted_local_id
-
-        # AllToAll-single: send only the ep_size real buckets (drop slot is skipped).
-        send_for_a2a = send_buf[:ep_size].contiguous()
-        recv_buf = torch.empty_like(send_for_a2a)
-        dist.all_to_all_single(recv_buf, send_for_a2a, group=self.ep_group)
-
-        # Flatten source-rank-major so the secondary sort matches training.
-        recv_flat = recv_buf.reshape(-1, H + 1)
-        recv_weighted = recv_flat[:, :H]
-        recv_local_id_fp = recv_flat[:, H]
-        valid_mask = recv_local_id_fp >= 0.0
-        recv_local_id = torch.where(
-            valid_mask, recv_local_id_fp, torch.zeros_like(recv_local_id_fp),
-        ).to(torch.int64)
-
-        # Local deterministic_index_add over received contribs.
-        local_out = torch.zeros(local_tokens, H, device=device, dtype=torch.float32)
-        deterministic_index_add(
-            local_out, recv_local_id, recv_weighted, valid_mask=valid_mask,
-        )
-
-        # Return the natural [local_tokens, H] shape. The cross-rank reduction
-        # has already happened in the AllToAll + local deterministic_index_add
-        # above, so the dispatcher's batch-invariant token_combine branch is
-        # a pass-through.
-        return local_out.to(hidden_states.dtype)
 
     def _vllm_forward(self, hidden_states, probs, routing_map):
         """vLLM Triton fused MoE kernel forward (BF16, CUDA-graph safe)."""

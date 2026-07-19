@@ -40,9 +40,6 @@ from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
-from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-    is_batch_invariant_mode_enabled,
-)
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.moe.token_dispatcher import MoEAllGatherTokenDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -125,6 +122,11 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
             runs_metadata_sync=runs_metadata_sync,
         )
         self.topk = config.moe_router_topk
+        if getattr(config, "batch_invariant_mode", False) and get_pg_size(self.ep_group) > 1:
+            raise AssertionError(
+                "batch_invariant_mode with inference-optimized MoE and expert parallelism "
+                "requires inference_moe_token_dispatcher_type='nvls'."
+            )
 
     @classmethod
     def allocate_buffers(cls) -> None:
@@ -154,15 +156,6 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         device = torch.cuda.current_device()
 
         if cls._use_allgather_v:
-            assert not is_batch_invariant_mode_enabled(), (
-                "batch_invariant_mode is incompatible with NCCLAllGatherDispatcher's "
-                "non-CG AllGatherV path: the batch-invariant _batch_invariant_global_unpermute "
-                "assumes uniform [ep_size * local_tokens, H] partitioning, but the "
-                "AllGatherV path produces a compact [sum(per-rank tokens), H] layout "
-                "where per-rank blocks are not aligned at rank * local_tokens "
-                "boundaries. batch-invariant runs are expected to use CUDA graphs "
-                "(which take the equal-token path)."
-            )
             local_count = torch.tensor([local_tokens], dtype=torch.int32, device=device)
             local_tokens_per_rank = torch.empty(ep_size, dtype=torch.int32, device=device)
             dist.all_gather_into_tensor(local_tokens_per_rank, local_count, group=self.ep_group)
@@ -258,33 +251,14 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         Non-CG path: expand compact output to padded layout, ReduceScatter,
         truncate.
 
-        Batch-invariant path: the cross-rank combine already happened in
-        InferenceGroupedMLP._batch_invariant_global_unpermute, which AllToAlls each raw
-        contribution to its home rank and runs one local
-        deterministic_index_add there. That matches training's single
-        reduction tree; ReduceScatter would add a second tree on top of the
-        per-rank sums and diverge in bf16. The cost is comm volume: the
-        AllToAll ships per-contribution fp32 rows, roughly topk * 2 the
-        bytes of the bf16 per-token ReduceScatter (fp32 transport is needed
-        because training forms the prob-weighted product in fp32).
-        hidden_states arrives here as the final [local_tokens, H] bf16
-        result, so this is a pass-through; a ReduceScatter would sum other
-        ranks' garbage into an already-final answer.
-
         Args:
-            hidden_states: [total_tokens, hidden_dim] expert outputs, or
-                [local_tokens, hidden_dim] bf16 under batch_invariant_mode.
+            hidden_states: [total_tokens, hidden_dim] expert outputs.
 
         Returns:
             [local_tokens, hidden_dim] bf16 local token outputs.
         """
         if self.ep_size == 1:
             return hidden_states.to(torch.bfloat16)
-
-        if is_batch_invariant_mode_enabled():
-            # The combine already happened in _batch_invariant_global_unpermute;
-            # hidden_states is this rank's final [local_tokens, H] result.
-            return hidden_states
 
         if not self.__class__._use_allgather_v:
             # CG path: equal token counts, standard reduce-scatter.
@@ -386,6 +360,12 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             ep_group: Expert parallel process group.
         """
         ep_size = get_pg_size(ep_group)
+        if ep_size <= 0 or ep_size & (ep_size - 1):
+            raise RuntimeError(
+                "NVLSAllGatherVDispatcher requires a power-of-two expert-parallel "
+                f"world size because the symmetric-memory Triton barrier uses "
+                f"tl.arange over WORLD_SIZE; got ep_size={ep_size}."
+            )
         cls._per_rank_worst_case_token_count = per_rank_worst_case_token_count
         global_max = per_rank_worst_case_token_count * ep_size
         device = torch.cuda.current_device()
@@ -586,29 +566,20 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     def token_combine(self, hidden_states):
         """ReduceScatter-V: sum expert outputs across EP ranks, scatter to local tokens.
 
-        Batch-invariant path: same as NCCLAllGatherDispatcher.token_combine —
-        the combine already happened upstream via AllToAll + one local
-        deterministic_index_add (matching training's reduction tree), so
-        hidden_states arrives as the final [local_tokens, H] bf16 result and
-        this is a pass-through.
+        Batch-invariant mode uses the same shape contract: mcore_fused_moe writes
+        each rank's deterministic local partial sums into the symmetric RSV
+        buffer, then this method uses NVLS ReduceScatterV to combine rank
+        partials.
 
         Args:
             hidden_states: [global_max, hidden_size] expert outputs (fp32
-                when written directly to the RSV buffer, bf16 otherwise), or
-                [local_tokens, hidden_size] bf16 under batch_invariant_mode.
+                when written directly to the RSV buffer, bf16 otherwise).
 
         Returns:
             [local_tokens, hidden_size] bf16 local token outputs.
         """
         if self.ep_size == 1:
             return hidden_states.to(torch.bfloat16)
-
-        if is_batch_invariant_mode_enabled():
-            # Pass-through: the cross-rank reduction already happened in
-            # InferenceGroupedMLP._batch_invariant_global_unpermute (AllToAll-padded combine
-            # + local deterministic_index_add), so hidden_states is already
-            # this rank's final [local_tokens, H] bf16 result.
-            return hidden_states
 
         rsv = self.__class__._symm_rsv
 

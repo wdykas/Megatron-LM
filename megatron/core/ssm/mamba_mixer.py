@@ -439,6 +439,10 @@ class MambaMixer(MegatronModule):
                 return self._dynamic_inference(hidden_states, inference_context)
             else:
                 assert inference_context.is_static_batching()
+                assert not self.config.batch_invariant_mode, (
+                    "batch_invariant_mode for Mamba inference is only supported with "
+                    "DynamicInferenceContext."
+                )
                 assert not self.config.sequence_parallel
                 conv_state, ssm_state = self._get_states_from_cache(inference_context, batch)
                 if inference_context.seqlen_offset > 0:
@@ -937,6 +941,19 @@ class MambaMixer(MegatronModule):
                     chunk_starts = cu_chunk_seqlens[:-1]
                     seq_idx_for_varlen = seq_idx[0, chunk_starts].contiguous()
 
+            boundary_chunk_indices = None
+            has_boundary = None
+            if self.config.batch_invariant_mode:
+                prefill_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.long)
+                tail_lens = prefill_lens % self.chunk_size
+                has_boundary = prefill_lens >= self.chunk_size
+                last_chunk_indices_long = last_chunk_indices.to(torch.long)
+                boundary_chunk_indices = torch.where(
+                    (tail_lens == 0) & (prefill_lens > 0),
+                    last_chunk_indices_long,
+                    last_chunk_indices_long - 1,
+                ).clamp(min=0)
+
             ssm_varlen_result = mamba_chunk_scan_combined_varlen(
                 x=x,
                 dt=dt,
@@ -958,21 +975,34 @@ class MambaMixer(MegatronModule):
                 initial_states=initial_ssm_state,
                 return_intermediate_states=False,
                 intermediate_chunk_indices=intermediate_chunk_indices,
+                boundary_chunk_indices=boundary_chunk_indices,
                 dt_softplus=True,
                 dt_limit=(0.0, float("inf")),
                 state_dtype=ssm_state.dtype,
             )
 
-            if intermediate_chunk_indices is not None:
+            if intermediate_chunk_indices is not None and boundary_chunk_indices is not None:
+                ssm_varlen_states, intermediate_ssm_states, boundary_ssm_states = ssm_varlen_result
+            elif intermediate_chunk_indices is not None:
                 ssm_varlen_states, intermediate_ssm_states = ssm_varlen_result
+                boundary_ssm_states = None
+            elif boundary_chunk_indices is not None:
+                ssm_varlen_states, boundary_ssm_states = ssm_varlen_result
+                intermediate_ssm_states = None
             else:
                 ssm_varlen_states = ssm_varlen_result
                 intermediate_ssm_states = None
+                boundary_ssm_states = None
 
             y = y.unsqueeze(0)
             z = z.unsqueeze(0)
 
-            tensor_masked_update(ssm_state, batch_indices, ssm_varlen_states)
+            if boundary_ssm_states is not None:
+                boundary_ssm_states = boundary_ssm_states * has_boundary.view(-1, 1, 1, 1).to(
+                    boundary_ssm_states.dtype
+                )
+            cache_states = boundary_ssm_states if boundary_ssm_states is not None else ssm_varlen_states
+            tensor_masked_update(ssm_state, batch_indices, cache_states)
 
             if self.config.batch_invariant_mode and cu_seqlens is not None:
                 self._batch_invariant_decode().seed(x, dt, B, C, cu_seqlens, batch_indices, ssm_state)
@@ -1203,6 +1233,10 @@ class MambaMixer(MegatronModule):
 
             y = y.unsqueeze(1)  # Restore seq dimension
         elif self.config.batch_invariant_mode:
+            assert batch_indices is not None, (
+                "batch_invariant_mode for Mamba decode requires dynamic batching "
+                "batch_indices."
+            )
             y = self._batch_invariant_decode().step(x, dt, B, C, batch_indices, ssm_state)
         else:
             A = self._get_decode_A_neg_exp()

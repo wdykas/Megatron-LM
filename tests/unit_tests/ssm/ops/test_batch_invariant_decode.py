@@ -21,6 +21,7 @@ try:
         make_batch_invariant_decode_buffers,
         seed_batch_invariant_decode_buffers,
     )
+    from megatron.core.ssm.ops.ssd_combined import mamba_chunk_scan_combined_varlen
 
     HAVE_BATCH_INVARIANT_DECODE = True
 except (ImportError, Exception):
@@ -140,6 +141,56 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
             ssm_state,
         )
 
+    def _varlen_boundary_state_from_prefill(self, x, dt, B, C, prefill_len):
+        """Production-shaped varlen prefill returning the last full chunk boundary state."""
+        chunk_boundaries = [0]
+        pos = self.chunk_size
+        while pos < prefill_len:
+            chunk_boundaries.append(pos)
+            pos += self.chunk_size
+        chunk_boundaries.append(prefill_len)
+
+        cu_chunk_seqlens = torch.tensor(
+            chunk_boundaries, dtype=torch.int32, device=self.device
+        )
+        last_chunk_indices = torch.tensor(
+            [len(chunk_boundaries) - 2], dtype=torch.int32, device=self.device
+        )
+        tail_len = prefill_len % self.chunk_size
+        has_boundary = prefill_len >= self.chunk_size
+        boundary_idx = last_chunk_indices.to(torch.long)
+        if tail_len != 0:
+            boundary_idx = boundary_idx - 1
+        boundary_idx = boundary_idx.clamp(min=0)
+
+        out = torch.zeros_like(x[0, :prefill_len])
+        seq_idx = torch.zeros(
+            len(chunk_boundaries) - 1, dtype=torch.int32, device=self.device
+        )
+        final_state, boundary_state = mamba_chunk_scan_combined_varlen(
+            x=x[0, :prefill_len],
+            dt=dt[0, :prefill_len],
+            A=self.A,
+            B=B[0, :prefill_len],
+            C=C[0, :prefill_len],
+            chunk_size=self.chunk_size,
+            cu_chunk_seqlens=cu_chunk_seqlens,
+            last_chunk_indices=last_chunk_indices,
+            seq_idx=seq_idx,
+            out=out,
+            D=self.D,
+            z=None,
+            dt_bias=self.dt_bias,
+            initial_states=None,
+            dt_softplus=True,
+            dt_limit=(0.0, float("inf")),
+            boundary_chunk_indices=boundary_idx,
+            state_dtype=self.dtype,
+        )
+        if not has_boundary:
+            boundary_state = torch.zeros_like(boundary_state)
+        return final_state, boundary_state
+
     def _assert_bitwise(self, a, b, msg):
         # bf16 outputs — bitwise-equal is the actual batch-invariant claim.
         diff = (a.float() - b.float()).abs().max().item()
@@ -167,6 +218,48 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
                 self._assert_bitwise(
                     y_batch_invariant[0, 0], y_full[0, prefill_len],
                     f"prefill_len={prefill_len}",
+                )
+
+    def test_dynamic_prefill_uses_boundary_state_not_prompt_end_state(self):
+        """Production prefill returns the prompt-end state too, but BIK decode
+        must keep the cache at the last full chunk boundary and put the tail in
+        the replay buffer."""
+        max_batch, slot = 4, 1
+        for prefill_len in [31, 33, 50, 95, 128]:
+            with self.subTest(prefill_len=prefill_len):
+                total = prefill_len + 1
+                x, dt, B, C = self._make_seq(total)
+                y_full, _ = _full_scan(
+                    x, dt, self.A, B, C, self.D, self.dt_bias, self.chunk_size,
+                )
+
+                _, boundary_state = self._varlen_boundary_state_from_prefill(
+                    x, dt, B, C, prefill_len
+                )
+                ssm_state = torch.randn(
+                    max_batch, self.nh, self.headdim, self.dstate,
+                    device=self.device, dtype=self.dtype,
+                )
+                ssm_state[slot] = boundary_state[0].to(self.dtype)
+
+                bufs = self._make_bufs(max_batch)
+                cu = torch.tensor([0, prefill_len], dtype=torch.int32, device=self.device)
+                batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
+                seed_batch_invariant_decode_buffers(
+                    bufs,
+                    x[0, :prefill_len],
+                    dt[0, :prefill_len],
+                    B[0, :prefill_len],
+                    C[0, :prefill_len],
+                    cu,
+                    batch_indices,
+                )
+                y_batch_invariant = self._decode_one_step(
+                    bufs, x, dt, B, C, prefill_len, slot, ssm_state
+                )
+                self._assert_bitwise(
+                    y_batch_invariant[0, 0], y_full[0, prefill_len],
+                    f"dynamic prefill boundary state prefill_len={prefill_len}",
                 )
 
     def test_short_prefill_zero_state_path(self):

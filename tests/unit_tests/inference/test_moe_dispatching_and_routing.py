@@ -230,6 +230,18 @@ class TestNCCLAllGatherDispatcher:
         assert dispatcher.topk == NANOV3_BASE["moe_router_topk"]
         assert dispatcher.ep_size == Utils.world_size
 
+    def test_init_rejects_batch_invariant_ep(self):
+        """MoE BIK on the inference EP path is NVLS-only on this branch."""
+        if Utils.world_size == 1:
+            pytest.skip("NCCL BIK rejection is only relevant with expert parallelism.")
+
+        with pytest.raises(ValueError, match="requires inference_moe_token_dispatcher_type"):
+            self._make_dispatcher(
+                batch_invariant_mode=True,
+                attention_backend=AttnBackend.flash,
+                inference_moe_token_dispatcher_type="nccl",
+            )
+
     @pytest.mark.parametrize("use_allgather_v", [False, True])
     def test_dispatch_combine(self, use_allgather_v):
         """Dispatch+combine correctness for both CG (equal-count) and prefill (variable-count) paths.
@@ -325,6 +337,9 @@ class TestNVLSAllGatherVDispatcher:
         from megatron.core.transformer.moe.token_dispatcher_inference import (
             NVLSAllGatherVDispatcher,
         )
+
+        if Utils.world_size <= 0 or Utils.world_size & (Utils.world_size - 1):
+            pytest.skip("NVLS Triton symmetric-memory barrier requires power-of-two EP size.")
 
         config = _make_base_config(expert_model_parallel_size=Utils.world_size)
         num_local_experts = config.num_moe_experts // Utils.world_size
@@ -439,3 +454,174 @@ class TestNVLSAllGatherVDispatcher:
 
         expected_combined = (global_hidden[start:end].float() * ep_size).bfloat16()
         torch.testing.assert_close(graph_combined, expected_combined, atol=0, rtol=0)
+
+    def test_cuda_graph_batch_invariant_combine_uses_nvls_rsv(self):
+        """Batch-invariant mode should still use NVLS ReduceScatterV on NVLS dispatcher.
+
+        The NCCL experiment path combines raw contributions before token_combine,
+        but the NVLS path keeps the simpler model: local deterministic unpermute
+        writes a global RSV-shaped tensor, then token_combine reduces/scatters it.
+        """
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            set_batch_invariant_mode,
+        )
+
+        torch.manual_seed(2026)
+        torch.cuda.manual_seed(2026)
+
+        dispatcher = self._make_dispatcher()
+        ep_size = dispatcher.ep_size
+        hidden_size = NANOV3_BASE["hidden_size"]
+        topk = NANOV3_BASE["moe_router_topk"]
+        num_experts = NANOV3_BASE["num_moe_experts"]
+        rank = torch.distributed.get_rank() if ep_size > 1 else 0
+
+        max_rank_tokens = 24
+        tokens_per_rank = [max(1, max_rank_tokens + r - (ep_size - 1)) for r in range(ep_size)]
+        local_tokens = tokens_per_rank[rank]
+        total_tokens = sum(tokens_per_rank)
+        global_max = _NVLS_ENGINE_MAX_TOKENS * ep_size
+
+        global_hidden = torch.randn(total_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+        global_probs = torch.randn(total_tokens, topk, device="cuda", dtype=torch.float32)
+        global_routing_map = torch.randint(0, num_experts, (total_tokens, topk), device="cuda")
+        if ep_size > 1:
+            torch.distributed.broadcast(global_hidden, src=0)
+            torch.distributed.broadcast(global_probs, src=0)
+            torch.distributed.broadcast(global_routing_map, src=0)
+
+        start = sum(tokens_per_rank[:rank])
+        end = start + local_tokens
+        static_hidden = global_hidden[start:end].contiguous()
+        static_probs = global_probs[start:end].contiguous()
+        static_routing_map = global_routing_map[start:end].contiguous()
+
+        with torch.no_grad(), set_batch_invariant_mode(True):
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(3):
+                    dispatcher.routing_map = static_routing_map
+                    dispatcher._local_tokens = local_tokens
+                    d_hidden, _ = dispatcher.token_dispatch(static_hidden, static_probs)
+                    dispatcher.token_combine(d_hidden.clone())
+            torch.cuda.current_stream().wait_stream(s)
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                dispatcher.routing_map = static_routing_map
+                dispatcher._local_tokens = local_tokens
+                d_hidden, _ = dispatcher.token_dispatch(static_hidden, static_probs)
+                assert d_hidden.shape[0] == global_max
+                graph_combined = dispatcher.token_combine(d_hidden.clone())
+
+            graph.replay()
+
+        assert graph_combined.shape == (local_tokens, hidden_size)
+        expected_combined = (global_hidden[start:end].float() * ep_size).bfloat16()
+        torch.testing.assert_close(graph_combined, expected_combined, atol=0, rtol=0)
+
+    def test_cuda_graph_batch_invariant_moe_layer_uses_nvls_rsv(self, monkeypatch):
+        """A real inference MoE layer should use the NVLS RSV combine under BIK.
+
+        This catches the production branch in InferenceGroupedMLP: NVLS keeps
+        mcore_fused_moe's normal local deterministic unpermute into the symmetric
+        RSV buffer; there is no NCCL-only raw-contribution AllToAll helper on
+        this branch.
+        """
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.parallel_state import get_expert_model_parallel_group
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            HAVE_DEEPGEMM_BF16,
+            set_batch_invariant_mode,
+        )
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        if Utils.world_size < 2:
+            pytest.skip("NVLS RSV branch test requires expert-parallel world_size > 1.")
+        if Utils.world_size & (Utils.world_size - 1):
+            pytest.skip("NVLS Triton symmetric-memory barrier requires power-of-two EP size.")
+        if not HAVE_DEEPGEMM_BF16:
+            pytest.skip("Batch-invariant torch MoE path requires DeepGEMM bf16 grouped kernels.")
+
+        torch.manual_seed(2027)
+        torch.cuda.manual_seed(2027)
+
+        config = _make_base_config(
+            expert_model_parallel_size=Utils.world_size,
+            inference_grouped_gemm_backend="torch",
+            inference_moe_token_dispatcher_type="nvls",
+            batch_invariant_mode=True,
+            attention_backend=AttnBackend.flash,
+            moe_shared_expert_intermediate_size=None,
+        )
+        ep_group = get_expert_model_parallel_group()
+        NVLSAllGatherVDispatcher.allocate_buffers(
+            per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
+            topk=config.moe_router_topk,
+            hidden_size=config.hidden_size,
+            ep_group=ep_group,
+        )
+
+        layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        assert isinstance(layer._inference_token_dispatcher, NVLSAllGatherVDispatcher)
+        layer.token_dispatcher = layer._inference_token_dispatcher
+        layer.shared_expert_overlap = layer._inference_token_dispatcher.shared_experts is not None
+        assert not hasattr(layer.experts, "_batch_invariant_global_unpermute")
+
+        used_rsv = {"value": False}
+        orig_get_rsv_tensor = NVLSAllGatherVDispatcher._get_rsv_tensor.__func__
+
+        def _tracked_get_rsv_tensor(cls):
+            tensor = orig_get_rsv_tensor(cls)
+            used_rsv["value"] = used_rsv["value"] or tensor is not None
+            return tensor
+
+        monkeypatch.setattr(
+            NVLSAllGatherVDispatcher, "_get_rsv_tensor", classmethod(_tracked_get_rsv_tensor)
+        )
+
+        local_tokens = 16
+        hidden_states = torch.randn(
+            local_tokens, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+        probs = torch.randn(
+            local_tokens, config.moe_router_topk, device="cuda", dtype=torch.float32
+        )
+        routing_map = (
+            torch.arange(local_tokens * config.moe_router_topk, device="cuda")
+            .reshape(local_tokens, config.moe_router_topk)
+            .remainder(config.num_moe_experts)
+            .to(torch.int64)
+        )
+
+        def _run_expert_and_combine():
+            preprocessed_hidden, preprocessed_probs = layer.preprocess(
+                hidden_states, probs, routing_map
+            )
+            dispatched_hidden, dispatched_probs = layer.dispatch(
+                preprocessed_hidden, preprocessed_probs
+            )
+            output, _ = layer.routed_experts_compute(dispatched_hidden, dispatched_probs)
+            output = layer.combine(output)
+            return layer.postprocess(output, None)
+
+        with torch.no_grad(), InferenceMode.active(), set_batch_invariant_mode(True):
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(3):
+                    _run_expert_and_combine()
+            torch.cuda.current_stream().wait_stream(s)
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graph_output = _run_expert_and_combine()
+
+            graph.replay()
+
+        assert used_rsv["value"]
+        assert graph_output.shape == hidden_states.shape
+        assert graph_output.dtype == torch.bfloat16

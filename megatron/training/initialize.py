@@ -86,11 +86,12 @@ def initialize_megatron(
     )
 
     if args.batch_invariant_mode:
+        batch_invariant_kernel_backend = getattr(args, "batch_invariant_kernel_backend", "deepgemm")
         print_rank_0(
             f"Enabling batch invariant mode globally "
-            f"(backend={args.batch_invariant_kernel_backend})"
+            f"(backend={batch_invariant_kernel_backend})"
         )
-        enable_batch_invariant_mode(backend=args.batch_invariant_kernel_backend)
+        enable_batch_invariant_mode(backend=batch_invariant_kernel_backend)
 
     # torch.distributed initialization
     def finish_mpu_init():

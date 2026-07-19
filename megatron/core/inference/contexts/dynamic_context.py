@@ -344,6 +344,22 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_ssm_states_dtype = mamba_inference_state_config.ssm_states_dtype
             self.mamba_chunk_size = mamba_inference_state_config.mamba_chunk_size
 
+            if getattr(model_config, "batch_invariant_mode", False):
+                assert self.num_speculative_tokens == 0, (
+                    "batch_invariant_mode for Mamba dynamic inference only supports "
+                    "one-token decode; set num_speculative_tokens=0."
+                )
+                assert not inference_config.enable_chunked_prefill, (
+                    "batch_invariant_mode for Mamba dynamic inference does not support "
+                    "chunked prefill because replay seeding must start from an absolute "
+                    "Mamba chunk boundary."
+                )
+                assert not inference_config.enable_prefix_caching, (
+                    "batch_invariant_mode for Mamba dynamic inference does not support "
+                    "prefix caching because replay seeding must account for the skipped "
+                    "absolute prompt offset."
+                )
+
             # For hybrid models, the layer map converts the global layer index to the
             # corresponding attention layer index or Mamba layer index depending on the
             # layer type.

@@ -6,6 +6,7 @@
 import contextlib
 import importlib
 import importlib.util
+import inspect
 import logging
 from collections import namedtuple
 from collections.abc import Callable
@@ -49,6 +50,7 @@ __all__ = [
     "disable_batch_invariant_mode",
     "enable_batch_invariant_mode",
     "grouped_gemm_batch_invariant",
+    "grouped_gemm_batch_invariant_alignment",
     "BatchInvariantGroupedGemmFn",
     "HAVE_DEEPGEMM_BF16",
     "deterministic_index_add",
@@ -331,7 +333,6 @@ def log_softmax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
     Args:
         input: Input tensor
         dim: Dimension along which to compute log_softmax (only -1 or last dim supported)
-    >> Stashed changes
     Returns:
         Tensor with log_softmax applied along the specified dimension
     """
@@ -531,9 +532,14 @@ def deterministic_index_add(
 
     Memory: an fp32 (N+1, H) cumsum buffer; ~4*N*H bytes peak.
     """
+    M = out.shape[0]
+    if M == 0:
+        return out
+
     if valid_mask is not None:
-        src = src * valid_mask.unsqueeze(-1).to(src.dtype)
-        idx = idx.clamp(min=0, max=out.shape[0] - 1)
+        valid_mask = valid_mask.to(torch.bool)
+        src = torch.where(valid_mask.unsqueeze(-1), src, torch.zeros_like(src))
+        idx = idx.clamp(min=0, max=M - 1)
 
     sorted_idx, perm = idx.sort(stable=True)
     sorted_src = src.index_select(0, perm)
@@ -542,7 +548,6 @@ def deterministic_index_add(
     zero = torch.zeros(1, H, device=csum.device, dtype=torch.float32)
     csum_with_zero = torch.cat([zero, csum], dim=0)
 
-    M = out.shape[0]
     queries = torch.arange(M + 1, device=idx.device, dtype=sorted_idx.dtype)
     boundaries = torch.searchsorted(sorted_idx, queries)
     seg_sum = csum_with_zero[boundaries[1:]] - csum_with_zero[boundaries[:-1]]
@@ -788,6 +793,61 @@ def _te_unpatch_general_grouped_gemm() -> None:
         _TE_GROUPED_GEMM_FUNC_ORIGS.pop(key, None)
 
 
+def _get_original_te_grouped_gemm():
+    for key in (
+        "module.grouped_linear.general_grouped_gemm",
+        "cpp_extensions.general_grouped_gemm",
+        "cpp_extensions.gemm.general_grouped_gemm",
+    ):
+        orig = _TE_GROUPED_GEMM_FUNC_ORIGS.get(key)
+        if orig is not None:
+            return orig
+    return None
+
+
+def _original_te_grouped_gemm_has_quantization_params(orig) -> bool:
+    try:
+        return "quantization_params" in inspect.signature(orig).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _call_original_te_grouped_gemm(
+    orig,
+    A,
+    B,
+    out,
+    quantization_params,
+    out_dtype,
+    *,
+    layout,
+    m_splits,
+    gelu,
+    grad,
+    accumulate,
+    bias,
+    use_bias,
+    use_split_accumulator,
+    D_dtype,
+    single_output,
+):
+    kwargs = dict(
+        layout=layout,
+        m_splits=m_splits,
+        gelu=gelu,
+        grad=grad,
+        accumulate=accumulate,
+        bias=bias,
+        use_bias=use_bias,
+        use_split_accumulator=use_split_accumulator,
+        D_dtype=D_dtype,
+        single_output=single_output,
+    )
+    if _original_te_grouped_gemm_has_quantization_params(orig):
+        return orig(A, B, out, quantization_params, out_dtype, **kwargs)
+    return orig(A, B, out, out_dtype, **kwargs)
+
+
 def _is_bf16_grouped_path(A, B, quantization_params, gelu: bool) -> bool:
     """Decide if TE's general_grouped_gemm call can be served by DeepGEMM bf16."""
     if gelu:
@@ -812,8 +872,8 @@ def _te_general_grouped_gemm_patched(
     A,
     B,
     out,
-    quantization_params,
-    out_dtype,
+    quantization_params=None,
+    out_dtype=None,
     layout: str = "TN",
     m_splits=None,
     gelu: bool = False,
@@ -832,18 +892,22 @@ def _te_general_grouped_gemm_patched(
     case we cannot guarantee batch-invariant: quantized inputs, gelu fusion,
     non-bf16 dtypes, or unsupported (layout, mode) combinations.
     """
+    # TE versions differ here:
+    #   old: general_grouped_gemm(A, B, out, out_dtype, ...)
+    #   new: general_grouped_gemm(A, B, out, quantization_params, out_dtype, ...)
+    if out_dtype is None and isinstance(quantization_params, torch.dtype):
+        out_dtype = quantization_params
+        quantization_params = None
+
     if not _is_bf16_grouped_path(A, B, quantization_params, gelu):
-        orig = _TE_GROUPED_GEMM_FUNC_ORIGS.get("module.grouped_linear.general_grouped_gemm")
-        if orig is None:
-            orig = _TE_GROUPED_GEMM_FUNC_ORIGS.get("cpp_extensions.general_grouped_gemm")
-        if orig is None:
-            orig = _TE_GROUPED_GEMM_FUNC_ORIGS.get("cpp_extensions.gemm.general_grouped_gemm")
+        orig = _get_original_te_grouped_gemm()
         if orig is None:
             raise RuntimeError(
                 "Batch-invariant grouped GEMM patch was invoked but no original "
                 "TE general_grouped_gemm was captured; patching order issue."
             )
-        return orig(
+        return _call_original_te_grouped_gemm(
+            orig,
             A,
             B,
             out,
@@ -873,8 +937,14 @@ def _te_general_grouped_gemm_patched(
     if (not single_output) and layout == "NT" and grad:
         return _batch_invariant_te_grouped_wgrad(A, B, out, m_splits, use_bias, accumulate)
     # Unknown TE call shape — defer to the original.
-    orig = _TE_GROUPED_GEMM_FUNC_ORIGS.get("module.grouped_linear.general_grouped_gemm")
-    return orig(
+    orig = _get_original_te_grouped_gemm()
+    if orig is None:
+        raise RuntimeError(
+            "Batch-invariant grouped GEMM patch was invoked but no original "
+            "TE general_grouped_gemm was captured; patching order issue."
+        )
+    return _call_original_te_grouped_gemm(
+        orig,
         A,
         B,
         out,
@@ -1409,6 +1479,12 @@ def _deepgemm_m_alignment() -> int:
     return _DEEPGEMM_M_ALIGNMENT
 
 
+def grouped_gemm_batch_invariant_alignment() -> int:
+    """Return the M alignment required by the DeepGEMM grouped-GEMM backend."""
+    _require_deepgemm_bf16("get_m_alignment_for_contiguous_layout")
+    return _deepgemm_m_alignment()
+
+
 def _expert_counts_from_m_indices(m_indices: torch.Tensor, num_experts: int) -> torch.Tensor:
     """Per-expert token counts from a sorted m_indices tensor. Ignores -1 rows."""
     valid = m_indices[m_indices >= 0]
@@ -1501,6 +1577,38 @@ def _bf16_grouped_gemm_contiguous(
     return d
 
 
+def _bf16_grouped_gemm_aligned_contiguous(
+    a: torch.Tensor, b: torch.Tensor, m_indices: torch.Tensor
+) -> torch.Tensor:
+    """DeepGEMM M-grouped GEMM for already aligned expert blocks.
+
+    This path is used by inference CUDA graphs. The caller is responsible for
+    using `grouped_gemm_batch_invariant_alignment()` when building expert
+    offsets, so no device-to-host count extraction or dynamic padding is needed
+    on the captured path.
+    """
+    _require_deepgemm_bf16("m_grouped_bf16_gemm_nt_contiguous")
+    assert (
+        a.dtype == torch.bfloat16 and b.dtype == torch.bfloat16
+    ), f"bf16 grouped GEMM requires bf16; got a.dtype={a.dtype}, b.dtype={b.dtype}"
+    assert a.is_contiguous() and b.is_contiguous(), "a, b must be contiguous"
+    assert (
+        m_indices.dtype == torch.int32 and m_indices.is_contiguous()
+    ), "m_indices must be int32 contiguous"
+    M_total, K = a.shape
+    E, N, K_b = b.shape
+    assert K == K_b, f"K mismatch between a ({K}) and b ({K_b})"
+    assert (
+        m_indices.shape[0] == M_total
+    ), f"m_indices length {m_indices.shape[0]} != M_total {M_total}"
+
+    d = torch.empty(M_total, N, device=a.device, dtype=torch.bfloat16)
+    if M_total == 0:
+        return d
+    deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, m_indices)
+    return d
+
+
 def _bf16_grouped_gemm_wgrad_contiguous(
     grad_y: torch.Tensor, x: torch.Tensor, k_indices: torch.Tensor, num_experts: int
 ) -> torch.Tensor:
@@ -1558,6 +1666,7 @@ def grouped_gemm_batch_invariant(
     m_indices: Optional[torch.Tensor] = None,
     offs: Optional[torch.Tensor] = None,
     m_total: Optional[int] = None,
+    already_aligned: bool = False,
 ) -> torch.Tensor:
     """Public functional API for batch-invariant bf16 grouped GEMM.
 
@@ -1569,7 +1678,12 @@ def grouped_gemm_batch_invariant(
             offs is not None and m_total is not None
         ), "grouped_gemm_batch_invariant: either m_indices or (offs, m_total) required"
         m_indices = _offs_to_m_indices(offs, m_total)
-    return _bf16_grouped_gemm_contiguous(a.contiguous(), b.contiguous(), m_indices)
+    a = a.contiguous()
+    b = b.contiguous()
+    m_indices = m_indices.contiguous()
+    if already_aligned:
+        return _bf16_grouped_gemm_aligned_contiguous(a, b, m_indices)
+    return _bf16_grouped_gemm_contiguous(a, b, m_indices)
 
 
 class BatchInvariantGroupedGemmFn(torch.autograd.Function):
@@ -1807,7 +1921,7 @@ def _unpin_mamba_autotuners():
 
 
 @contextlib.contextmanager
-def set_batch_invariant_mode(enabled: bool = True):
+def set_batch_invariant_mode(enabled: bool = True, backend: Optional[str] = None):
     """Context manager to toggle global batch-invariant mode.
 
     When `enabled` is True, batch-invariant kernels are enabled for the duration of
@@ -1818,10 +1932,16 @@ def set_batch_invariant_mode(enabled: bool = True):
     # Save the previous on/off state so we can correctly restore it, even under
     # nested usage or when toggling from True->False inside an outer True scope.
     prev_enabled = _batch_invariant_MODE
+    prev_backend = _BATCH_INVARIANT_BACKEND
 
     # Apply the requested state only if it differs from the current one.
     if enabled and not prev_enabled:
-        enable_batch_invariant_mode()
+        enable_batch_invariant_mode(backend=backend or "triton")
+    elif enabled and prev_enabled and backend is not None and backend != prev_backend:
+        raise RuntimeError(
+            "Cannot switch batch-invariant backend inside an active context "
+            f"(active={prev_backend!r}, requested={backend!r})."
+        )
     elif not enabled and prev_enabled:
         disable_batch_invariant_mode()
 
@@ -1834,4 +1954,4 @@ def set_batch_invariant_mode(enabled: bool = True):
         if enabled and not prev_enabled:
             disable_batch_invariant_mode()
         elif not enabled and prev_enabled:
-            enable_batch_invariant_mode()
+            enable_batch_invariant_mode(backend=prev_backend)
