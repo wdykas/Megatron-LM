@@ -127,12 +127,25 @@ def seed_batch_invariant_decode_buffers(
     )
 
     # Row-gather indices for each sequence's tail, (num_seqs, chunk_size).
-    # Positions past the tail alias trailing rows; clamped and never
-    # consumed.
+    # Positions past the tail duplicate a valid token from the same sequence
+    # instead of clamping to the global last row. Dynamic batches may pad the
+    # physical token tensor, and those padded rows are not guaranteed to stay
+    # finite after arbitrary layers. The row-gated scan still evaluates a whole
+    # Triton M-block around the target row; causally masked 0 * NaN products in
+    # future rows can poison the target row on tensor cores. Keeping the entire
+    # physical replay chunk finite avoids that without changing the logical
+    # scan prefix marked by num_buffered.
     offsets = torch.arange(chunk_size, device=x.device, dtype=torch.long)
-    tail_token_idx = (
-        (seq_ends - tail_lens).unsqueeze(1) + offsets.unsqueeze(0)
-    ).clamp(max=x.shape[0] - 1)
+    safe_tail_lens = torch.clamp(tail_lens, min=1)
+    safe_tail_offsets = torch.minimum(offsets.unsqueeze(0), (safe_tail_lens - 1).unsqueeze(1))
+    safe_tail_starts = torch.where(
+        tail_lens > 0,
+        seq_ends - tail_lens,
+        torch.clamp(seq_ends - 1, min=0),
+    )
+    tail_token_idx = (safe_tail_starts.unsqueeze(1) + safe_tail_offsets).clamp(
+        max=x.shape[0] - 1
+    )
 
     bufs.x[slots] = x[tail_token_idx]
     bufs.dt[slots] = dt[tail_token_idx]
@@ -248,7 +261,7 @@ def batch_invariant_decode_buffered_scan(
 
     # The scan stored each lane's target row at out[i]; padding lanes
     # return zeros.
-    y = (out * is_active.view(-1, 1, 1).to(out.dtype)).unsqueeze(1)
+    y = torch.where(is_active.view(-1, 1, 1), out, torch.zeros_like(out)).unsqueeze(1)
 
     # Crossed slots restart their buffer; the rest advance. Inactive lanes
     # write 0 to the trash row, keeping its cursor pinned in bounds.

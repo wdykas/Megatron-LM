@@ -262,6 +262,56 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
                     f"dynamic prefill boundary state prefill_len={prefill_len}",
                 )
 
+    def test_seed_ignores_nonfinite_physical_padding_rows(self):
+        """Dynamic prefill can carry padded physical token rows after the real
+        prefix. Seed must duplicate a valid per-sequence tail token into unused
+        replay-buffer rows; otherwise masked future rows can still poison the
+        row-gated Triton dot as 0 * NaN."""
+        max_batch, slot = 4, 0
+        prefill_len = self.chunk_size + 1
+        total = prefill_len + 1
+        x, dt, B, C = self._make_seq(total)
+        y_full, _ = _full_scan(
+            x, dt, self.A, B, C, self.D, self.dt_bias, self.chunk_size,
+        )
+
+        _, boundary_state = self._varlen_boundary_state_from_prefill(x, dt, B, C, prefill_len)
+        ssm_state = torch.zeros(
+            max_batch, self.nh, self.headdim, self.dstate,
+            device=self.device, dtype=self.dtype,
+        )
+        ssm_state[slot] = boundary_state[0].to(self.dtype)
+
+        nan_x = torch.full_like(x[0, :1], float("nan"))
+        nan_dt = torch.full_like(dt[0, :1], float("nan"))
+        nan_B = torch.full_like(B[0, :1], float("nan"))
+        nan_C = torch.full_like(C[0, :1], float("nan"))
+
+        bufs = self._make_bufs(max_batch)
+        cu = torch.tensor([0, prefill_len], dtype=torch.int32, device=self.device)
+        batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
+        seed_batch_invariant_decode_buffers(
+            bufs,
+            torch.cat([x[0, :prefill_len], nan_x], dim=0),
+            torch.cat([dt[0, :prefill_len], nan_dt], dim=0),
+            torch.cat([B[0, :prefill_len], nan_B], dim=0),
+            torch.cat([C[0, :prefill_len], nan_C], dim=0),
+            cu,
+            batch_indices,
+        )
+        self.assertTrue(torch.isfinite(bufs.x[slot]).all())
+        self.assertTrue(torch.isfinite(bufs.dt[slot]).all())
+        self.assertTrue(torch.isfinite(bufs.B[slot]).all())
+        self.assertTrue(torch.isfinite(bufs.C[slot]).all())
+
+        y_batch_invariant = self._decode_one_step(
+            bufs, x, dt, B, C, prefill_len, slot, ssm_state
+        )
+        self._assert_bitwise(
+            y_batch_invariant[0, 0], y_full[0, prefill_len],
+            "nonfinite physical padding rows",
+        )
+
     def test_short_prefill_zero_state_path(self):
         """prefill_len < chunk_size: no boundary state — seeding must zero the cache."""
         max_batch, slot = 2, 0

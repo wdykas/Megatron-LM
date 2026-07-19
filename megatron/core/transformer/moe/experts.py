@@ -1000,9 +1000,28 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
         """Torch grouped_mm fused MoE forward via mcore_fused_moe.
 
-        With the NVLS dispatcher, mcore_fused_moe writes the local deterministic
-        unpermute directly into the symmetric RSV buffer and token_combine runs
-        NVLS ReduceScatterV to combine rank partials.
+        Batch-invariant MoE is intentionally routed through the NVLS dispatcher
+        for EP>1. The invariant contract is:
+
+        1. Dispatch is data movement only. NVLS AllGatherV gathers hidden
+           states, routing_map, and probs into fixed symmetric buffers; it does
+           not perform floating-point reductions whose order could vary with the
+           dynamic batch.
+        2. Expert GEMMs use the DeepGEMM-backed batch-invariant grouped-GEMM
+           path. Expert token blocks are padded to DeepGEMM's required alignment
+           before the captured path, so a token's GEMM result does not depend on
+           how many neighboring tokens routed to the same or different experts.
+        3. Local top-k unpermute is deterministic. mcore_fused_moe weights expert
+           outputs in fp32 and uses deterministic_index_add instead of atomic_add,
+           keeping duplicate-token reductions in a fixed order while preserving
+           CUDA graph compatible static shapes through masks.
+        4. Cross-rank combine is a single NVLS ReduceScatterV over the symmetric
+           RSV buffer. Each rank writes deterministic local partial sums into
+           the same fixed [global_max, hidden] layout, and token_combine reduces
+           those rank partials back to each token's owner rank.
+
+        Dynamic batching therefore changes only valid-token metadata and masked
+        rows, not the math path used by any valid token.
         """
         local_expert_start = self.ep_group.rank() * self.num_local_experts
         output = mcore_fused_moe(
