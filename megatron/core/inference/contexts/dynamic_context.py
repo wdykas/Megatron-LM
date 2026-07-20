@@ -303,6 +303,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             self.num_attention_heads_per_partition = 1
 
+        self.batch_invariant_mode = getattr(model_config, "batch_invariant_mode", False)
         self.num_speculative_tokens = inference_config.num_speculative_tokens
         assert self.num_speculative_tokens < inference_config.block_size_tokens, (
             f"num_speculative_tokens ({self.num_speculative_tokens}) must be < "
@@ -344,7 +345,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_ssm_states_dtype = mamba_inference_state_config.ssm_states_dtype
             self.mamba_chunk_size = mamba_inference_state_config.mamba_chunk_size
 
-            if getattr(model_config, "batch_invariant_mode", False):
+            if self.batch_invariant_mode:
                 assert self.num_speculative_tokens == 0, (
                     "batch_invariant_mode for Mamba dynamic inference only supports "
                     "one-token decode; set num_speculative_tokens=0."
@@ -2007,7 +2008,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_to_kv_block_ids[0:N, 0] = dummy_block_idx
 
         # 3. Token-level state consumed by the triton KV append kernel.
-        self.token_to_input_ids[0:T].fill_(0)
+        if self.batch_invariant_mode:
+            self.token_to_input_ids[0:T].fill_(0)
         self.token_to_block_idx[0:T] = dummy_block_idx
         # Compute per-request token positions: e.g. query_lengths [3,2] -> [0,1,2,0,1]
         query_lengths = self.request_query_lengths[0:N]
@@ -2015,8 +2017,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Per-token start offset: e.g. starts [0,3], query_lengths [3,2] -> [0,0,0,3,3]
         per_token_start = torch.repeat_interleave(starts, query_lengths)
         positions = torch.arange(T, device=query_lengths.device) - per_token_start
-        self.token_to_pos_ids[0:T] = positions
-        self.token_to_position_in_request[0:T] = positions
+        if self.batch_invariant_mode:
+            self.token_to_pos_ids[0:T] = positions
+            self.token_to_position_in_request[0:T] = positions
         self.token_to_local_position_within_kv_block[0:T] = torch.remainder(
             positions, self.block_size_tokens
         )
@@ -2136,17 +2139,28 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self.pad_active_slices()
 
-        # Pad token-level inputs with neutral values before the coalesced H2D
-        # transfer. Dynamic batching often runs kernels over
-        # padded_active_token_count for CUDA graph compatibility; leaving these
-        # slots stale lets prior requests influence padding rows.
-        if self.active_token_count < self.padded_active_token_count:
+        if self.batch_invariant_mode and self.active_token_count < self.padded_active_token_count:
+            # Pad token-level inputs with neutral values before the coalesced H2D
+            # transfer. The batch-invariant graph path may run kernels over
+            # padded_active_token_count; leaving these slots stale lets prior
+            # requests influence padding rows.
             self.token_to_input_ids[self.padding_slice] = 0
             self.token_to_pos_ids[self.padding_slice] = 0
             self.token_to_request_idx[self.padding_slice] = 0
             self.token_to_block_idx[self.padding_slice] = self.kv_block_allocator.dummy_block_idx
             self.token_to_local_position_within_kv_block[self.padding_slice] = 0
             self.token_to_position_in_request[self.padding_slice] = 0
+        else:
+            # Update token position indexes.
+            self.token_to_block_idx[self.active_token_count : self.padded_active_token_count] = (
+                self.kv_block_allocator.dummy_block_idx
+            )
+            self.token_to_local_position_within_kv_block[
+                self.active_token_count : self.padded_active_token_count
+            ] = 0
+            self.token_to_position_in_request[
+                self.active_token_count : self.padded_active_token_count
+            ] = 0
 
         self.active_attn_metadata = (
             self.graph_attn_metadata  # type: ignore[assignment]

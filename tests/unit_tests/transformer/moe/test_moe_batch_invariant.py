@@ -191,7 +191,7 @@ def test_inference_bf16_grouped_mm_routes_when_enabled():
     assert torch.equal(y_batch_invariant, y_direct)
 
 
-def test_padded_squared_relu_zeros_aligned_padding_rows():
+def test_batch_invariant_padded_squared_relu_zeros_aligned_padding_rows():
     """Aligned padding rows are still inside grouped-GEMM expert blocks.
 
     They must be deterministic zeros, not uninitialized data, because the
@@ -212,7 +212,7 @@ def test_padded_squared_relu_zeros_aligned_padding_rows():
     permutation_map = torch.tensor([0, -1, 1, -1], device="cuda", dtype=torch.int32)
     n_used = torch.tensor([3], device="cuda", dtype=torch.int32)
 
-    y = padded_squared_relu(x, permutation_map, n_used)
+    y = padded_squared_relu(x, permutation_map, n_used, zero_padding_rows=True)
     torch.cuda.synchronize()
 
     expected0 = torch.tensor([0.0, 9.0, 0.25, 0.0], device="cuda", dtype=torch.bfloat16)

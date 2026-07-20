@@ -1,9 +1,10 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Padding-aware activation kernels for fused MoE.
 
-These kernels write deterministic zeros for padding rows (where
-permutation_map == -1). The second grouped GEMM still reads rows inside aligned
-expert blocks, so padding rows cannot be left uninitialized.
+The BF16 kernel skips padding rows (where permutation_map == -1) by default to
+preserve the existing eager behavior, and can optionally zero those rows for
+batch-invariant grouped-GEMM replay. The MXFP8 fused kernel keeps its existing
+padding behavior unchanged.
 """
 
 from unittest.mock import MagicMock
@@ -40,8 +41,9 @@ def _squared_relu_kernel(
     max_rows,  # output_size (fixed for CG)
     BLOCK_N: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,  # grid size (fixed for CG)
+    ZERO_PADDING_ROWS: tl.constexpr,
 ):
-    """Squared ReLU that gates rows beyond n_used and zeros alignment padding.
+    """Squared ReLU that skips rows beyond n_used and alignment padding by default.
 
     Grid: fixed NUM_BLOCKS CTAs, each iterating over multiple rows.
     n_used_ptr gates how many rows are processed — required for CUDA graph compatibility.
@@ -52,18 +54,30 @@ def _squared_relu_kernel(
         return
     for row in tl.range(pid, max_rows, NUM_BLOCKS):
         if row < n_used:
-            valid_row = tl.load(src_idx_ptr + row) >= 0
-            for n in tl.range(0, N, BLOCK_N):
-                o = n + tl.arange(0, BLOCK_N)
-                m = o < N
-                x = tl.load(input_ptr + row * N + o, mask=m, other=0.0).to(tl.float32)
-                r = tl.maximum(x, 0.0)
-                y = tl.where(valid_row, r * r, 0.0)
-                tl.store(output_ptr + row * N + o, y.to(tl.bfloat16), mask=m)
+            if ZERO_PADDING_ROWS:
+                valid_row = tl.load(src_idx_ptr + row) >= 0
+                for n in tl.range(0, N, BLOCK_N):
+                    o = n + tl.arange(0, BLOCK_N)
+                    m = o < N
+                    x = tl.load(input_ptr + row * N + o, mask=m, other=0.0).to(tl.float32)
+                    r = tl.maximum(x, 0.0)
+                    y = tl.where(valid_row, r * r, 0.0)
+                    tl.store(output_ptr + row * N + o, y.to(tl.bfloat16), mask=m)
+            else:
+                if tl.load(src_idx_ptr + row) >= 0:
+                    for n in tl.range(0, N, BLOCK_N):
+                        o = n + tl.arange(0, BLOCK_N)
+                        m = o < N
+                        x = tl.load(input_ptr + row * N + o, mask=m).to(tl.float32)
+                        r = tl.maximum(x, 0.0)
+                        tl.store(output_ptr + row * N + o, (r * r).to(tl.bfloat16), mask=m)
 
 
 def padded_squared_relu(
-    x: torch.Tensor, permutation_map: torch.Tensor, n_used: torch.Tensor
+    x: torch.Tensor,
+    permutation_map: torch.Tensor,
+    n_used: torch.Tensor,
+    zero_padding_rows: bool = False,
 ) -> torch.Tensor:
     """Squared ReLU activation that skips rows beyond n_used and alignment-padding rows.
 
@@ -71,13 +85,23 @@ def padded_squared_relu(
         x: [output_size, ffn_hidden] BF16 FC1 output.
         permutation_map: [output_size] int32, original token index or -1 for padding.
         n_used: scalar int32 CUDA tensor = inclusive_expert_offsets[-1].
+        zero_padding_rows: write deterministic zeros for permutation_map == -1 rows.
+            Used only by the batch-invariant bf16 grouped-GEMM path.
     """
     M, N = x.shape
     out = torch.empty(M, N, dtype=x.dtype, device=x.device)
     BLOCK_N = min(triton.next_power_of_2(N), 1024)
     NUM_BLOCKS = min(M, 512)
     _squared_relu_kernel[(NUM_BLOCKS,)](
-        x, out, permutation_map, n_used, N, M, BLOCK_N=BLOCK_N, NUM_BLOCKS=NUM_BLOCKS
+        x,
+        out,
+        permutation_map,
+        n_used,
+        N,
+        M,
+        BLOCK_N=BLOCK_N,
+        NUM_BLOCKS=NUM_BLOCKS,
+        ZERO_PADDING_ROWS=zero_padding_rows,
     )
     return out
 
