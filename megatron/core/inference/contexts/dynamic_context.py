@@ -2023,6 +2023,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         per_token_start = torch.repeat_interleave(starts, query_lengths)
         positions = torch.arange(T, device=query_lengths.device) - per_token_start
         if self.batch_invariant_mode:
+            # BIK Mamba replay reads both position views from the captured GPU
+            # metadata, so dummy EP ranks seed them like real requests.
             self.token_to_pos_ids[0:T] = positions
             self.token_to_position_in_request[0:T] = positions
         self.token_to_local_position_within_kv_block[0:T] = torch.remainder(
