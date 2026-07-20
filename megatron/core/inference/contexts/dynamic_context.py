@@ -303,6 +303,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             self.num_attention_heads_per_partition = 1
 
+        # BIK graph replay depends on dynamic-context padding decisions.
         self.batch_invariant_mode = model_config.batch_invariant_mode
         self.num_speculative_tokens = inference_config.num_speculative_tokens
         assert self.num_speculative_tokens < inference_config.block_size_tokens, (
@@ -346,6 +347,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_chunk_size = mamba_inference_state_config.mamba_chunk_size
 
             if self.batch_invariant_mode:
+                # Mamba BIK replay currently assumes one-token decode from an
+                # explicit prompt replay boundary.
                 assert self.num_speculative_tokens == 0, (
                     "batch_invariant_mode for Mamba dynamic inference only supports "
                     "one-token decode; set num_speculative_tokens=0."
@@ -2009,6 +2012,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # 3. Token-level state consumed by the triton KV append kernel.
         if self.batch_invariant_mode:
+            # Dummy EP ranks still replay the captured graph; seed neutral token
+            # inputs so masked rows cannot inherit stale request state.
             self.token_to_input_ids[0:T].fill_(0)
         self.token_to_block_idx[0:T] = dummy_block_idx
         # Compute per-request token positions: e.g. query_lengths [3,2] -> [0,1,2,0,1]
@@ -2140,10 +2145,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.pad_active_slices()
 
         if self.batch_invariant_mode and self.active_token_count < self.padded_active_token_count:
-            # Pad token-level inputs with neutral values before the coalesced H2D
-            # transfer. The batch-invariant graph path may run kernels over
-            # padded_active_token_count; leaving these slots stale lets prior
-            # requests influence padding rows.
+            # BIK kernels run to the padded graph shape, so scrub unused rows
+            # before the coalesced H2D transfer.
             self.token_to_input_ids[self.padding_slice] = 0
             self.token_to_pos_ids[self.padding_slice] = 0
             self.token_to_request_idx[self.padding_slice] = 0

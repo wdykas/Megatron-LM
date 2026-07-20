@@ -276,25 +276,20 @@ class TEGroupedMLP(MegatronModule):
                 self.num_local_experts, align_size=align_size
             )
 
-        # When batch-invariant mode is on, redirect per-expert weight tensors to
-        # views into a single contiguous [E, N, K] buffer. This (a) avoids paying
-        # a stack-copy on every forward when our patched general_grouped_gemm
-        # needs a [E, N, K] tensor, and (b) makes training weight storage byte-
-        # identical to InferenceGroupedMLP._build_concatenated_weights, which is
-        # what gives bitwise train==inference parity for RL.
+        # Batch-invariant mode uses the same contiguous expert-weight buffers
+        # that inference consumes, so training and inference see identical
+        # storage layout without a per-forward stack copy.
         if self.config.batch_invariant_mode:
             self._build_contiguous_weight_buffers()
 
     @torch.no_grad()
     def _build_contiguous_weight_buffers(self):
-        """Stack per-expert weights into contiguous [E, N, K] buffers and redirect
-        each weight{i}.data to a view into it. Idempotent.
-        """
+        """Build canonical contiguous expert-weight buffers. Idempotent."""
         for linear, buf_name in (
-            (self.linear_fc1, '_batch_invariant_fc1_weight'),
-            (self.linear_fc2, '_batch_invariant_fc2_weight'),
+            (self.linear_fc1, '_fc1_weight'),
+            (self.linear_fc2, '_fc2_weight'),
         ):
-            if getattr(self, buf_name, None) is not None:
+            if self._buffers.get(buf_name) is not None:
                 continue
             per_expert = [getattr(linear, f'weight{i}') for i in range(self.num_local_experts)]
             w0 = per_expert[0]
@@ -949,47 +944,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         - Training updates to flow through (param.data is a view into the big tensor)
         - torch.nn.functional.grouped_mm / FlashInfer to use the big tensor directly
         """
-        batch_invariant_fc1 = getattr(self, '_batch_invariant_fc1_weight', None)
-        batch_invariant_fc2 = getattr(self, '_batch_invariant_fc2_weight', None)
-        if batch_invariant_fc1 is not None and batch_invariant_fc2 is not None:
-            # TEGroupedMLP already redirected per-expert Parameter.data into
-            # contiguous buffers for the batch-invariant training path. Reuse
-            # those same buffers for inference instead of allocating a second
-            # stacked copy.
-            delattr(self, '_batch_invariant_fc1_weight')
-            delattr(self, '_batch_invariant_fc2_weight')
-            self.register_buffer('_fc1_weight', batch_invariant_fc1, persistent=False)
-            self.register_buffer('_fc2_weight', batch_invariant_fc2, persistent=False)
-            return
-
-        # Get device/dtype from existing TE weights
-        device = self.linear_fc1.weight0.device
-        dtype = self.linear_fc1.weight0.dtype
-
-        fc1_shape = self.linear_fc1.weight0.shape  # [out_features, in_features]
-        fc2_shape = self.linear_fc2.weight0.shape
-
-        # Create big contiguous tensors
-        _fc1_weight = torch.empty(self.num_local_experts, *fc1_shape, device=device, dtype=dtype)
-        _fc2_weight = torch.empty(self.num_local_experts, *fc2_shape, device=device, dtype=dtype)
-
-        # Copy existing TE weights into big tensors, then point param.data to the views
-        for i in range(self.num_local_experts):
-            fc1_param = getattr(self.linear_fc1, f'weight{i}')
-            fc2_param = getattr(self.linear_fc2, f'weight{i}')
-
-            # Copy initialized data into contiguous buffer
-            _fc1_weight[i].copy_(fc1_param.data)
-            _fc2_weight[i].copy_(fc2_param.data)
-
-            # Redirect param.data to view into contiguous buffer.
-            # The nn.Parameter object stays the same — TE's internal state is preserved.
-            fc1_param.data = _fc1_weight[i]
-            fc2_param.data = _fc2_weight[i]
-
-        # Register big tensors as non-persistent buffers (for .to() device movement, not saved)
-        self.register_buffer('_fc1_weight', _fc1_weight, persistent=False)
-        self.register_buffer('_fc2_weight', _fc2_weight, persistent=False)
+        self._build_contiguous_weight_buffers()
 
     def _flashinfer_forward(self, hidden_states, routing_map, probs):
         """FlashInfer fused MoE kernel for CUDA-graphed inference iterations."""
