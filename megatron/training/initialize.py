@@ -86,7 +86,7 @@ def initialize_megatron(
     )
 
     if args.batch_invariant_mode:
-        batch_invariant_kernel_backend = getattr(args, "batch_invariant_kernel_backend", "deepgemm")
+        batch_invariant_kernel_backend = args.batch_invariant_kernel_backend
         print_rank_0(
             f"Enabling batch invariant mode globally "
             f"(backend={batch_invariant_kernel_backend})"

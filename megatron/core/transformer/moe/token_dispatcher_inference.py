@@ -122,7 +122,7 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
             runs_metadata_sync=runs_metadata_sync,
         )
         self.topk = config.moe_router_topk
-        if getattr(config, "batch_invariant_mode", False) and get_pg_size(self.ep_group) > 1:
+        if config.batch_invariant_mode and get_pg_size(self.ep_group) > 1:
             raise AssertionError(
                 "batch_invariant_mode with inference-optimized MoE and expert parallelism "
                 "requires inference_moe_token_dispatcher_type='nvls'."
