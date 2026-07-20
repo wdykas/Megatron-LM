@@ -415,12 +415,11 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         # RS requires bf16 (hardware multimem reduce is bf16-only).
         # Check the matmul output shape: if it is NVLS-eligible, the RS output
         # (world_size times smaller on dim 0) is too.
-        # Under batch-invariant mode we force the NCCL fallback: multimem
-        # reduce sums across ranks via hardware multicast atomics whose
-        # ordering doesn't match NCCL's ring-traversal order, so it drifts
-        # vs training (which uses NCCL RS under sequence parallelism). NCCL
-        # RS is deterministic for a fixed topology and matches training
-        # bitwise.
+        # This is tensor-parallel sequence-parallel reduce-scatter, not the
+        # MoE expert-parallel NVLS ReduceScatterV path. Under batch-invariant
+        # mode we force the NCCL fallback here: TP multimem reduce sums across
+        # ranks in an order that can differ from the NCCL sequence-parallel
+        # training path, so it can drift vs training.
         can_use_nvls = (
             self.triton_nvls_kernels_allowed
             and x.dtype == torch.bfloat16
@@ -549,9 +548,10 @@ def inference_reduce_scatter_to_sequence_parallel_region(
         config, 'inference_disable_triton_nvls_kernels', False
     )
 
-    # Under batch-invariant mode, drop the NVLS multimem path: its
-    # cross-rank reduction order differs from NCCL's ring traversal, so it
-    # drifts vs training (which uses NCCL RS under sequence parallelism).
+    # This helper is for tensor-parallel sequence-parallel reduce-scatter, not
+    # MoE expert-parallel NVLS communication. Under batch-invariant mode, use
+    # the NCCL fallback so inference follows the same TP reduction path as
+    # training.
     if (
         triton_nvls_kernels_allowed
         and SymmetricMemoryManager.is_initialized("tp")

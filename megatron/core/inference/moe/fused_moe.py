@@ -220,6 +220,7 @@ def mcore_fused_moe(
         activation_out = MXFP8Tensor.from_bf16(activation_out, backend="triton")
     fc2_output = mm_fn(activation_out, fc2_weight, offs)
 
+    # --- Post-processing: unpermute ---
     return unpermute_tokens(
         fc2_output, permuted_probs, permutation_map, max_tokens, n_used, valid_tokens, out=out
     )

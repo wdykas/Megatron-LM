@@ -949,6 +949,19 @@ class InferenceGroupedMLP(TEGroupedMLP):
         - Training updates to flow through (param.data is a view into the big tensor)
         - torch.nn.functional.grouped_mm / FlashInfer to use the big tensor directly
         """
+        batch_invariant_fc1 = getattr(self, '_batch_invariant_fc1_weight', None)
+        batch_invariant_fc2 = getattr(self, '_batch_invariant_fc2_weight', None)
+        if batch_invariant_fc1 is not None and batch_invariant_fc2 is not None:
+            # TEGroupedMLP already redirected per-expert Parameter.data into
+            # contiguous buffers for the batch-invariant training path. Reuse
+            # those same buffers for inference instead of allocating a second
+            # stacked copy.
+            delattr(self, '_batch_invariant_fc1_weight')
+            delattr(self, '_batch_invariant_fc2_weight')
+            self.register_buffer('_fc1_weight', batch_invariant_fc1, persistent=False)
+            self.register_buffer('_fc2_weight', batch_invariant_fc2, persistent=False)
+            return
+
         # Get device/dtype from existing TE weights
         device = self.linear_fc1.weight0.device
         dtype = self.linear_fc1.weight0.dtype

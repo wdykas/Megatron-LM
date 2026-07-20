@@ -521,10 +521,11 @@ def unpermute(
     output_tokens = torch.zeros(
         restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
     )
-    # AllToAll (training) and AllGather (inference) feed identical topk
-    # contributions in different orders. `scatter_add_` uses atomic adds and
-    # diverges in the low bits across orders; `deterministic_index_add` does
-    # an order-invariant sort + cumsum combine.
+    # Batch-invariant dispatchers present duplicate top-k contributions in a
+    # fixed expert-major order. Avoid `scatter_add_` atomics here; they can
+    # accumulate the same fixed contribution stream in a nondeterministic order.
+    # `deterministic_index_add` uses a stable sort + cumsum, so accumulation is
+    # fixed for that contribution-order contract.
     if is_batch_invariant_mode_enabled():
         deterministic_index_add(output_tokens, sorted_indices, permuted_tokens)
     elif torch.are_deterministic_algorithms_enabled():

@@ -984,6 +984,27 @@ def _stack_weights_for_deepgemm(weights: List[torch.Tensor]) -> torch.Tensor:
         and base.is_contiguous()
     ):
         return base
+    # Assigning Parameter.data to stacked[i] keeps the shared storage and
+    # storage offsets, but PyTorch does not preserve _base/view metadata on the
+    # Parameter object. Detect that common case directly so the training path
+    # does not pay a torch.stack copy every grouped-GEMM call.
+    first_storage = first.untyped_storage().data_ptr()
+    expert_stride = first.numel()
+    if (
+        first.is_contiguous()
+        and all(
+            w.shape == first.shape
+            and w.stride() == first.stride()
+            and w.untyped_storage().data_ptr() == first_storage
+            and w.storage_offset() == first.storage_offset() + i * expert_stride
+            for i, w in enumerate(weights)
+        )
+    ):
+        return torch.as_strided(
+            first,
+            size=expected_shape,
+            stride=(expert_stride, *first.stride()),
+        )
     return torch.stack([w.contiguous() for w in weights], dim=0)
 
 
@@ -1927,6 +1948,9 @@ def set_batch_invariant_mode(enabled: bool = True, backend: Optional[str] = None
     When `enabled` is True, batch-invariant kernels are enabled for the duration of
     the context; when False, they are disabled for the duration. This implementation
     is re-entrant and correctly restores the previous state even under nesting.
+    Production initialization passes TransformerConfig.batch_invariant_kernel_backend
+    explicitly; the helper default remains "triton" for tests that exercise
+    non-bf16 operators.
     """
     global _batch_invariant_MODE, _batch_invariant_LIB
     # Save the previous on/off state so we can correctly restore it, even under

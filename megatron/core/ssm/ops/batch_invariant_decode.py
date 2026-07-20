@@ -68,9 +68,9 @@ def make_batch_invariant_decode_buffers(
 
     Buffers get max_batch + 1 rows: the extra row is a write sink for
     inactive lanes (batch_indices < 0). With inactive lanes redirected
-    there, every scatter can write unconditionally; duplicate indices only
-    occur among inactive lanes writing identical values, so there is no
-    write-order race.
+    there, every scatter can write unconditionally. Duplicate indices only
+    occur among inactive lanes writing the trash row; that row is masked from
+    outputs and never writes a real SSM cache slot.
     """
     rows = max_batch + 1
     return BatchInvariantDecodeBuffers(
