@@ -20,7 +20,6 @@ from megatron.core.tensor_parallel import (
 from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-    deterministic_index_add,
     is_batch_invariant_mode_enabled,
 )
 from megatron.core.transformer.enums import CudaGraphModule
@@ -312,6 +311,7 @@ def permute(
     drop_and_pad: bool = False,
     tokens_per_expert: Optional[torch.Tensor] = None,
     align_size: int = 0,
+    return_batch_invariant_inverse_map: bool = False,
 ) -> Tuple[
     torch.Tensor,
     Optional[torch.Tensor],
@@ -344,6 +344,8 @@ def permute(
         tokens_per_expert (torch.Tensor, optional): Tensor of shape `[num_experts]` containing
                                                     actual token counts per expert.
         align_size (int, optional): The alignment size for the input tensor for fp8 or fp4.
+        return_batch_invariant_inverse_map (bool, optional): Return a fixed-shape
+            BIK inverse map in the `pad_offsets` slot for graph-safe unpermute.
 
     Returns:
         Tuple[
@@ -390,6 +392,7 @@ def permute(
     num_tokens, hidden = tokens.shape
     num_experts = routing_map.shape[1]
     permuted_probs = None
+    batch_invariant_inverse_map = None
     if drop_and_pad and not (num_out_tokens is None):
         capacity = num_out_tokens // num_experts
         assert not routing_map.requires_grad
@@ -416,6 +419,15 @@ def permute(
         assert (
             num_out_tokens is not None
         ), "num_out_tokens is required for the argsort-based permute"
+        if return_batch_invariant_inverse_map:
+            assert isinstance(
+                num_out_tokens, int
+            ), "batch-invariant graph unpermute requires static num_out_tokens"
+            assert (
+                num_out_tokens % num_tokens == 0
+            ), "batch-invariant graph unpermute expects fixed top-k per token"
+            inverse_routing_map = routing_map.bool()
+            topk = num_out_tokens // num_tokens
 
         # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
         routing_map = routing_map.bool().T.contiguous()
@@ -430,10 +442,34 @@ def permute(
         if probs is not None:
             permuted_probs = probs.T.contiguous().reshape(-1)[flat_sorted]
 
+        if return_batch_invariant_inverse_map:
+            row_ids = torch.arange(num_out_tokens, device=tokens.device, dtype=torch.long)
+            expert_ids = torch.div(flat_sorted, num_tokens, rounding_mode='floor').to(torch.long)
+            token_ids = sorted_indices.to(torch.long)
+            slots_by_token_expert = inverse_routing_map.to(torch.long).cumsum(dim=1) - 1
+            row_slots = slots_by_token_expert[token_ids, expert_ids]
+            linear_slots = token_ids * topk + row_slots
+
+            inverse_rows = torch.full(
+                (num_tokens, topk), -1, device=tokens.device, dtype=torch.long
+            )
+            inverse_experts = torch.full(
+                (num_tokens, topk), -1, device=tokens.device, dtype=torch.long
+            )
+            inverse_rows.view(-1).scatter_(0, linear_slots, row_ids)
+            inverse_experts.view(-1).scatter_(0, linear_slots, expert_ids)
+            batch_invariant_inverse_map = torch.stack((inverse_rows, inverse_experts), dim=0)
+
     # use the mapping to permute the tokens
     permuted_input = tokens.index_select(0, sorted_indices)
 
-    return permuted_input, permuted_probs, sorted_indices, None, tokens_per_expert
+    return (
+        permuted_input,
+        permuted_probs,
+        sorted_indices,
+        batch_invariant_inverse_map,
+        tokens_per_expert,
+    )
 
 
 def unpermute(
@@ -445,6 +481,8 @@ def unpermute(
     fused: bool = False,
     drop_and_pad: bool = False,
     pad_offsets: Optional[torch.Tensor] = None,
+    batch_invariant_ep_rank_tree: bool = False,
+    batch_invariant_inverse_map: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Restore the original order of tokens after permutation. If probs are provided, it
@@ -470,10 +508,21 @@ def unpermute(
             Tensor of per-expert cumulative padding offsets used to remove padding added
             during permutation. This is the fourth output of `moe_permute_and_pad_with_probs`
             and is required when unpermuting padded outputs. Defaults to None.
+        batch_invariant_ep_rank_tree (bool, optional): In batch-invariant mode, first reduce
+            global expert shards into per-EP-rank partials, then add ranks in order. The
+            AllToAll training combine path opts into this to match NVLS inference.
+        batch_invariant_inverse_map (torch.Tensor, optional): Fixed-shape
+            `[2, num_tokens, topk]` map from token/top-k slot to permuted row and
+            global expert id. Used by BIK CUDA graph paths.
 
     Returns:
         torch.Tensor: The tokens restored to their original order.
     """
+    batch_invariant_mode = is_batch_invariant_mode_enabled()
+    if batch_invariant_mode:
+        assert not fused, "batch-invariant MoE unpermute requires the unfused path"
+        assert not drop_and_pad, "batch-invariant MoE supports dynamic dropless routing only"
+
     if fused:
         if not HAVE_TE or fused_unpermute is None:
             raise ValueError("fused_unpermute is not available. Please install TE >= 2.1.0.")
@@ -490,6 +539,88 @@ def unpermute(
 
     _, hidden = restore_shape
     input_dtype = permuted_tokens.dtype
+
+    if batch_invariant_mode:
+        assert routing_map is not None, "batch-invariant MoE unpermute requires routing_map"
+
+        output_tokens = torch.zeros(
+            restore_shape, dtype=torch.float32, device=permuted_tokens.device
+        )
+        num_experts = routing_map.size(1)
+        ep_size = 1
+        experts_per_rank = num_experts
+        if batch_invariant_ep_rank_tree:
+            ep_size = parallel_state.get_expert_model_parallel_world_size() or 1
+            assert num_experts % ep_size == 0, "batch-invariant MoE expects contiguous EP shards"
+            experts_per_rank = num_experts // ep_size
+
+        if batch_invariant_inverse_map is not None:
+            inverse_rows = batch_invariant_inverse_map[0]
+            inverse_experts = batch_invariant_inverse_map[1]
+            topk = inverse_rows.size(1)
+            for ep_rank in range(ep_size):
+                if batch_invariant_ep_rank_tree:
+                    rank_partial = torch.zeros_like(output_tokens)
+                    start_expert = ep_rank * experts_per_rank
+                    end_expert = start_expert + experts_per_rank
+                else:
+                    rank_partial = output_tokens
+                for k in range(topk):
+                    row_ids = inverse_rows[:, k]
+                    expert_ids = inverse_experts[:, k]
+                    valid_mask = row_ids >= 0
+                    if batch_invariant_ep_rank_tree:
+                        valid_mask = (
+                            valid_mask
+                            & (expert_ids >= start_expert)
+                            & (expert_ids < end_expert)
+                        )
+                    safe_rows = row_ids.clamp_min(0)
+                    chunk = permuted_tokens.index_select(0, safe_rows).to(torch.float32)
+                    if probs is not None:
+                        safe_experts = expert_ids.clamp_min(0)
+                        chunk = chunk * probs.gather(1, safe_experts.unsqueeze(1)).to(
+                            torch.float32
+                        )
+                    chunk = torch.where(
+                        valid_mask.unsqueeze(-1), chunk, torch.zeros_like(chunk)
+                    )
+                    rank_partial += chunk
+                if batch_invariant_ep_rank_tree:
+                    output_tokens += rank_partial
+            return output_tokens.to(dtype=input_dtype)
+
+        assert not is_graph_capturing(), (
+            "batch-invariant MoE unpermute requires batch_invariant_inverse_map "
+            "during CUDA graph capture"
+        )
+
+        cursor = 0
+        for ep_rank in range(ep_size):
+            if batch_invariant_ep_rank_tree:
+                rank_partial = torch.zeros_like(output_tokens)
+            else:
+                rank_partial = output_tokens
+            start_expert = ep_rank * experts_per_rank
+            end_expert = start_expert + experts_per_rank
+            for expert_id in range(start_expert, end_expert):
+                expert_mask = routing_map[:, expert_id].to(torch.bool)
+                n_tokens = int(expert_mask.sum().item())
+                if n_tokens == 0:
+                    continue
+                token_ids = torch.nonzero(expert_mask, as_tuple=False).squeeze(-1)
+                next_cursor = cursor + n_tokens
+
+                chunk = permuted_tokens[cursor:next_cursor].to(torch.float32)
+                if probs is not None:
+                    chunk = chunk * probs[token_ids, expert_id].to(torch.float32).unsqueeze(-1)
+                # Token ids are unique within one expert chunk; the loops fix
+                # expert and rank order.
+                rank_partial.index_add_(0, token_ids, chunk)
+                cursor = next_cursor
+            if batch_invariant_ep_rank_tree:
+                output_tokens += rank_partial
+        return output_tokens.to(dtype=input_dtype)
 
     if probs is not None:
         assert routing_map is not None, "Mask must be provided to permute the probs."
@@ -521,14 +652,7 @@ def unpermute(
     output_tokens = torch.zeros(
         restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
     )
-    # Batch-invariant dispatchers present duplicate top-k contributions in a
-    # fixed expert-major order. Avoid `scatter_add_` atomics here; they can
-    # accumulate the same fixed contribution stream in a nondeterministic order.
-    # `deterministic_index_add` uses a stable sort + cumsum, so accumulation is
-    # fixed for that contribution-order contract.
-    if is_batch_invariant_mode_enabled():
-        deterministic_index_add(output_tokens, sorted_indices, permuted_tokens)
-    elif torch.are_deterministic_algorithms_enabled():
+    if torch.are_deterministic_algorithms_enabled():
         output_tokens.index_add_(0, sorted_indices, permuted_tokens)
     else:
         # Scatter add the permuted_input back to the original positions

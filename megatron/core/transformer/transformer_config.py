@@ -2503,6 +2503,19 @@ class TransformerConfig(ModelParallelConfig):
                 assert not (
                     self.fp8 or self.fp4
                 ), "Batch-invariant MoE is bf16-only. Disable fp8/fp4 to use it."
+                assert not (
+                    self.moe_permute_fusion or self.moe_permute_fusion_into_hybridep
+                ), (
+                    "Batch-invariant MoE requires the unfused permute/unpermute path so "
+                    "top-k reductions use the fixed batch-invariant add tree."
+                )
+                assert not (
+                    self.moe_pad_expert_input_to_capacity
+                    or self.moe_pad_experts_for_cuda_graph_inference
+                ), (
+                    "Batch-invariant MoE supports dynamic dropless routing only. "
+                    "Disable MoE capacity/expert padding."
+                )
 
 
 @dataclass

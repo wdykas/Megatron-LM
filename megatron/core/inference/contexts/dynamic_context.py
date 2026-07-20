@@ -650,6 +650,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             get_pg_size(self.expert_model_parallel_group) > 1
             and model_config.transformer_impl == "transformer_engine"
         )
+        if (
+            self.batch_invariant_mode
+            and model_config.num_moe_experts is not None
+            and self._training_ep_dispatcher
+            and inference_config.use_cuda_graphs_for_non_decode_steps
+        ):
+            raise AssertionError(
+                "batch_invariant_mode MoE non-decode CUDA graphs require "
+                "transformer_impl='inference_optimized' with "
+                "inference_moe_token_dispatcher_type='nvls'. The transformer_engine "
+                "MoE dispatcher only supports decode-only CUDA graphs."
+            )
 
         # We only allow non-decode cuda graphs for the nvls dispatcher
         force_disable_non_decode_cuda_graphs = (

@@ -31,6 +31,7 @@ import torch.distributed as dist
 from megatron.core.inference.communication.torch_symm_triton import (
     multimem_all_gatherv_3tensor,
     multimem_reduce_scatter_v,
+    ordered_reduce_scatter_v,
 )
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.moe.metadata import fused_metadata_update
@@ -43,6 +44,9 @@ from megatron.core.tensor_parallel import (
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.moe.token_dispatcher import MoEAllGatherTokenDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    is_batch_invariant_mode_enabled,
+)
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import get_pg_rank, get_pg_size
 
@@ -566,10 +570,9 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     def token_combine(self, hidden_states):
         """ReduceScatter-V: sum expert outputs across EP ranks, scatter to local tokens.
 
-        Batch-invariant mode uses the same shape contract: mcore_fused_moe writes
-        each rank's deterministic local partial sums into the symmetric RSV
-        buffer, then this method uses NVLS ReduceScatterV to combine rank
-        partials.
+        In batch-invariant mode, the symmetric RSV buffer is still used for data
+        visibility, but the rank reduction is an explicit fp32 rank-order loop
+        rather than a hardware multimem reduction.
 
         Args:
             hidden_states: [global_max, hidden_size] expert outputs (fp32
@@ -591,14 +594,24 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             dtype=rsv["tensor"].dtype,
             device=hidden_states.device,
         )
-        multimem_reduce_scatter_v(
-            output,
-            rsv["tensor"],
-            rsv["handle"],
-            rank_token_offset=self._rank_token_offset(),
-            ep_max_tokens=self._ep_max_tokens(),
-            per_rank_max_tokens=self._per_rank_worst_case_token_count,
-        )
+        if is_batch_invariant_mode_enabled():
+            ordered_reduce_scatter_v(
+                output,
+                rsv["tensor"],
+                rsv["handle"],
+                rank_token_offset=self._rank_token_offset(),
+                ep_max_tokens=self._ep_max_tokens(),
+                per_rank_max_tokens=self._per_rank_worst_case_token_count,
+            )
+        else:
+            multimem_reduce_scatter_v(
+                output,
+                rsv["tensor"],
+                rsv["handle"],
+                rank_token_offset=self._rank_token_offset(),
+                ep_max_tokens=self._ep_max_tokens(),
+                per_rank_max_tokens=self._per_rank_worst_case_token_count,
+            )
         return output.to(torch.bfloat16)
 
     def combine_postprocess(self, hidden_states):

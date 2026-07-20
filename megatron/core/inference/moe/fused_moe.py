@@ -183,6 +183,7 @@ def mcore_fused_moe(
     # --- Pre-processing: permute ---
     if use_fused_quant:
         # Fused permute + MXFP8 quantize: single kernel produces MXFP8Tensor
+        inverse_map = None
         hidden_states, permuted_probs, permutation_map, offs = permute_and_quantize_mxfp8(
             hidden_states,
             probs,
@@ -193,15 +194,28 @@ def mcore_fused_moe(
             alignment=expert_alignment,
         )
     else:
-        hidden_states, permuted_probs, permutation_map, offs = permute_tokens(
-            hidden_states,
-            probs,
-            routing_map,
-            local_expert_start,
-            num_local_experts,
-            valid_tokens,
-            alignment=expert_alignment,
-        )
+        if is_batch_invariant_mode_enabled():
+            hidden_states, permuted_probs, permutation_map, offs, inverse_map = permute_tokens(
+                hidden_states,
+                probs,
+                routing_map,
+                local_expert_start,
+                num_local_experts,
+                valid_tokens,
+                alignment=expert_alignment,
+                return_inverse_map=True,
+            )
+        else:
+            inverse_map = None
+            hidden_states, permuted_probs, permutation_map, offs = permute_tokens(
+                hidden_states,
+                probs,
+                routing_map,
+                local_expert_start,
+                num_local_experts,
+                valid_tokens,
+                alignment=expert_alignment,
+            )
 
     # --- FC1 -> activation -> FC2 ---
     # Quantize if MXFP8 path and hidden_states not already quantized (fused permute+quant
@@ -222,5 +236,12 @@ def mcore_fused_moe(
 
     # --- Post-processing: unpermute ---
     return unpermute_tokens(
-        fc2_output, permuted_probs, permutation_map, max_tokens, n_used, valid_tokens, out=out
+        fc2_output,
+        permuted_probs,
+        permutation_map,
+        max_tokens,
+        n_used,
+        valid_tokens,
+        out=out,
+        inverse_map=inverse_map,
     )

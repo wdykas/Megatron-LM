@@ -852,8 +852,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 config.expert_model_parallel_size == 1 or self._nvls_dispatcher
             ), (
                 "batch_invariant_mode with inference-optimized MoE and expert parallelism "
-                "requires inference_moe_token_dispatcher_type='nvls'. The NCCL raw-contribution "
-                "AllToAll BIK path is intentionally not supported on this branch."
+                "requires inference_moe_token_dispatcher_type='nvls' so the combine uses "
+                "the ordered symmetric-memory rank reduction."
             )
 
     def _resolve_flashinfer_activation_type(self):
@@ -979,14 +979,12 @@ class InferenceGroupedMLP(TEGroupedMLP):
            path. Expert token blocks are padded to DeepGEMM's required alignment
            before the captured path, so a token's GEMM result does not depend on
            how many neighboring tokens routed to the same or different experts.
-        3. Local top-k unpermute is deterministic. mcore_fused_moe weights expert
-           outputs in fp32 and uses deterministic_index_add instead of atomic_add,
-           keeping duplicate-token reductions in a fixed order while preserving
-           CUDA graph compatible static shapes through masks.
-        4. Cross-rank combine is a single NVLS ReduceScatterV over the symmetric
-           RSV buffer. Each rank writes deterministic local partial sums into
-           the same fixed [global_max, hidden] layout, and token_combine reduces
-           those rank partials back to each token's owner rank.
+        3. Local unpermute reduces each token in fp32 by increasing local-expert
+           id. It never uses atomic_add or a global segmented cumsum, so other
+           tokens in the dynamic batch cannot affect the token's add tree.
+        4. Cross-rank combine uses the symmetric RSV buffer for peer visibility,
+           then token_combine explicitly loads rank 0, rank 1, ... in fp32. It
+           does not use multimem.ld_reduce under batch-invariant mode.
 
         Dynamic batching therefore changes only valid-token metadata and masked
         rows, not the math path used by any valid token.

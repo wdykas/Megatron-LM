@@ -178,6 +178,47 @@ class TestDynamicContext:
         assert position_ids.cpu().tolist() == [[0, 0, 0, 0]]
 
     @pytest.mark.internal
+    def test_batch_invariant_moe_non_decode_graphs_require_inference_dispatcher(
+        self, monkeypatch
+    ):
+        """Do not silently turn a requested BIK full-graph run into decode-only graphs."""
+        fake_ep_group = object()
+
+        monkeypatch.setattr(parallel_state, "get_expert_model_parallel_world_size", lambda: 2)
+        monkeypatch.setattr(
+            parallel_state, "get_expert_model_parallel_group", lambda: fake_ep_group
+        )
+        monkeypatch.setattr(
+            "megatron.core.inference.contexts.dynamic_context.get_pg_size",
+            lambda group: 2 if group is fake_ep_group else 1,
+        )
+
+        model_config = TransformerConfig(
+            params_dtype=torch.bfloat16,
+            num_layers=2,
+            kv_channels=8,
+            num_attention_heads=2,
+            batch_invariant_mode=True,
+            num_moe_experts=4,
+            transformer_impl="transformer_engine",
+            inference_moe_token_dispatcher_type="nvls",
+            attention_backend=AttnBackend.flash,
+        )
+        inference_config = InferenceConfig(
+            max_sequence_length=64,
+            buffer_size_gb=0.01,
+            block_size_tokens=16,
+            max_tokens=8,
+            max_requests=4,
+            num_cuda_graphs=1,
+            use_cuda_graphs_for_non_decode_steps=True,
+            unified_memory_level=0,
+        )
+
+        with pytest.raises(AssertionError, match="inference_optimized"):
+            DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
+
+    @pytest.mark.internal
     @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_initialize_dynamic_context(self, is_hybrid_model: bool):

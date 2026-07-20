@@ -455,16 +455,19 @@ class TestNVLSAllGatherVDispatcher:
         expected_combined = (global_hidden[start:end].float() * ep_size).bfloat16()
         torch.testing.assert_close(graph_combined, expected_combined, atol=0, rtol=0)
 
-    def test_cuda_graph_batch_invariant_combine_uses_nvls_rsv(self):
-        """Batch-invariant mode should still use NVLS ReduceScatterV on NVLS dispatcher.
+    def test_cuda_graph_batch_invariant_combine_uses_ordered_symmetric_memory(self, monkeypatch):
+        """Batch-invariant mode should use ordered peer loads on NVLS dispatcher.
 
-        The NCCL experiment path combines raw contributions before token_combine,
-        but the NVLS path keeps the simpler model: local deterministic unpermute
-        writes a global RSV-shaped tensor, then token_combine reduces/scatters it.
+        The graph path still writes local partials into the symmetric RSV buffer,
+        but the combine must not use multimem.ld_reduce under BIK.
         """
         from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
             set_batch_invariant_mode,
         )
+        from megatron.core.transformer.moe import token_dispatcher_inference
+
+        if Utils.world_size < 2:
+            pytest.skip("Ordered RSV combine requires expert-parallel world_size > 1.")
 
         torch.manual_seed(2026)
         torch.cuda.manual_seed(2026)
@@ -496,6 +499,19 @@ class TestNVLSAllGatherVDispatcher:
         static_probs = global_probs[start:end].contiguous()
         static_routing_map = global_routing_map[start:end].contiguous()
 
+        ordered_calls = {"value": 0}
+        orig_ordered_reduce_scatter_v = token_dispatcher_inference.ordered_reduce_scatter_v
+
+        def _tracked_ordered_reduce_scatter_v(*args, **kwargs):
+            ordered_calls["value"] += 1
+            return orig_ordered_reduce_scatter_v(*args, **kwargs)
+
+        monkeypatch.setattr(
+            token_dispatcher_inference,
+            "ordered_reduce_scatter_v",
+            _tracked_ordered_reduce_scatter_v,
+        )
+
         with torch.no_grad(), set_batch_invariant_mode(True):
             s = torch.cuda.Stream()
             s.wait_stream(torch.cuda.current_stream())
@@ -517,17 +533,17 @@ class TestNVLSAllGatherVDispatcher:
 
             graph.replay()
 
+        assert ordered_calls["value"] > 0
         assert graph_combined.shape == (local_tokens, hidden_size)
         expected_combined = (global_hidden[start:end].float() * ep_size).bfloat16()
         torch.testing.assert_close(graph_combined, expected_combined, atol=0, rtol=0)
 
-    def test_cuda_graph_batch_invariant_moe_layer_uses_nvls_rsv(self, monkeypatch):
-        """A real inference MoE layer should use the NVLS RSV combine under BIK.
+    def test_cuda_graph_batch_invariant_moe_layer_uses_ordered_rsv(self, monkeypatch):
+        """A real inference MoE layer should use ordered RSV combine under BIK.
 
-        This catches the production branch in InferenceGroupedMLP: NVLS keeps
-        mcore_fused_moe's normal local deterministic unpermute into the symmetric
-        RSV buffer; there is no NCCL-only raw-contribution AllToAll helper on
-        this branch.
+        This catches the production branch in InferenceGroupedMLP: mcore_fused_moe
+        writes deterministic local partials into the symmetric RSV buffer, then
+        token_combine uses explicit rank-order fp32 loads.
         """
         from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
         from megatron.core.parallel_state import get_expert_model_parallel_group
@@ -538,6 +554,7 @@ class TestNVLSAllGatherVDispatcher:
         from megatron.core.transformer.moe.token_dispatcher_inference import (
             NVLSAllGatherVDispatcher,
         )
+        from megatron.core.transformer.moe import token_dispatcher_inference
 
         if Utils.world_size < 2:
             pytest.skip("NVLS RSV branch test requires expert-parallel world_size > 1.")
@@ -582,6 +599,18 @@ class TestNVLSAllGatherVDispatcher:
         monkeypatch.setattr(
             NVLSAllGatherVDispatcher, "_get_rsv_tensor", classmethod(_tracked_get_rsv_tensor)
         )
+        ordered_calls = {"value": 0}
+        orig_ordered_reduce_scatter_v = token_dispatcher_inference.ordered_reduce_scatter_v
+
+        def _tracked_ordered_reduce_scatter_v(*args, **kwargs):
+            ordered_calls["value"] += 1
+            return orig_ordered_reduce_scatter_v(*args, **kwargs)
+
+        monkeypatch.setattr(
+            token_dispatcher_inference,
+            "ordered_reduce_scatter_v",
+            _tracked_ordered_reduce_scatter_v,
+        )
 
         local_tokens = 16
         hidden_states = torch.randn(
@@ -623,5 +652,6 @@ class TestNVLSAllGatherVDispatcher:
             graph.replay()
 
         assert used_rsv["value"]
+        assert ordered_calls["value"] > 0
         assert graph_output.shape == hidden_states.shape
         assert graph_output.dtype == torch.bfloat16
