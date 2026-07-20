@@ -347,21 +347,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_chunk_size = mamba_inference_state_config.mamba_chunk_size
 
             if self.batch_invariant_mode:
-                # Mamba BIK replay currently assumes one-token decode from an
-                # explicit prompt replay boundary.
                 assert self.num_speculative_tokens == 0, (
                     "batch_invariant_mode for Mamba dynamic inference only supports "
                     "one-token decode; set num_speculative_tokens=0."
-                )
-                assert not inference_config.enable_chunked_prefill, (
-                    "batch_invariant_mode for Mamba dynamic inference does not support "
-                    "chunked prefill because replay seeding must start from an absolute "
-                    "Mamba chunk boundary."
-                )
-                assert not inference_config.enable_prefix_caching, (
-                    "batch_invariant_mode for Mamba dynamic inference does not support "
-                    "prefix caching because replay seeding must account for the skipped "
-                    "absolute prompt offset."
                 )
 
             # For hybrid models, the layer map converts the global layer index to the
@@ -715,6 +703,11 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
+        if self.batch_invariant_mode and self.is_hybrid_model and self.enable_chunked_prefill:
+            assert self.max_tokens >= self.mamba_chunk_size, (
+                "batch-invariant Mamba chunked prefill requires max_tokens >= "
+                f"mamba_chunk_size ({self.mamba_chunk_size})."
+            )
 
         # FlashInfer.
         if inference_config.use_flashinfer_fused_rope is True:
@@ -2657,10 +2650,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Clamp so that effective_prefill_chunk_length >= 2 when possible.
         # A single-token prefill chunk (effective == 1) causes max_seqlen_q == 1,
         # which routes the batch into the flash-attention decode kernel and crashes.
-        # Round down to a block boundary to keep block-table indexing consistent.
+        # Round down to a safe restore boundary.
         if prefill_chunk_length - prefix_skip_tokens < 2 and prefill_chunk_length >= 2:
             max_skip = prefill_chunk_length - 2
-            prefix_skip_tokens = (max_skip // self.block_size_tokens) * self.block_size_tokens
+            skip_granularity = self.block_size_tokens
+            if self.batch_invariant_mode and self.is_hybrid_model:
+                skip_granularity = self.mamba_chunk_size
+            prefix_skip_tokens = (max_skip // skip_granularity) * skip_granularity
 
         effective_prefill_chunk_length = prefill_chunk_length - prefix_skip_tokens
         num_blocks_from_pool = max(
@@ -2930,20 +2926,28 @@ class DynamicInferenceContext(BaseInferenceContext):
             else:
                 self._pending_mamba_zeros.append(mamba_idx)
 
-            # compute_and_store_offsets sets both CPU state (hash_to_block_id,
-            # _eos_cache_block_id_gpu) and GPU staging buffers.  Runs immediately
-            # because commit_intermediate_states() reads the CPU state after the
-            # forward pass.
-            if self.mamba_slot_allocator is not None:
-                self.mamba_slot_allocator.compute_and_store_offsets(
-                    req,
-                    current_id,
-                    prefix_skip_tokens,
-                    prefill_chunk_length,
-                    num_matched_blocks,
-                    matched_block_ids,
-                    overall_required_blocks,
-                )
+        is_final_prefill = (
+            req.finished_chunk_token_count + prefill_chunk_length == len(req.prompt_tokens)
+        )
+        # BIK publishes the final continuation's reusable Mamba boundary.
+        # Non-BIK keeps the existing first-prefill-only behavior.
+        if (
+            self.is_hybrid_model
+            and self.mamba_slot_allocator is not None
+            and (
+                req.finished_chunk_token_count == 0
+                or (self.batch_invariant_mode and is_final_prefill)
+            )
+        ):
+            self.mamba_slot_allocator.compute_and_store_offsets(
+                req,
+                current_id,
+                prefix_skip_tokens,
+                prefill_chunk_length,
+                num_matched_blocks,
+                matched_block_ids,
+                overall_required_blocks,
+            )
 
         self.active_token_count += effective_prefill_chunk_length
         self.lifetime_prefill_token_count += effective_prefill_chunk_length

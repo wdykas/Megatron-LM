@@ -33,10 +33,6 @@ class BatchInvariantDecodeBuffers:
     # Tokens buffered since the slot's last chunk boundary; doubles as the
     # write cursor for the next token.
     num_buffered: torch.Tensor  # (max_batch + 1,) int32
-    # 1.0 normally; 0.0 while a slot's prefill hasn't crossed a chunk
-    # boundary yet, meaning its cached ssm state is stale and the kernels
-    # must treat the initial state as zero.
-    state_scale: torch.Tensor  # (max_batch + 1,) fp32
     # Per-lane target-row output, allocated once and sliced per step.
     out: torch.Tensor          # (max_batch + 1, nheads, headdim)
 
@@ -80,7 +76,6 @@ def make_batch_invariant_decode_buffers(
         B=torch.zeros(rows, chunk_size, ngroups, dstate, device=device, dtype=dtype),
         C=torch.zeros(rows, chunk_size, ngroups, dstate, device=device, dtype=dtype),
         num_buffered=torch.zeros(rows, device=device, dtype=torch.int32),
-        state_scale=torch.ones(rows, device=device, dtype=torch.float32),
         out=torch.empty(rows, nheads, headdim, device=device, dtype=dtype),
     )
 
@@ -97,11 +92,9 @@ def seed_batch_invariant_decode_buffers(
     """Seed each request's decode buffer with its prefill's partial-chunk tail.
 
     Decode replays the buffer so the new token sits at the same intra-chunk
-    position a full scan would give it. When prefill_len < chunk_size no
-    boundary was crossed, so the whole prefill goes into the buffer and
-    state_scale[slot] is set to 0.0: the state the prefill left in the cache
-    is mid-chunk and must not be used, so the kernels zero the initial state
-    instead.
+    position a full scan would give it. The live SSM cache is kept at the last
+    full chunk boundary by the prefill path; this function stores only the
+    unfinished chunk tail.
 
     No host syncs or Python loops; the engine captures prefill steps into
     CUDA graphs, so this has to be capture-legal. Buffer positions past the
@@ -157,15 +150,6 @@ def seed_batch_invariant_decode_buffers(
     bufs.num_buffered[slots] = torch.where(
         is_active, tail_lens, torch.zeros_like(tail_lens)
     ).to(torch.int32)
-
-    # Short prefills never produced a boundary state; tell the kernels to
-    # zero the initial state for those slots. Multiplying by 0.0/1.0 is
-    # exact, and this avoids writing into the engine-owned cache.
-    bufs.state_scale[slots] = torch.where(
-        is_active & (prefill_lens < chunk_size),
-        torch.zeros_like(prefill_lens, dtype=torch.float32),
-        torch.ones_like(prefill_lens, dtype=torch.float32),
-    )
 
 
 def batch_invariant_decode_buffered_scan(
@@ -254,9 +238,6 @@ def batch_invariant_decode_buffered_scan(
         D=D,
         dt_bias=dt_bias,
         dt_softplus=True,
-        state_dtype=ssm_state.dtype,
-        dst_states=ssm_state.view(ssm_state.shape[0], ssm_state.shape[1], -1),
-        init_scale=bufs.state_scale,
     )
 
     # The scan stored each lane's target row at out[i]; padding lanes
@@ -268,14 +249,6 @@ def batch_invariant_decode_buffered_scan(
     bufs.num_buffered[slots] = torch.where(
         crossed | ~is_active, torch.zeros_like(write_pos), write_pos + 1
     ).to(torch.int32)
-
-    # Crossed slots now have a valid boundary state in the cache, so their
-    # init scale goes back to 1.0. Everyone else rewrites their current
-    # value.
-    prev_scale = bufs.state_scale[slots]
-    bufs.state_scale[slots] = torch.where(
-        crossed, torch.ones_like(prev_scale), prev_scale
-    )
 
     return y
 
@@ -308,13 +281,13 @@ class MambaBatchInvariantDecode:
             )
         return self.bufs
 
-    def seed(self, x, dt, B, C, cu_seqlens, batch_indices, ssm_state) -> None:
+    def seed(self, x, dt, B, C, cu_seqlens, batch_indices, max_batch) -> None:
         """Seed from the prefill tail. x: (total, nheads, headdim);
         B/C: (total, ngroups, dstate)."""
         nheads, headdim = x.shape[-2], x.shape[-1]
         ngroups, dstate = B.shape[-2], B.shape[-1]
         bufs = self._get_bufs(
-            ssm_state.shape[0], nheads, headdim, ngroups, dstate, x.device, x.dtype
+            max_batch, nheads, headdim, ngroups, dstate, x.device, x.dtype
         )
         seed_batch_invariant_decode_buffers(bufs, x, dt, B, C, cu_seqlens, batch_indices)
 

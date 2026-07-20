@@ -95,10 +95,10 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
     def _seed_from_prefill(self, bufs, x, dt, B, C, prefill_len, slot, max_batch):
         """Run the prefill through the reference scan, store its ssm_state at
         the slot, and seed the batch-invariant buffer with the partial-chunk tail."""
-        # Fill with garbage: like production, ssm_state may hold a stale value
-        # (the prefill kernel writes prompt-end state even for prefills shorter
-        # than a chunk). Seeding is responsible for zeroing it in that case.
-        ssm_state = torch.randn(
+        # Production BIK prefill keeps ssm_state at a full Mamba chunk
+        # boundary. Short prefills therefore keep the zero initial boundary;
+        # longer prefills store the largest chunk-aligned prefix state.
+        ssm_state = torch.zeros(
             max_batch, self.nh, self.headdim, self.dstate,
             device=self.device, dtype=self.dtype,
         )
@@ -141,7 +141,9 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
             ssm_state,
         )
 
-    def _varlen_boundary_state_from_prefill(self, x, dt, B, C, prefill_len):
+    def _varlen_boundary_state_from_prefill(
+        self, x, dt, B, C, prefill_len, initial_states=None
+    ):
         """Production-shaped varlen prefill returning the last full chunk boundary state."""
         chunk_boundaries = [0]
         pos = self.chunk_size
@@ -181,14 +183,18 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
             D=self.D,
             z=None,
             dt_bias=self.dt_bias,
-            initial_states=None,
+            initial_states=initial_states,
             dt_softplus=True,
             dt_limit=(0.0, float("inf")),
             boundary_chunk_indices=boundary_idx,
             state_dtype=self.dtype,
         )
         if not has_boundary:
-            boundary_state = torch.zeros_like(boundary_state)
+            boundary_state = (
+                torch.zeros_like(boundary_state)
+                if initial_states is None
+                else initial_states
+            )
         return final_state, boundary_state
 
     def _assert_bitwise(self, a, b, msg):
@@ -262,6 +268,62 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
                     f"dynamic prefill boundary state prefill_len={prefill_len}",
                 )
 
+    def test_chunked_prefill_handoff_matches_full_scan(self):
+        """Splitting prefill at a Mamba boundary preserves exact decode output."""
+        max_batch, slot = 2, 0
+        first_chunk_len = 2 * self.chunk_size
+
+        for final_chunk_len in [20, self.chunk_size + 13]:
+            with self.subTest(final_chunk_len=final_chunk_len):
+                prefill_len = first_chunk_len + final_chunk_len
+                x, dt, B, C = self._make_seq(prefill_len + 1)
+                y_full, _ = _full_scan(
+                    x, dt, self.A, B, C, self.D, self.dt_bias, self.chunk_size,
+                )
+
+                _, first_boundary = self._varlen_boundary_state_from_prefill(
+                    x[:, :first_chunk_len],
+                    dt[:, :first_chunk_len],
+                    B[:, :first_chunk_len],
+                    C[:, :first_chunk_len],
+                    first_chunk_len,
+                )
+                _, final_boundary = self._varlen_boundary_state_from_prefill(
+                    x[:, first_chunk_len:prefill_len],
+                    dt[:, first_chunk_len:prefill_len],
+                    B[:, first_chunk_len:prefill_len],
+                    C[:, first_chunk_len:prefill_len],
+                    final_chunk_len,
+                    initial_states=first_boundary,
+                )
+
+                ssm_state = torch.zeros(
+                    max_batch, self.nh, self.headdim, self.dstate,
+                    device=self.device, dtype=self.dtype,
+                )
+                ssm_state[slot] = final_boundary[0]
+                bufs = self._make_bufs(max_batch)
+                cu = torch.tensor(
+                    [0, final_chunk_len], dtype=torch.int32, device=self.device
+                )
+                seed_batch_invariant_decode_buffers(
+                    bufs,
+                    x[0, first_chunk_len:prefill_len],
+                    dt[0, first_chunk_len:prefill_len],
+                    B[0, first_chunk_len:prefill_len],
+                    C[0, first_chunk_len:prefill_len],
+                    cu,
+                    torch.tensor([slot], dtype=torch.int32, device=self.device),
+                )
+                y_batch_invariant = self._decode_one_step(
+                    bufs, x, dt, B, C, prefill_len, slot, ssm_state
+                )
+                self._assert_bitwise(
+                    y_batch_invariant[0, 0],
+                    y_full[0, prefill_len],
+                    f"chunked prefill final_chunk_len={final_chunk_len}",
+                )
+
     def test_seed_ignores_nonfinite_physical_padding_rows(self):
         """Dynamic prefill can carry padded physical token rows after the real
         prefix. Seed must duplicate a valid per-sequence tail token into unused
@@ -312,8 +374,8 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
             "nonfinite physical padding rows",
         )
 
-    def test_short_prefill_zero_state_path(self):
-        """prefill_len < chunk_size: no boundary state — seeding must zero the cache."""
+    def test_short_prefill_uses_zero_boundary_state(self):
+        """prefill_len < chunk_size: decode replays from the zero boundary."""
         max_batch, slot = 2, 0
         for prefill_len in [1, 7, 16, 31]:
             with self.subTest(prefill_len=prefill_len):
@@ -326,9 +388,6 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
                 ssm_state = self._seed_from_prefill(
                     bufs, x, dt, B, C, prefill_len, slot, max_batch,
                 )
-                # Sanity: no boundary crossed → the kernels must be told to
-                # ignore the (garbage) cached state via a zero init scale.
-                self.assertEqual(bufs.state_scale[slot].item(), 0.0)
                 y_batch_invariant = self._decode_one_step(
                     bufs, x, dt, B, C, prefill_len, slot, ssm_state,
                 )
@@ -367,7 +426,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         each slot's output must match its own full scan."""
         max_batch = 4
         slots = [0, 2]
-        prefill_lens = [25, 70]  # one short (zero-state), one long (boundary state)
+        prefill_lens = [25, 70]  # one short, one long with a boundary state
         x_per_slot, dt_per_slot, B_per_slot, C_per_slot = [], [], [], []
         y_refs = []
         for plen in prefill_lens:
@@ -463,6 +522,74 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
             )
             # Padding lanes must return zeros.
             self.assertEqual(y_batch_invariant[1:].abs().max().item(), 0.0)
+
+    def test_cuda_graph_replay_matches_full_scan(self):
+        """A captured decode step advances persistent state exactly across replays."""
+        max_batch, slot = 2, 0
+        prefill_len = 20
+        x, dt, B, C = self._make_seq(prefill_len + 2)
+        y_full, _ = _full_scan(
+            x, dt, self.A, B, C, self.D, self.dt_bias, self.chunk_size,
+        )
+
+        # Compile Triton before capture without touching the graph's buffers.
+        warmup_bufs = self._make_bufs(max_batch)
+        warmup_state = self._seed_from_prefill(
+            warmup_bufs, x, dt, B, C, prefill_len, slot, max_batch,
+        )
+        self._decode_one_step(
+            warmup_bufs, x, dt, B, C, prefill_len, slot, warmup_state
+        )
+
+        bufs = self._make_bufs(max_batch)
+        ssm_state = self._seed_from_prefill(
+            bufs, x, dt, B, C, prefill_len, slot, max_batch,
+        )
+        batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
+        static_x = x[:, prefill_len : prefill_len + 1].clone()
+        static_dt = dt[:, prefill_len : prefill_len + 1].clone()
+        static_B = B[:, prefill_len : prefill_len + 1].clone()
+        static_C = C[:, prefill_len : prefill_len + 1].clone()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_output = batch_invariant_decode_buffered_scan(
+                bufs,
+                static_x,
+                static_dt,
+                static_B,
+                static_C,
+                self.A,
+                self.D,
+                self.dt_bias,
+                batch_indices,
+                ssm_state,
+            )
+
+        # Capture executes once, so restore the replay cursor before the first replay.
+        cu = torch.tensor([0, prefill_len], dtype=torch.int32, device=self.device)
+        seed_batch_invariant_decode_buffers(
+            bufs,
+            x[0, :prefill_len],
+            dt[0, :prefill_len],
+            B[0, :prefill_len],
+            C[0, :prefill_len],
+            cu,
+            batch_indices,
+        )
+        graph.replay()
+        self._assert_bitwise(
+            graph_output[0, 0], y_full[0, prefill_len], "CUDA graph replay step 0"
+        )
+
+        static_x.copy_(x[:, prefill_len + 1 : prefill_len + 2])
+        static_dt.copy_(dt[:, prefill_len + 1 : prefill_len + 2])
+        static_B.copy_(B[:, prefill_len + 1 : prefill_len + 2])
+        static_C.copy_(C[:, prefill_len + 1 : prefill_len + 2])
+        graph.replay()
+        self._assert_bitwise(
+            graph_output[0, 0], y_full[0, prefill_len + 1], "CUDA graph replay step 1"
+        )
 
     def test_crossing_with_dominant_carried_state(self):
         """Boundary crossing where the carried state dominates the output

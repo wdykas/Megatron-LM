@@ -998,14 +998,16 @@ class MambaMixer(MegatronModule):
             z = z.unsqueeze(0)
 
             if boundary_ssm_states is not None:
-                boundary_ssm_states = boundary_ssm_states * has_boundary.view(-1, 1, 1, 1).to(
-                    boundary_ssm_states.dtype
-                )
-            cache_states = boundary_ssm_states if boundary_ssm_states is not None else ssm_varlen_states
+                boundary_mask = has_boundary.view(-1, 1, 1, 1)
+                cache_states = torch.where(boundary_mask, boundary_ssm_states, initial_ssm_state)
+            else:
+                cache_states = ssm_varlen_states
             tensor_masked_update(ssm_state, batch_indices, cache_states)
 
             if self.config.batch_invariant_mode and cu_seqlens is not None:
-                self._batch_invariant_decode().seed(x, dt, B, C, cu_seqlens, batch_indices, ssm_state)
+                self._batch_invariant_decode().seed(
+                    x, dt, B, C, cu_seqlens, batch_indices, max_batch=ssm_state.shape[0]
+                )
 
             # Write intermediate states to pre-allocated output buffers
             # All tensor ops, no Python loops, fully CUDA graph compatible.

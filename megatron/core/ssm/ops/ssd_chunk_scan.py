@@ -90,7 +90,6 @@ def _chunk_scan_fwd_kernel(
     initstates_ptr,
     cu_chunk_seqlens_ptr,
     target_rows_ptr,
-    init_scale_ptr,
     # Matrix dimensions
     chunk_size: tl.constexpr,
     hdim: tl.constexpr,
@@ -137,7 +136,6 @@ def _chunk_scan_fwd_kernel(
     HAS_Z: tl.constexpr,
     HAS_TARGET_ROWS: tl.constexpr,
     HAS_CHUNK_STARTS: tl.constexpr,
-    HAS_INIT_SCALE: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -244,12 +242,6 @@ def _chunk_scan_fwd_kernel(
                 mask=(offs_k_dstate[:, None] < dstate) & (offs_n[None, :] < hdim),
                 other=0.0,
             )
-            if HAS_INIT_SCALE:
-                # 0.0 marks slots with no valid boundary state yet; the
-                # multiply is exact for both 0.0 and 1.0.
-                prev_states = prev_states * tl.load(init_scale_ptr + seq_idx).to(
-                    prev_states.dtype
-                )
             prev_states = prev_states.to(C_ptr.dtype.element_ty)
 
         acc = tl.dot(C, prev_states) * scale_m[:, None]
@@ -274,10 +266,6 @@ def _chunk_scan_fwd_kernel(
                     mask=(offs_k_dstate[:, None] < dstate - k) & (offs_n[None, :] < hdim),
                     other=0.0,
                 )
-                if HAS_INIT_SCALE:
-                    prev_states = prev_states * tl.load(init_scale_ptr + seq_idx).to(
-                        prev_states.dtype
-                    )
                 prev_states = prev_states.to(C_ptr.dtype.element_ty)
             acc += tl.dot(C, prev_states)
             C_ptrs += BLOCK_SIZE_K
@@ -389,7 +377,6 @@ def _chunk_scan_fwd(
     initial_states=None,
     target_rows=None,
     chunk_starts=None,
-    init_scale=None,
 ):
     assert seq_idx is not None, "this implementation requires seq_idx"
     if chunk_starts is not None:
@@ -442,7 +429,6 @@ def _chunk_scan_fwd(
         initstates_ptr=initial_states,
         cu_chunk_seqlens_ptr=cu_chunk_seqlens,
         target_rows_ptr=target_rows,
-        init_scale_ptr=init_scale,
         chunk_size=chunk_size,
         hdim=headdim,
         dstate=dstate,
@@ -486,7 +472,6 @@ def _chunk_scan_fwd(
         HAS_Z=z is not None,
         HAS_TARGET_ROWS=target_rows is not None,
         HAS_CHUNK_STARTS=chunk_starts is not None,
-        HAS_INIT_SCALE=init_scale is not None,
         BLOCK_SIZE_DSTATE=max(triton.next_power_of_2(dstate), 16),
         IS_TRITON_22=TRITON_22,
         HAS_INITSTATES=initial_states is not None,

@@ -35,7 +35,6 @@ def _state_passing_fwd_kernel(
     dst_states_ptr,
     dst_indices_ptr,
     dst_flags_ptr,
-    init_scale_ptr,
     # Matrix dimensions
     dim: tl.constexpr,
     nchunks,
@@ -62,7 +61,7 @@ def _state_passing_fwd_kernel(
     HAS_INITSTATES: tl.constexpr,
     HAS_DST_STATES: tl.constexpr,
     ALWAYS_NEW_SEQ: tl.constexpr,
-    HAS_INIT_SCALE: tl.constexpr,
+    STORE_OUTPUT: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid_h = tl.program_id(axis=1)
@@ -106,16 +105,13 @@ def _state_passing_fwd_kernel(
                     + offs_m * stride_initstates_dim
                 )
                 states = tl.load(initstates_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
-                if HAS_INIT_SCALE:
-                    # 0.0 marks slots with no valid boundary state yet; the
-                    # multiply is exact for both 0.0 and 1.0.
-                    states = states * tl.load(init_scale_ptr + seq_idx).to(tl.float32)
             else:
                 states = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
 
         prev_seq_idx = seq_idx
         states = tl.exp(dA_cs) * states + new_states
-        tl.store(out_ptrs, states, mask=offs_m < dim)
+        if STORE_OUTPUT:
+            tl.store(out_ptrs, states, mask=offs_m < dim)
 
         if HAS_DST_STATES:
             # Decode mode: persist crossing slots' boundary states straight
@@ -148,27 +144,30 @@ def _state_passing_fwd(
     dst_indices=None,
     dst_flags=None,
     always_new_seq=False,
-    init_scale=None,
 ):
     """
-    dst_states/dst_indices/dst_flags (all-or-none): for each chunk with
-    dst_flags[c] != 0, also store the computed boundary state to
-    dst_states[dst_indices[c]], converted to its dtype. Saves the decode
-    path a separate scatter pass.
+    dst_states/dst_indices/dst_flags (all-or-none) enable decode mode: flagged
+    boundary states are written directly to dst_states and no output tensor is
+    allocated.
     """
     nchunks, nheads, dim = states.shape
     chunk_size = dA_cumsum.shape[-1]
     assert dA_cumsum.shape == (nheads, nchunks, chunk_size)
     seqlen = seq_idx.shape[-1]
-    out_dtype = states.dtype if out_dtype is None else out_dtype
-    out = torch.empty((nchunks, nheads, dim), device=states.device, dtype=out_dtype)
+    has_dst = dst_states is not None
+    if not has_dst:
+        out_dtype = states.dtype if out_dtype is None else out_dtype
+        out = torch.empty((nchunks, nheads, dim), device=states.device, dtype=out_dtype)
+        out_strides = out.stride()
+    else:
+        out = states
+        out_strides = (0, 0, 0)
 
     initial_states_strides = (
         (initial_states.stride(0), initial_states.stride(1), initial_states.stride(2))
         if initial_states is not None
         else (0, 0, 0)
     )
-    has_dst = dst_states is not None
     if has_dst:
         assert dst_indices is not None and dst_flags is not None
         assert dst_states.shape[1] == nheads and dst_states.shape[2] == dim
@@ -190,7 +189,6 @@ def _state_passing_fwd(
             dst_states_ptr=dst_states,
             dst_indices_ptr=dst_indices,
             dst_flags_ptr=dst_flags,
-            init_scale_ptr=init_scale,
             dim=dim,
             nchunks=nchunks,
             seqlen=seqlen if seq_idx is not None else 0,
@@ -198,9 +196,9 @@ def _state_passing_fwd(
             stride_states_chunk=states.stride(0),
             stride_states_head=states.stride(1),
             stride_states_dim=states.stride(2),
-            stride_out_chunk=out.stride(0),
-            stride_out_head=out.stride(1),
-            stride_out_dim=out.stride(2),
+            stride_out_chunk=out_strides[0],
+            stride_out_head=out_strides[1],
+            stride_out_dim=out_strides[2],
             stride_dA_cs_head=dA_cumsum.stride(0),
             stride_dA_cs_chunk=dA_cumsum.stride(1),
             stride_dA_cs_csize=dA_cumsum.stride(2),
@@ -214,6 +212,6 @@ def _state_passing_fwd(
             HAS_INITSTATES=initial_states is not None,
             HAS_DST_STATES=has_dst,
             ALWAYS_NEW_SEQ=always_new_seq,
-            HAS_INIT_SCALE=init_scale is not None,
+            STORE_OUTPUT=not has_dst,
         )
-    return out
+    return None if has_dst else out
