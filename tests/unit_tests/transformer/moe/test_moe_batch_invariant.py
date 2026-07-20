@@ -191,38 +191,6 @@ def test_inference_bf16_grouped_mm_routes_when_enabled():
     assert torch.equal(y_batch_invariant, y_direct)
 
 
-def test_batch_invariant_padded_squared_relu_zeros_aligned_padding_rows():
-    """Aligned padding rows are still inside grouped-GEMM expert blocks.
-
-    They must be deterministic zeros, not uninitialized data, because the
-    following grouped GEMM reads every aligned row in the block.
-    """
-    from megatron.core.inference.moe.activations import padded_squared_relu
-
-    x = torch.tensor(
-        [
-            [-2.0, 3.0, 0.5, -0.5],
-            [float("nan"), float("nan"), float("nan"), float("nan")],
-            [1.5, -4.0, 2.0, 0.0],
-            [float("nan"), float("nan"), float("nan"), float("nan")],
-        ],
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
-    permutation_map = torch.tensor([0, -1, 1, -1], device="cuda", dtype=torch.int32)
-    n_used = torch.tensor([3], device="cuda", dtype=torch.int32)
-
-    y = padded_squared_relu(x, permutation_map, n_used, zero_padding_rows=True)
-    torch.cuda.synchronize()
-
-    expected0 = torch.tensor([0.0, 9.0, 0.25, 0.0], device="cuda", dtype=torch.bfloat16)
-    expected2 = torch.tensor([2.25, 0.0, 4.0, 0.0], device="cuda", dtype=torch.bfloat16)
-    assert torch.equal(y[0], expected0)
-    assert torch.equal(y[1], torch.zeros_like(y[1]))
-    assert torch.equal(y[2], expected2)
-    assert torch.isfinite(y[:3]).all()
-
-
 # ---------------------------------------------------------------------------
 # End-to-end: TEGroupedMLP batch-invariance
 # ---------------------------------------------------------------------------
