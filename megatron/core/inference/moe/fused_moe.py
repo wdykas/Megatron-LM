@@ -20,10 +20,10 @@ from megatron.core.inference.moe.permute import (
     unpermute_tokens,
 )
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
-from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-    grouped_gemm_batch_invariant_alignment,
-    grouped_gemm_batch_invariant,
-    is_batch_invariant_mode_enabled,
+from .batch_invariant import (
+    enabled as batch_invariant_enabled,
+    grouped_mm as batch_invariant_grouped_mm,
+    grouped_mm_alignment as batch_invariant_grouped_mm_alignment,
 )
 
 try:
@@ -59,15 +59,9 @@ def _bf16_grouped_mm(
     uses torch.nn.functional.grouped_mm.
     """
     assert x_bf16.dtype == torch.bfloat16, f"Expected bf16 input, got {x_bf16.dtype}"
-    if is_batch_invariant_mode_enabled():
+    if batch_invariant_enabled():
         # weight is [E, N, K], which is the layout DeepGEMM's NT call expects directly.
-        return grouped_gemm_batch_invariant(
-            x_bf16,
-            weight,
-            offs=offs.to(torch.int32),
-            m_total=x_bf16.shape[0],
-            already_aligned=True,
-        )
+        return batch_invariant_grouped_mm(x_bf16, weight, offs)
     return grouped_mm(x_bf16, weight.transpose(1, 2), offs=offs)
 
 
@@ -149,8 +143,9 @@ def mcore_fused_moe(
     use_mxfp8 = isinstance(fc1_weight, MXFP8Tensor)
     # Fused quant kernels only apply to MXFP8 path
     use_fused_quant = use_mxfp8 and not disable_fused_quant_kernels
+    batch_invariant_mode = batch_invariant_enabled()
 
-    if is_batch_invariant_mode_enabled():
+    if batch_invariant_mode:
         # batch-invariant mode intercepts the bf16 grouped GEMM path
         # (`_bf16_grouped_mm` → `grouped_gemm_batch_invariant`). The MXFP8
         # path uses `scaled_grouped_mm` and is not batch-invariant-instrumented.
@@ -170,8 +165,8 @@ def mcore_fused_moe(
         expert_alignment = 128
     else:
         mm_fn = _bf16_grouped_mm
-        if is_batch_invariant_mode_enabled():
-            expert_alignment = grouped_gemm_batch_invariant_alignment()
+        if batch_invariant_mode:
+            expert_alignment = batch_invariant_grouped_mm_alignment()
         else:
             assert (
                 HAVE_GROUPED_MM
@@ -194,7 +189,7 @@ def mcore_fused_moe(
             alignment=expert_alignment,
         )
     else:
-        if is_batch_invariant_mode_enabled():
+        if batch_invariant_mode:
             hidden_states, permuted_probs, permutation_map, offs, inverse_map = permute_tokens(
                 hidden_states,
                 probs,

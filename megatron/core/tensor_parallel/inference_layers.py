@@ -387,9 +387,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
                 config.sequence_parallel
             ), "--transformer-impl=inference_optimized requires --sequence-parallel"
 
-        self.triton_nvls_kernels_allowed = not getattr(
-            config, 'inference_disable_triton_nvls_kernels', False
-        )
+        self.triton_nvls_kernels_allowed = not config.inference_disable_triton_nvls_kernels
 
         # Placeholder for next layer norm weights for fused
         # reduce-scatter + add + rms-norm + all-gather
@@ -509,9 +507,7 @@ def inference_all_gather_from_tensor_model_parallel_region(
     if tp_size == 1:
         return x
 
-    triton_nvls_kernels_allowed = not getattr(
-        config, 'inference_disable_triton_nvls_kernels', False
-    )
+    triton_nvls_kernels_allowed = not config.inference_disable_triton_nvls_kernels
 
     if triton_nvls_kernels_allowed and SymmetricMemoryManager.is_initialized("tp"):
         ag_buffer_dims = list(x.size())
@@ -541,9 +537,7 @@ def inference_reduce_scatter_to_sequence_parallel_region(
     if tp_size == 1:
         return x
 
-    triton_nvls_kernels_allowed = not getattr(
-        config, 'inference_disable_triton_nvls_kernels', False
-    )
+    triton_nvls_kernels_allowed = not config.inference_disable_triton_nvls_kernels
 
     # TP sequence-parallel RS: use NCCL in batch-invariant mode to match
     # training. This does not affect MoE EP NVLS.
