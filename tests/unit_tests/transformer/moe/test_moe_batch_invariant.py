@@ -16,7 +16,6 @@ import torch.nn.functional as F
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     HAVE_DEEPGEMM_BF16,
-    BatchInvariantGroupedGemmFn,
     _bf16_grouped_gemm_contiguous,
     _m_splits_to_m_indices,
     _offs_to_m_indices,
@@ -130,36 +129,6 @@ def test_grouped_gemm_per_expert_token_count_invariance():
     # The 8 rows assigned to expert 1 inside y_B must match y_A bitwise.
     y_B_target = y_B[16 : 16 + 8]
     assert torch.equal(y_A, y_B_target)
-
-
-# ---------------------------------------------------------------------------
-# Training path: BatchInvariantGroupedGemmFn (autograd) vs inference functional
-# ---------------------------------------------------------------------------
-
-
-def test_train_and_inference_kernel_bitwise_parity():
-    """The autograd Function used by the training-path patch and the functional
-    API used by the inference-path patch must produce bitwise-identical outputs
-    when fed the same tensors. This is the kernel-level contract underlying the
-    higher-level train↔inference parity."""
-    torch.manual_seed(2)
-    E, K, N = 4, 96, 64
-    per_expert = 24
-    M = per_expert * E
-    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
-    w = torch.randn(E, N, K, device="cuda", dtype=torch.bfloat16)
-    m_indices = torch.repeat_interleave(
-        torch.arange(E, device="cuda", dtype=torch.int32),
-        torch.tensor([per_expert] * E, device="cuda", dtype=torch.int32),
-    ).contiguous()
-    # offs is the inclusive cumulative offsets the inference path uses.
-    offs = torch.tensor([(i + 1) * per_expert for i in range(E)], dtype=torch.int32, device="cuda")
-
-    with torch.no_grad():
-        y_train = BatchInvariantGroupedGemmFn.apply(x, w, m_indices, E)
-        y_infer = grouped_gemm_batch_invariant(x, w, offs=offs, m_total=M)
-
-    assert torch.equal(y_train, y_infer)
 
 
 # ---------------------------------------------------------------------------

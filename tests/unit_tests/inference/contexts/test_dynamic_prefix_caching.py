@@ -860,6 +860,18 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
             == 0
         )
 
+        cached_one_left_req = self._req(
+            ctx, self._prompt(2 * ctx.mamba_chunk_size + 1), request_id=4
+        )
+        assert (
+            engine._mamba_batch_invariant_prefill_chunk_length(
+                cached_one_left_req,
+                ctx.mamba_chunk_size,
+                cached_prefix_tokens=ctx.mamba_chunk_size,
+            )
+            == 0
+        )
+
     @pytest.mark.internal
     def test_mamba_intermediate_offsets(self):
         bs = 256

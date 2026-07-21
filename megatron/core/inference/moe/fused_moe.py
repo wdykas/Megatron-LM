@@ -189,28 +189,18 @@ def mcore_fused_moe(
             alignment=expert_alignment,
         )
     else:
-        if batch_invariant_mode:
-            hidden_states, permuted_probs, permutation_map, offs, inverse_map = permute_tokens(
-                hidden_states,
-                probs,
-                routing_map,
-                local_expert_start,
-                num_local_experts,
-                valid_tokens,
-                alignment=expert_alignment,
-                return_inverse_map=True,
-            )
-        else:
-            inverse_map = None
-            hidden_states, permuted_probs, permutation_map, offs = permute_tokens(
-                hidden_states,
-                probs,
-                routing_map,
-                local_expert_start,
-                num_local_experts,
-                valid_tokens,
-                alignment=expert_alignment,
-            )
+        permuted = permute_tokens(
+            hidden_states,
+            probs,
+            routing_map,
+            local_expert_start,
+            num_local_experts,
+            valid_tokens,
+            alignment=expert_alignment,
+            return_inverse_map=batch_invariant_mode,
+        )
+        hidden_states, permuted_probs, permutation_map, offs = permuted[:4]
+        inverse_map = permuted[4] if batch_invariant_mode else None
 
     # --- FC1 -> activation -> FC2 ---
     # Quantize if MXFP8 path and hidden_states not already quantized (fused permute+quant

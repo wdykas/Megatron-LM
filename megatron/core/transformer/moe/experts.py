@@ -839,7 +839,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         # (mcore_fused_moe → bf16 grouped GEMM → grouped_gemm_batch_invariant).
         # FlashInfer and vLLM backends use their own Triton/atomic_add combine
         # kernels that we do not intercept.
-        if config.batch_invariant_mode:
+        if getattr(config, "batch_invariant_mode", False):
             assert (
                 self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH
             ), (

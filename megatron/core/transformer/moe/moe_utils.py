@@ -527,9 +527,6 @@ def unpermute(
             **extra_kwargs,
         )
 
-    _, hidden = restore_shape
-    input_dtype = permuted_tokens.dtype
-
     if batch_invariant_mode:
         assert routing_map is not None, "batch-invariant MoE unpermute requires routing_map"
         return batch_invariant_unpermute(
@@ -540,6 +537,9 @@ def unpermute(
             ep_rank_tree=batch_invariant_ep_rank_tree,
             inverse_map=batch_invariant_inverse_map,
         )
+
+    _, hidden = restore_shape
+    input_dtype = permuted_tokens.dtype
 
     if probs is not None:
         assert routing_map is not None, "Mask must be provided to permute the probs."

@@ -1,12 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import pytest
 import torch
 
-from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-    deterministic_index_add,
-    set_batch_invariant_mode,
-)
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
 from megatron.rl.rl_utils import selective_log_softmax
 
 
@@ -33,22 +29,6 @@ def test_selective_log_softmax_batch_invariant():
     # If the kernel is batch invariant, each example's output should not depend
     # on its position in the batch.
     assert torch.equal(batch_invariant_logps, batch_invariant_logps_perm[perm.argsort()])
-
-
-def test_deterministic_index_add_masks_invalid_nan_rows():
-    out = torch.zeros(2, 2, device="cuda", dtype=torch.float32)
-    idx = torch.tensor([0, 1, 0], device="cuda", dtype=torch.int64)
-    src = torch.tensor(
-        [[1.0, 1.0], [2.0, 2.0], [float("nan"), float("nan")]],
-        device="cuda",
-        dtype=torch.float32,
-    )
-    valid_mask = torch.tensor([True, True, False], device="cuda")
-
-    deterministic_index_add(out, idx, src, valid_mask=valid_mask)
-
-    expected = torch.tensor([[1.0, 1.0], [2.0, 2.0]], device="cuda", dtype=torch.float32)
-    torch.testing.assert_close(out, expected, rtol=0.0, atol=0.0)
 
 
 def test_moe_unpermute_batch_invariant_branch_is_token_local():

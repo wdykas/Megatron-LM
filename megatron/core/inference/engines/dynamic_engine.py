@@ -1493,13 +1493,11 @@ class DynamicInferenceEngine(AbstractEngine):
             return 0
 
         computed_tokens = (capacity // chunk_size) * chunk_size
+        if remaining - (cached_prefix_tokens + computed_tokens) == 1:
+            computed_tokens -= chunk_size
         if computed_tokens <= 0:
             return 0
-
-        raw_length = cached_prefix_tokens + computed_tokens
-        if remaining - raw_length == 1:
-            raw_length -= chunk_size
-        return max(raw_length, 0)
+        return cached_prefix_tokens + computed_tokens
 
     def schedule_waiting_requests(self):
         """Tries to schedule any requests in the waiting pool."""

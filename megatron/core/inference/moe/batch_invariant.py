@@ -48,31 +48,6 @@ def grouped_mm_alignment() -> int:
     return grouped_gemm_batch_invariant_alignment()
 
 
-def _ceil_div(a, b):
-    return (a + b - 1) // b
-
-
-@triton.jit
-def _init_inverse_permutation_map_kernel(
-    inverse_map_ptr,
-    numel,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """Fill inverse_map with -1."""
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < numel
-    tl.store(inverse_map_ptr + offsets, tl.full([BLOCK_SIZE], -1, tl.int32), mask=mask)
-
-
-def init_inverse_permutation_map(inverse_map: torch.Tensor) -> None:
-    """Fill inverse_map with -1 without a host sync."""
-    BLOCK_SIZE = 1024
-    _init_inverse_permutation_map_kernel[(_ceil_div(inverse_map.numel(), BLOCK_SIZE),)](
-        inverse_map, inverse_map.numel(), BLOCK_SIZE=BLOCK_SIZE
-    )
-
-
 @triton.jit
 def _unpermute_tokens_kernel(
     expert_out_ptr,  # [output_size, hidden_dim] bf16 expert outputs

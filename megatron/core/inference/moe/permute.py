@@ -13,12 +13,10 @@ from unittest.mock import MagicMock
 
 import torch
 
-from .batch_invariant import (
-    enabled as batch_invariant_enabled,
-    init_inverse_permutation_map,
-    unpermute_tokens as batch_invariant_unpermute_tokens,
-)
 from megatron.core.utils import null_decorator
+
+from .batch_invariant import enabled as batch_invariant_enabled
+from .batch_invariant import unpermute_tokens as batch_invariant_unpermute_tokens
 
 try:
     import triton
@@ -360,10 +358,9 @@ def permute_tokens(
     permutation_map = torch.empty(output_size, dtype=torch.int32, device=probs.device)
     inverse_map = None
     if return_inverse_map:
-        inverse_map = torch.empty(
-            max_tokens, num_local_experts, dtype=torch.int32, device=probs.device
+        inverse_map = torch.full(
+            (max_tokens, num_local_experts), -1, dtype=torch.int32, device=probs.device
         )
-        init_inverse_permutation_map(inverse_map)
     # Only initialize [0, n_used) to -1; activation and unpermute kernels are gated
     # by the same inclusive_expert_offsets[-1] pointer so they never read beyond n_used.
     init_permutation_map(permutation_map, inclusive_expert_offsets[-1:])
@@ -490,7 +487,7 @@ def unpermute_tokens(
     assert (
         permuted_probs.dtype == torch.float32
     ), f"permuted_probs must be fp32, got {permuted_probs.dtype}"
-    output_size, hidden_dim = expert_output.shape
+    hidden_dim = expert_output.shape[1]
 
     # Triton kernel below uses tl.atomic_add (non-deterministic). Batch-invariant
     # MoE instead reduces each token independently in fixed local-expert order,
@@ -504,6 +501,7 @@ def unpermute_tokens(
             expert_output, permuted_probs, inverse_map, valid_tokens, out
         )
 
+    output_size = expert_output.shape[0]
     BLOCK_H = min(triton.next_power_of_2(hidden_dim), 1024)
     if out is None:
         out = torch.empty(num_tokens, hidden_dim, dtype=torch.float32, device=expert_output.device)

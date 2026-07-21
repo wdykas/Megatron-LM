@@ -51,9 +51,7 @@ __all__ = [
     "enable_batch_invariant_mode",
     "grouped_gemm_batch_invariant",
     "grouped_gemm_batch_invariant_alignment",
-    "BatchInvariantGroupedGemmFn",
     "HAVE_DEEPGEMM_BF16",
-    "deterministic_index_add",
 ]
 
 
@@ -496,63 +494,6 @@ def mean_dim(
     )
 
     return output
-
-
-def deterministic_index_add(
-    out: torch.Tensor,
-    idx: torch.Tensor,
-    src: torch.Tensor,
-    valid_mask: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Deterministic, CUDA-graph-compatible equivalent of `out.index_add_(0, idx, src)`.
-
-    Math: ``out[i] += sum over j where idx[j]==i of src[j]``.
-
-    Unlike `torch.Tensor.index_add_`, the result is bitwise-stable across
-    runs *without* requiring `torch.use_deterministic_algorithms(True)`, and
-    captures cleanly into a `torch.cuda.CUDAGraph` (no `.item()`, no
-    data-dependent shapes).
-
-    Algorithm: sort by `idx` (duplicates become contiguous segments) →
-    inclusive fp32 cumsum on the sorted src → `searchsorted` gives a fixed
-    `(M+1,)` boundary tensor → segment sums via gather + subtract.
-
-    Args:
-        out: (M, H) destination, updated in place.
-        idx: (N,) integer indices in [0, M). Need not be sorted; we sort
-            internally with stable=True.
-        src: (N, H) contributions in the same dtype as `out` (any precision —
-            cumsum accumulates in fp32 then casts back).
-        valid_mask: optional (N,) bool. Rows with mask=False contribute zero;
-            their idx is clamped to a valid range so the corresponding update
-            is a no-op. Use this instead of slicing `src[:n_used]` to keep
-            shapes static under CG capture.
-    Returns:
-        `out` (same tensor, updated).
-
-    Memory: an fp32 (N+1, H) cumsum buffer; ~4*N*H bytes peak.
-    """
-    M = out.shape[0]
-    if M == 0:
-        return out
-
-    if valid_mask is not None:
-        valid_mask = valid_mask.to(torch.bool)
-        src = torch.where(valid_mask.unsqueeze(-1), src, torch.zeros_like(src))
-        idx = idx.clamp(min=0, max=M - 1)
-
-    sorted_idx, perm = idx.sort(stable=True)
-    sorted_src = src.index_select(0, perm)
-    H = sorted_src.shape[-1]
-    csum = sorted_src.to(torch.float32).cumsum(dim=0)
-    zero = torch.zeros(1, H, device=csum.device, dtype=torch.float32)
-    csum_with_zero = torch.cat([zero, csum], dim=0)
-
-    queries = torch.arange(M + 1, device=idx.device, dtype=sorted_idx.dtype)
-    boundaries = torch.searchsorted(sorted_idx, queries)
-    seg_sum = csum_with_zero[boundaries[1:]] - csum_with_zero[boundaries[:-1]]
-    out.add_(seg_sum.to(out.dtype))
-    return out
 
 
 # Kernel backend for mm / addmm. Selected at `enable_batch_invariant_mode` time
@@ -1705,48 +1646,6 @@ def grouped_gemm_batch_invariant(
     if already_aligned:
         return _bf16_grouped_gemm_aligned_contiguous(a, b, m_indices)
     return _bf16_grouped_gemm_contiguous(a, b, m_indices)
-
-
-class BatchInvariantGroupedGemmFn(torch.autograd.Function):
-    """Autograd-aware batch-invariant bf16 grouped GEMM.
-
-    Used by the TE training-path patch to make TEGroupedMLP differentiable while
-    still producing bitwise-identical activations to the inference path.
-
-    Conventions:
-        x:         [M_total, K]   bf16 inputs, contiguous, expert-grouped.
-        w_stack:   [E, N, K]      bf16 weights, NT layout (DeepGEMM transposes B).
-        m_indices: [M_total]      int32 expert id per row.
-    """
-
-    @staticmethod
-    def forward(
-        ctx, x: torch.Tensor, w_stack: torch.Tensor, m_indices: torch.Tensor, num_experts: int
-    ):
-        """Y[r] = X[r] @ W[m_indices[r]]^T   for each row r."""
-        assert x.dtype == torch.bfloat16 and w_stack.dtype == torch.bfloat16
-        x = x.contiguous()
-        w_stack = w_stack.contiguous()
-        m_indices = m_indices.contiguous()
-        y = _bf16_grouped_gemm_contiguous(x, w_stack, m_indices)
-        ctx.save_for_backward(x, w_stack, m_indices)
-        ctx.num_experts = num_experts
-        return y
-
-    @staticmethod
-    def backward(ctx, grad_y: torch.Tensor):
-        """dX = grad_y @ W[g] (M-grouped NT) ; dW[g] = grad_y[g]^T @ X[g] (K-grouped TN)."""
-        x, w_stack, m_indices = ctx.saved_tensors
-        E = ctx.num_experts
-        grad_y = grad_y.contiguous()
-
-        # dgrad: pass w_stack transposed to [E, K, N] so DeepGEMM's NT call computes
-        # grad_y @ W (with W treated as [in=K, out=N] per expert).
-        w_kn = w_stack.transpose(1, 2).contiguous()
-        dx = _bf16_grouped_gemm_contiguous(grad_y, w_kn, m_indices)
-
-        dw_stack = _bf16_grouped_gemm_wgrad_contiguous(grad_y, x, m_indices, E)
-        return dx, dw_stack, None, None
 
 
 def _te_rmsnorm_forward_patched(self, x: torch.Tensor) -> torch.Tensor:

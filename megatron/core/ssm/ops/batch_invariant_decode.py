@@ -41,11 +41,6 @@ class BatchInvariantDecodeBuffers:
         """Write sink for inactive lanes (the buffers' extra last row)."""
         return self.num_buffered.shape[0] - 1
 
-    @property
-    def max_lanes(self) -> int:
-        """Largest decode batch the preallocated buffers support."""
-        return self.num_buffered.shape[0]
-
 
 def make_batch_invariant_decode_buffers(
     max_batch: int,
@@ -191,9 +186,10 @@ def batch_invariant_decode_buffered_scan(
         "batch-invariant Mamba decode assumes one new token per request "
         "per call (no speculative decoding)."
     )
-    assert num_lanes <= bufs.max_lanes, (
+    max_lanes = bufs.out.shape[0]
+    assert num_lanes <= max_lanes, (
         f"decode batch of {num_lanes} lanes exceeds the preallocated buffers "
-        f"({bufs.max_lanes} lanes); increase max_batch."
+        f"({max_lanes} lanes); increase max_batch."
     )
 
     # Redirect inactive lanes (batch_indices < 0) to the trash row so the
@@ -271,24 +267,26 @@ class MambaBatchInvariantDecode:
         self.mixer = mixer
         self.bufs: Optional[BatchInvariantDecodeBuffers] = None
 
-    def _get_bufs(
-        self, max_batch, nheads, headdim, ngroups, dstate, device, dtype
-    ) -> BatchInvariantDecodeBuffers:
+    def _get_bufs(self, max_batch, x, B) -> BatchInvariantDecodeBuffers:
         if self.bufs is None:
+            nheads, headdim = x.shape[-2:]
+            ngroups, dstate = B.shape[-2:]
             self.bufs = make_batch_invariant_decode_buffers(
-                max_batch, self.mixer.chunk_size, nheads, headdim, ngroups, dstate,
-                device, dtype,
+                max_batch,
+                self.mixer.chunk_size,
+                nheads,
+                headdim,
+                ngroups,
+                dstate,
+                x.device,
+                x.dtype,
             )
         return self.bufs
 
     def seed(self, x, dt, B, C, cu_seqlens, batch_indices, max_batch) -> None:
         """Seed from the prefill tail. x: (total, nheads, headdim);
         B/C: (total, ngroups, dstate)."""
-        nheads, headdim = x.shape[-2], x.shape[-1]
-        ngroups, dstate = B.shape[-2], B.shape[-1]
-        bufs = self._get_bufs(
-            max_batch, nheads, headdim, ngroups, dstate, x.device, x.dtype
-        )
+        bufs = self._get_bufs(max_batch, x, B)
         seed_batch_invariant_decode_buffers(bufs, x, dt, B, C, cu_seqlens, batch_indices)
 
     def step(self, x, dt, B, C, batch_indices, ssm_state) -> torch.Tensor:
@@ -308,11 +306,7 @@ class MambaBatchInvariantDecode:
             D = D.float().view(-1, mixer.headdim)
         dt_bias = mixer.cp.get_dt_bias().float()
 
-        nheads, headdim = x.shape[-2], x.shape[-1]
-        ngroups, dstate = B.shape[-2], B.shape[-1]
-        bufs = self._get_bufs(
-            ssm_state.shape[0], nheads, headdim, ngroups, dstate, x.device, x.dtype
-        )
+        bufs = self._get_bufs(ssm_state.shape[0], x, B)
 
         y = batch_invariant_decode_buffered_scan(
             bufs, x, dt, B, C, A, D, dt_bias, batch_indices, ssm_state

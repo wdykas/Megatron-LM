@@ -304,7 +304,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.num_attention_heads_per_partition = 1
 
         # BIK graph replay depends on dynamic-context padding decisions.
-        self.batch_invariant_mode = model_config.batch_invariant_mode
+        self.batch_invariant_mode = getattr(model_config, "batch_invariant_mode", False)
         self.num_speculative_tokens = inference_config.num_speculative_tokens
         assert self.num_speculative_tokens < inference_config.block_size_tokens, (
             f"num_speculative_tokens ({self.num_speculative_tokens}) must be < "
@@ -2152,25 +2152,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.pad_active_slices()
 
         if self.batch_invariant_mode and self.active_token_count < self.padded_active_token_count:
-            # BIK kernels run to the padded graph shape, so scrub unused rows
-            # before the coalesced H2D transfer.
+            # BIK kernels consume all metadata at the padded graph shape, so
+            # scrub the additional fields that default kernels do not read.
             self.token_to_input_ids[self.padding_slice] = 0
             self.token_to_pos_ids[self.padding_slice] = 0
             self.token_to_request_idx[self.padding_slice] = 0
-            self.token_to_block_idx[self.padding_slice] = self.kv_block_allocator.dummy_block_idx
-            self.token_to_local_position_within_kv_block[self.padding_slice] = 0
-            self.token_to_position_in_request[self.padding_slice] = 0
-        else:
-            # Update token position indexes.
-            self.token_to_block_idx[self.active_token_count : self.padded_active_token_count] = (
-                self.kv_block_allocator.dummy_block_idx
-            )
-            self.token_to_local_position_within_kv_block[
-                self.active_token_count : self.padded_active_token_count
-            ] = 0
-            self.token_to_position_in_request[
-                self.active_token_count : self.padded_active_token_count
-            ] = 0
+
+        # Update metadata read by both default and BIK kernels.
+        self.token_to_block_idx[self.padding_slice] = self.kv_block_allocator.dummy_block_idx
+        self.token_to_local_position_within_kv_block[self.padding_slice] = 0
+        self.token_to_position_in_request[self.padding_slice] = 0
 
         self.active_attn_metadata = (
             self.graph_attn_metadata  # type: ignore[assignment]

@@ -126,7 +126,7 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
             runs_metadata_sync=runs_metadata_sync,
         )
         self.topk = config.moe_router_topk
-        if config.batch_invariant_mode and get_pg_size(self.ep_group) > 1:
+        if getattr(config, "batch_invariant_mode", False) and get_pg_size(self.ep_group) > 1:
             raise AssertionError(
                 "batch_invariant_mode with inference-optimized MoE and expert parallelism "
                 "requires inference_moe_token_dispatcher_type='nvls'."
@@ -594,24 +594,19 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             dtype=rsv["tensor"].dtype,
             device=hidden_states.device,
         )
-        if is_batch_invariant_mode_enabled():
-            ordered_reduce_scatter_v(
-                output,
-                rsv["tensor"],
-                rsv["handle"],
-                rank_token_offset=self._rank_token_offset(),
-                ep_max_tokens=self._ep_max_tokens(),
-                per_rank_max_tokens=self._per_rank_worst_case_token_count,
-            )
-        else:
-            multimem_reduce_scatter_v(
-                output,
-                rsv["tensor"],
-                rsv["handle"],
-                rank_token_offset=self._rank_token_offset(),
-                ep_max_tokens=self._ep_max_tokens(),
-                per_rank_max_tokens=self._per_rank_worst_case_token_count,
-            )
+        reduce_scatter_v = (
+            ordered_reduce_scatter_v
+            if is_batch_invariant_mode_enabled()
+            else multimem_reduce_scatter_v
+        )
+        reduce_scatter_v(
+            output,
+            rsv["tensor"],
+            rsv["handle"],
+            rank_token_offset=self._rank_token_offset(),
+            ep_max_tokens=self._ep_max_tokens(),
+            per_rank_max_tokens=self._per_rank_worst_case_token_count,
+        )
         return output.to(torch.bfloat16)
 
     def combine_postprocess(self, hidden_states):
