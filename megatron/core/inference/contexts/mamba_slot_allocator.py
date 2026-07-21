@@ -388,7 +388,6 @@ class MambaSlotAllocator:
         skip_tokens: int,
         prefill_chunk_length: int,
         num_matched_blocks: int,
-        matched_block_ids: list,
         overall_required_blocks: int,
     ) -> None:
         """Compute intermediate state extraction offsets and store per-request.
@@ -399,7 +398,6 @@ class MambaSlotAllocator:
             skip_tokens: Number of tokens being skipped (mamba match).
             prefill_chunk_length: Total prefill chunk length before skipping.
             num_matched_blocks: Number of KV-matched blocks.
-            matched_block_ids: List of matched KV block IDs.
             overall_required_blocks: Total blocks needed for this request.
         """
         ctx = self.context
@@ -433,7 +431,11 @@ class MambaSlotAllocator:
             last_aligned_abs = (prompt_len // ctx.block_size_tokens) * ctx.block_size_tokens
             penultimate_abs = (overall_required_blocks - 1) * ctx.block_size_tokens
             candidate_abs_positions = [kv_div_abs, last_aligned_abs, penultimate_abs]
-            live_state_is_cacheable = chunk_end_abs == prompt_len and prompt_len > 0
+            live_state_is_cacheable = (
+                chunk_end_abs == prompt_len
+                and prompt_len % ctx.block_size_tokens == 0
+                and prompt_len > 0
+            )
 
         # The extraction kernel returns states only at complete relative chunks.
         offsets_set = set()
@@ -461,15 +463,12 @@ class MambaSlotAllocator:
         self._intermediate_counts_cpu[current_id] = count
 
         # The live state is reusable only at an aligned prompt end.
-        if live_state_is_cacheable and chunk_end_abs % ctx.block_size_tokens == 0:
+        if live_state_is_cacheable:
             last_block_idx = chunk_end_abs // ctx.block_size_tokens - 1
-            if last_block_idx >= 0:
-                self._eos_cache_block_id_cpu[current_id] = ctx.request_to_kv_block_ids[current_id][
-                    last_block_idx
-                ]
-                self._has_intermediates = True
-            else:
-                self._eos_cache_block_id_cpu[current_id] = -1
+            self._eos_cache_block_id_cpu[current_id] = ctx.request_to_kv_block_ids[current_id][
+                last_block_idx
+            ]
+            self._has_intermediates = True
         else:
             self._eos_cache_block_id_cpu[current_id] = -1
 

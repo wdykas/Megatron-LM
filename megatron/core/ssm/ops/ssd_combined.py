@@ -37,7 +37,6 @@ def _mamba_chunk_scan_combined_fwd(
     cu_chunk_seqlens=None,
     last_chunk_indices=None,
     intermediate_chunk_indices=None,
-    boundary_chunk_indices=None,
     dt_softplus=False,
     dt_limit=(0.0, float("inf")),
     state_dtype=None,
@@ -154,12 +153,9 @@ def _mamba_chunk_scan_combined_fwd(
         return states
 
     final_states = states[last_chunk_indices]
-    results = [final_states]
     if intermediate_chunk_indices is not None:
-        results.append(states[intermediate_chunk_indices])
-    if boundary_chunk_indices is not None:
-        results.append(states[boundary_chunk_indices])
-    return tuple(results) if len(results) > 1 else final_states
+        return final_states, states[intermediate_chunk_indices]
+    return final_states
 
 
 def mamba_chunk_scan_decode_rows(
@@ -288,7 +284,6 @@ def mamba_chunk_scan_combined_varlen(
     dt_limit=(0.0, float("inf")),
     return_intermediate_states=False,
     intermediate_chunk_indices=None,
-    boundary_chunk_indices=None,
     state_dtype=None,
 ):
     """
@@ -311,14 +306,10 @@ def mamba_chunk_scan_combined_varlen(
         intermediate_chunk_indices: (N,) optional int64 tensor of chunk indices at which to
             extract intermediate SSM states. When provided, returns (final_states,
             intermediate_states) instead of just final_states.
-        boundary_chunk_indices: (batch,) optional int64 tensor of chunk indices whose states
-            are also returned. Used by batch-invariant decode to keep the state cache at the
-            last full Mamba chunk boundary while the partial tail lives in the replay buffer.
         state_dtype: The data type of the ssm state
     Return:
-        varlen_states: (batch, nheads, headdim, dstate). If optional state
-        index tensors are provided, returns a tuple beginning with varlen_states
-        followed by intermediate_states and/or boundary_states in argument order.
+        varlen_states: (batch, nheads, headdim, dstate), or
+        (varlen_states, intermediate_states) if intermediate_chunk_indices is provided
     """
 
     assert seq_idx is not None
@@ -340,7 +331,6 @@ def mamba_chunk_scan_combined_varlen(
         cu_chunk_seqlens=cu_chunk_seqlens,
         last_chunk_indices=last_chunk_indices,
         intermediate_chunk_indices=intermediate_chunk_indices,
-        boundary_chunk_indices=boundary_chunk_indices,
         dt_softplus=dt_softplus,
         dt_limit=dt_limit,
         state_dtype=state_dtype,

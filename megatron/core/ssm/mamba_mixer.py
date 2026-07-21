@@ -947,14 +947,12 @@ class MambaMixer(MegatronModule):
                 prefill_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.long)
                 tail_lens = prefill_lens % self.chunk_size
                 has_boundary = prefill_lens >= self.chunk_size
-                last_chunk_indices_long = last_chunk_indices.to(torch.long)
-                boundary_chunk_indices = torch.where(
-                    (tail_lens == 0) & (prefill_lens > 0),
-                    last_chunk_indices_long,
-                    last_chunk_indices_long - 1,
+                # A partial tail uses the preceding full chunk's state.
+                boundary_chunk_indices = (
+                    last_chunk_indices.to(torch.long) - (tail_lens > 0).to(torch.long)
                 ).clamp(min=0)
 
-            ssm_varlen_result = mamba_chunk_scan_combined_varlen(
+            chunk_states = mamba_chunk_scan_combined_varlen(
                 x=x,
                 dt=dt,
                 A=A,
@@ -973,38 +971,24 @@ class MambaMixer(MegatronModule):
                 z=z if not self.rmsnorm else None,
                 dt_bias=self.cp.get_dt_bias().float(),
                 initial_states=initial_ssm_state,
-                return_intermediate_states=False,
-                intermediate_chunk_indices=intermediate_chunk_indices,
-                boundary_chunk_indices=boundary_chunk_indices,
+                return_intermediate_states=True,
                 dt_softplus=True,
                 dt_limit=(0.0, float("inf")),
                 state_dtype=ssm_state.dtype,
             )
 
-            if intermediate_chunk_indices is not None and boundary_chunk_indices is not None:
-                ssm_varlen_states, intermediate_ssm_states, boundary_ssm_states = ssm_varlen_result
-            elif intermediate_chunk_indices is not None:
-                ssm_varlen_states, intermediate_ssm_states = ssm_varlen_result
-                boundary_ssm_states = None
-            elif boundary_chunk_indices is not None:
-                ssm_varlen_states, boundary_ssm_states = ssm_varlen_result
-                intermediate_ssm_states = None
-            else:
-                ssm_varlen_states = ssm_varlen_result
-                intermediate_ssm_states = None
-                boundary_ssm_states = None
-
             y = y.unsqueeze(0)
             z = z.unsqueeze(0)
 
-            if boundary_ssm_states is not None:
+            cache_states = chunk_states[last_chunk_indices]
+            if boundary_chunk_indices is not None:
                 boundary_mask = has_boundary.view(-1, 1, 1, 1)
-                cache_states = torch.where(boundary_mask, boundary_ssm_states, initial_ssm_state)
-            else:
-                cache_states = ssm_varlen_states
+                cache_states = torch.where(
+                    boundary_mask, chunk_states[boundary_chunk_indices], initial_ssm_state
+                )
             tensor_masked_update(ssm_state, batch_indices, cache_states)
 
-            if self.config.batch_invariant_mode and cu_seqlens is not None:
+            if self.config.batch_invariant_mode:
                 self._batch_invariant_decode().seed(
                     x, dt, B, C, cu_seqlens, batch_indices, max_batch=ssm_state.shape[0]
                 )
@@ -1015,6 +999,7 @@ class MambaMixer(MegatronModule):
             # but we only fill the per-graph-bucket prefix; readers consult
             # per_request_intermediate_counts to know the real count.
             if intermediate_chunk_indices is not None and intermediate_ssm_out is not None:
+                intermediate_ssm_states = chunk_states[intermediate_chunk_indices]
                 n = intermediate_ssm_states.shape[0]
                 intermediate_ssm_out[:n].copy_(intermediate_ssm_states)
 

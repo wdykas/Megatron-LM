@@ -1467,10 +1467,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 return i + 1
         return 0
 
-    def _using_mamba_batch_invariant_prefill(self) -> bool:
-        """Whether prefill chunks must end on Mamba chunk boundaries."""
-        return self.context.batch_invariant_mode and self.context.is_hybrid_model
-
     def _mamba_batch_invariant_prefill_chunk_length(
         self, req: DynamicInferenceRequest, capacity: int, cached_prefix_tokens: int = 0
     ) -> int:
@@ -1603,7 +1599,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # is_continuing_chunked_prefill is True if we are scheduling next
             # chunk of a existing chunked prefill request
             is_continuing_chunked_prefill = self.context.chunked_prefill_request_id >= 0
-            mamba_bik_prefill = self._using_mamba_batch_invariant_prefill()
+            mamba_bik_prefill = self.context.batch_invariant_mode and self.context.is_hybrid_model
 
             # Check for conflicting block hashes.
             if prefix_caching_enabled and not is_continuing_chunked_prefill:
@@ -1626,18 +1622,16 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Use remaining prompt tokens for scheduling decisions
             remaining_len = len(req.remaining_prompt_tokens)
-            raw_tokens_fully_fit = (
-                self.context.active_token_count + remaining_len <= self.context.max_tokens
-            )
             token_partially_can_be_added = self.context.active_token_count < self.context.max_tokens
             request_can_be_added, effective_tokens_fit, kv_cache_available = (
                 self.context.check_availability(req)
             )
             request_can_be_added = is_continuing_chunked_prefill or request_can_be_added
-            if mamba_bik_prefill and prefix_caching_enabled:
-                token_fully_can_be_added = effective_tokens_fit
-            else:
-                token_fully_can_be_added = raw_tokens_fully_fit
+            token_fully_can_be_added = (
+                effective_tokens_fit
+                if mamba_bik_prefill
+                else self.context.active_token_count + remaining_len <= self.context.max_tokens
+            )
 
             if request_can_be_added and kv_cache_available:
                 if token_fully_can_be_added:
@@ -1672,11 +1666,11 @@ class DynamicInferenceEngine(AbstractEngine):
                     prefill_chunk_length = self.context.max_tokens - self.context.active_token_count
 
                     if mamba_bik_prefill:
-                        cached_prefix_tokens = 0
-                        if mamba_caching_enabled and not is_continuing_chunked_prefill:
-                            cached_prefix_tokens = (
-                                req._mamba_num_matched_blocks * self.context.block_size_tokens
-                            )
+                        cached_prefix_tokens = (
+                            req._mamba_num_matched_blocks * self.context.block_size_tokens
+                            if mamba_caching_enabled and not is_continuing_chunked_prefill
+                            else 0
+                        )
                         prefill_chunk_length = self._mamba_batch_invariant_prefill_chunk_length(
                             req, prefill_chunk_length, cached_prefix_tokens
                         )

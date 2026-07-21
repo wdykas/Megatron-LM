@@ -2015,11 +2015,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_kv_length_offsets[0:N].fill_(0)
         self.request_to_kv_block_ids[0:N, 0] = dummy_block_idx
 
-        # 3. Token-level state consumed by the triton KV append kernel.
-        if self.batch_invariant_mode:
-            # Dummy EP ranks still replay the captured graph; seed neutral token
-            # inputs so masked rows cannot inherit stale request state.
-            self.token_to_input_ids[0:T].fill_(0)
+        # 3. Dummy ranks still replay captured graphs, so keep all token
+        # metadata neutral rather than inheriting state from a prior replay.
+        self.token_to_input_ids[0:T].fill_(0)
         self.token_to_block_idx[0:T] = dummy_block_idx
         # Compute per-request token positions: e.g. query_lengths [3,2] -> [0,1,2,0,1]
         query_lengths = self.request_query_lengths[0:N]
@@ -2027,11 +2025,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Per-token start offset: e.g. starts [0,3], query_lengths [3,2] -> [0,0,0,3,3]
         per_token_start = torch.repeat_interleave(starts, query_lengths)
         positions = torch.arange(T, device=query_lengths.device) - per_token_start
-        if self.batch_invariant_mode:
-            # BIK Mamba replay reads both position views from the captured GPU
-            # metadata, so dummy EP ranks seed them like real requests.
-            self.token_to_pos_ids[0:T] = positions
-            self.token_to_position_in_request[0:T] = positions
+        self.token_to_pos_ids[0:T] = positions
+        self.token_to_position_in_request[0:T] = positions
         self.token_to_local_position_within_kv_block[0:T] = torch.remainder(
             positions, self.block_size_tokens
         )
@@ -2151,14 +2146,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self.pad_active_slices()
 
-        if self.batch_invariant_mode and self.active_token_count < self.padded_active_token_count:
-            # BIK kernels consume all metadata at the padded graph shape, so
-            # scrub the additional fields that default kernels do not read.
-            self.token_to_input_ids[self.padding_slice] = 0
-            self.token_to_pos_ids[self.padding_slice] = 0
-            self.token_to_request_idx[self.padding_slice] = 0
-
-        # Update metadata read by both default and BIK kernels.
+        # Graph padding must never inherit token metadata from a prior replay.
+        self.token_to_input_ids[self.padding_slice] = 0
+        self.token_to_pos_ids[self.padding_slice] = 0
+        self.token_to_request_idx[self.padding_slice] = 0
         self.token_to_block_idx[self.padding_slice] = self.kv_block_allocator.dummy_block_idx
         self.token_to_local_position_within_kv_block[self.padding_slice] = 0
         self.token_to_position_in_request[self.padding_slice] = 0
@@ -2936,7 +2927,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 prefix_skip_tokens,
                 prefill_chunk_length,
                 num_matched_blocks,
-                matched_block_ids,
                 overall_required_blocks,
             )
 

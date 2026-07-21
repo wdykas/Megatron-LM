@@ -132,35 +132,6 @@ def test_grouped_gemm_per_expert_token_count_invariance():
 
 
 # ---------------------------------------------------------------------------
-# Inference path: _bf16_grouped_mm dispatches to batch-invariant kernel
-# ---------------------------------------------------------------------------
-
-
-def test_inference_bf16_grouped_mm_routes_when_enabled():
-    """When batch_invariant_mode is on, fused_moe._bf16_grouped_mm must produce
-    the same result as a direct call to grouped_gemm_batch_invariant. When off,
-    it must agree with torch.nn.functional.grouped_mm.
-    """
-    from megatron.core.inference.moe.fused_moe import HAVE_GROUPED_MM, _bf16_grouped_mm
-
-    if not HAVE_GROUPED_MM:
-        pytest.skip("torch.nn.functional.grouped_mm not available.")
-
-    torch.manual_seed(4)
-    E, K, N = 4, 64, 48
-    per_expert = grouped_gemm_batch_invariant_alignment()
-    M = per_expert * E
-    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
-    w = torch.randn(E, N, K, device="cuda", dtype=torch.bfloat16)
-    offs = torch.tensor([(i + 1) * per_expert for i in range(E)], dtype=torch.int32, device="cuda")
-
-    with set_batch_invariant_mode(True):
-        y_batch_invariant = _bf16_grouped_mm(x, w, offs)
-    y_direct = grouped_gemm_batch_invariant(x, w, offs=offs, m_total=M, already_aligned=True)
-    assert torch.equal(y_batch_invariant, y_direct)
-
-
-# ---------------------------------------------------------------------------
 # End-to-end: TEGroupedMLP batch-invariance
 # ---------------------------------------------------------------------------
 

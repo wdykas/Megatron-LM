@@ -410,18 +410,6 @@ def _ordered_reduce_scatter_v_kernel(
 
             tl.store(local_ptr + token_offset * HIDDEN_SIZE + offsets, acc, mask=mask)
 
-    # Do not let a faster rank overwrite its symmetric RSV buffer for the next
-    # replay while a peer is still reading this replay's rows.
-    sync_threads()
-    symm_mem_sync(
-        signal_pad_ptrs,
-        None,
-        RANK,
-        WORLD_SIZE,
-        hasPreviousMemAccess=True,
-        hasSubsequentMemAccess=False,
-    )
-
 
 def ordered_reduce_scatter_v(
     output_tensor: torch.Tensor,

@@ -14,7 +14,6 @@ host syncs, so the whole step is CUDA-graph capturable.
 """
 
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 
@@ -25,7 +24,6 @@ from megatron.core.ssm.ops.ssd_combined import mamba_chunk_scan_decode_rows
 class BatchInvariantDecodeBuffers:
     """Per-slot persistent state for the buffered decode scan."""
 
-    chunk_size: int
     x: torch.Tensor            # (max_batch + 1, chunk_size, nheads, headdim)
     dt: torch.Tensor           # (max_batch + 1, chunk_size, nheads)
     B: torch.Tensor            # (max_batch + 1, chunk_size, ngroups, dstate)
@@ -65,7 +63,6 @@ def make_batch_invariant_decode_buffers(
     """
     rows = max_batch + 1
     return BatchInvariantDecodeBuffers(
-        chunk_size=chunk_size,
         x=torch.zeros(rows, chunk_size, nheads, headdim, device=device, dtype=dtype),
         dt=torch.zeros(rows, chunk_size, nheads, device=device, dtype=dtype),
         B=torch.zeros(rows, chunk_size, ngroups, dstate, device=device, dtype=dtype),
@@ -73,6 +70,15 @@ def make_batch_invariant_decode_buffers(
         num_buffered=torch.zeros(rows, device=device, dtype=torch.int32),
         out=torch.empty(rows, nheads, headdim, device=device, dtype=dtype),
     )
+
+
+def _decode_slots(
+    bufs: BatchInvariantDecodeBuffers, batch_indices: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map inactive lanes to the buffers' extra write-sink row."""
+    slots = batch_indices.to(torch.long)
+    is_active = slots >= 0
+    return slots.masked_fill(~is_active, bufs.trash_row), is_active
 
 
 def seed_batch_invariant_decode_buffers(
@@ -96,7 +102,7 @@ def seed_batch_invariant_decode_buffers(
     tail get a duplicated row, which is fine: the scan is causal and
     num_buffered marks the valid prefix.
     """
-    chunk_size = bufs.chunk_size
+    chunk_size = bufs.x.shape[1]
     num_seqs = cu_seqlens.numel() - 1
 
     seq_starts = cu_seqlens[:-1].to(torch.long)
@@ -108,11 +114,7 @@ def seed_batch_invariant_decode_buffers(
 
     # Redirect inactive lanes (batch_indices < 0) to the trash row so all
     # writes below are unconditional.
-    requested_slots = batch_indices[:num_seqs].to(torch.long)
-    is_active = requested_slots >= 0
-    slots = torch.where(
-        is_active, requested_slots, torch.full_like(requested_slots, bufs.trash_row)
-    )
+    slots, is_active = _decode_slots(bufs, batch_indices[:num_seqs])
 
     # Row-gather indices for each sequence's tail, (num_seqs, chunk_size).
     # Positions past the tail duplicate a valid token from the same sequence
@@ -181,7 +183,7 @@ def batch_invariant_decode_buffered_scan(
     """
     num_lanes, tokens_per_lane, nheads, headdim = x.shape
     dstate = B.shape[-1]
-    chunk_size = bufs.chunk_size
+    chunk_size = bufs.x.shape[1]
     assert tokens_per_lane == 1, (
         "batch-invariant Mamba decode assumes one new token per request "
         "per call (no speculative decoding)."
@@ -194,11 +196,7 @@ def batch_invariant_decode_buffered_scan(
 
     # Redirect inactive lanes (batch_indices < 0) to the trash row so the
     # buffer writes below are unconditional.
-    requested_slots = batch_indices.to(torch.long)
-    is_active = requested_slots >= 0
-    slots = torch.where(
-        is_active, requested_slots, torch.full_like(requested_slots, bufs.trash_row)
-    )
+    slots, is_active = _decode_slots(bufs, batch_indices)
     # ssm_state is engine-owned and has no trash row: clamp for reads. Its
     # only writes happen in-kernel for crossing slots, which never alias.
     state_slots = slots.clamp(max=bufs.trash_row - 1)
@@ -265,7 +263,7 @@ class MambaBatchInvariantDecode:
         # otherwise silently drop it.
         assert mixer.rmsnorm, "batch_invariant_mode requires rmsnorm=True"
         self.mixer = mixer
-        self.bufs: Optional[BatchInvariantDecodeBuffers] = None
+        self.bufs: BatchInvariantDecodeBuffers | None = None
 
     def _get_bufs(self, max_batch, x, B) -> BatchInvariantDecodeBuffers:
         if self.bufs is None:

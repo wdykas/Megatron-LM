@@ -15,8 +15,7 @@ import torch
 
 from megatron.core.utils import null_decorator
 
-from .batch_invariant import enabled as batch_invariant_enabled
-from .batch_invariant import unpermute_tokens as batch_invariant_unpermute_tokens
+from . import batch_invariant
 
 try:
     import triton
@@ -492,12 +491,12 @@ def unpermute_tokens(
     # Triton kernel below uses tl.atomic_add (non-deterministic). Batch-invariant
     # MoE instead reduces each token independently in fixed local-expert order,
     # so unrelated tokens cannot affect the accumulation tree.
-    if batch_invariant_enabled():
+    if batch_invariant.enabled():
         assert inverse_map is not None, "batch-invariant MoE unpermute requires inverse_map"
         # The BIK kernel stores every row tok < valid_tokens, including zero
         # rows for tokens with no local expert contribution. Rows beyond
         # valid_tokens are not read by the graphed RSV combine.
-        return batch_invariant_unpermute_tokens(
+        return batch_invariant.unpermute_tokens(
             expert_output, permuted_probs, inverse_map, valid_tokens, out
         )
 

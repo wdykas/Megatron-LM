@@ -20,11 +20,8 @@ from megatron.core.inference.moe.permute import (
     unpermute_tokens,
 )
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
-from .batch_invariant import (
-    enabled as batch_invariant_enabled,
-    grouped_mm as batch_invariant_grouped_mm,
-    grouped_mm_alignment as batch_invariant_grouped_mm_alignment,
-)
+
+from . import batch_invariant
 
 try:
     from torch.nn.functional import grouped_mm
@@ -52,16 +49,8 @@ class ActivationType(Enum):
 def _bf16_grouped_mm(
     x_bf16: torch.Tensor, weight: torch.Tensor, offs: torch.Tensor
 ) -> torch.Tensor:
-    """BF16 grouped GEMM.
-
-    In batch-invariant mode, routes to the DeepGEMM-backed kernel shared with
-    the training path, so RL rollout==train log-probs match bitwise. Otherwise
-    uses torch.nn.functional.grouped_mm.
-    """
+    """BF16 grouped GEMM using torch.nn.functional.grouped_mm."""
     assert x_bf16.dtype == torch.bfloat16, f"Expected bf16 input, got {x_bf16.dtype}"
-    if batch_invariant_enabled():
-        # weight is [E, N, K], which is the layout DeepGEMM's NT call expects directly.
-        return batch_invariant_grouped_mm(x_bf16, weight, offs)
     return grouped_mm(x_bf16, weight.transpose(1, 2), offs=offs)
 
 
@@ -143,18 +132,17 @@ def mcore_fused_moe(
     use_mxfp8 = isinstance(fc1_weight, MXFP8Tensor)
     # Fused quant kernels only apply to MXFP8 path
     use_fused_quant = use_mxfp8 and not disable_fused_quant_kernels
-    batch_invariant_mode = batch_invariant_enabled()
+    batch_invariant_mode = batch_invariant.enabled()
 
     if batch_invariant_mode:
-        # batch-invariant mode intercepts the bf16 grouped GEMM path
-        # (`_bf16_grouped_mm` → `grouped_gemm_batch_invariant`). The MXFP8
-        # path uses `scaled_grouped_mm` and is not batch-invariant-instrumented.
+        # The MXFP8 path uses scaled_grouped_mm and is not batch invariant.
         assert not use_mxfp8, (
             "batch_invariant_mode requires the bf16 grouped GEMM path; got "
             "MXFP8 weights. Disable mxfp8 or batch_invariant_mode."
         )
-
-    if use_mxfp8:
+        mm_fn = batch_invariant.grouped_mm
+        expert_alignment = batch_invariant.grouped_mm_alignment()
+    elif use_mxfp8:
         assert (
             HAVE_SCALED_GMM
         ), "torch.nn.functional.scaled_grouped_mm not available. Install PyTorch 2.10+."
@@ -164,14 +152,11 @@ def mcore_fused_moe(
         # satisfy both constraints.
         expert_alignment = 128
     else:
+        assert (
+            HAVE_GROUPED_MM
+        ), "torch.nn.functional.grouped_mm not available. Install PyTorch 2.10+."
         mm_fn = _bf16_grouped_mm
-        if batch_invariant_mode:
-            expert_alignment = batch_invariant_grouped_mm_alignment()
-        else:
-            assert (
-                HAVE_GROUPED_MM
-            ), "torch.nn.functional.grouped_mm not available. Install PyTorch 2.10+."
-            expert_alignment = 16
+        expert_alignment = 16
 
     activation_func = _get_activation_func(activation_type, fused_quant=use_fused_quant)
 

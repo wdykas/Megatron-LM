@@ -893,7 +893,6 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
             prefix_skip,
             len(prompt),
             len(matched),
-            [ctx.request_to_kv_block_ids[0][i].item() for i in range(len(matched))],
             overall,
         )
         # Penultimate block offset (block 2 boundary) is a valid intermediate
