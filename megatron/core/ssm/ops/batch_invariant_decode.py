@@ -112,7 +112,7 @@ class BatchInvariantDecodeBuffers:
 
 
 def batch_invariant_decode_buffered_scan(
-    bufs: BatchInvariantDecodeBuffers,
+    buffers: BatchInvariantDecodeBuffers,
     x: torch.Tensor,           # (num_lanes, 1, nheads, headdim)
     dt: torch.Tensor,          # (num_lanes, 1, nheads)
     B: torch.Tensor,           # (num_lanes, 1, ngroups, dstate)
@@ -129,12 +129,12 @@ def batch_invariant_decode_buffered_scan(
     """
     num_lanes, tokens_per_lane, nheads, headdim = x.shape
     dstate = B.shape[-1]
-    chunk_size = bufs.x.shape[1]
+    chunk_size = buffers.x.shape[1]
     assert tokens_per_lane == 1, (
         "batch-invariant Mamba decode assumes one new token per request "
         "per call (no speculative decoding)."
     )
-    max_lanes = bufs.out.shape[0]
+    max_lanes = buffers.out.shape[0]
     assert num_lanes <= max_lanes, (
         f"decode batch of {num_lanes} lanes exceeds the preallocated buffers "
         f"({max_lanes} lanes); increase max_batch."
@@ -142,32 +142,32 @@ def batch_invariant_decode_buffered_scan(
 
     # Redirect inactive lanes (batch_indices < 0) to the trash row so the
     # buffer writes below are unconditional.
-    slots, is_active = bufs.map_slots(batch_indices)
+    slots, is_active = buffers.map_slots(batch_indices)
     # ssm_state is engine-owned and has no trash row: clamp for reads. Its
     # only writes happen in-kernel for crossing slots, which never alias.
-    state_slots = slots.clamp(max=bufs.trash_row - 1)
+    state_slots = slots.clamp(max=buffers.trash_row - 1)
 
     # Write the new token at each slot's cursor; write_pos is also the
     # token's intra-chunk row, the one row the scan must produce.
-    write_pos = bufs.num_buffered[slots].to(torch.long)
-    bufs.x[slots, write_pos] = x[:, 0]
-    bufs.dt[slots, write_pos] = dt[:, 0]
-    bufs.B[slots, write_pos] = B[:, 0]
-    bufs.C[slots, write_pos] = C[:, 0]
+    write_pos = buffers.num_buffered[slots].to(torch.long)
+    buffers.x[slots, write_pos] = x[:, 0]
+    buffers.dt[slots, write_pos] = dt[:, 0]
+    buffers.B[slots, write_pos] = B[:, 0]
+    buffers.C[slots, write_pos] = C[:, 0]
 
     # A slot crosses its chunk boundary when this token fills the buffer.
     crossed = (write_pos + 1 == chunk_size) & is_active
-    out = bufs.out[:num_lanes]
+    out = buffers.out[:num_lanes]
 
     # Run the gated pipeline over the buffers and ssm_state in place. State
     # passing writes crossing slots' boundary states straight into
     # ssm_state, so no scatter is needed afterwards.
     mamba_chunk_scan_decode_rows(
-        bufs.x.view(-1, nheads, headdim),
-        bufs.dt.view(-1, nheads),
+        buffers.x.view(-1, nheads, headdim),
+        buffers.dt.view(-1, nheads),
         A,
-        bufs.B.view(-1, bufs.B.shape[-2], dstate),
-        bufs.C.view(-1, bufs.C.shape[-2], dstate),
+        buffers.B.view(-1, buffers.B.shape[-2], dstate),
+        buffers.C.view(-1, buffers.C.shape[-2], dstate),
         chunk_size,
         chunk_starts=(slots * chunk_size).to(torch.int32),
         slots=state_slots.to(torch.int32),
@@ -186,7 +186,7 @@ def batch_invariant_decode_buffered_scan(
 
     # Crossed slots restart their buffer; the rest advance. Inactive lanes
     # write 0 to the trash row, keeping its cursor pinned in bounds.
-    bufs.num_buffered[slots] = torch.where(
+    buffers.num_buffered[slots] = torch.where(
         crossed | ~is_active, torch.zeros_like(write_pos), write_pos + 1
     ).to(torch.int32)
 
@@ -202,13 +202,13 @@ class MambaBatchInvariantDecode:
         # otherwise silently drop it.
         assert mixer.rmsnorm, "batch_invariant_mode requires rmsnorm=True"
         self.mixer = mixer
-        self.bufs: BatchInvariantDecodeBuffers | None = None
+        self.buffers: BatchInvariantDecodeBuffers | None = None
 
-    def _get_bufs(self, max_batch, x, B) -> BatchInvariantDecodeBuffers:
-        if self.bufs is None:
+    def _get_buffers(self, max_batch, x, B) -> BatchInvariantDecodeBuffers:
+        if self.buffers is None:
             nheads, headdim = x.shape[-2:]
             ngroups, dstate = B.shape[-2:]
-            self.bufs = BatchInvariantDecodeBuffers.allocate(
+            self.buffers = BatchInvariantDecodeBuffers.allocate(
                 max_batch,
                 self.mixer.chunk_size,
                 nheads,
@@ -218,12 +218,12 @@ class MambaBatchInvariantDecode:
                 x.device,
                 x.dtype,
             )
-        return self.bufs
+        return self.buffers
 
     def seed(self, x, dt, B, C, cu_seqlens, batch_indices, max_batch) -> None:
         """Seed replay buffers from the prefill tail."""
-        bufs = self._get_bufs(max_batch, x, B)
-        bufs.seed(x, dt, B, C, cu_seqlens, batch_indices)
+        buffers = self._get_buffers(max_batch, x, B)
+        buffers.seed(x, dt, B, C, cu_seqlens, batch_indices)
 
     def step(self, x, dt, B, C, batch_indices, ssm_state) -> torch.Tensor:
         """Run one decode step using the mixer's flattened layouts."""
@@ -239,9 +239,9 @@ class MambaBatchInvariantDecode:
             D = D.float().view(-1, mixer.headdim)
         dt_bias = mixer.cp.get_dt_bias().float()
 
-        bufs = self._get_bufs(ssm_state.shape[0], x, B)
+        buffers = self._get_buffers(ssm_state.shape[0], x, B)
 
         y = batch_invariant_decode_buffered_scan(
-            bufs, x, dt, B, C, A, D, dt_bias, batch_indices, ssm_state
+            buffers, x, dt, B, C, A, D, dt_bias, batch_indices, ssm_state
         )
         return y.reshape(batch, 1, -1)
