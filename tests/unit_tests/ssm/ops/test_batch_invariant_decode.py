@@ -11,7 +11,6 @@ try:
     from megatron.core.ssm.ops.batch_invariant_decode import (
         BatchInvariantDecodeBuffers,
         batch_invariant_decode_buffered_scan,
-        seed_batch_invariant_decode_buffers,
     )
     from megatron.core.ssm.ops.ssd_combined import mamba_chunk_scan_combined_varlen
 
@@ -106,11 +105,9 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
 
         cu = torch.tensor([0, prefill_len], dtype=torch.int32, device=self.device)
         batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
-        # seed_batch_invariant_decode_buffers expects the squeeze-batch layout
-        # (the flat (total, nh, p) form used inside the mixer's prefill path).
+        # Buffer seeding expects the flat layout used by the mixer's prefill path.
         # Here total == prefill_len since we have 1 sequence.
-        seed_batch_invariant_decode_buffers(
-            bufs,
+        bufs.seed(
             x[0, :prefill_len],
             dt[0, :prefill_len],
             B[0, :prefill_len],
@@ -245,8 +242,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
                 bufs = self._make_bufs(max_batch)
                 cu = torch.tensor([0, prefill_len], dtype=torch.int32, device=self.device)
                 batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
-                seed_batch_invariant_decode_buffers(
-                    bufs,
+                bufs.seed(
                     x[0, :prefill_len],
                     dt[0, :prefill_len],
                     B[0, :prefill_len],
@@ -300,8 +296,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
                 cu = torch.tensor(
                     [0, final_chunk_len], dtype=torch.int32, device=self.device
                 )
-                seed_batch_invariant_decode_buffers(
-                    bufs,
+                bufs.seed(
                     x[0, first_chunk_len:prefill_len],
                     dt[0, first_chunk_len:prefill_len],
                     B[0, first_chunk_len:prefill_len],
@@ -346,8 +341,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         bufs = self._make_bufs(max_batch)
         cu = torch.tensor([0, prefill_len], dtype=torch.int32, device=self.device)
         batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
-        seed_batch_invariant_decode_buffers(
-            bufs,
+        bufs.seed(
             torch.cat([x[0, :prefill_len], nan_x], dim=0),
             torch.cat([dt[0, :prefill_len], nan_dt], dim=0),
             torch.cat([B[0, :prefill_len], nan_B], dim=0),
@@ -562,8 +556,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
 
         # Capture executes once, so restore the replay cursor before the first replay.
         cu = torch.tensor([0, prefill_len], dtype=torch.int32, device=self.device)
-        seed_batch_invariant_decode_buffers(
-            bufs,
+        bufs.seed(
             x[0, :prefill_len],
             dt[0, :prefill_len],
             B[0, :prefill_len],
@@ -611,8 +604,8 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         )
         cu = torch.tensor([0, prefill_len], dtype=torch.int32, device=self.device)
         batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
-        seed_batch_invariant_decode_buffers(
-            bufs, x[0, :prefill_len], dt[0, :prefill_len],
+        bufs.seed(
+            x[0, :prefill_len], dt[0, :prefill_len],
             B[0, :prefill_len], C[0, :prefill_len], cu, batch_indices,
         )
         for k in range(n_decode):

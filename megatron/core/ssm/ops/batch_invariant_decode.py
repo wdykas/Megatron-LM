@@ -58,56 +58,57 @@ class BatchInvariantDecodeBuffers:
         is_active = slots >= 0
         return slots.masked_fill(~is_active, self.trash_row), is_active
 
+    def seed(
+        self,
+        x: torch.Tensor,
+        dt: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        batch_indices: torch.Tensor,
+    ) -> None:
+        """Store each prefill's unfinished chunk for decode replay."""
+        chunk_size = self.x.shape[1]
+        num_seqs = cu_seqlens.numel() - 1
 
-def seed_batch_invariant_decode_buffers(
-    bufs: BatchInvariantDecodeBuffers,
-    x: torch.Tensor,
-    dt: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    batch_indices: torch.Tensor,
-) -> None:
-    """Store each prefill's unfinished chunk for decode replay."""
-    chunk_size = bufs.x.shape[1]
-    num_seqs = cu_seqlens.numel() - 1
+        seq_starts = cu_seqlens[:-1].to(torch.long)
+        seq_ends = cu_seqlens[1:].to(torch.long)
+        prefill_lens = seq_ends - seq_starts
+        # Covers every case: prefill_len < chunk_size gives prefill_len,
+        # boundary-aligned gives 0.
+        tail_lens = prefill_lens % chunk_size
 
-    seq_starts = cu_seqlens[:-1].to(torch.long)
-    seq_ends = cu_seqlens[1:].to(torch.long)
-    prefill_lens = seq_ends - seq_starts
-    # Covers every case: prefill_len < chunk_size gives prefill_len,
-    # boundary-aligned gives 0.
-    tail_lens = prefill_lens % chunk_size
+        # Redirect inactive lanes (batch_indices < 0) to the trash row so all
+        # writes below are unconditional.
+        slots, is_active = self.map_slots(batch_indices[:num_seqs])
 
-    # Redirect inactive lanes (batch_indices < 0) to the trash row so all
-    # writes below are unconditional.
-    slots, is_active = bufs.map_slots(batch_indices[:num_seqs])
+        # Fill unused rows with a valid token from the same sequence. The row-gated
+        # kernel evaluates a full M-block, so finite padding prevents masked NaNs
+        # from reaching the target row through tensor-core operations.
+        offsets = torch.arange(chunk_size, device=x.device, dtype=torch.long)
+        safe_tail_lens = torch.clamp(tail_lens, min=1)
+        safe_tail_offsets = torch.minimum(
+            offsets.unsqueeze(0), (safe_tail_lens - 1).unsqueeze(1)
+        )
+        safe_tail_starts = torch.where(
+            tail_lens > 0,
+            seq_ends - tail_lens,
+            torch.clamp(seq_ends - 1, min=0),
+        )
+        tail_token_idx = (safe_tail_starts.unsqueeze(1) + safe_tail_offsets).clamp(
+            max=x.shape[0] - 1
+        )
 
-    # Fill unused rows with a valid token from the same sequence. The row-gated
-    # kernel evaluates a full M-block, so finite padding prevents masked NaNs
-    # from reaching the target row through tensor-core operations.
-    offsets = torch.arange(chunk_size, device=x.device, dtype=torch.long)
-    safe_tail_lens = torch.clamp(tail_lens, min=1)
-    safe_tail_offsets = torch.minimum(offsets.unsqueeze(0), (safe_tail_lens - 1).unsqueeze(1))
-    safe_tail_starts = torch.where(
-        tail_lens > 0,
-        seq_ends - tail_lens,
-        torch.clamp(seq_ends - 1, min=0),
-    )
-    tail_token_idx = (safe_tail_starts.unsqueeze(1) + safe_tail_offsets).clamp(
-        max=x.shape[0] - 1
-    )
+        self.x[slots] = x[tail_token_idx]
+        self.dt[slots] = dt[tail_token_idx]
+        self.B[slots] = B[tail_token_idx]
+        self.C[slots] = C[tail_token_idx]
 
-    bufs.x[slots] = x[tail_token_idx]
-    bufs.dt[slots] = dt[tail_token_idx]
-    bufs.B[slots] = B[tail_token_idx]
-    bufs.C[slots] = C[tail_token_idx]
-
-    # Keep the trash row's count pinned at 0 so its buffer writes stay in
-    # bounds.
-    bufs.num_buffered[slots] = torch.where(
-        is_active, tail_lens, torch.zeros_like(tail_lens)
-    ).to(torch.int32)
+        # Keep the trash row's count pinned at 0 so its buffer writes stay in
+        # bounds.
+        self.num_buffered[slots] = torch.where(
+            is_active, tail_lens, torch.zeros_like(tail_lens)
+        ).to(torch.int32)
 
 
 def batch_invariant_decode_buffered_scan(
@@ -222,7 +223,7 @@ class MambaBatchInvariantDecode:
     def seed(self, x, dt, B, C, cu_seqlens, batch_indices, max_batch) -> None:
         """Seed replay buffers from the prefill tail."""
         bufs = self._get_bufs(max_batch, x, B)
-        seed_batch_invariant_decode_buffers(bufs, x, dt, B, C, cu_seqlens, batch_indices)
+        bufs.seed(x, dt, B, C, cu_seqlens, batch_indices)
 
     def step(self, x, dt, B, C, batch_indices, ssm_state) -> torch.Tensor:
         """Run one decode step using the mixer's flattened layouts."""
