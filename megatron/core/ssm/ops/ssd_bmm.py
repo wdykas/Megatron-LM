@@ -86,7 +86,7 @@ def _bmm_chunk_fwd_kernel(
     stride_outn: tl.constexpr,
     # Meta-parameters
     IS_CAUSAL: tl.constexpr,
-    DECODE_MODE: tl.constexpr,
+    HAS_TARGET_ROWS: tl.constexpr,
     dot_dtype: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -101,8 +101,8 @@ def _bmm_chunk_fwd_kernel(
     if IS_CAUSAL:
         if pid_n * BLOCK_SIZE_N >= (pid_m + 1) * BLOCK_SIZE_M:
             return
-    if DECODE_MODE:
-        # Decode mode: only row target_rows[pid_c] of the chunk scan is
+    if HAS_TARGET_ROWS:
+        # Only row target_rows[pid_c] of the chunk scan is
         # consumed. Skip M-blocks that don't contain it and N-blocks past it
         # (the scan causally zeroes CB columns beyond the target row anyway).
         # The surviving block runs the same instructions as the ungated
@@ -114,8 +114,8 @@ def _bmm_chunk_fwd_kernel(
             return
 
     chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)
-    if DECODE_MODE:
-        # Decode mode: fixed-length windows at caller-given buffer offsets.
+    if HAS_TARGET_ROWS:
+        # Target rows use fixed-length windows at caller-given buffer offsets.
         chunk_seqlen_end = chunk_seqlen_start + chunk_size
     else:
         chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
@@ -181,11 +181,11 @@ def _bmm_chunk_fwd(
     Return:
         out: (nchunks, ngroups, chunk_size, chunk_size)
     """
-    decode_mode = chunk_starts is not None
-    assert (target_rows is not None) == decode_mode, (
+    has_target_rows = target_rows is not None
+    assert (chunk_starts is not None) == has_target_rows, (
         "target_rows and chunk_starts must be provided together"
     )
-    if decode_mode:
+    if has_target_rows:
         cu_chunk_seqlens = chunk_starts
     seqlen, ngroups, k = a.shape
     assert b.shape == a.shape
@@ -194,7 +194,7 @@ def _bmm_chunk_fwd(
     if b.stride(-1) != 1 and b.stride(0) != 1:
         b = b.contiguous()
 
-    nchunks = len(cu_chunk_seqlens) - (0 if decode_mode else 1)
+    nchunks = len(cu_chunk_seqlens) - (0 if has_target_rows else 1)
     # Allocates output.
     out_dtype = a.dtype if output_dtype is None else output_dtype
     out = torch.empty((nchunks, ngroups, chunk_size, chunk_size), device=a.device, dtype=out_dtype)
@@ -230,7 +230,7 @@ def _bmm_chunk_fwd(
             stride_outm=out.stride(-2),
             stride_outn=out.stride(-1),
             IS_CAUSAL=causal,
-            DECODE_MODE=decode_mode,
+            HAS_TARGET_ROWS=has_target_rows,
             dot_dtype=dot_dtype,
         )
     return out

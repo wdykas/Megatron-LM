@@ -211,7 +211,7 @@ def _chunk_state_fwd_kernel(
     stride_dA_cs_chunk: tl.int64,
     stride_dA_cs_csize: tl.constexpr,
     # Meta-parameters
-    DECODE_MODE: tl.constexpr,
+    HAS_CHUNK_FLAGS: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -221,14 +221,14 @@ def _chunk_state_fwd_kernel(
     num_pid_n = tl.cdiv(dstate, BLOCK_SIZE_N)
     pid_m = tl.program_id(axis=0) // num_pid_n
     pid_n = tl.program_id(axis=0) % num_pid_n
-    if DECODE_MODE:
-        # Decode mode: a chunk's state is only consumed when its slot
+    if HAS_CHUNK_FLAGS:
+        # A flagged chunk's state is consumed when its slot
         # crosses the boundary this step. Skip the matmul otherwise; the
         # uninitialized rows are never read downstream.
         if tl.load(chunk_flags_ptr + pid_c) == 0:
             return
     chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)
-    if DECODE_MODE:
+    if HAS_CHUNK_FLAGS:
         chunk_seqlen_end = chunk_seqlen_start + chunk_size
     else:
         chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
@@ -350,11 +350,11 @@ def _chunk_state_fwd(
     chunk_flags=None,
     chunk_starts=None,
 ):
-    decode_mode = chunk_starts is not None
-    assert (chunk_flags is not None) == decode_mode, (
+    has_chunk_flags = chunk_flags is not None
+    assert (chunk_starts is not None) == has_chunk_flags, (
         "chunk_flags and chunk_starts must be provided together"
     )
-    if decode_mode:
+    if has_chunk_flags:
         cu_chunk_seqlens = chunk_starts
     seqlen, nheads, headdim = x.shape
     _, nchunks, chunk_size = dt.shape
@@ -407,7 +407,7 @@ def _chunk_state_fwd(
             stride_dA_cs_head=dA_cumsum.stride(0),
             stride_dA_cs_chunk=dA_cumsum.stride(1),
             stride_dA_cs_csize=dA_cumsum.stride(2),
-            DECODE_MODE=decode_mode,
+            HAS_CHUNK_FLAGS=has_chunk_flags,
         )
     return states
 
