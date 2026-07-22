@@ -941,6 +941,8 @@ class MambaMixer(MegatronModule):
                     chunk_starts = cu_chunk_seqlens[:-1]
                     seq_idx_for_varlen = seq_idx[0, chunk_starts].contiguous()
 
+            # Batch-invariant decode replays the partial prefill tail, so keep
+            # the cached SSM state at the last complete chunk boundary.
             boundary_chunk_indices = None
             has_boundary = None
             if self.config.batch_invariant_mode:
