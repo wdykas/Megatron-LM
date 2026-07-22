@@ -71,18 +71,7 @@ def seed_batch_invariant_decode_buffers(
     cu_seqlens: torch.Tensor,
     batch_indices: torch.Tensor,
 ) -> None:
-    """Seed each request's decode buffer with its prefill's partial-chunk tail.
-
-    Decode replays the buffer so the new token sits at the same intra-chunk
-    position a full scan would give it. The live SSM cache is kept at the last
-    full chunk boundary by the prefill path; this function stores only the
-    unfinished chunk tail.
-
-    No host syncs or Python loops; the engine captures prefill steps into
-    CUDA graphs, so this has to be capture-legal. Buffer positions past the
-    tail get a duplicated row, which is fine: the scan is causal and
-    num_buffered marks the valid prefix.
-    """
+    """Store each prefill's unfinished chunk for decode replay."""
     chunk_size = bufs.x.shape[1]
     num_seqs = cu_seqlens.numel() - 1
 
@@ -97,15 +86,9 @@ def seed_batch_invariant_decode_buffers(
     # writes below are unconditional.
     slots, is_active = _decode_slots(bufs, batch_indices[:num_seqs])
 
-    # Row-gather indices for each sequence's tail, (num_seqs, chunk_size).
-    # Positions past the tail duplicate a valid token from the same sequence
-    # instead of clamping to the global last row. Dynamic batches may pad the
-    # physical token tensor, and those padded rows are not guaranteed to stay
-    # finite after arbitrary layers. The row-gated scan still evaluates a whole
-    # Triton M-block around the target row; causally masked 0 * NaN products in
-    # future rows can poison the target row on tensor cores. Keeping the entire
-    # physical replay chunk finite avoids that without changing the logical
-    # scan prefix marked by num_buffered.
+    # Fill unused rows with a valid token from the same sequence. The row-gated
+    # kernel evaluates a full M-block, so finite padding prevents masked NaNs
+    # from reaching the target row through tensor-core operations.
     offsets = torch.arange(chunk_size, device=x.device, dtype=torch.long)
     safe_tail_lens = torch.clamp(tail_lens, min=1)
     safe_tail_offsets = torch.minimum(offsets.unsqueeze(0), (safe_tail_lens - 1).unsqueeze(1))
@@ -142,25 +125,9 @@ def batch_invariant_decode_buffered_scan(
     batch_indices: torch.Tensor,
     ssm_state: torch.Tensor,
 ) -> torch.Tensor:
-    """One decode step, bitwise identical to a full-sequence chunked scan.
+    """Run one decode token with full chunk-scan arithmetic.
 
-    Why not something simpler: selective_state_update drifts ~6e-5 vs the
-    chunked scan (different fp arithmetic), and running the chunked scan on
-    just the new token drifts ~2.4e-4 because the token sits at intra-chunk
-    position 0 instead of where the full scan has it (measured at
-    nemotron6_3b_moe dims in the unit tests). Re-scanning the buffered
-    partial chunk puts the token at the right position with the right
-    preceding inputs, so the result matches exactly. When a buffer fills to
-    chunk_size the returned state is a real boundary state; it is written to
-    ssm_state and the buffer restarts.
-
-    The kernels read the buffers and ssm_state in place (each lane's chunk
-    is the window at slot * chunk_size) and only compute the rows/states a
-    step consumes. All shapes are fixed per decode batch size and there are
-    no host syncs, so the step captures into CUDA graphs.
-
-    Returns y of shape (num_lanes, 1, nheads, headdim). Mutates bufs and
-    ssm_state.
+    Mutates the replay buffers and commits ``ssm_state`` when a chunk fills.
     """
     num_lanes, tokens_per_lane, nheads, headdim = x.shape
     dstate = B.shape[-1]
@@ -229,14 +196,7 @@ def batch_invariant_decode_buffered_scan(
 
 
 class MambaBatchInvariantDecode:
-    """Adapter between a MambaMixer and the buffered decode.
-
-    Owns the decode buffers and translates the mixer's conventions (flat
-    layouts, context-parallel projections, config flags) into the tensor-op
-    API above, so the mixer itself only carries two call sites. Uses the
-    mixer by duck typing; the import direction stays
-    mixer -> batch_invariant_decode.
-    """
+    """Adapter between a MambaMixer and the buffered decode."""
 
     def __init__(self, mixer):
         # The gate is applied outside the scan (RMSNormGated), so the
@@ -263,16 +223,12 @@ class MambaBatchInvariantDecode:
         return self.bufs
 
     def seed(self, x, dt, B, C, cu_seqlens, batch_indices, max_batch) -> None:
-        """Seed from the prefill tail. x: (total, nheads, headdim);
-        B/C: (total, ngroups, dstate)."""
+        """Seed replay buffers from the prefill tail."""
         bufs = self._get_bufs(max_batch, x, B)
         seed_batch_invariant_decode_buffers(bufs, x, dt, B, C, cu_seqlens, batch_indices)
 
     def step(self, x, dt, B, C, batch_indices, ssm_state) -> torch.Tensor:
-        """One decode step. Inputs in the mixer's flat layout:
-        x (batch, 1, nheads*headdim), dt (batch, 1, nheads),
-        B/C (batch, 1, ngroups*dstate). Returns (batch, 1, nheads*headdim).
-        """
+        """Run one decode step using the mixer's flattened layouts."""
         mixer = self.mixer
         batch = x.shape[0]
         x = x.view(batch, 1, -1, mixer.headdim)
