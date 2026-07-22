@@ -39,7 +39,6 @@ def grouped_mm(x_bf16: torch.Tensor, weight: torch.Tensor, offs: torch.Tensor) -
         weight,
         offs=offs.to(torch.int32),
         m_total=x_bf16.shape[0],
-        already_aligned=True,
     )
 
 

@@ -313,7 +313,7 @@ def test_column_parallel_linear_batch_invariant_randomized():
 
 @pytest.mark.skipif(
     not (is_te_min_version("2.10.0") and HAVE_FA3),
-    reason="TE attention batch-invariant tests require TE >= 2.10.0 and FlashAttention-3",
+    reason="TE attention BIK tests require TE >= 2.10.0 and FlashAttention-3",
 )
 def test_te_attention_layer_batch_invariant_randomized():
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -414,7 +414,7 @@ def test_te_column_parallel_linear_parity():
     Utils.initialize_model_parallel(1, 1)
     model_parallel_cuda_manual_seed(123)
 
-    cfg_batch_invariant = TransformerConfig(
+    cfg_bik = TransformerConfig(
         num_layers=1,
         hidden_size=128,
         num_attention_heads=4,
@@ -444,11 +444,11 @@ def test_te_column_parallel_linear_parity():
 
     # Create layers with same weights
     torch.manual_seed(456)
-    layer_batch_invariant = TEColumnParallelLinear(
-        input_size=cfg_batch_invariant.hidden_size,
+    layer_bik = TEColumnParallelLinear(
+        input_size=cfg_bik.hidden_size,
         output_size=256,
-        config=cfg_batch_invariant,
-        init_method=init_method_normal(cfg_batch_invariant.init_method_std),
+        config=cfg_bik,
+        init_method=init_method_normal(cfg_bik.init_method_std),
         gather_output=False,
         bias=True,
         skip_bias_add=False,
@@ -469,34 +469,34 @@ def test_te_column_parallel_linear_parity():
 
     # Test forward pass
     x = torch.randn(
-        64, cfg_batch_invariant.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        64, cfg_bik.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
     )
     x_clone = x.clone().detach().requires_grad_(True)
 
     with set_batch_invariant_mode(True):
-        out_batch_invariant, _ = layer_batch_invariant(x)
+        out_bik, _ = layer_bik(x)
 
     with set_batch_invariant_mode(False):
         out_regular, _ = layer_regular(x_clone)
 
     # Check forward outputs are close
     assert (
-        out_batch_invariant.shape == out_regular.shape
-    ), f"Shape mismatch: {out_batch_invariant.shape} vs {out_regular.shape}"
-    max_diff = (out_batch_invariant - out_regular).abs().max().item()
+        out_bik.shape == out_regular.shape
+    ), f"Shape mismatch: {out_bik.shape} vs {out_regular.shape}"
+    max_diff = (out_bik - out_regular).abs().max().item()
     assert max_diff < 1e-3, f"Forward output difference too large: {max_diff}"
 
     # Test backward pass
-    grad_output = torch.randn_like(out_batch_invariant)
+    grad_output = torch.randn_like(out_bik)
 
-    out_batch_invariant.backward(grad_output)
+    out_bik.backward(grad_output)
     out_regular.backward(grad_output.clone())
 
     # Check gradients are close
     grad_diff = (x.grad - x_clone.grad).abs().max().item()
     assert grad_diff < 1e-3, f"Input gradient difference too large: {grad_diff}"
 
-    weight_grad_diff = (layer_batch_invariant.weight.grad - layer_regular.weight.grad).abs().max().item()
+    weight_grad_diff = (layer_bik.weight.grad - layer_regular.weight.grad).abs().max().item()
     assert weight_grad_diff < 1e-3, f"Weight gradient difference too large: {weight_grad_diff}"
 
     Utils.destroy_model_parallel()
@@ -509,7 +509,7 @@ def test_te_rmsnorm_parity():
     Utils.initialize_model_parallel(1, 1)
     model_parallel_cuda_manual_seed(123)
 
-    cfg_batch_invariant = TransformerConfig(
+    cfg_bik = TransformerConfig(
         num_layers=1,
         hidden_size=128,
         num_attention_heads=4,
@@ -539,8 +539,8 @@ def test_te_rmsnorm_parity():
 
     # Create layers with same weights
     torch.manual_seed(789)
-    layer_batch_invariant = TENorm(
-        config=cfg_batch_invariant, hidden_size=cfg_batch_invariant.hidden_size, eps=cfg_batch_invariant.layernorm_epsilon
+    layer_bik = TENorm(
+        config=cfg_bik, hidden_size=cfg_bik.hidden_size, eps=cfg_bik.layernorm_epsilon
     ).cuda()
 
     torch.manual_seed(789)
@@ -550,32 +550,32 @@ def test_te_rmsnorm_parity():
 
     # Test forward pass
     x = torch.randn(
-        48, cfg_batch_invariant.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        48, cfg_bik.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
     )
     x_clone = x.clone().detach().requires_grad_(True)
     with set_batch_invariant_mode(False):
         out_regular = layer_regular(x_clone)
 
     with set_batch_invariant_mode(True):
-        out_batch_invariant = layer_batch_invariant(x)
+        out_bik = layer_bik(x)
 
     # Check forward outputs are close
-    assert out_batch_invariant.shape == out_regular.shape
-    assert out_batch_invariant.dtype == out_regular.dtype
-    max_diff = (out_batch_invariant - out_regular).abs().max().item()
+    assert out_bik.shape == out_regular.shape
+    assert out_bik.dtype == out_regular.dtype
+    max_diff = (out_bik - out_regular).abs().max().item()
     assert max_diff < 1e-3, f"Forward output difference too large: {max_diff}"
 
     # Test backward pass
-    grad_output = torch.randn_like(out_batch_invariant)
+    grad_output = torch.randn_like(out_bik)
 
-    out_batch_invariant.backward(grad_output)
+    out_bik.backward(grad_output)
     out_regular.backward(grad_output.clone())
 
     # Check gradients are close
     grad_diff = (x.grad - x_clone.grad).abs().max().item()
     assert grad_diff < 1e-3, f"Input gradient difference too large: {grad_diff}"
 
-    weight_grad_diff = (layer_batch_invariant.weight.grad - layer_regular.weight.grad).abs().max().item()
+    weight_grad_diff = (layer_bik.weight.grad - layer_regular.weight.grad).abs().max().item()
     assert weight_grad_diff < 1e-3, f"Weight gradient difference too large: {weight_grad_diff}"
 
     Utils.destroy_model_parallel()
@@ -588,7 +588,7 @@ def test_te_layernorm_linear_parity():
     Utils.initialize_model_parallel(1, 1)
     model_parallel_cuda_manual_seed(123)
 
-    cfg_batch_invariant = TransformerConfig(
+    cfg_bik = TransformerConfig(
         num_layers=1,
         hidden_size=128,
         num_attention_heads=4,
@@ -617,11 +617,11 @@ def test_te_layernorm_linear_parity():
     )
 
     torch.manual_seed(321)
-    layer_batch_invariant = TELayerNormColumnParallelLinear(
-        input_size=cfg_batch_invariant.hidden_size,
+    layer_bik = TELayerNormColumnParallelLinear(
+        input_size=cfg_bik.hidden_size,
         output_size=256,
-        config=cfg_batch_invariant,
-        init_method=init_method_normal(cfg_batch_invariant.init_method_std),
+        config=cfg_bik,
+        init_method=init_method_normal(cfg_bik.init_method_std),
         gather_output=False,
         bias=True,
         skip_bias_add=False,
@@ -641,29 +641,29 @@ def test_te_layernorm_linear_parity():
     ).cuda()
 
     x = torch.randn(
-        48, cfg_batch_invariant.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        48, cfg_bik.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
     )
     x_clone = x.clone().detach().requires_grad_(True)
 
     with set_batch_invariant_mode(True):
-        out_batch_invariant, _ = layer_batch_invariant(x)
+        out_bik, _ = layer_bik(x)
 
     with set_batch_invariant_mode(False):
         out_regular, _ = layer_regular(x_clone)
 
-    assert out_batch_invariant.shape == out_regular.shape
-    max_diff = (out_batch_invariant - out_regular).abs().max().item()
+    assert out_bik.shape == out_regular.shape
+    max_diff = (out_bik - out_regular).abs().max().item()
     assert max_diff < 1e-3, f"Forward output difference too large: {max_diff}"
 
-    grad_output = torch.randn_like(out_batch_invariant)
+    grad_output = torch.randn_like(out_bik)
 
-    out_batch_invariant.backward(grad_output)
+    out_bik.backward(grad_output)
     out_regular.backward(grad_output.clone())
 
     grad_diff = (x.grad - x_clone.grad).abs().max().item()
     assert grad_diff < 1e-3, f"Input gradient difference too large: {grad_diff}"
 
-    weight_grad_diff = (layer_batch_invariant.weight.grad - layer_regular.weight.grad).abs().max().item()
+    weight_grad_diff = (layer_bik.weight.grad - layer_regular.weight.grad).abs().max().item()
     assert weight_grad_diff < 1e-3, f"Weight gradient difference too large: {weight_grad_diff}"
 
     Utils.destroy_model_parallel()
@@ -695,7 +695,7 @@ def _te_general_gemm(*args, **kwargs):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_batch_invariant_te_general_gemm_chunking_deterministic(dtype):
+def test_bik_te_general_gemm_chunking_deterministic(dtype):
     torch.manual_seed(123)
     M1, M2, K, N = 37, 23, 128, 128
     A1 = torch.randn(M1, K, **_device(dtype))
@@ -722,7 +722,7 @@ def test_batch_invariant_te_general_gemm_chunking_deterministic(dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_batch_invariant_te_general_gemm_numerical_parity(dtype):
+def test_bik_te_general_gemm_numerical_parity(dtype):
     torch.manual_seed(111)
     M, K, N = 64, 96, 96
     A = torch.randn(M, K, **_device(dtype))
@@ -732,6 +732,6 @@ def test_batch_invariant_te_general_gemm_numerical_parity(dtype):
 
     # Batch-invariant inside context
     with set_batch_invariant_mode(True):
-        C_batch_invariant = _te_general_gemm(A, B, out_dtype=dtype, layout="TN")[0]
+        C_bik = _te_general_gemm(A, B, out_dtype=dtype, layout="TN")[0]
 
-    torch.testing.assert_close(C_batch_invariant, C_ref, **_tols(dtype))
+    torch.testing.assert_close(C_bik, C_ref, **_tols(dtype))

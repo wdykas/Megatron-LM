@@ -77,7 +77,7 @@ def _configure_flash_attention_env():
     os.environ['NVTE_UNFUSED_ATTN'] = '0'
 
 
-def _build_flash_attn_batch_invariant_model(seq_len: int, vocab_size: int, hidden_size: int = 128) -> GPTModel:
+def _build_flash_attn_bik_model(seq_len: int, vocab_size: int, hidden_size: int = 128) -> GPTModel:
     cfg = TransformerConfig(
         num_layers=2,
         hidden_size=hidden_size,
@@ -136,7 +136,7 @@ class TestGPTModelBatchInvariant:
 
     def test_forward_batch_invariant(self):
         _configure_flash_attention_env()
-        model = _build_flash_attn_batch_invariant_model(self.sequence_length, self.vocab_size)
+        model = _build_flash_attn_bik_model(self.sequence_length, self.vocab_size)
         model = Float16Module(model.config, model).eval()
         batch_size = 6
         splits = [2, 1, 3]
@@ -180,7 +180,7 @@ class TestGPTModelBatchInvariant:
         _configure_flash_attention_env()
         seq_len = 48
         vocab_size = 96
-        base_model = _build_flash_attn_batch_invariant_model(seq_len, vocab_size)
+        base_model = _build_flash_attn_bik_model(seq_len, vocab_size)
         inference_model = Float16Module(base_model.config, base_model).cuda().eval()
 
         ctx = DynamicInferenceContext(
@@ -257,7 +257,7 @@ class TestGPTModelBatchInvariant:
         _configure_flash_attention_env()
         seq_len = 48
         vocab_size = 96
-        base_model = _build_flash_attn_batch_invariant_model(seq_len, vocab_size)
+        base_model = _build_flash_attn_bik_model(seq_len, vocab_size)
         inference_model = Float16Module(base_model.config, base_model).cuda().eval()
 
         def _run_engine_with_order(order):

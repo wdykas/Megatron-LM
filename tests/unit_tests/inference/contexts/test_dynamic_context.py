@@ -200,6 +200,7 @@ class TestDynamicContext:
             num_attention_heads=2,
             batch_invariant_mode=True,
             num_moe_experts=4,
+            moe_token_dispatcher_type="alltoall",
             transformer_impl="transformer_engine",
             inference_moe_token_dispatcher_type="nvls",
             attention_backend=AttnBackend.flash,

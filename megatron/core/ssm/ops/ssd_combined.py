@@ -154,8 +154,10 @@ def _mamba_chunk_scan_combined_fwd(
 
     final_states = states[last_chunk_indices]
     if intermediate_chunk_indices is not None:
-        return final_states, states[intermediate_chunk_indices]
-    return final_states
+        intermediate_states = states[intermediate_chunk_indices]
+        return final_states, intermediate_states
+    else:
+        return final_states
 
 
 def mamba_chunk_scan_decode_rows(
@@ -261,7 +263,6 @@ def mamba_chunk_scan_decode_rows(
         dst_states=initial_states.flatten(-2),
         dst_indices=slots,
         dst_flags=chunk_flags,
-        always_new_seq=True,
     )
 
 

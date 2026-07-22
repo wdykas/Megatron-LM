@@ -61,7 +61,7 @@ _LOGGER = logging.getLogger(__name__)
 def _matmul_launch_metadata(
     grid: Callable[..., Any], kernel: Any, args: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """Build launch metadata for Triton matmul kernels used in batch-invariant matmul."""
+    """Build launch metadata for Triton matmul kernels used in BIK matmul."""
     ret = {}
     m, n, k = args["M"], args["N"], args["K"]
     ret["name"] = f"{kernel.name} [M={m}, N={n}, K={k}]"
@@ -331,6 +331,7 @@ def log_softmax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
     Args:
         input: Input tensor
         dim: Dimension along which to compute log_softmax (only -1 or last dim supported)
+    >> Stashed changes
     Returns:
         Tensor with log_softmax applied along the specified dimension
     """
@@ -496,8 +497,8 @@ def mean_dim(
     return output
 
 
-# Kernel backend for mm / addmm. Selected at `enable_batch_invariant_mode` time
-# from `TransformerConfig.batch_invariant_kernel_backend`.
+# Kernel backend for mm / addmm. Production uses DeepGEMM; the Triton option
+# remains available to tests that exercise non-bf16 operators.
 #   "deepgemm" (default): DeepGEMM `bf16_gemm_nn` — bitwise-identical to
 #       `torch.mm`. Requires bf16 CUDA inputs on Hopper/Blackwell.
 #   "triton": batch-invariant Triton `matmul_persistent` — works on any CUDA
@@ -514,7 +515,7 @@ def _mm_deepgemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """
     if a.dtype != torch.bfloat16:
         raise RuntimeError(
-            f"batch_invariant_kernel_backend='deepgemm' requires bf16 inputs "
+            f"The DeepGEMM batch-invariant backend requires bf16 inputs "
             f"(got {a.dtype}); use backend='triton' for fp16/fp32."
         )
     M = a.shape[0]
@@ -1131,7 +1132,7 @@ def _extract_te_gemm_args(args: tuple, kwargs: Dict[str, Any]):
     return A, B, out_dtype, layout, out, bias, grad
 
 
-def _is_supported_dtype_for_batch_invariant(t: torch.dtype) -> bool:
+def _is_supported_dtype_for_bik(t: torch.dtype) -> bool:
     return t in {torch.float16, torch.bfloat16, torch.float32}
 
 
@@ -1273,7 +1274,7 @@ def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
         raise ValueError("Batch-invariant GEMM requires A and B tensors.")
     if (not A.is_cuda) or (not B.is_cuda):
         raise RuntimeError("Batch-invariant GEMM requires CUDA tensors.")
-    if not _is_supported_dtype_for_batch_invariant(A.dtype) or not _is_supported_dtype_for_batch_invariant(B.dtype):
+    if not _is_supported_dtype_for_bik(A.dtype) or not _is_supported_dtype_for_bik(B.dtype):
         raise RuntimeError(f"Unsupported dtype for batch-invariant GEMM: {A.dtype}, {B.dtype}")
 
     # Disallow GEMM-comm overlap in batch-invariant mode
@@ -1311,7 +1312,7 @@ class BatchInvariantRMSNormFn(torch.autograd.Function):
         """
         if not x.is_cuda:
             raise RuntimeError("Batch-invariant RMSNorm requires CUDA tensors.")
-        if not _is_supported_dtype_for_batch_invariant(x.dtype):
+        if not _is_supported_dtype_for_bik(x.dtype):
             raise RuntimeError(f"Unsupported dtype for batch-invariant RMSNorm: {x.dtype}")
         weight_eff = weight + 1.0 if zero_centered_gamma else weight
 
@@ -1625,27 +1626,12 @@ def grouped_gemm_batch_invariant(
     a: torch.Tensor,
     b: torch.Tensor,
     *,
-    m_indices: Optional[torch.Tensor] = None,
-    offs: Optional[torch.Tensor] = None,
-    m_total: Optional[int] = None,
-    already_aligned: bool = False,
+    offs: torch.Tensor,
+    m_total: int,
 ) -> torch.Tensor:
-    """Public functional API for batch-invariant bf16 grouped GEMM.
-
-    Either pass m_indices directly, or pass (offs, m_total) and we'll build the
-    indices via _offs_to_m_indices.
-    """
-    if m_indices is None:
-        assert (
-            offs is not None and m_total is not None
-        ), "grouped_gemm_batch_invariant: either m_indices or (offs, m_total) required"
-        m_indices = _offs_to_m_indices(offs, m_total)
-    a = a.contiguous()
-    b = b.contiguous()
-    m_indices = m_indices.contiguous()
-    if already_aligned:
-        return _bf16_grouped_gemm_aligned_contiguous(a, b, m_indices)
-    return _bf16_grouped_gemm_contiguous(a, b, m_indices)
+    """Run the graph-safe grouped GEMM over pre-aligned inference expert blocks."""
+    m_indices = _offs_to_m_indices(offs, m_total).contiguous()
+    return _bf16_grouped_gemm_aligned_contiguous(a.contiguous(), b.contiguous(), m_indices)
 
 
 def _te_rmsnorm_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
@@ -1680,12 +1666,12 @@ def enable_batch_invariant_mode(backend: str = "deepgemm"):
         return
     if backend not in _BATCH_INVARIANT_BACKENDS:
         raise ValueError(
-            f"Unknown batch_invariant_kernel_backend={backend!r}; "
+            f"Unknown batch-invariant backend {backend!r}; "
             f"expected one of {_BATCH_INVARIANT_BACKENDS}."
         )
     if backend == "deepgemm" and not HAVE_DEEPGEMM_BF16:
         raise RuntimeError(
-            "batch_invariant_kernel_backend='deepgemm' requires DeepGEMM with "
+            "The DeepGEMM batch-invariant backend requires DeepGEMM with "
             "bf16 bindings. Install DeepGEMM or use backend='triton'."
         )
     _BATCH_INVARIANT_BACKEND = backend
@@ -1847,9 +1833,7 @@ def set_batch_invariant_mode(enabled: bool = True, backend: Optional[str] = None
     When `enabled` is True, batch-invariant kernels are enabled for the duration of
     the context; when False, they are disabled for the duration. This implementation
     is re-entrant and correctly restores the previous state even under nesting.
-    Production initialization passes TransformerConfig.batch_invariant_kernel_backend
-    explicitly; the helper default remains "triton" for tests that exercise
-    non-bf16 operators.
+    The helper default remains "triton" for tests that exercise non-bf16 operators.
     """
     global _batch_invariant_MODE, _batch_invariant_LIB
     # Save the previous on/off state so we can correctly restore it, even under

@@ -60,8 +60,6 @@ def _state_passing_fwd_kernel(
     # Meta-parameters
     HAS_INITSTATES: tl.constexpr,
     HAS_DST_STATES: tl.constexpr,
-    ALWAYS_NEW_SEQ: tl.constexpr,
-    STORE_OUTPUT: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid_h = tl.program_id(axis=1)
@@ -89,12 +87,13 @@ def _state_passing_fwd_kernel(
         new_states = tl.load(states_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
         dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
         seq_idx = tl.load(seq_idx_ptr + c * stride_seq_idx_chunk)
-        is_new_seq = prev_seq_idx != seq_idx
-        if ALWAYS_NEW_SEQ:
+        if HAS_DST_STATES:
             # Decode mode: every chunk is its own sequence. seq_idx carries
             # slot ids that can repeat on padding lanes, so change detection
             # can't be trusted.
             is_new_seq = True
+        else:
+            is_new_seq = prev_seq_idx != seq_idx
         # we have started a new sequence
         if is_new_seq:
             if HAS_INITSTATES:
@@ -110,7 +109,7 @@ def _state_passing_fwd_kernel(
 
         prev_seq_idx = seq_idx
         states = tl.exp(dA_cs) * states + new_states
-        if STORE_OUTPUT:
+        if not HAS_DST_STATES:
             tl.store(out_ptrs, states, mask=offs_m < dim)
 
         if HAS_DST_STATES:
@@ -143,7 +142,6 @@ def _state_passing_fwd(
     dst_states=None,
     dst_indices=None,
     dst_flags=None,
-    always_new_seq=False,
 ):
     """
     dst_states/dst_indices/dst_flags (all-or-none) enable decode mode: flagged
@@ -155,6 +153,9 @@ def _state_passing_fwd(
     assert dA_cumsum.shape == (nheads, nchunks, chunk_size)
     seqlen = seq_idx.shape[-1]
     has_dst = dst_states is not None
+    assert (dst_indices is not None) == has_dst and (dst_flags is not None) == has_dst, (
+        "dst_states, dst_indices, and dst_flags must be provided together"
+    )
     if not has_dst:
         out_dtype = states.dtype if out_dtype is None else out_dtype
         out = torch.empty((nchunks, nheads, dim), device=states.device, dtype=out_dtype)
@@ -169,7 +170,6 @@ def _state_passing_fwd(
         else (0, 0, 0)
     )
     if has_dst:
-        assert dst_indices is not None and dst_flags is not None
         assert dst_states.shape[1] == nheads and dst_states.shape[2] == dim
     dst_strides = (
         (dst_states.stride(0), dst_states.stride(1), dst_states.stride(2))
@@ -211,7 +211,5 @@ def _state_passing_fwd(
             stride_dst_dim=dst_strides[2],
             HAS_INITSTATES=initial_states is not None,
             HAS_DST_STATES=has_dst,
-            ALWAYS_NEW_SEQ=always_new_seq,
-            STORE_OUTPUT=not has_dst,
         )
     return None if has_dst else out

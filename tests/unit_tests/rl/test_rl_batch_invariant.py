@@ -1,5 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import os
 
+import pytest
 import torch
 
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
@@ -20,66 +22,15 @@ def test_selective_log_softmax_batch_invariant():
     perm = torch.randperm(B, device=device)
 
     with set_batch_invariant_mode(True):
-        batch_invariant_logps = selective_log_softmax(logits, labels)  # [B, S]
-        batch_invariant_logps_perm = selective_log_softmax(
+        bik_logps = selective_log_softmax(logits, labels)  # [B, S]
+        bik_logps_perm = selective_log_softmax(
             logits[perm], labels[perm]
         )  # [B, S] corresponding to permuted batch
 
     # Undo the permutation on the permuted outputs and compare elementwise.
     # If the kernel is batch invariant, each example's output should not depend
     # on its position in the batch.
-    assert torch.equal(batch_invariant_logps, batch_invariant_logps_perm[perm.argsort()])
-
-
-def test_moe_unpermute_batch_invariant_branch_is_token_local():
-    from megatron.core.transformer.moe.moe_utils import unpermute
-
-    hidden = 8
-    sorted_indices_a = torch.tensor([1, 1], device="cuda", dtype=torch.int64)
-    routing_map_a = torch.tensor([[False, False], [True, True]], device="cuda")
-    tokens_a = torch.ones(2, hidden, device="cuda", dtype=torch.bfloat16)
-
-    sorted_indices_b = torch.tensor([0, 1, 1], device="cuda", dtype=torch.int64)
-    routing_map_b = torch.tensor([[True, False], [True, True]], device="cuda")
-    tokens_b = torch.ones(3, hidden, device="cuda", dtype=torch.bfloat16)
-    tokens_b[0] = 1e20
-
-    with set_batch_invariant_mode(True):
-        out_a = unpermute(tokens_a, sorted_indices_a, (2, hidden), routing_map=routing_map_a)
-        out_b = unpermute(tokens_b, sorted_indices_b, (2, hidden), routing_map=routing_map_b)
-
-    expected = torch.full((hidden,), 2.0, device="cuda", dtype=torch.bfloat16)
-    torch.testing.assert_close(out_a[1], expected, rtol=0.0, atol=0.0)
-    torch.testing.assert_close(out_b[1], expected, rtol=0.0, atol=0.0)
-
-
-def test_moe_unpermute_batch_invariant_training_tree_matches_rank_partials():
-    from megatron.core import parallel_state
-    from megatron.core.transformer.moe.moe_utils import unpermute
-
-    hidden = 4
-    tokens = torch.tensor(
-        [[1e20], [1.0], [-1e20], [1.0]], device="cuda", dtype=torch.float32
-    ).expand(4, hidden)
-    sorted_indices = torch.zeros(4, device="cuda", dtype=torch.int64)
-    routing_map = torch.ones(1, 4, device="cuda", dtype=torch.bool)
-
-    parallel_state.set_expert_model_parallel_world_size(2)
-    try:
-        with set_batch_invariant_mode(True):
-            out = unpermute(
-                tokens,
-                sorted_indices,
-                (1, hidden),
-                routing_map=routing_map,
-                batch_invariant_ep_rank_tree=True,
-            )
-    finally:
-        parallel_state.set_expert_model_parallel_world_size(None)
-
-    # Rank-partial tree: (1e20 + 1) + (-1e20 + 1) == 0 in fp32.
-    # A flat expert-order tree would produce 1.0 for this pattern.
-    torch.testing.assert_close(out[0], torch.zeros(hidden, device="cuda"), rtol=0.0, atol=0.0)
+    assert torch.equal(bik_logps, bik_logps_perm[perm.argsort()])
 
 
 def test_moe_unpermute_batch_invariant_inverse_map_rank_tree():
@@ -104,7 +55,6 @@ def test_moe_unpermute_batch_invariant_inverse_map_rank_tree():
                 sorted_indices,
                 (1, hidden),
                 routing_map=routing_map,
-                batch_invariant_ep_rank_tree=True,
                 batch_invariant_inverse_map=inverse_map,
             )
     finally:
@@ -138,7 +88,6 @@ def test_moe_batch_invariant_permute_unpermute_cuda_graph_non_padded():
             sorted_indices,
             tokens.shape,
             routing_map=routing_map,
-            batch_invariant_ep_rank_tree=True,
             batch_invariant_inverse_map=inverse_map,
         )
 

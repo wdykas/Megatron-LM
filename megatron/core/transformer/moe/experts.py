@@ -282,9 +282,16 @@ class TEGroupedMLP(MegatronModule):
         if self.config.batch_invariant_mode:
             self._build_contiguous_weight_buffers()
 
+    @torch.inference_mode(False)  # Lazy inference construction must create normal tensors.
     @torch.no_grad()
     def _build_contiguous_weight_buffers(self):
-        """Build canonical contiguous expert-weight buffers. Idempotent."""
+        """Build canonical stacked weights while preserving TE Parameter objects.
+
+        Each per-expert Parameter is redirected to its slice of the registered
+        buffer, so training updates and inference grouped GEMMs share storage.
+        The method is idempotent because inference may call it lazily after the
+        batch-invariant training path already built the buffers.
+        """
         for linear, buf_name in (
             (self.linear_fc1, '_fc1_weight'),
             (self.linear_fc2, '_fc2_weight'),
@@ -835,27 +842,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
         self._nvls_dispatcher = config.inference_moe_token_dispatcher_type == 'nvls'
 
-        # Batch-invariant mode only instruments the TORCH backend
-        # (mcore_fused_moe → bf16 grouped GEMM → grouped_gemm_batch_invariant).
-        # FlashInfer and vLLM backends use their own Triton/atomic_add combine
-        # kernels that we do not intercept.
-        if getattr(config, "batch_invariant_mode", False):
-            assert (
-                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH
-            ), (
-                f"batch_invariant_mode requires "
-                f"--inference-grouped-gemm-backend=torch (batch-invariant mode is "
-                f"only wired into the TORCH backend); got "
-                f"{self.inference_grouped_gemm_backend}."
-            )
-            assert (
-                config.expert_model_parallel_size == 1 or self._nvls_dispatcher
-            ), (
-                "batch_invariant_mode with inference-optimized MoE and expert parallelism "
-                "requires inference_moe_token_dispatcher_type='nvls' so the combine uses "
-                "the ordered symmetric-memory rank reduction."
-            )
-
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
         assert (
@@ -889,7 +875,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         Note: this creates a contiguous copy since per-expert MXFP8Tensor attributes
         are not contiguous across experts. This is a one-time cost at first forward.
 
-        Unlike _build_concatenated_weights, this does not create nn.Parameter views
+        Unlike _build_contiguous_weight_buffers, this does not create nn.Parameter views
         back into the buffer — MXFP8 weights are not nn.Parameters (they are plain
         MXFP8Tensor attributes set by quantize_model_to_mxfp8). This path is only
         intended for non-colocated inference.
@@ -918,7 +904,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             setattr(self, buf_name, MXFP8Tensor(data=stacked_data, scale=stacked_scale))
 
             # Redirect per-expert weight .data to views into the stacked buffer,
-            # mirroring _build_concatenated_weights. This frees the original
+            # mirroring _build_contiguous_weight_buffers. This frees the original
             # allocations while keeping the Parameter objects intact.
             for i in range(self.num_local_experts):
                 w = getattr(linear, f'weight{i}')
@@ -928,23 +914,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 elif hasattr(w, 'data') and isinstance(w.data, MXFP8Tensor):
                     w.data.data = stacked_data[i]
                     w.data.scale = stacked_scale[i]
-
-    @torch.inference_mode(False)  # needed for non-colocated inference.
-    def _build_concatenated_weights(self):
-        """Create big contiguous weight tensors that share storage with TE's per-expert parameters.
-
-        Creates _fc1_weight and _fc2_weight as contiguous tensors of shape
-        [num_experts, out_features, in_features]. Instead of replacing TE's parameters
-        (which breaks TE's internal bookkeeping), we redirect each parameter's .data
-        to be a view into the contiguous buffer. The nn.Parameter objects themselves
-        remain untouched in TE's module, preserving FP8 scaling state, etc.
-
-        This allows:
-        - TE's forward to work correctly (same Parameter objects, same internal state)
-        - Training updates to flow through (param.data is a view into the big tensor)
-        - torch.nn.functional.grouped_mm / FlashInfer to use the big tensor directly
-        """
-        self._build_contiguous_weight_buffers()
 
     def _flashinfer_forward(self, hidden_states, routing_map, probs):
         """FlashInfer fused MoE kernel for CUDA-graphed inference iterations."""
@@ -966,28 +935,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
         return output, None
 
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
-        """Torch grouped_mm fused MoE forward via mcore_fused_moe.
+        """Torch grouped-MoE forward, including the batch-invariant path.
 
-        Batch-invariant MoE is intentionally routed through the NVLS dispatcher
-        for EP>1. The invariant contract is:
-
-        1. Dispatch is data movement only. NVLS AllGatherV gathers hidden
-           states, routing_map, and probs into fixed symmetric buffers; it does
-           not perform floating-point reductions whose order could vary with the
-           dynamic batch.
-        2. Expert GEMMs use the DeepGEMM-backed batch-invariant grouped-GEMM
-           path. Expert token blocks are padded to DeepGEMM's required alignment
-           before the captured path, so a token's GEMM result does not depend on
-           how many neighboring tokens routed to the same or different experts.
-        3. Local unpermute reduces each token in fp32 by increasing local-expert
-           id. It never uses atomic_add or a global segmented cumsum, so other
-           tokens in the dynamic batch cannot affect the token's add tree.
-        4. Cross-rank combine uses the symmetric RSV buffer for peer visibility,
-           then token_combine explicitly loads rank 0, rank 1, ... in fp32. It
-           does not use multimem.ld_reduce under batch-invariant mode.
-
-        Dynamic batching therefore changes only valid-token metadata and masked
-        rows, not the math path used by any valid token.
+        BIK uses aligned DeepGEMM, token-local expert-order unpermute, and an
+        explicit rank-order NVLS combine when expert parallelism is enabled.
         """
         local_expert_start = self.ep_group.rank() * self.num_local_experts
         output = mcore_fused_moe(
@@ -1061,7 +1012,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             ):
                 self._build_concatenated_mxfp8_weights()
             else:
-                self._build_concatenated_weights()
+                self._build_contiguous_weight_buffers()
             self._concatenated_weights_built = True
 
         if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:

@@ -19,8 +19,6 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     _bf16_grouped_gemm_contiguous,
     _m_splits_to_m_indices,
     _offs_to_m_indices,
-    grouped_gemm_batch_invariant,
-    grouped_gemm_batch_invariant_alignment,
     set_batch_invariant_mode,
 )
 
@@ -169,6 +167,7 @@ def _build_moe_layer(hidden_size=64, ffn=128, num_experts=4, topk=1):
         moe_ffn_hidden_size=ffn,
         moe_grouped_gemm=True,
         moe_router_topk=topk,
+        moe_token_dispatcher_type="alltoall",
         moe_router_load_balancing_type="sinkhorn",
         gated_linear_unit=False,
         activation_func=F.gelu,

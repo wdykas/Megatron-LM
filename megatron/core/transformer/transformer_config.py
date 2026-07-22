@@ -1347,15 +1347,20 @@ class TransformerConfig(ModelParallelConfig):
                     "Set inference_grouped_gemm_backend to 'torch' for MXFP8."
                 )
 
-            if (
-                self.batch_invariant_mode
-                and self.expert_model_parallel_size > 1
-                and self.inference_moe_token_dispatcher_type != "nvls"
-            ):
-                raise ValueError(
-                    "batch_invariant_mode with inference-optimized MoE and expert parallelism "
-                    "requires inference_moe_token_dispatcher_type='nvls'."
-                )
+            if self.batch_invariant_mode:
+                if self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.TORCH:
+                    raise ValueError(
+                        "batch_invariant_mode requires "
+                        "inference_grouped_gemm_backend='torch'."
+                    )
+                if (
+                    self.expert_model_parallel_size > 1
+                    and self.inference_moe_token_dispatcher_type != "nvls"
+                ):
+                    raise ValueError(
+                        "batch_invariant_mode with inference-optimized MoE and expert "
+                        "parallelism requires inference_moe_token_dispatcher_type='nvls'."
+                    )
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")
@@ -2495,6 +2500,11 @@ class TransformerConfig(ModelParallelConfig):
                     HAVE_DEEPGEMM_BF16,
                 )
 
+                if self.transformer_impl != "inference_optimized":
+                    assert self.moe_token_dispatcher_type == "alltoall", (
+                        "Batch-invariant MoE training requires "
+                        "moe_token_dispatcher_type='alltoall'."
+                    )
                 assert HAVE_DEEPGEMM_BF16, (
                     "batch_invariant_mode=True with MoE requires DeepGEMM with bf16 "
                     "grouped-GEMM bindings (m_grouped_bf16_gemm_nt_contiguous). "

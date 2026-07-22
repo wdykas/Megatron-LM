@@ -239,6 +239,7 @@ class TestNCCLAllGatherDispatcher:
             self._make_dispatcher(
                 batch_invariant_mode=True,
                 attention_backend=AttnBackend.flash,
+                inference_grouped_gemm_backend="torch",
                 inference_moe_token_dispatcher_type="nccl",
             )
 

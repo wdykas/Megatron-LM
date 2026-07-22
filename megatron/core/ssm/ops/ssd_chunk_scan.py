@@ -134,8 +134,7 @@ def _chunk_scan_fwd_kernel(
     HAS_D: tl.constexpr,
     D_HAS_HDIM: tl.constexpr,
     HAS_Z: tl.constexpr,
-    HAS_TARGET_ROWS: tl.constexpr,
-    HAS_CHUNK_STARTS: tl.constexpr,
+    DECODE_MODE: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -148,7 +147,7 @@ def _chunk_scan_fwd_kernel(
     num_pid_n = tl.cdiv(hdim, BLOCK_SIZE_N)
     pid_m = tl.program_id(axis=0) // num_pid_n
     pid_n = tl.program_id(axis=0) % num_pid_n
-    if HAS_TARGET_ROWS:
+    if DECODE_MODE:
         # Decode mode: only row target_rows[pid_c] of this chunk's output is
         # consumed, so skip every M-block that doesn't contain it. The
         # surviving block runs the same instructions as the ungated kernel.
@@ -156,7 +155,7 @@ def _chunk_scan_fwd_kernel(
             return
     cb_ptr += pid_c * stride_cb_chunk + (pid_h // nheads_ngroups_ratio) * stride_cb_head
     chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)
-    if HAS_CHUNK_STARTS:
+    if DECODE_MODE:
         # Decode mode: fixed-length windows at caller-given buffer offsets.
         chunk_seqlen_end = chunk_seqlen_start + chunk_size
     else:
@@ -172,7 +171,7 @@ def _chunk_scan_fwd_kernel(
 
     seq_idx_ptr += pid_c * stride_seq_idx_chunk
     seq_idx = tl.load(seq_idx_ptr)
-    if HAS_CHUNK_STARTS:
+    if DECODE_MODE:
         # Decode mode: every chunk is its own sequence and seq_idx carries
         # the slot id into initial_states (which may be the engine's state
         # cache). Reading initial_states unconditionally means padding lanes
@@ -334,7 +333,7 @@ def _chunk_scan_fwd_kernel(
         ).to(tl.float32)
         acc *= z * tl.sigmoid(z)
 
-    if HAS_TARGET_ROWS:
+    if DECODE_MODE:
         # Store just the target row to a compact (nchunks, nheads, hdim)
         # output; nothing else is consumed downstream. Same acc values as
         # the full store, only the mask is narrower.
@@ -379,7 +378,11 @@ def _chunk_scan_fwd(
     chunk_starts=None,
 ):
     assert seq_idx is not None, "this implementation requires seq_idx"
-    if chunk_starts is not None:
+    decode_mode = chunk_starts is not None
+    assert (target_rows is not None) == decode_mode, (
+        "target_rows and chunk_starts must be provided together"
+    )
+    if decode_mode:
         cu_chunk_seqlens = chunk_starts
 
     seqlen, nheads, headdim = x.shape
@@ -470,8 +473,7 @@ def _chunk_scan_fwd(
         HAS_D=D is not None,
         D_HAS_HDIM=D.dim() == 2 if D is not None else True,
         HAS_Z=z is not None,
-        HAS_TARGET_ROWS=target_rows is not None,
-        HAS_CHUNK_STARTS=chunk_starts is not None,
+        DECODE_MODE=decode_mode,
         BLOCK_SIZE_DSTATE=max(triton.next_power_of_2(dstate), 16),
         IS_TRITON_22=TRITON_22,
         HAS_INITSTATES=initial_states is not None,

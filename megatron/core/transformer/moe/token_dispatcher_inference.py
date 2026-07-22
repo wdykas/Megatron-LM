@@ -126,11 +126,6 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
             runs_metadata_sync=runs_metadata_sync,
         )
         self.topk = config.moe_router_topk
-        if getattr(config, "batch_invariant_mode", False) and get_pg_size(self.ep_group) > 1:
-            raise AssertionError(
-                "batch_invariant_mode with inference-optimized MoE and expert parallelism "
-                "requires inference_moe_token_dispatcher_type='nvls'."
-            )
 
     @classmethod
     def allocate_buffers(cls) -> None:
@@ -252,8 +247,7 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         """Scatter-reduce expert outputs back to each EP rank.
 
         CG path: standard ReduceScatter (equal token counts guaranteed).
-        Non-CG path: expand compact output to padded layout, ReduceScatter,
-        truncate.
+        Non-CG path: expand compact output to padded layout, ReduceScatter, truncate.
 
         Args:
             hidden_states: [total_tokens, hidden_dim] expert outputs.

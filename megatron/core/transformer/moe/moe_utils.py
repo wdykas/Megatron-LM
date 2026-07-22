@@ -471,7 +471,6 @@ def unpermute(
     fused: bool = False,
     drop_and_pad: bool = False,
     pad_offsets: Optional[torch.Tensor] = None,
-    batch_invariant_ep_rank_tree: bool = False,
     batch_invariant_inverse_map: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
@@ -498,9 +497,6 @@ def unpermute(
             Tensor of per-expert cumulative padding offsets used to remove padding added
             during permutation. This is the fourth output of `moe_permute_and_pad_with_probs`
             and is required when unpermuting padded outputs. Defaults to None.
-        batch_invariant_ep_rank_tree (bool, optional): In batch-invariant mode, first reduce
-            global expert shards into per-EP-rank partials, then add ranks in order. The
-            AllToAll training combine path opts into this to match NVLS inference.
         batch_invariant_inverse_map (torch.Tensor, optional): Fixed-shape
             `[2, num_tokens, topk]` map from token/top-k slot to permuted row and
             global expert id. Used by BIK CUDA graph paths.
@@ -529,12 +525,14 @@ def unpermute(
 
     if batch_invariant_mode:
         assert routing_map is not None, "batch-invariant MoE unpermute requires routing_map"
+        assert batch_invariant_inverse_map is not None, (
+            "batch-invariant MoE unpermute requires the AllToAll inverse map"
+        )
         return batch_invariant_unpermute(
             permuted_tokens,
             restore_shape,
             probs=probs,
-            routing_map=routing_map,
-            ep_rank_tree=batch_invariant_ep_rank_tree,
+            num_experts=routing_map.size(1),
             inverse_map=batch_invariant_inverse_map,
         )
 
@@ -572,6 +570,13 @@ def unpermute(
         restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
     )
     if torch.are_deterministic_algorithms_enabled():
+        # Use index_add which is deterministic when deterministic algorithms are enabled
+        # and is CUDA graph compatible
+        output_tokens = torch.zeros(
+            restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
+        )
+        # index_add is deterministic when torch.use_deterministic_algorithms(True) is set
+        # and is CUDA graph compatible unlike scatter_add
         output_tokens.index_add_(0, sorted_indices, permuted_tokens)
     else:
         # Scatter add the permuted_input back to the original positions

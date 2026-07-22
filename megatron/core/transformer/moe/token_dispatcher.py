@@ -871,7 +871,6 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             routing_map=self.routing_map,
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
-            batch_invariant_ep_rank_tree=self.ep_size > 1,
             batch_invariant_inverse_map=self.batch_invariant_inverse_permutation_mapping,
         )
 

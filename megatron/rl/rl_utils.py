@@ -721,8 +721,8 @@ def selective_log_softmax(logits, index):
         `torch.Tensor`:
             Gathered log probabilities with the same shape as `index`.
     """
-    use_batch_invariant_logsoftmax = is_batch_invariant_mode_enabled()
-    if logits.dtype in [torch.float32, torch.float64] and not use_batch_invariant_logsoftmax:
+    use_bik_logsoftmax = is_batch_invariant_mode_enabled()
+    if logits.dtype in [torch.float32, torch.float64] and not use_bik_logsoftmax:
         selected_logits = torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
         # loop to reduce peak mem consumption
         logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])
@@ -1978,8 +1978,7 @@ def megatron_rl_inference_mode(
     # Use local CUDA graphs during rollout inference. An empty module list preserves
     # full-layer capture when the configured inference scope is layer.
     model[0].config.cuda_graph_modules = []
-    if args.cuda_graph_impl != "none":
-        model[0].config.cuda_graph_impl = "local"
+    model[0].config.cuda_graph_impl = "local"
     model[0].config.inference_cuda_graph_scope = args.inference_cuda_graph_scope
 
     # If we get a lower precision wrapper, we go one object deeper.
