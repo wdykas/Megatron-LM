@@ -52,14 +52,11 @@ class BatchInvariantDecodeBuffers:
         """Write sink for inactive lanes (the buffers' extra last row)."""
         return self.num_buffered.shape[0] - 1
 
-
-def _decode_slots(
-    bufs: BatchInvariantDecodeBuffers, batch_indices: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Map inactive lanes to the buffers' extra write-sink row."""
-    slots = batch_indices.to(torch.long)
-    is_active = slots >= 0
-    return slots.masked_fill(~is_active, bufs.trash_row), is_active
+    def map_slots(self, batch_indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Map inactive lanes to the trash row."""
+        slots = batch_indices.to(torch.long)
+        is_active = slots >= 0
+        return slots.masked_fill(~is_active, self.trash_row), is_active
 
 
 def seed_batch_invariant_decode_buffers(
@@ -84,7 +81,7 @@ def seed_batch_invariant_decode_buffers(
 
     # Redirect inactive lanes (batch_indices < 0) to the trash row so all
     # writes below are unconditional.
-    slots, is_active = _decode_slots(bufs, batch_indices[:num_seqs])
+    slots, is_active = bufs.map_slots(batch_indices[:num_seqs])
 
     # Fill unused rows with a valid token from the same sequence. The row-gated
     # kernel evaluates a full M-block, so finite padding prevents masked NaNs
@@ -144,7 +141,7 @@ def batch_invariant_decode_buffered_scan(
 
     # Redirect inactive lanes (batch_indices < 0) to the trash row so the
     # buffer writes below are unconditional.
-    slots, is_active = _decode_slots(bufs, batch_indices)
+    slots, is_active = bufs.map_slots(batch_indices)
     # ssm_state is engine-owned and has no trash row: clamp for reads. Its
     # only writes happen in-kernel for crossing slots, which never alias.
     state_slots = slots.clamp(max=bufs.trash_row - 1)
