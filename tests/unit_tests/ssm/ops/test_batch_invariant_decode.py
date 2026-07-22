@@ -95,7 +95,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
     def _seed_from_prefill(self, bufs, x, dt, B, C, prefill_len, slot, max_batch):
         """Run the prefill through the reference scan, store its ssm_state at
         the slot, and seed the batch-invariant buffer with the partial-chunk tail."""
-        # Production BIK prefill keeps ssm_state at a full Mamba chunk
+        # Production batch-invariant prefill keeps ssm_state at a full Mamba chunk
         # boundary. Short prefills therefore keep the zero initial boundary;
         # longer prefills store the largest chunk-aligned prefix state.
         ssm_state = torch.zeros(
@@ -229,7 +229,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
                 )
 
     def test_dynamic_prefill_uses_boundary_state_not_prompt_end_state(self):
-        """Production prefill returns the prompt-end state too, but BIK decode
+        """Production prefill returns the prompt-end state too, but batch-invariant decode
         must keep the cache at the last full chunk boundary and put the tail in
         the replay buffer."""
         max_batch, slot = 4, 1

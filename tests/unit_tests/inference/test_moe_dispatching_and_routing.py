@@ -231,9 +231,11 @@ class TestNCCLAllGatherDispatcher:
         assert dispatcher.ep_size == Utils.world_size
 
     def test_init_rejects_batch_invariant_ep(self):
-        """MoE BIK on the inference EP path is NVLS-only on this branch."""
+        """Batch-invariant MoE on the inference EP path is NVLS-only on this branch."""
         if Utils.world_size == 1:
-            pytest.skip("NCCL BIK rejection is only relevant with expert parallelism.")
+            pytest.skip(
+                "NCCL batch-invariant rejection is only relevant with expert parallelism."
+            )
 
         with pytest.raises(ValueError, match="requires inference_moe_token_dispatcher_type"):
             self._make_dispatcher(
@@ -460,7 +462,7 @@ class TestNVLSAllGatherVDispatcher:
         """Batch-invariant mode should use ordered peer loads on NVLS dispatcher.
 
         The graph path still writes local partials into the symmetric RSV buffer,
-        but the combine must not use multimem.ld_reduce under BIK.
+        but the combine must not use multimem.ld_reduce in batch-invariant mode.
         """
         from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
             set_batch_invariant_mode,
@@ -540,7 +542,7 @@ class TestNVLSAllGatherVDispatcher:
         torch.testing.assert_close(graph_combined, expected_combined, atol=0, rtol=0)
 
     def test_cuda_graph_batch_invariant_moe_layer_uses_ordered_rsv(self, monkeypatch):
-        """A real inference MoE layer should use ordered RSV combine under BIK.
+        """A real inference MoE layer should use ordered RSV combine in batch-invariant mode.
 
         This catches the production branch in InferenceGroupedMLP: mcore_fused_moe
         writes deterministic local partials into the symmetric RSV buffer, then

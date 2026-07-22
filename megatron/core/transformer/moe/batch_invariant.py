@@ -14,7 +14,7 @@ def build_inverse_permutation_map(
     sorted_indices: torch.Tensor,
     num_out_tokens: int,
 ) -> torch.Tensor:
-    """Build token/top-k -> permuted-row and expert-id map for BIK unpermute.
+    """Build token/top-k -> permuted-row and expert-id map for batch-invariant unpermute.
 
     The regular permutation map is row -> token. Batch-invariant unpermute needs
     the inverse ownership model so each output token can read its routed rows and

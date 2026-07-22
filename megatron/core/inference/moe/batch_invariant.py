@@ -43,7 +43,7 @@ def grouped_mm(x_bf16: torch.Tensor, weight: torch.Tensor, offs: torch.Tensor) -
 
 
 def grouped_mm_alignment() -> int:
-    """Per-expert row alignment required by the BIK grouped GEMM."""
+    """Per-expert row alignment required by the batch-invariant grouped GEMM."""
     return grouped_gemm_batch_invariant_alignment()
 
 

@@ -349,7 +349,7 @@ def permute(
                                                     actual token counts per expert.
         align_size (int, optional): The alignment size for the input tensor for fp8 or fp4.
         return_batch_invariant_inverse_map (bool, optional): Return a fixed-shape
-            BIK inverse map in the `pad_offsets` slot for graph-safe unpermute.
+            batch-invariant inverse map in the `pad_offsets` slot for graph-safe unpermute.
 
     Returns:
         Tuple[
@@ -499,7 +499,7 @@ def unpermute(
             and is required when unpermuting padded outputs. Defaults to None.
         batch_invariant_inverse_map (torch.Tensor, optional): Fixed-shape
             `[2, num_tokens, topk]` map from token/top-k slot to permuted row and
-            global expert id. Used by BIK CUDA graph paths.
+            global expert id. Used by batch-invariant CUDA graph paths.
 
     Returns:
         torch.Tensor: The tokens restored to their original order.

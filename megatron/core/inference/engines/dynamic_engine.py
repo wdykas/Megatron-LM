@@ -1591,7 +1591,9 @@ class DynamicInferenceEngine(AbstractEngine):
             # is_continuing_chunked_prefill is True if we are scheduling next
             # chunk of a existing chunked prefill request
             is_continuing_chunked_prefill = self.context.chunked_prefill_request_id >= 0
-            mamba_bik_prefill = self.context.batch_invariant_mode and self.context.is_hybrid_model
+            batch_invariant_mamba_prefill = (
+                self.context.batch_invariant_mode and self.context.is_hybrid_model
+            )
 
             # Check for conflicting block hashes.
             if prefix_caching_enabled and not is_continuing_chunked_prefill:
@@ -1653,7 +1655,7 @@ class DynamicInferenceEngine(AbstractEngine):
                                 pending_block_hashes.add(block_hash)
                     prefill_chunk_length = self.context.max_tokens - self.context.active_token_count
 
-                    if mamba_bik_prefill:
+                    if batch_invariant_mamba_prefill:
                         prefill_chunk_length = self._mamba_batch_invariant_prefill_chunk_length(
                             req, prefill_chunk_length
                         )
@@ -1667,7 +1669,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     # with the Flash Attention kernel.
                     # See https://github.com/Dao-AILab/flash-attention/issues/1537
                     if (
-                        not mamba_bik_prefill and remaining_len - prefill_chunk_length == 1
+                        not batch_invariant_mamba_prefill
+                        and remaining_len - prefill_chunk_length == 1
                     ):
                         if prefill_chunk_length > 1:
                             prefill_chunk_length -= 1
