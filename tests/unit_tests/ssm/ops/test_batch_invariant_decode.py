@@ -468,9 +468,9 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
                 f"multi-slot slot={slots[i]} prefill_len={plen}",
             )
 
-    def test_inactive_padding_lanes(self):
-        """batch_indices mixing -1 padding lanes with active slot 0 (the CUDA-
-        graph padding pattern). Padding lanes must not perturb slot 0's buffer
+    def test_inactive_padding_entries(self):
+        """batch_indices mixing -1 padding entries with active slot 0 (the CUDA-
+        graph padding pattern). Padding entries must not perturb slot 0's buffer
         or output — they are redirected to the buffers' trash row."""
         max_batch, slot = 2, 0
         prefill_len = 50
@@ -488,7 +488,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         batch_indices = torch.tensor([slot, -1, -1], dtype=torch.int32, device=self.device)
         for k in range(n_decode):
             pos = prefill_len + k
-            # Lane 0 carries the real token; padding lanes carry garbage.
+            # Entry 0 carries the real token; padding entries carry garbage.
             def pad3(t):
                 junk = torch.randn(
                     2, *t.shape[1:], device=t.device, dtype=t.dtype
@@ -508,7 +508,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
             self._assert_bitwise(
                 y_batch_invariant[0, 0], y_full[0, pos], f"padded step k={k}"
             )
-            # Padding lanes must return zeros.
+            # Padding entries must return zeros.
             self.assertEqual(y_batch_invariant[1:].abs().max().item(), 0.0)
 
     def test_cuda_graph_replay_matches_full_scan(self):

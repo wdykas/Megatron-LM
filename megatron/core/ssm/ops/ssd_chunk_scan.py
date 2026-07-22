@@ -174,7 +174,7 @@ def _chunk_scan_fwd_kernel(
     if DECODE_MODE:
         # Decode mode: every chunk is its own sequence and seq_idx carries
         # the slot id into initial_states (which may be the engine's state
-        # cache). Reading initial_states unconditionally means padding lanes
+        # cache). Reading initial_states unconditionally means padding entries
         # with duplicate slot ids can never pick up another chunk's carried
         # state, and the (dummy) carried-states pointer is never typed into
         # the program.

@@ -19,7 +19,7 @@ class BatchInvariantDecodeBuffers:
     # Tokens buffered since the slot's last chunk boundary; doubles as the
     # write cursor for the next token.
     num_buffered: torch.Tensor  # (max_batch + 1,) int32
-    # Per-lane target-row output, allocated once and sliced per step.
+    # Per-entry target-row output, allocated once and sliced per step.
     out: torch.Tensor          # (max_batch + 1, nheads, headdim)
 
     @classmethod
@@ -35,7 +35,7 @@ class BatchInvariantDecodeBuffers:
         dtype: torch.dtype,
     ) -> "BatchInvariantDecodeBuffers":
         """Allocate the per-slot decode buffers."""
-        # Padding lanes use batch index -1. Map them to an extra row so
+        # Padding entries use batch index -1. Map them to an extra row so
         # fixed-shape graph code can write without touching a live request.
         rows = max_batch + 1
         return cls(
@@ -49,11 +49,11 @@ class BatchInvariantDecodeBuffers:
 
     @property
     def trash_row(self) -> int:
-        """Write sink for inactive lanes (the buffers' extra last row)."""
+        """Write sink for padding entries (the buffers' extra last row)."""
         return self.num_buffered.shape[0] - 1
 
     def map_slots(self, batch_indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Map inactive lanes to the trash row."""
+        """Map padding entries to the trash row."""
         slots = batch_indices.to(torch.long)
         is_active = slots >= 0
         return slots.masked_fill(~is_active, self.trash_row), is_active
@@ -78,7 +78,7 @@ class BatchInvariantDecodeBuffers:
         # boundary-aligned gives 0.
         tail_lens = prefill_lens % chunk_size
 
-        # Redirect inactive lanes (batch_indices < 0) to the trash row so all
+        # Redirect padding entries (batch_indices < 0) to the trash row so all
         # writes below are unconditional.
         slots, is_active = self.map_slots(batch_indices[:num_seqs])
 
@@ -113,10 +113,10 @@ class BatchInvariantDecodeBuffers:
 
 def batch_invariant_decode_buffered_scan(
     buffers: BatchInvariantDecodeBuffers,
-    x: torch.Tensor,           # (num_lanes, 1, nheads, headdim)
-    dt: torch.Tensor,          # (num_lanes, 1, nheads)
-    B: torch.Tensor,           # (num_lanes, 1, ngroups, dstate)
-    C: torch.Tensor,           # (num_lanes, 1, ngroups, dstate)
+    x: torch.Tensor,           # (decode_batch_size, 1, nheads, headdim)
+    dt: torch.Tensor,          # (decode_batch_size, 1, nheads)
+    B: torch.Tensor,           # (decode_batch_size, 1, ngroups, dstate)
+    C: torch.Tensor,           # (decode_batch_size, 1, ngroups, dstate)
     A: torch.Tensor,
     D: torch.Tensor,
     dt_bias: torch.Tensor,
@@ -127,20 +127,20 @@ def batch_invariant_decode_buffered_scan(
 
     Mutates the replay buffers and commits ``ssm_state`` when a chunk fills.
     """
-    num_lanes, tokens_per_lane, nheads, headdim = x.shape
+    decode_batch_size, tokens_per_entry, nheads, headdim = x.shape
     dstate = B.shape[-1]
     chunk_size = buffers.x.shape[1]
-    assert tokens_per_lane == 1, (
+    assert tokens_per_entry == 1, (
         "batch-invariant Mamba decode assumes one new token per request "
         "per call (no speculative decoding)."
     )
-    max_lanes = buffers.out.shape[0]
-    assert num_lanes <= max_lanes, (
-        f"decode batch of {num_lanes} lanes exceeds the preallocated buffers "
-        f"({max_lanes} lanes); increase max_batch."
+    output_capacity = buffers.out.shape[0]
+    assert decode_batch_size <= output_capacity, (
+        f"decode batch size {decode_batch_size} exceeds the output buffer capacity "
+        f"({output_capacity}); increase max_batch."
     )
 
-    # Redirect inactive lanes (batch_indices < 0) to the trash row so the
+    # Redirect padding entries (batch_indices < 0) to the trash row so the
     # buffer writes below are unconditional.
     slots, is_active = buffers.map_slots(batch_indices)
     # ssm_state is engine-owned and has no trash row: clamp for reads. Its
@@ -157,7 +157,7 @@ def batch_invariant_decode_buffered_scan(
 
     # A slot crosses its chunk boundary when this token fills the buffer.
     crossed = (write_pos + 1 == chunk_size) & is_active
-    out = buffers.out[:num_lanes]
+    out = buffers.out[:decode_batch_size]
 
     # Run the gated pipeline over the buffers and ssm_state in place. State
     # passing writes crossing slots' boundary states straight into
@@ -180,11 +180,11 @@ def batch_invariant_decode_buffered_scan(
         dt_softplus=True,
     )
 
-    # The scan stored each lane's target row at out[i]; padding lanes
+    # The scan stored each entry's target row at out[i]; padding entries
     # return zeros.
     y = torch.where(is_active.view(-1, 1, 1), out, torch.zeros_like(out)).unsqueeze(1)
 
-    # Crossed slots restart their buffer; the rest advance. Inactive lanes
+    # Crossed slots restart their buffer; the rest advance. Padding entries
     # write 0 to the trash row, keeping its cursor pinned in bounds.
     buffers.num_buffered[slots] = torch.where(
         crossed | ~is_active, torch.zeros_like(write_pos), write_pos + 1

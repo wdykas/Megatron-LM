@@ -89,7 +89,7 @@ def _state_passing_fwd_kernel(
         seq_idx = tl.load(seq_idx_ptr + c * stride_seq_idx_chunk)
         if HAS_DST_STATES:
             # Decode mode: every chunk is its own sequence. seq_idx carries
-            # slot ids that can repeat on padding lanes, so change detection
+            # slot ids that can repeat for padding entries, so change detection
             # can't be trusted.
             is_new_seq = True
         else:

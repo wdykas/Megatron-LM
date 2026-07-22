@@ -195,7 +195,7 @@ def mamba_chunk_scan_decode_rows(
         chunk_starts: (nseq,) int32, window offset per chunk
             (slot * chunk_size for per-slot buffers).
         slots: (nseq,) int32, live-cache row containing each chunk's incoming
-            state. May repeat on padding lanes.
+            state. May repeat for padding entries.
         target_rows: (nseq,) int32, the only output row read per chunk.
         chunk_flags: (nseq,), nonzero where the slot crosses its boundary.
         initial_states: (num_states, nheads, headdim, dstate), the engine's
