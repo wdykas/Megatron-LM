@@ -22,42 +22,35 @@ class BatchInvariantDecodeBuffers:
     # Per-lane target-row output, allocated once and sliced per step.
     out: torch.Tensor          # (max_batch + 1, nheads, headdim)
 
+    @classmethod
+    def allocate(
+        cls,
+        max_batch: int,
+        chunk_size: int,
+        nheads: int,
+        headdim: int,
+        ngroups: int,
+        dstate: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> "BatchInvariantDecodeBuffers":
+        """Allocate the per-slot decode buffers."""
+        # Padding lanes use batch index -1. Map them to an extra row so
+        # fixed-shape graph code can write without touching a live request.
+        rows = max_batch + 1
+        return cls(
+            x=torch.zeros(rows, chunk_size, nheads, headdim, device=device, dtype=dtype),
+            dt=torch.zeros(rows, chunk_size, nheads, device=device, dtype=dtype),
+            B=torch.zeros(rows, chunk_size, ngroups, dstate, device=device, dtype=dtype),
+            C=torch.zeros(rows, chunk_size, ngroups, dstate, device=device, dtype=dtype),
+            num_buffered=torch.zeros(rows, device=device, dtype=torch.int32),
+            out=torch.empty(rows, nheads, headdim, device=device, dtype=dtype),
+        )
+
     @property
     def trash_row(self) -> int:
         """Write sink for inactive lanes (the buffers' extra last row)."""
         return self.num_buffered.shape[0] - 1
-
-
-def make_batch_invariant_decode_buffers(
-    max_batch: int,
-    chunk_size: int,
-    nheads: int,
-    headdim: int,
-    ngroups: int,
-    dstate: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> BatchInvariantDecodeBuffers:
-    """Allocate the per-slot decode buffers.
-
-    No z buffer: batch-invariant mode only supports rmsnorm models, where
-    the gate is applied outside the scan and z is never read.
-
-    Buffers get max_batch + 1 rows: the extra row is a write sink for
-    inactive lanes (batch_indices < 0). With inactive lanes redirected
-    there, every scatter can write unconditionally. Duplicate indices only
-    occur among inactive lanes writing the trash row; that row is masked from
-    outputs and never writes a real SSM cache slot.
-    """
-    rows = max_batch + 1
-    return BatchInvariantDecodeBuffers(
-        x=torch.zeros(rows, chunk_size, nheads, headdim, device=device, dtype=dtype),
-        dt=torch.zeros(rows, chunk_size, nheads, device=device, dtype=dtype),
-        B=torch.zeros(rows, chunk_size, ngroups, dstate, device=device, dtype=dtype),
-        C=torch.zeros(rows, chunk_size, ngroups, dstate, device=device, dtype=dtype),
-        num_buffered=torch.zeros(rows, device=device, dtype=torch.int32),
-        out=torch.empty(rows, nheads, headdim, device=device, dtype=dtype),
-    )
 
 
 def _decode_slots(
@@ -257,7 +250,7 @@ class MambaBatchInvariantDecode:
         if self.bufs is None:
             nheads, headdim = x.shape[-2:]
             ngroups, dstate = B.shape[-2:]
-            self.bufs = make_batch_invariant_decode_buffers(
+            self.bufs = BatchInvariantDecodeBuffers.allocate(
                 max_batch,
                 self.mixer.chunk_size,
                 nheads,

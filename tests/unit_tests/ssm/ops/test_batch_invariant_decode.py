@@ -9,8 +9,8 @@ try:
     from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
     from megatron.core.ssm.ops.batch_invariant_decode import (
+        BatchInvariantDecodeBuffers,
         batch_invariant_decode_buffered_scan,
-        make_batch_invariant_decode_buffers,
         seed_batch_invariant_decode_buffers,
     )
     from megatron.core.ssm.ops.ssd_combined import mamba_chunk_scan_combined_varlen
@@ -78,7 +78,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         )
 
     def _make_bufs(self, max_batch):
-        return make_batch_invariant_decode_buffers(
+        return BatchInvariantDecodeBuffers.allocate(
             max_batch, self.chunk_size,
             self.nh, self.headdim, self.ngroups, self.dstate,
             self.device, self.dtype,
