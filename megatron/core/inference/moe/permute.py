@@ -367,6 +367,13 @@ def permute_tokens(
     BLOCK_H = min(triton.next_power_of_2(hidden_dim), 1024)
     max_pairs = max_tokens * topk
     NUM_BLOCKS = min(max_pairs, 512)
+    # The inverse-map pointer is unused when HAS_INVERSE=False. Reuse an existing
+    # int32 device tensor instead of allocating a dummy buffer for that kernel variant.
+    inverse_map_ptr = (
+        batch_invariant_inverse_map
+        if batch_invariant_inverse_map is not None
+        else permutation_map
+    )
     _permute_tokens_kernel[(NUM_BLOCKS,)](
         hidden_states,
         probs,
@@ -374,7 +381,7 @@ def permute_tokens(
         permuted_hidden,
         permuted_probs,
         permutation_map,
-        batch_invariant_inverse_map if batch_invariant_inverse_map is not None else permutation_map,
+        inverse_map_ptr,
         exclusive_expert_offsets,
         valid_tokens,
         hidden_dim,
