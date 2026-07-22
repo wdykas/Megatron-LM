@@ -421,7 +421,7 @@ class TestUnpermuteTokens:
                 2,
                 _vt(2),
                 _vt(2),
-                inverse_map=inverse_a,
+                batch_invariant_inverse_map=inverse_a,
             )
             out_b = unpermute_tokens(
                 expert_output_b,
@@ -430,7 +430,7 @@ class TestUnpermuteTokens:
                 2,
                 _vt(3),
                 _vt(2),
-                inverse_map=inverse_b,
+                batch_invariant_inverse_map=inverse_b,
             )
 
         expected = torch.full((hidden_dim,), 2.0, device="cuda")

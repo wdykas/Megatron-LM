@@ -906,47 +906,9 @@ def _te_general_grouped_gemm_patched(
 
 
 def _stack_weights_for_deepgemm(weights: List[torch.Tensor]) -> torch.Tensor:
-    """Stack a per-expert weight list into a contiguous [E, N, K] buffer.
-
-    For TEGroupedMLP with the optional contiguous-weight optimization (see
-    experts.py), all weights are already views into a single [E, N, K] tensor;
-    we detect that case and return the underlying tensor without copying.
-    """
+    """Stack a per-expert weight list into a contiguous [E, N, K] buffer."""
     if not weights:
         return torch.empty(0)
-    first = weights[0]
-    base = first._base if first._base is not None else first
-    expected_shape = (len(weights), *first.shape)
-    if (
-        base.dim() == 3
-        and base.shape == expected_shape
-        and all(
-            (w._base is base) and w.data_ptr() == base[i].data_ptr() for i, w in enumerate(weights)
-        )
-        and base.is_contiguous()
-    ):
-        return base
-    # Assigning Parameter.data to stacked[i] keeps the shared storage and
-    # storage offsets, but PyTorch does not preserve _base/view metadata on the
-    # Parameter object. Detect that common case directly so the training path
-    # does not pay a torch.stack copy every grouped-GEMM call.
-    first_storage = first.untyped_storage().data_ptr()
-    expert_stride = first.numel()
-    if (
-        first.is_contiguous()
-        and all(
-            w.shape == first.shape
-            and w.stride() == first.stride()
-            and w.untyped_storage().data_ptr() == first_storage
-            and w.storage_offset() == first.storage_offset() + i * expert_stride
-            for i, w in enumerate(weights)
-        )
-    ):
-        return torch.as_strided(
-            first,
-            size=expected_shape,
-            stride=(expert_stride, *first.stride()),
-        )
     return torch.stack([w.contiguous() for w in weights], dim=0)
 
 
@@ -965,7 +927,7 @@ def _batch_invariant_te_grouped_forward(A, B, out, m_splits, bias, use_bias, acc
     m_total = x_cat.shape[0]
     m_indices = _m_splits_to_m_indices(m_splits, x_cat.device, m_total)
 
-    y = _bf16_grouped_gemm_contiguous(x_cat, w_stack, m_indices)
+    y = _bf16_grouped_gemm_contiguous(x_cat, w_stack, m_indices, m_splits)
     if use_bias and bias is not None:
         offset = 0
         for i, m in enumerate(m_splits):
@@ -999,7 +961,7 @@ def _batch_invariant_te_grouped_dgrad(A, B, out, m_splits, accumulate):
     m_indices = _m_splits_to_m_indices(m_splits, dy_cat.device, m_total)
     # NT call interprets B as [E, out_dim, in_dim]; for dgrad we need W as [E, K, N]
     w_kn = w_stack.transpose(1, 2).contiguous()
-    dx = _bf16_grouped_gemm_contiguous(dy_cat, w_kn, m_indices)
+    dx = _bf16_grouped_gemm_contiguous(dy_cat, w_kn, m_indices, m_splits)
     if dx.dtype != out_buf.dtype:
         dx = dx.to(out_buf.dtype)
     out_buf.copy_(dx)
@@ -1017,9 +979,8 @@ def _batch_invariant_te_grouped_wgrad(A, B, out, m_splits, use_bias, accumulate)
     x_cat = torch.cat([a.contiguous() for a in A], dim=0)
     dy_cat = torch.cat([b.contiguous() for b in B], dim=0)
     m_total = x_cat.shape[0]
-    k_indices = _m_splits_to_m_indices(m_splits, x_cat.device, m_total)
-
-    dw_stack = _bf16_grouped_gemm_wgrad_contiguous(dy_cat, x_cat, k_indices, E)
+    assert sum(m_splits) == m_total
+    dw_stack = _bf16_grouped_gemm_wgrad_contiguous(dy_cat, x_cat, m_splits)
 
     grad_bias = [None] * E
     if use_bias:
@@ -1165,7 +1126,7 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
             opA = opA.reshape(-1, opA.shape[-1])
         elif opA.dim() < 2:
             raise ValueError(f"opA has insufficient dimensions: {opA.shape}")
-        assert opA.dim() == 2, f"opA must be 2D for matmul_persistent, got shape {opA.shape}"
+        assert opA.dim() == 2, f"opA must be 2D, got shape {opA.shape}"
 
         # Flatten all leading dims of opB except the last feature dim to match TE behavior
         if opB.dim() >= 2:
@@ -1177,7 +1138,7 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
             opB_2d = opB
 
         # Perform GEMM: (N_total, K) @ (K, O) -> (N_total, O)
-        base_2d = matmul_persistent(opB_2d, opA, bias=None)
+        base_2d = mm_batch_invariant(opB_2d, opA)
 
         # Reshape back to original leading dims with output features at the end
         out = base_2d.reshape(*leading_shape, base_2d.shape[-1])
@@ -1448,47 +1409,38 @@ def grouped_gemm_batch_invariant_alignment() -> int:
     return _deepgemm_m_alignment()
 
 
-def _expert_counts_from_m_indices(m_indices: torch.Tensor, num_experts: int) -> torch.Tensor:
-    """Per-expert token counts from a sorted m_indices tensor. Ignores -1 rows."""
-    valid = m_indices[m_indices >= 0]
-    return torch.bincount(valid.long(), minlength=num_experts).to(torch.int64)
-
-
-def _pad_for_m_grouped(a: torch.Tensor, m_indices: torch.Tensor, num_experts: int) -> tuple:
+def _pad_for_m_grouped(a: torch.Tensor, counts: List[int]) -> tuple:
     """Pad an M-grouped contiguous input to satisfy DeepGEMM's per-expert M alignment.
 
-    Returns (a_padded, m_indices_padded, padded_counts_cpu, true_counts_cpu).
+    Returns the padded input, row-to-expert map, and padded counts.
     The padded layout groups expert i's true rows contiguously at the start of
     its 128-aligned block; remaining rows in the block are zero with m_indices=-1.
     """
-    A = _deepgemm_m_alignment()
-    counts = _expert_counts_from_m_indices(m_indices, num_experts)
-    counts_cpu = counts.tolist()
-    padded_counts_cpu = [((c + A - 1) // A) * A for c in counts_cpu]
-    M_pad = sum(padded_counts_cpu)
+    alignment = _deepgemm_m_alignment()
+    padded_counts = [((count + alignment - 1) // alignment) * alignment for count in counts]
+    M_pad = sum(padded_counts)
     if M_pad == 0:
         return (
             torch.empty(0, a.shape[1], device=a.device, dtype=a.dtype),
             torch.empty(0, device=a.device, dtype=torch.int32),
-            padded_counts_cpu,
-            counts_cpu,
+            padded_counts,
         )
 
     a_padded = torch.zeros(M_pad, a.shape[1], device=a.device, dtype=a.dtype)
     m_indices_padded = torch.full((M_pad,), -1, device=a.device, dtype=torch.int32)
     src = 0
     dst = 0
-    for i, (c, cp) in enumerate(zip(counts_cpu, padded_counts_cpu)):
-        if c > 0:
-            a_padded[dst : dst + c] = a[src : src + c]
-            m_indices_padded[dst : dst + c] = i
-        src += c
-        dst += cp
-    return a_padded, m_indices_padded, padded_counts_cpu, counts_cpu
+    for i, (count, padded_count) in enumerate(zip(counts, padded_counts)):
+        if count > 0:
+            a_padded[dst : dst + count] = a[src : src + count]
+            m_indices_padded[dst : dst + count] = i
+        src += count
+        dst += padded_count
+    return a_padded, m_indices_padded, padded_counts
 
 
 def _bf16_grouped_gemm_contiguous(
-    a: torch.Tensor, b: torch.Tensor, m_indices: torch.Tensor
+    a: torch.Tensor, b: torch.Tensor, m_indices: torch.Tensor, counts: List[int]
 ) -> torch.Tensor:
     """bf16 M-grouped GEMM via DeepGEMM. Deterministic / batch-invariant.
 
@@ -1517,7 +1469,8 @@ def _bf16_grouped_gemm_contiguous(
         m_indices.shape[0] == M_total
     ), f"m_indices length {m_indices.shape[0]} != M_total {M_total}"
 
-    a_padded, m_indices_padded, padded_counts_cpu, counts_cpu = _pad_for_m_grouped(a, m_indices, E)
+    assert len(counts) == E and sum(counts) == M_total
+    a_padded, m_indices_padded, padded_counts = _pad_for_m_grouped(a, counts)
     M_pad = a_padded.shape[0]
     if M_pad == 0:
         return torch.zeros(M_total, N, device=a.device, dtype=torch.bfloat16)
@@ -1527,16 +1480,13 @@ def _bf16_grouped_gemm_contiguous(
 
     # Strip padding: copy each expert's true rows back to a [M_total, N] tensor.
     d = torch.empty(M_total, N, device=a.device, dtype=torch.bfloat16)
-    # Rows with m_indices == -1 (post-padding tail in the input) get zero output.
-    if (m_indices < 0).any():
-        d.zero_()
     src = 0
     dst = 0
-    for c, cp in zip(counts_cpu, padded_counts_cpu):
-        if c > 0:
-            d[src : src + c] = d_padded[dst : dst + c]
-        src += c
-        dst += cp
+    for count, padded_count in zip(counts, padded_counts):
+        if count > 0:
+            d[src : src + count] = d_padded[dst : dst + count]
+        src += count
+        dst += padded_count
     return d
 
 
@@ -1573,14 +1523,12 @@ def _bf16_grouped_gemm_aligned_contiguous(
 
 
 def _bf16_grouped_gemm_wgrad_contiguous(
-    grad_y: torch.Tensor, x: torch.Tensor, k_indices: torch.Tensor, num_experts: int
+    grad_y: torch.Tensor, x: torch.Tensor, counts: List[int]
 ) -> torch.Tensor:
     """K-grouped TN GEMM producing per-expert weight gradients via DeepGEMM.
 
-    grad_y:    [M_total, N] bf16, contiguous, expert-grouped (rows of expert i
-                                              are contiguous; k_indices is sorted).
+    grad_y:    [M_total, N] bf16, contiguous, expert-grouped.
     x:         [M_total, K] bf16, contiguous, expert-grouped (same row ordering).
-    k_indices: [M_total]    int32, expert id per row (the K-axis grouping label).
     Returns:   [E, N, K]    bf16 stacked per-expert wgrad.
 
     DeepGEMM's k_grouped_bf16 kernel computes in fp32 and requires fp32 d/c
@@ -1590,14 +1538,14 @@ def _bf16_grouped_gemm_wgrad_contiguous(
     _require_deepgemm_bf16("k_grouped_bf16_gemm_tn_contiguous")
     assert grad_y.dtype == torch.bfloat16 and x.dtype == torch.bfloat16
     assert grad_y.is_contiguous() and x.is_contiguous()
-    assert k_indices.dtype == torch.int32 and k_indices.is_contiguous()
     M_total, N = grad_y.shape
     M_total_b, K = x.shape
     assert M_total == M_total_b
 
-    A = _deepgemm_m_alignment()
-    counts = _expert_counts_from_m_indices(k_indices, num_experts).tolist()
-    padded_counts = [((c + A - 1) // A) * A for c in counts]
+    num_experts = len(counts)
+    assert sum(counts) == M_total
+    alignment = _deepgemm_m_alignment()
+    padded_counts = [((count + alignment - 1) // alignment) * alignment for count in counts]
     M_pad = sum(padded_counts)
     if M_pad == 0:
         return torch.zeros(num_experts, N, K, device=grad_y.device, dtype=torch.bfloat16)
@@ -1705,49 +1653,15 @@ def disable_batch_invariant_mode():
 # (autotuner, original configs list) pairs saved by _pin_mamba_autotuners.
 _PINNED_AUTOTUNERS: list = []
 
-# Pinned tile config per Mamba forward kernel. Hardcoded rather than
-# autotuned because parity needs the same choice in every process; measured
-# on GB200 at nemotron dims (nheads=128, headdim=64, dstate=128, chunk=128).
-# Other hardware stays correct, possibly suboptimal - retune there and
-# update.
-_PREFERRED_MAMBA_CONFIGS = {
-    # bmm M=64 / scan M=32 favor smaller M-blocks than the pure training
-    # optimum (M=128 / M=64): decode's row gating computes one M-block per
-    # chunk, so smaller blocks cut its work. Training scan time is unchanged
-    # while gated decode improves 17%.
+# Rollout uses the repo kernels while training uses mamba_ssm. Pin a config
+# present in both copies so autotune timing cannot change the reduction order.
+_PINNED_MAMBA_CONFIGS = {
     "_bmm_chunk_fwd_kernel": {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32},
     "_chunk_scan_fwd_kernel": {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32},
     "_chunk_state_fwd_kernel": {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32},
     "_chunk_cumsum_fwd_kernel": {"BLOCK_SIZE_H": 8},
     "_state_passing_fwd_kernel": {"BLOCK_SIZE": 1024},
 }
-
-
-def _autotune_config_cost(cfg):
-    """Deterministic config ranking: block footprint * stages, warps tiebreak.
-
-    Mirrors megatron.core.ssm.ops.determinism._estimate_config_cost so the
-    repo and package kernels (identical config lists; the repo is a port)
-    resolve to the same config.
-    """
-    block_product = 1
-    for key, val in cfg.kwargs.items():
-        if key.startswith("BLOCK") and isinstance(val, int):
-            block_product *= val
-    stages = getattr(cfg, "num_stages", 1) or 1
-    warps = getattr(cfg, "num_warps", 1) or 1
-    return (block_product * stages, warps)
-
-
-def _choose_pinned_config(kernel_name, configs):
-    """Pick the config to pin: the preferred table entry when present in the
-    kernel's config list, else the deterministic cheapest-cost fallback."""
-    preferred = _PREFERRED_MAMBA_CONFIGS.get(kernel_name)
-    if preferred is not None:
-        for cfg in configs:
-            if all(cfg.kwargs.get(k) == v for k, v in preferred.items()):
-                return cfg
-    return min(configs, key=_autotune_config_cost)
 
 
 def _pin_mamba_autotuners():
@@ -1809,7 +1723,12 @@ def _pin_mamba_autotuners():
         if not isinstance(kernel, Autotuner) or len(kernel.configs) <= 1:
             continue
         name = getattr(getattr(kernel, "fn", None), "__name__", "")
-        chosen = _choose_pinned_config(name, kernel.configs)
+        expected = _PINNED_MAMBA_CONFIGS[name]
+        chosen = next(
+            cfg
+            for cfg in kernel.configs
+            if all(cfg.kwargs.get(key) == value for key, value in expected.items())
+        )
         _PINNED_AUTOTUNERS.append((kernel, kernel.configs))
         kernel.configs = [chosen]
         if hasattr(kernel, "cache"):

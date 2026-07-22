@@ -48,7 +48,7 @@ def grouped_mm_alignment() -> int:
 
 
 @triton.jit
-def _unpermute_tokens_kernel(
+def _unpermute_tokens_batch_invariant_kernel(
     expert_out_ptr,  # [output_size, hidden_dim] bf16 expert outputs
     probs_ptr,  # [output_size] fp32 routing probabilities
     inverse_map_ptr,  # [num_tokens, num_local_experts] permuted row or -1
@@ -82,7 +82,7 @@ def _unpermute_tokens_kernel(
         tl.store(output_ptr + tok * hidden_dim + offsets, acc, mask=mask_h)
 
 
-def unpermute_tokens(
+def unpermute_tokens_batch_invariant(
     expert_output: torch.Tensor,
     permuted_probs: torch.Tensor,
     inverse_map: torch.Tensor,
@@ -99,7 +99,7 @@ def unpermute_tokens(
 
     BLOCK_H = min(triton.next_power_of_2(hidden_dim), 1024)
     grid = (num_tokens, triton.cdiv(hidden_dim, BLOCK_H))
-    _unpermute_tokens_kernel[grid](
+    _unpermute_tokens_batch_invariant_kernel[grid](
         expert_output,
         permuted_probs,
         inverse_map,

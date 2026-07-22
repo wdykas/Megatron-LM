@@ -298,7 +298,7 @@ def permute_tokens(
     num_local_experts: int,
     valid_tokens: torch.Tensor,
     alignment: int = 1,
-    return_inverse_map: bool = False,
+    return_batch_invariant_inverse_map: bool = False,
 ) -> tuple:
     """Permute tokens into expert-grouped order.
 
@@ -315,21 +315,22 @@ def permute_tokens(
         valid_tokens: scalar int32 CUDA tensor with the number of valid tokens this
             iteration. Fixed address; value updated each step before graph replay.
         alignment: per-expert token alignment (default 1).
-        return_inverse_map: if True, also return a token/local-expert -> permuted-row map
-            used by batch-invariant unpermute.
+        return_batch_invariant_inverse_map: if True, also return the map used by
+            batch-invariant unpermute.
 
     Returns:
         By default, returns the original 4-tuple:
         (permuted_hidden, permuted_probs, permutation_map, inclusive_offsets).
-        If return_inverse_map=True, appends inverse_map as a fifth return value.
+        If return_batch_invariant_inverse_map=True, appends the inverse map as a
+        fifth return value.
         - permuted_hidden: [output_size, hidden_size]
         - permuted_probs: [output_size]
         - permutation_map: [output_size] int32, maps each permuted row back to
           its original token index. Used by unpermute_tokens to scatter expert
           outputs back and by activation kernels to skip padding rows (-1).
         - inclusive_offsets: [num_local_experts] int32 cumulative offsets for grouped_mm
-        - inverse_map: [max_tokens, num_local_experts] int32 map from token/local-expert
-          to permuted row, only present when return_inverse_map=True.
+        - inverse map: [max_tokens, num_local_experts] int32 map from token/local-expert
+          to permuted row, only present when requested.
     """
     max_tokens, hidden_dim = hidden_states.shape
     topk = probs.shape[1]
@@ -355,9 +356,9 @@ def permute_tokens(
     )
     permuted_probs = torch.empty(output_size, dtype=probs.dtype, device=probs.device)
     permutation_map = torch.empty(output_size, dtype=torch.int32, device=probs.device)
-    inverse_map = None
-    if return_inverse_map:
-        inverse_map = torch.full(
+    batch_invariant_inverse_map = None
+    if return_batch_invariant_inverse_map:
+        batch_invariant_inverse_map = torch.full(
             (max_tokens, num_local_experts), -1, dtype=torch.int32, device=probs.device
         )
     # Only initialize [0, n_used) to -1; activation and unpermute kernels are gated
@@ -373,7 +374,7 @@ def permute_tokens(
         permuted_hidden,
         permuted_probs,
         permutation_map,
-        inverse_map if inverse_map is not None else permutation_map,
+        batch_invariant_inverse_map if batch_invariant_inverse_map is not None else permutation_map,
         exclusive_expert_offsets,
         valid_tokens,
         hidden_dim,
@@ -383,10 +384,16 @@ def permute_tokens(
         num_local_experts,
         BLOCK_H=BLOCK_H,
         NUM_BLOCKS=NUM_BLOCKS,
-        HAS_INVERSE=inverse_map is not None,
+        HAS_INVERSE=batch_invariant_inverse_map is not None,
     )
-    if return_inverse_map:
-        return permuted_hidden, permuted_probs, permutation_map, inclusive_expert_offsets, inverse_map
+    if return_batch_invariant_inverse_map:
+        return (
+            permuted_hidden,
+            permuted_probs,
+            permutation_map,
+            inclusive_expert_offsets,
+            batch_invariant_inverse_map,
+        )
     return permuted_hidden, permuted_probs, permutation_map, inclusive_expert_offsets
 
 
@@ -462,7 +469,7 @@ def unpermute_tokens(
     n_used: torch.Tensor,
     valid_tokens: torch.Tensor,
     out: torch.Tensor = None,
-    inverse_map: torch.Tensor = None,
+    batch_invariant_inverse_map: torch.Tensor = None,
 ) -> torch.Tensor:
     """Unpermute expert outputs back to original token order.
 
@@ -492,12 +499,18 @@ def unpermute_tokens(
     # MoE instead reduces each token independently in fixed local-expert order,
     # so unrelated tokens cannot affect the accumulation tree.
     if batch_invariant.enabled():
-        assert inverse_map is not None, "batch-invariant MoE unpermute requires inverse_map"
+        assert batch_invariant_inverse_map is not None, (
+            "batch-invariant MoE unpermute requires its inverse map"
+        )
         # The BIK kernel stores every row tok < valid_tokens, including zero
         # rows for tokens with no local expert contribution. Rows beyond
         # valid_tokens are not read by the graphed RSV combine.
-        return batch_invariant.unpermute_tokens(
-            expert_output, permuted_probs, inverse_map, valid_tokens, out
+        return batch_invariant.unpermute_tokens_batch_invariant(
+            expert_output,
+            permuted_probs,
+            batch_invariant_inverse_map,
+            valid_tokens,
+            out,
         )
 
     output_size = expert_output.shape[0]

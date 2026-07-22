@@ -1,6 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-import math
 from typing import TYPE_CHECKING, Dict
 
 import torch
@@ -388,6 +387,7 @@ class MambaSlotAllocator:
         skip_tokens: int,
         prefill_chunk_length: int,
         num_matched_blocks: int,
+        matched_block_ids: list,
         overall_required_blocks: int,
     ) -> None:
         """Compute intermediate state extraction offsets and store per-request.
@@ -398,49 +398,28 @@ class MambaSlotAllocator:
             skip_tokens: Number of tokens being skipped (mamba match).
             prefill_chunk_length: Total prefill chunk length before skipping.
             num_matched_blocks: Number of KV-matched blocks.
+            matched_block_ids: List of matched KV block IDs.
             overall_required_blocks: Total blocks needed for this request.
         """
         ctx = self.context
         prompt_len = len(req.prompt_tokens)
-        mamba_chunk_size = ctx.mamba_chunk_size
-        finished = req.finished_chunk_token_count
+        num_kv_matched = num_matched_blocks
+        kv_div_abs = num_kv_matched * ctx.block_size_tokens
+        last_aligned_abs = (prompt_len // ctx.block_size_tokens) * ctx.block_size_tokens
+        seq_len = prefill_chunk_length - skip_tokens  # effective prefill length
 
-        if ctx.batch_invariant_mode:
-            chunk_start_abs = finished + skip_tokens
-            chunk_end_abs = finished + prefill_chunk_length
-            seq_len = chunk_end_abs - chunk_start_abs
+        # Compute relative offsets (relative to prefill start after skip)
+        kv_div_rel = kv_div_abs - skip_tokens
+        last_aligned_rel = last_aligned_abs - skip_tokens
+        penultimate_abs = (overall_required_blocks - 1) * ctx.block_size_tokens
+        penultimate_rel = penultimate_abs - skip_tokens
 
-            # Cache the farthest state that is both a KV-block end and a full
-            # Mamba chunk boundary. For an aligned prompt, also cache the live
-            # end state; the previous boundary is still needed to recompute the
-            # final token and produce its logit on a cache hit.
-            cache_stride = math.lcm(ctx.block_size_tokens, mamba_chunk_size)
-            live_state_is_cacheable = (
-                chunk_end_abs == prompt_len
-                and chunk_end_abs % cache_stride == 0
-                and chunk_end_abs > chunk_start_abs
-            )
-            latest_boundary = ((chunk_end_abs - 1) // cache_stride) * cache_stride
-            candidate_abs_positions = [latest_boundary]
-        else:
-            # Preserve the existing non-BIK first-prefill offset selection.
-            chunk_start_abs = skip_tokens
-            chunk_end_abs = prefill_chunk_length
-            seq_len = chunk_end_abs - chunk_start_abs
-            kv_div_abs = num_matched_blocks * ctx.block_size_tokens
-            last_aligned_abs = (prompt_len // ctx.block_size_tokens) * ctx.block_size_tokens
-            penultimate_abs = (overall_required_blocks - 1) * ctx.block_size_tokens
-            candidate_abs_positions = [kv_div_abs, last_aligned_abs, penultimate_abs]
-            live_state_is_cacheable = (
-                chunk_end_abs == prompt_len
-                and prompt_len % ctx.block_size_tokens == 0
-                and prompt_len > 0
-            )
+        # Determine mamba_chunk_size from mamba config (128 is the standard SSM kernel chunk size)
+        mamba_chunk_size = 128
 
-        # The extraction kernel returns states only at complete relative chunks.
+        # Build offset list: include if > 0, < seq_len, and % mamba_chunk_size == 0
         offsets_set = set()
-        for abs_pos in candidate_abs_positions:
-            offset = abs_pos - chunk_start_abs
+        for offset in [kv_div_rel, last_aligned_rel, penultimate_rel]:
             if offset > 0 and offset < seq_len and offset % mamba_chunk_size == 0:
                 offsets_set.add(offset)
 
@@ -449,9 +428,7 @@ class MambaSlotAllocator:
 
         # CPU bookkeeping writes (no GPU kernel launches).
         if count > 0:
-            abs_tokens_cpu = torch.tensor(
-                [chunk_start_abs + o for o in offsets], dtype=torch.int64
-            )
+            abs_tokens_cpu = torch.tensor([skip_tokens + o for o in offsets], dtype=torch.int64)
             block_indices_cpu = abs_tokens_cpu // ctx.block_size_tokens - 1
             bids_cpu = ctx.request_to_kv_block_ids[current_id][block_indices_cpu]
 
@@ -462,13 +439,16 @@ class MambaSlotAllocator:
             self._has_intermediates = True
         self._intermediate_counts_cpu[current_id] = count
 
-        # The live state is reusable only at an aligned prompt end.
-        if live_state_is_cacheable:
-            last_block_idx = chunk_end_abs // ctx.block_size_tokens - 1
-            self._eos_cache_block_id_cpu[current_id] = ctx.request_to_kv_block_ids[current_id][
-                last_block_idx
-            ]
-            self._has_intermediates = True
+        # Block-aligned EOS: prompt_len is exactly block-aligned
+        if last_aligned_abs == prompt_len and prompt_len > 0:
+            last_block_idx = prompt_len // ctx.block_size_tokens - 1
+            if last_block_idx >= 0:
+                self._eos_cache_block_id_cpu[current_id] = ctx.request_to_kv_block_ids[current_id][
+                    last_block_idx
+                ]
+                self._has_intermediates = True
+            else:
+                self._eos_cache_block_id_cpu[current_id] = -1
         else:
             self._eos_cache_block_id_cpu[current_id] = -1
 

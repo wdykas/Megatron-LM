@@ -276,38 +276,6 @@ class TEGroupedMLP(MegatronModule):
                 self.num_local_experts, align_size=align_size
             )
 
-        # Batch-invariant mode uses the same contiguous expert-weight buffers
-        # that inference consumes, so training and inference see identical
-        # storage layout without a per-forward stack copy.
-        if self.config.batch_invariant_mode:
-            self._build_contiguous_weight_buffers()
-
-    @torch.inference_mode(False)  # Lazy inference construction must create normal tensors.
-    @torch.no_grad()
-    def _build_contiguous_weight_buffers(self):
-        """Build canonical stacked weights while preserving TE Parameter objects.
-
-        Each per-expert Parameter is redirected to its slice of the registered
-        buffer, so training updates and inference grouped GEMMs share storage.
-        The method is idempotent because inference may call it lazily after the
-        batch-invariant training path already built the buffers.
-        """
-        for linear, buf_name in (
-            (self.linear_fc1, '_fc1_weight'),
-            (self.linear_fc2, '_fc2_weight'),
-        ):
-            if self._buffers.get(buf_name) is not None:
-                continue
-            per_expert = [getattr(linear, f'weight{i}') for i in range(self.num_local_experts)]
-            w0 = per_expert[0]
-            stacked = torch.empty(
-                self.num_local_experts, *w0.shape, device=w0.device, dtype=w0.dtype
-            )
-            for i, w in enumerate(per_expert):
-                stacked[i].copy_(w.data)
-                w.data = stacked[i]
-            self.register_buffer(buf_name, stacked, persistent=False)
-
     @staticmethod
     def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
         if bias_parallel is None:
@@ -875,7 +843,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         Note: this creates a contiguous copy since per-expert MXFP8Tensor attributes
         are not contiguous across experts. This is a one-time cost at first forward.
 
-        Unlike _build_contiguous_weight_buffers, this does not create nn.Parameter views
+        Unlike _build_concatenated_weights, this does not create nn.Parameter views
         back into the buffer — MXFP8 weights are not nn.Parameters (they are plain
         MXFP8Tensor attributes set by quantize_model_to_mxfp8). This path is only
         intended for non-colocated inference.
@@ -904,7 +872,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             setattr(self, buf_name, MXFP8Tensor(data=stacked_data, scale=stacked_scale))
 
             # Redirect per-expert weight .data to views into the stacked buffer,
-            # mirroring _build_contiguous_weight_buffers. This frees the original
+            # mirroring _build_concatenated_weights. This frees the original
             # allocations while keeping the Parameter objects intact.
             for i in range(self.num_local_experts):
                 w = getattr(linear, f'weight{i}')
@@ -914,6 +882,50 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 elif hasattr(w, 'data') and isinstance(w.data, MXFP8Tensor):
                     w.data.data = stacked_data[i]
                     w.data.scale = stacked_scale[i]
+
+    @torch.inference_mode(False)  # needed for non-colocated inference.
+    def _build_concatenated_weights(self):
+        """Create big contiguous weight tensors that share storage with TE's per-expert parameters.
+
+        Creates _fc1_weight and _fc2_weight as contiguous tensors of shape
+        [num_experts, out_features, in_features]. Instead of replacing TE's parameters
+        (which breaks TE's internal bookkeeping), we redirect each parameter's .data
+        to be a view into the contiguous buffer. The nn.Parameter objects themselves
+        remain untouched in TE's module, preserving FP8 scaling state, etc.
+
+        This allows:
+        - TE's forward to work correctly (same Parameter objects, same internal state)
+        - Training updates to flow through (param.data is a view into the big tensor)
+        - torch.nn.functional.grouped_mm / FlashInfer to use the big tensor directly
+        """
+        # Get device/dtype from existing TE weights
+        device = self.linear_fc1.weight0.device
+        dtype = self.linear_fc1.weight0.dtype
+
+        fc1_shape = self.linear_fc1.weight0.shape  # [out_features, in_features]
+        fc2_shape = self.linear_fc2.weight0.shape
+
+        # Create big contiguous tensors
+        _fc1_weight = torch.empty(self.num_local_experts, *fc1_shape, device=device, dtype=dtype)
+        _fc2_weight = torch.empty(self.num_local_experts, *fc2_shape, device=device, dtype=dtype)
+
+        # Copy existing TE weights into big tensors, then point param.data to the views
+        for i in range(self.num_local_experts):
+            fc1_param = getattr(self.linear_fc1, f'weight{i}')
+            fc2_param = getattr(self.linear_fc2, f'weight{i}')
+
+            # Copy initialized data into contiguous buffer
+            _fc1_weight[i].copy_(fc1_param.data)
+            _fc2_weight[i].copy_(fc2_param.data)
+
+            # Redirect param.data to view into contiguous buffer.
+            # The nn.Parameter object stays the same — TE's internal state is preserved.
+            fc1_param.data = _fc1_weight[i]
+            fc2_param.data = _fc2_weight[i]
+
+        # Register big tensors as non-persistent buffers (for .to() device movement, not saved)
+        self.register_buffer('_fc1_weight', _fc1_weight, persistent=False)
+        self.register_buffer('_fc2_weight', _fc2_weight, persistent=False)
 
     def _flashinfer_forward(self, hidden_states, routing_map, probs):
         """FlashInfer fused MoE kernel for CUDA-graphed inference iterations."""
@@ -935,11 +947,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         return output, None
 
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
-        """Torch grouped-MoE forward, including the batch-invariant path.
-
-        BIK uses aligned DeepGEMM, token-local expert-order unpermute, and an
-        explicit rank-order NVLS combine when expert parallelism is enabled.
-        """
+        """Torch grouped_mm fused MoE forward via mcore_fused_moe."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
         output = mcore_fused_moe(
             hidden_states,
@@ -1012,7 +1020,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             ):
                 self._build_concatenated_mxfp8_weights()
             else:
-                self._build_contiguous_weight_buffers()
+                self._build_concatenated_weights()
             self._concatenated_weights_built = True
 
         if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:

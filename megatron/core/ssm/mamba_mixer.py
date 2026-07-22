@@ -952,10 +952,7 @@ class MambaMixer(MegatronModule):
                     last_chunk_indices.to(torch.long) - (tail_lens > 0).to(torch.long)
                 ).clamp(min=0)
 
-            return_chunk_states = (
-                self.config.batch_invariant_mode or intermediate_chunk_indices is not None
-            )
-            scan_states = mamba_chunk_scan_combined_varlen(
+            scan_result = mamba_chunk_scan_combined_varlen(
                 x=x,
                 dt=dt,
                 A=A,
@@ -974,7 +971,10 @@ class MambaMixer(MegatronModule):
                 z=z if not self.rmsnorm else None,
                 dt_bias=self.cp.get_dt_bias().float(),
                 initial_states=initial_ssm_state,
-                return_intermediate_states=return_chunk_states,
+                return_intermediate_states=self.config.batch_invariant_mode,
+                intermediate_chunk_indices=(
+                    None if self.config.batch_invariant_mode else intermediate_chunk_indices
+                ),
                 dt_softplus=True,
                 dt_limit=(0.0, float("inf")),
                 state_dtype=ssm_state.dtype,
@@ -983,14 +983,24 @@ class MambaMixer(MegatronModule):
             y = y.unsqueeze(0)
             z = z.unsqueeze(0)
 
-            cache_states = scan_states[last_chunk_indices] if return_chunk_states else scan_states
-            if boundary_chunk_indices is not None:
+            if self.config.batch_invariant_mode:
+                scan_states = scan_result
                 boundary_mask = has_boundary.view(-1, 1, 1, 1)
                 cache_states = torch.where(
                     boundary_mask, scan_states[boundary_chunk_indices], initial_ssm_state
                 )
-            tensor_masked_update(ssm_state, batch_indices, cache_states)
+                intermediate_ssm_states = (
+                    scan_states[intermediate_chunk_indices]
+                    if intermediate_chunk_indices is not None
+                    else None
+                )
+            elif intermediate_chunk_indices is not None:
+                cache_states, intermediate_ssm_states = scan_result
+            else:
+                cache_states = scan_result
+                intermediate_ssm_states = None
 
+            tensor_masked_update(ssm_state, batch_indices, cache_states)
             if self.config.batch_invariant_mode:
                 self._batch_invariant_decode().seed(
                     x, dt, B, C, cu_seqlens, batch_indices, max_batch=ssm_state.shape[0]
@@ -1002,7 +1012,6 @@ class MambaMixer(MegatronModule):
             # but we only fill the per-graph-bucket prefix; readers consult
             # per_request_intermediate_counts to know the real count.
             if intermediate_chunk_indices is not None and intermediate_ssm_out is not None:
-                intermediate_ssm_states = scan_states[intermediate_chunk_indices]
                 n = intermediate_ssm_states.shape[0]
                 intermediate_ssm_out[:n].copy_(intermediate_ssm_states)
 

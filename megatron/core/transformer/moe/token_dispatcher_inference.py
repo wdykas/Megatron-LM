@@ -358,12 +358,6 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             ep_group: Expert parallel process group.
         """
         ep_size = get_pg_size(ep_group)
-        if ep_size <= 0 or ep_size & (ep_size - 1):
-            raise RuntimeError(
-                "NVLSAllGatherVDispatcher requires a power-of-two expert-parallel "
-                f"world size because the symmetric-memory Triton barrier uses "
-                f"tl.arange over WORLD_SIZE; got ep_size={ep_size}."
-            )
         cls._per_rank_worst_case_token_count = per_rank_worst_case_token_count
         global_max = per_rank_worst_case_token_count * ep_size
         device = torch.cuda.current_device()

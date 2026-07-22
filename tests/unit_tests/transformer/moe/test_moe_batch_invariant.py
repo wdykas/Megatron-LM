@@ -84,13 +84,24 @@ def test_grouped_gemm_split_invariance(E):
         torch.tensor([per_expert] * E, device="cuda", dtype=torch.int32),
     ).contiguous()
 
-    y_full = _bf16_grouped_gemm_contiguous(x, w, m_indices)
+    counts = [per_expert] * E
+    y_full = _bf16_grouped_gemm_contiguous(x, w, m_indices, counts)
 
     # Split into halves at expert boundaries (mid-expert split is not legal for
     # contiguous-layout DeepGEMM — must split on a boundary).
     half = (E // 2) * per_expert
-    y0 = _bf16_grouped_gemm_contiguous(x[:half].contiguous(), w, m_indices[:half].contiguous())
-    y1 = _bf16_grouped_gemm_contiguous(x[half:].contiguous(), w, m_indices[half:].contiguous())
+    y0 = _bf16_grouped_gemm_contiguous(
+        x[:half].contiguous(),
+        w,
+        m_indices[:half].contiguous(),
+        counts[: E // 2] + [0] * (E // 2),
+    )
+    y1 = _bf16_grouped_gemm_contiguous(
+        x[half:].contiguous(),
+        w,
+        m_indices[half:].contiguous(),
+        [0] * (E // 2) + counts[E // 2 :],
+    )
     y_cat = torch.cat([y0, y1], dim=0)
     assert torch.equal(
         y_full, y_cat
@@ -107,7 +118,7 @@ def test_grouped_gemm_per_expert_token_count_invariance():
 
     # Layout A: just expert 1's tokens.
     m_indices_A = torch.full((8,), 1, dtype=torch.int32, device="cuda")
-    y_A = _bf16_grouped_gemm_contiguous(x_target, w, m_indices_A)
+    y_A = _bf16_grouped_gemm_contiguous(x_target, w, m_indices_A, [0, 8, 0, 0])
 
     # Layout B: expert 0 (16 rows), then expert 1 (8 rows, same x_target),
     # then expert 3 (12 rows).
@@ -122,7 +133,7 @@ def test_grouped_gemm_per_expert_token_count_invariance():
         ],
         dim=0,
     ).contiguous()
-    y_B = _bf16_grouped_gemm_contiguous(x_B, w, m_indices_B)
+    y_B = _bf16_grouped_gemm_contiguous(x_B, w, m_indices_B, [16, 8, 0, 12])
 
     # The 8 rows assigned to expert 1 inside y_B must match y_A bitwise.
     y_B_target = y_B[16 : 16 + 8]

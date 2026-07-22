@@ -303,8 +303,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             self.num_attention_heads_per_partition = 1
 
-        # BIK graph replay depends on dynamic-context padding decisions.
-        self.batch_invariant_mode = getattr(model_config, "batch_invariant_mode", False)
+        self.batch_invariant_mode = model_config.batch_invariant_mode
         self.num_speculative_tokens = inference_config.num_speculative_tokens
         assert self.num_speculative_tokens < inference_config.block_size_tokens, (
             f"num_speculative_tokens ({self.num_speculative_tokens}) must be < "
@@ -638,18 +637,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             get_pg_size(self.expert_model_parallel_group) > 1
             and model_config.transformer_impl == "transformer_engine"
         )
-        if (
-            self.batch_invariant_mode
-            and model_config.num_moe_experts is not None
-            and self._training_ep_dispatcher
-            and inference_config.use_cuda_graphs_for_non_decode_steps
-        ):
-            raise AssertionError(
-                "batch_invariant_mode MoE non-decode CUDA graphs require "
-                "transformer_impl='inference_optimized' with "
-                "inference_moe_token_dispatcher_type='nvls'. The transformer_engine "
-                "MoE dispatcher only supports decode-only CUDA graphs."
-            )
 
         # We only allow non-decode cuda graphs for the nvls dispatcher
         force_disable_non_decode_cuda_graphs = (
@@ -704,6 +691,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
         if self.batch_invariant_mode and self.is_hybrid_model and self.enable_chunked_prefill:
+            # Non-final prefills must advance by a complete Mamba chunk. A smaller
+            # per-step token budget would leave the request unable to make progress.
             assert self.max_tokens >= self.mamba_chunk_size, (
                 "batch-invariant Mamba chunked prefill requires max_tokens >= "
                 f"mamba_chunk_size ({self.mamba_chunk_size})."
@@ -2015,9 +2004,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_kv_length_offsets[0:N].fill_(0)
         self.request_to_kv_block_ids[0:N, 0] = dummy_block_idx
 
-        # 3. Dummy ranks still replay captured graphs, so keep all token
-        # metadata neutral rather than inheriting state from a prior replay.
-        self.token_to_input_ids[0:T].fill_(0)
+        # 3. Token-level state consumed by the triton KV append kernel.
         self.token_to_block_idx[0:T] = dummy_block_idx
         # Compute per-request token positions: e.g. query_lengths [3,2] -> [0,1,2,0,1]
         query_lengths = self.request_query_lengths[0:N]
@@ -2025,8 +2012,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Per-token start offset: e.g. starts [0,3], query_lengths [3,2] -> [0,0,0,3,3]
         per_token_start = torch.repeat_interleave(starts, query_lengths)
         positions = torch.arange(T, device=query_lengths.device) - per_token_start
-        self.token_to_pos_ids[0:T] = positions
-        self.token_to_position_in_request[0:T] = positions
         self.token_to_local_position_within_kv_block[0:T] = torch.remainder(
             positions, self.block_size_tokens
         )
@@ -2146,13 +2131,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self.pad_active_slices()
 
-        # Graph padding must never inherit token metadata from a prior replay.
-        self.token_to_input_ids[self.padding_slice] = 0
-        self.token_to_pos_ids[self.padding_slice] = 0
-        self.token_to_request_idx[self.padding_slice] = 0
-        self.token_to_block_idx[self.padding_slice] = self.kv_block_allocator.dummy_block_idx
-        self.token_to_local_position_within_kv_block[self.padding_slice] = 0
-        self.token_to_position_in_request[self.padding_slice] = 0
+        # Update token position indexes.
+        self.token_to_block_idx[self.active_token_count : self.padded_active_token_count] = (
+            self.kv_block_allocator.dummy_block_idx
+        )
+        self.token_to_local_position_within_kv_block[
+            self.active_token_count : self.padded_active_token_count
+        ] = 0
+        self.token_to_position_in_request[
+            self.active_token_count : self.padded_active_token_count
+        ] = 0
 
         self.active_attn_metadata = (
             self.graph_attn_metadata  # type: ignore[assignment]
@@ -2632,13 +2620,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Clamp so that effective_prefill_chunk_length >= 2 when possible.
         # A single-token prefill chunk (effective == 1) causes max_seqlen_q == 1,
         # which routes the batch into the flash-attention decode kernel and crashes.
-        # Round down to a safe restore boundary.
+        # Round down to a block boundary to keep block-table indexing consistent.
         if prefill_chunk_length - prefix_skip_tokens < 2 and prefill_chunk_length >= 2:
             max_skip = prefill_chunk_length - 2
-            skip_granularity = self.block_size_tokens
-            if self.batch_invariant_mode and self.is_hybrid_model:
-                skip_granularity = self.mamba_chunk_size
-            prefix_skip_tokens = (max_skip // skip_granularity) * skip_granularity
+            prefix_skip_tokens = (max_skip // self.block_size_tokens) * self.block_size_tokens
 
         effective_prefill_chunk_length = prefill_chunk_length - prefix_skip_tokens
         num_blocks_from_pool = max(
@@ -2908,27 +2893,20 @@ class DynamicInferenceContext(BaseInferenceContext):
             else:
                 self._pending_mamba_zeros.append(mamba_idx)
 
-        is_final_prefill = (
-            req.finished_chunk_token_count + prefill_chunk_length == len(req.prompt_tokens)
-        )
-        # BIK publishes the final continuation's reusable Mamba boundary.
-        # Non-BIK keeps the existing first-prefill-only behavior.
-        if (
-            self.is_hybrid_model
-            and self.mamba_slot_allocator is not None
-            and (
-                req.finished_chunk_token_count == 0
-                or (self.batch_invariant_mode and is_final_prefill)
-            )
-        ):
-            self.mamba_slot_allocator.compute_and_store_offsets(
-                req,
-                current_id,
-                prefix_skip_tokens,
-                prefill_chunk_length,
-                num_matched_blocks,
-                overall_required_blocks,
-            )
+            # compute_and_store_offsets sets both CPU state (hash_to_block_id,
+            # _eos_cache_block_id_gpu) and GPU staging buffers.  Runs immediately
+            # because commit_intermediate_states() reads the CPU state after the
+            # forward pass.
+            if self.mamba_slot_allocator is not None:
+                self.mamba_slot_allocator.compute_and_store_offsets(
+                    req,
+                    current_id,
+                    prefix_skip_tokens,
+                    prefill_chunk_length,
+                    num_matched_blocks,
+                    matched_block_ids,
+                    overall_required_blocks,
+                )
 
         self.active_token_count += effective_prefill_chunk_length
         self.lifetime_prefill_token_count += effective_prefill_chunk_length

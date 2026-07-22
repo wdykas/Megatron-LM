@@ -163,7 +163,7 @@ def mcore_fused_moe(
     # --- Pre-processing: permute ---
     if use_fused_quant:
         # Fused permute + MXFP8 quantize: single kernel produces MXFP8Tensor
-        inverse_map = None
+        batch_invariant_inverse_map = None
         hidden_states, permuted_probs, permutation_map, offs = permute_and_quantize_mxfp8(
             hidden_states,
             probs,
@@ -182,10 +182,12 @@ def mcore_fused_moe(
             num_local_experts,
             valid_tokens,
             alignment=expert_alignment,
-            return_inverse_map=batch_invariant_mode,
+            return_batch_invariant_inverse_map=batch_invariant_mode,
         )
         hidden_states, permuted_probs, permutation_map, offs = permuted[:4]
-        inverse_map = permuted[4] if batch_invariant_mode else None
+        # Maps each (token, local expert) pair to its row in the expert-grouped buffer,
+        # allowing batch-invariant unpermute to read contributions in fixed expert order.
+        batch_invariant_inverse_map = permuted[4] if batch_invariant_mode else None
 
     # --- FC1 -> activation -> FC2 ---
     # Quantize if MXFP8 path and hidden_states not already quantized (fused permute+quant
@@ -213,5 +215,5 @@ def mcore_fused_moe(
         n_used,
         valid_tokens,
         out=out,
-        inverse_map=inverse_map,
+        batch_invariant_inverse_map=batch_invariant_inverse_map,
     )

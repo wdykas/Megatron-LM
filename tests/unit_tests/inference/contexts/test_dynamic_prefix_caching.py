@@ -783,45 +783,6 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert not msa5.has_state(bid5) and bh5 not in msa5.hash_to_block_id
 
     @pytest.mark.internal
-    def test_batch_invariant_mamba_prefix_skip_is_chunk_aligned(self):
-        ctx = self._mctx(block_size_tokens=32, batch_invariant_mode=True)
-        bs = ctx.block_size_tokens
-        prompt = self._prompt(bs * 10)
-        ctx.add_request(self._req(ctx, prompt.clone()))
-
-        req = self._req(ctx, prompt.clone(), request_id=2)
-        req._mamba_num_matched_blocks = 8  # raw Mamba skip = 256 tokens.
-
-        (_, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(req, 257)
-        assert prefix_skip == ctx.mamba_chunk_size
-        assert eff_chunk == 257 - ctx.mamba_chunk_size
-
-    @pytest.mark.internal
-    def test_batch_invariant_mamba_eos_cache_requires_chunk_boundary(self):
-        ctx = self._mctx(block_size_tokens=32, batch_invariant_mode=True)
-        ctx.add_request(self._req(ctx, self._prompt(96)))
-        assert ctx.mamba_slot_allocator._eos_cache_block_id_cpu[0].item() < 0
-
-        ctx2 = self._mctx(block_size_tokens=32, batch_invariant_mode=True)
-        ctx2.add_request(self._req(ctx2, self._prompt(ctx2.mamba_chunk_size)))
-        assert ctx2.mamba_slot_allocator._eos_cache_block_id_cpu[0].item() >= 0
-
-        # Aligned prompts keep both the live end state and the previous
-        # boundary needed to recompute the final token's logit.
-        ctx3 = self._mctx(block_size_tokens=32, batch_invariant_mode=True)
-        ctx3.add_request(self._req(ctx3, self._prompt(3 * ctx3.mamba_chunk_size)))
-        assert ctx3.mamba_slot_allocator._eos_cache_block_id_cpu[0].item() >= 0
-        assert ctx3.mamba_slot_allocator._intermediate_counts_cpu[0].item() == 1
-        assert ctx3.mamba_slot_allocator._intermediate_offsets_cpu[0, 0].item() == 256
-
-        # An unaligned final prompt extracts the farthest reusable boundary.
-        ctx4 = self._mctx(block_size_tokens=32, batch_invariant_mode=True)
-        ctx4.add_request(self._req(ctx4, self._prompt(500)))
-        assert ctx4.mamba_slot_allocator._eos_cache_block_id_cpu[0].item() < 0
-        assert ctx4.mamba_slot_allocator._intermediate_counts_cpu[0].item() == 1
-        assert ctx4.mamba_slot_allocator._intermediate_offsets_cpu[0, 0].item() == 384
-
-    @pytest.mark.internal
     def test_batch_invariant_mamba_chunked_prefill_scheduler_alignment(self):
         ctx = self._mctx(block_size_tokens=32, batch_invariant_mode=True)
         engine = _StubEngine(ctx, enable_chunked_prefill=True)
@@ -830,25 +791,6 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert engine._mamba_batch_invariant_prefill_chunk_length(req, 300) == 256
         assert engine._mamba_batch_invariant_prefill_chunk_length(req, 100) == 0
 
-        req._mamba_num_matched_blocks = 8
-        raw_chunk = engine._mamba_batch_invariant_prefill_chunk_length(
-            req, 128, cached_prefix_tokens=8 * ctx.block_size_tokens
-        )
-        assert raw_chunk == 384
-
-        # The context skips the cached 256-token prefix and computes one
-        # aligned 128-token chunk without referring past the scheduled range.
-        cached_ctx = self._mctx(block_size_tokens=32, batch_invariant_mode=True)
-        prompt = self._prompt(500)
-        cached_ctx.add_request(self._req(cached_ctx, prompt.clone()))
-        cached_req = self._req(cached_ctx, prompt.clone(), request_id=4)
-        cached_req._mamba_num_matched_blocks = 8
-        (_, _, _, _, prefix_skip, effective) = cached_ctx._compute_prefix_match(
-            cached_req, raw_chunk
-        )
-        assert prefix_skip == 256
-        assert effective == 128
-
         short_req = self._req(ctx, self._prompt(200), request_id=2)
         assert engine._mamba_batch_invariant_prefill_chunk_length(short_req, 300) == 200
 
@@ -856,18 +798,6 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert (
             engine._mamba_batch_invariant_prefill_chunk_length(
                 one_left_req, ctx.mamba_chunk_size
-            )
-            == 0
-        )
-
-        cached_one_left_req = self._req(
-            ctx, self._prompt(2 * ctx.mamba_chunk_size + 1), request_id=4
-        )
-        assert (
-            engine._mamba_batch_invariant_prefill_chunk_length(
-                cached_one_left_req,
-                ctx.mamba_chunk_size,
-                cached_prefix_tokens=ctx.mamba_chunk_size,
             )
             == 0
         )
@@ -893,6 +823,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
             prefix_skip,
             len(prompt),
             len(matched),
+            [ctx.request_to_kv_block_ids[0][i].item() for i in range(len(matched))],
             overall,
         )
         # Penultimate block offset (block 2 boundary) is a valid intermediate

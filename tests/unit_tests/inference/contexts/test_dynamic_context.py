@@ -18,7 +18,6 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -125,99 +124,6 @@ class TestDynamicContext:
     @classmethod
     def teardown_class(cls):
         Utils.destroy_model_parallel()
-
-    @pytest.mark.internal
-    def test_batch_invariant_decode_graph_pads_input_and_position_ids(self):
-        """BIK decode graphs consume padded input/position rows.
-
-        Without neutralizing those rows, stale IDs from a previous step become
-        part of the captured forward whenever the chosen graph bucket is larger
-        than the active decode count.
-        """
-        model_config = TransformerConfig(
-            params_dtype=torch.float32,
-            num_layers=2,
-            kv_channels=8,
-            num_attention_heads=2,
-            batch_invariant_mode=True,
-            attention_backend=AttnBackend.flash,
-        )
-        inference_config = InferenceConfig(
-            max_sequence_length=64,
-            buffer_size_gb=0.01,
-            block_size_tokens=16,
-            max_tokens=8,
-            max_requests=4,
-            num_cuda_graphs=1,
-            use_cuda_graphs_for_non_decode_steps=True,
-            unified_memory_level=0,
-        )
-        ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
-        requests = [
-            DynamicInferenceRequest(
-                request_id=i,
-                prompt_tokens=torch.tensor([10 + i], dtype=torch.long),
-                sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
-            )
-            for i in range(2)
-        ]
-
-        ctx.add_dummy_requests_parallel(requests, count_as_prefill=False)
-        ctx.num_prefill_requests = 0
-        ctx.token_to_input_ids[2:4] = torch.tensor([777, 778], dtype=torch.long)
-        ctx.token_to_pos_ids[2:4] = torch.tensor([888, 889], dtype=torch.long)
-
-        ctx.initialize_attention_state()
-        ctx.transfer_bookkeeping_to_gpu()
-        input_ids, position_ids = ctx.current_input_and_position_ids()
-
-        assert ctx.using_cuda_graph_this_step()
-        assert ctx.active_token_count == 2
-        assert ctx.padded_active_token_count == 4
-        assert input_ids.cpu().tolist() == [[10, 11, 0, 0]]
-        assert position_ids.cpu().tolist() == [[0, 0, 0, 0]]
-
-    @pytest.mark.internal
-    def test_batch_invariant_moe_non_decode_graphs_require_inference_dispatcher(
-        self, monkeypatch
-    ):
-        """Do not silently turn a requested BIK full-graph run into decode-only graphs."""
-        fake_ep_group = object()
-
-        monkeypatch.setattr(parallel_state, "get_expert_model_parallel_world_size", lambda: 2)
-        monkeypatch.setattr(
-            parallel_state, "get_expert_model_parallel_group", lambda: fake_ep_group
-        )
-        monkeypatch.setattr(
-            "megatron.core.inference.contexts.dynamic_context.get_pg_size",
-            lambda group: 2 if group is fake_ep_group else 1,
-        )
-
-        model_config = TransformerConfig(
-            params_dtype=torch.bfloat16,
-            num_layers=2,
-            kv_channels=8,
-            num_attention_heads=2,
-            batch_invariant_mode=True,
-            num_moe_experts=4,
-            moe_token_dispatcher_type="alltoall",
-            transformer_impl="transformer_engine",
-            inference_moe_token_dispatcher_type="nvls",
-            attention_backend=AttnBackend.flash,
-        )
-        inference_config = InferenceConfig(
-            max_sequence_length=64,
-            buffer_size_gb=0.01,
-            block_size_tokens=16,
-            max_tokens=8,
-            max_requests=4,
-            num_cuda_graphs=1,
-            use_cuda_graphs_for_non_decode_steps=True,
-            unified_memory_level=0,
-        )
-
-        with pytest.raises(AssertionError, match="inference_optimized"):
-            DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
 
     @pytest.mark.internal
     @rounder_override(64)

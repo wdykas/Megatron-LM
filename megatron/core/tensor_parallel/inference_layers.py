@@ -45,10 +45,7 @@ except ImportError:
 
 
 def _te_rms_norm_kernel(x: torch.Tensor, weight: torch.Tensor, eps: float):
-    # In batch-invariant mode, route through the pure-torch batch-invariant
-    # RMSNorm so the inference path uses the same kernel as the training-side
-    # recompute. tex.rmsnorm_fwd is empirically batch-invariant for common
-    # shapes, but not contractually so — this branch makes the guarantee explicit.
+    # Use the same RMSNorm kernel as the training recompute.
     if is_batch_invariant_mode_enabled():
         return rmsnorm_batch_invariant(x, weight, eps).to(x.dtype)
     x_shape = x.shape
