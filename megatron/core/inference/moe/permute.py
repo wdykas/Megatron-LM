@@ -493,7 +493,7 @@ def unpermute_tokens(
     assert (
         permuted_probs.dtype == torch.float32
     ), f"permuted_probs must be fp32, got {permuted_probs.dtype}"
-    hidden_dim = expert_output.shape[1]
+    output_size, hidden_dim = expert_output.shape
 
     # Triton kernel below uses tl.atomic_add (non-deterministic). Batch-invariant
     # MoE instead reduces each token independently in fixed local-expert order,
@@ -502,10 +502,10 @@ def unpermute_tokens(
         assert batch_invariant_inverse_map is not None, (
             "batch-invariant MoE unpermute requires its inverse map"
         )
-        # The BIK kernel stores every row tok < valid_tokens, including zero
+        # The expert-order kernel stores every row tok < valid_tokens, including zero
         # rows for tokens with no local expert contribution. Rows beyond
         # valid_tokens are not read by the graphed RSV combine.
-        return batch_invariant.unpermute_tokens_batch_invariant(
+        return batch_invariant.unpermute_tokens_in_expert_order(
             expert_output,
             permuted_probs,
             batch_invariant_inverse_map,
@@ -513,7 +513,6 @@ def unpermute_tokens(
             out,
         )
 
-    output_size = expert_output.shape[0]
     BLOCK_H = min(triton.next_power_of_2(hidden_dim), 1024)
     if out is None:
         out = torch.empty(num_tokens, hidden_dim, dtype=torch.float32, device=expert_output.device)
