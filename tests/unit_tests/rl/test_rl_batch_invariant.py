@@ -87,6 +87,7 @@ def test_moe_batch_invariant_permute_unpermute_cuda_graph_non_padded():
             permuted,
             sorted_indices,
             tokens.shape,
+            probs=probs,
             routing_map=routing_map,
             batch_invariant_inverse_map=inverse_map,
         )
@@ -109,3 +110,7 @@ def test_moe_batch_invariant_permute_unpermute_cuda_graph_non_padded():
         parallel_state.set_expert_model_parallel_world_size(None)
 
     torch.testing.assert_close(graph_out, expected, rtol=0.0, atol=0.0)
+    reference = (
+        tokens.float() * probs[:, 0, None] + tokens.float() * probs[:, 2, None]
+    ).to(tokens.dtype)
+    torch.testing.assert_close(graph_out, reference, rtol=0.0, atol=0.0)

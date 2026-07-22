@@ -67,7 +67,7 @@ def _bmm_chunk_fwd_kernel(
     a_ptr,
     b_ptr,
     out_ptr,
-    cu_chunk_seqlens_ptr,
+    chunk_offsets_ptr,
     target_rows_ptr,
     # Matrix dimensions
     seqlen,
@@ -102,23 +102,19 @@ def _bmm_chunk_fwd_kernel(
         if pid_n * BLOCK_SIZE_N >= (pid_m + 1) * BLOCK_SIZE_M:
             return
     if HAS_TARGET_ROWS:
-        # Only row target_rows[pid_c] of the chunk scan is
-        # consumed. Skip M-blocks that don't contain it and N-blocks past it
-        # (the scan causally zeroes CB columns beyond the target row anyway).
-        # The surviving block runs the same instructions as the ungated
-        # kernel, so its output is unchanged.
+        # Keep the target row's tile and its causal column tiles.
         tr = tl.load(target_rows_ptr + pid_c)
         if pid_m != tr // BLOCK_SIZE_M:
             return
         if pid_n * BLOCK_SIZE_N > tr:
             return
 
-    chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)
+    chunk_seqlen_start = tl.load(chunk_offsets_ptr + pid_c)
     if HAS_TARGET_ROWS:
-        # Target rows use fixed-length windows at caller-given buffer offsets.
+        # Fixed windows need only a start offset.
         chunk_seqlen_end = chunk_seqlen_start + chunk_size
     else:
-        chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
+        chunk_seqlen_end = tl.load(chunk_offsets_ptr + pid_c + 1)
 
     a_ptr += chunk_seqlen_start * stride_a_seqlen + pid_h * stride_a_head
     b_ptr += chunk_seqlen_start * stride_b_seqlen + pid_h * stride_b_head
@@ -186,7 +182,12 @@ def _bmm_chunk_fwd(
         "target_rows and chunk_starts must be provided together"
     )
     if has_target_rows:
-        cu_chunk_seqlens = chunk_starts
+        # chunk_starts has one fixed-window start per chunk.
+        chunk_offsets = chunk_starts
+        nchunks = len(chunk_starts)
+    else:
+        chunk_offsets = cu_chunk_seqlens
+        nchunks = len(cu_chunk_seqlens) - 1
     seqlen, ngroups, k = a.shape
     assert b.shape == a.shape
     if a.stride(-1) != 1 and a.stride(0) != 1:
@@ -194,7 +195,6 @@ def _bmm_chunk_fwd(
     if b.stride(-1) != 1 and b.stride(0) != 1:
         b = b.contiguous()
 
-    nchunks = len(cu_chunk_seqlens) - (0 if has_target_rows else 1)
     # Allocates output.
     out_dtype = a.dtype if output_dtype is None else output_dtype
     out = torch.empty((nchunks, ngroups, chunk_size, chunk_size), device=a.device, dtype=out_dtype)
@@ -213,7 +213,7 @@ def _bmm_chunk_fwd(
             a_ptr=a,
             b_ptr=b,
             out_ptr=out,
-            cu_chunk_seqlens_ptr=cu_chunk_seqlens,
+            chunk_offsets_ptr=chunk_offsets,
             target_rows_ptr=target_rows,
             seqlen=seqlen,
             chunk_size=chunk_size,

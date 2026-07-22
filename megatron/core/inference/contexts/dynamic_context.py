@@ -691,11 +691,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
         if self.batch_invariant_mode and self.is_hybrid_model and self.enable_chunked_prefill:
-            # Non-final prefills must leave the SSM cache at a Mamba chunk boundary.
-            # If the per-step budget cannot fit one chunk, scheduling rounds the
-            # prefill length down to zero and the request cannot make progress.
-            assert self.max_tokens >= self.mamba_chunk_size, (
-                "batch-invariant Mamba chunked prefill requires max_tokens >= "
+            # A chunk plus its final token must fit in one step; otherwise a prompt
+            # of that length can never advance without an invalid one-token tail.
+            assert self.max_tokens > self.mamba_chunk_size, (
+                "batch-invariant Mamba chunked prefill requires max_tokens > "
                 f"mamba_chunk_size ({self.mamba_chunk_size})."
             )
 

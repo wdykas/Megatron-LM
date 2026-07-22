@@ -55,12 +55,14 @@ class PrefixCachingTestBase:
         block_size_tokens=32,
         max_sequence_length=512,
         rounder=64,
+        max_requests=None,
         enable_prefix_caching=True,
         max_tokens=None,
         prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
         mamba_config=None,
         prefix_caching_mamba_gb=None,
         batch_invariant_mode=False,
+        enable_chunked_prefill=False,
     ):
         DynamicInferenceContext.ROUNDER = rounder
         DynamicInferenceContext.TOKEN_ROUNDER = rounder
@@ -80,6 +82,7 @@ class PrefixCachingTestBase:
         )
         inference_config = InferenceConfig(
             max_sequence_length=max_sequence_length,
+            max_requests=max_requests,
             buffer_size_gb=buffer_size_gb,
             paused_buffer_size_gb=0.2 * buffer_size_gb,
             block_size_tokens=block_size_tokens,
@@ -88,6 +91,7 @@ class PrefixCachingTestBase:
             use_flashinfer_fused_rope=None,
             unified_memory_level=0,
             enable_prefix_caching=enable_prefix_caching,
+            enable_chunked_prefill=enable_chunked_prefill,
             prefix_caching_eviction_policy=prefix_caching_eviction_policy,
             prefix_caching_mamba_gb=prefix_caching_mamba_gb,
         )
@@ -801,6 +805,20 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
             )
             == 0
         )
+        assert (
+            engine._mamba_batch_invariant_prefill_chunk_length(
+                one_left_req, ctx.mamba_chunk_size + 1
+            )
+            == ctx.mamba_chunk_size + 1
+        )
+
+        with pytest.raises(AssertionError, match="max_tokens > mamba_chunk_size"):
+            self._mctx(
+                batch_invariant_mode=True,
+                enable_chunked_prefill=True,
+                max_tokens=ctx.mamba_chunk_size,
+                max_requests=64,
+            )
 
     @pytest.mark.internal
     def test_mamba_intermediate_offsets(self):

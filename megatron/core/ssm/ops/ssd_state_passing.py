@@ -84,13 +84,18 @@ def _state_passing_fwd_kernel(
 
     prev_seq_idx = 0
     for c in range(nchunks):
-        new_states = tl.load(states_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+        if HAS_DST_STATES:
+            dst_flag = tl.load(dst_flags_ptr + c) != 0
+        else:
+            dst_flag = True
+        # Unflagged destination chunks have no chunk state.
+        new_states = tl.load(states_ptrs, mask=(offs_m < dim) & dst_flag, other=0.0).to(
+            tl.float32
+        )
         dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
         seq_idx = tl.load(seq_idx_ptr + c * stride_seq_idx_chunk)
         if HAS_DST_STATES:
-            # Decode mode: every chunk is its own sequence. seq_idx carries
-            # slot ids that can repeat for padding entries, so change detection
-            # can't be trusted.
+            # Destination chunks start from their indexed initial state.
             is_new_seq = True
         else:
             is_new_seq = prev_seq_idx != seq_idx
@@ -113,11 +118,8 @@ def _state_passing_fwd_kernel(
             tl.store(out_ptrs, states, mask=offs_m < dim)
 
         if HAS_DST_STATES:
-            # Decode mode: persist crossing slots' boundary states straight
-            # into the state cache. Same fp32 value as `out`; the store
-            # converts to the cache dtype. Each crossing chunk writes its own
-            # slot, so there are no duplicate indices.
-            if tl.load(dst_flags_ptr + c) != 0:
+            # Commit completed chunks directly to the state cache.
+            if dst_flag:
                 dst_idx = tl.load(dst_indices_ptr + c).to(tl.int64)
                 dst_ptrs = (
                     dst_states_ptr
@@ -144,9 +146,8 @@ def _state_passing_fwd(
     dst_flags=None,
 ):
     """
-    dst_states/dst_indices/dst_flags (all-or-none) enable decode mode: flagged
-    boundary states are written directly to dst_states and no output tensor is
-    allocated.
+    dst_states/dst_indices/dst_flags write flagged boundary states directly to
+    dst_states without allocating an output tensor.
     """
     nchunks, nheads, dim = states.shape
     chunk_size = dA_cumsum.shape[-1]

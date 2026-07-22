@@ -51,7 +51,7 @@ def _chunk_cumsum_fwd_kernel(
     dt_bias_ptr,
     dt_out_ptr,
     dA_cumsum_ptr,
-    cu_chunk_seqlens_ptr,
+    chunk_offsets_ptr,
     # Matrix dimension
     seqlen,
     nheads: tl.constexpr,
@@ -81,13 +81,12 @@ def _chunk_cumsum_fwd_kernel(
     pid_c = tl.program_id(axis=0).to(tl.int64)
     pid_h = tl.program_id(axis=1)
 
-    chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)
+    chunk_seqlen_start = tl.load(chunk_offsets_ptr + pid_c)
     if HAS_CHUNK_STARTS:
-        # Decode mode: fixed-length windows at caller-given buffer offsets
-        # rather than adjacent [cu[c], cu[c+1]) spans.
+        # Fixed windows need only a start offset.
         chunk_seqlen_end = chunk_seqlen_start + chunk_size
     else:
-        chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
+        chunk_seqlen_end = tl.load(chunk_offsets_ptr + pid_c + 1)
 
     dt_ptr += chunk_seqlen_start * stride_dt_seqlen
     dt_out_ptr += pid_c * stride_dt_out_chunk
@@ -185,7 +184,7 @@ def _chunk_state_fwd_kernel(
     states_ptr,
     dt_ptr,
     dA_cumsum_ptr,
-    cu_chunk_seqlens_ptr,
+    chunk_offsets_ptr,
     chunk_flags_ptr,
     # Matrix dimensions
     hdim: tl.constexpr,
@@ -222,16 +221,15 @@ def _chunk_state_fwd_kernel(
     pid_m = tl.program_id(axis=0) // num_pid_n
     pid_n = tl.program_id(axis=0) % num_pid_n
     if HAS_CHUNK_FLAGS:
-        # A flagged chunk's state is consumed when its slot
-        # crosses the boundary this step. Skip the matmul otherwise; the
-        # uninitialized rows are never read downstream.
+        # Only completed chunks need a boundary state.
         if tl.load(chunk_flags_ptr + pid_c) == 0:
             return
-    chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)
+    chunk_seqlen_start = tl.load(chunk_offsets_ptr + pid_c)
     if HAS_CHUNK_FLAGS:
+        # Chunk flags are paired with fixed-window starts.
         chunk_seqlen_end = chunk_seqlen_start + chunk_size
     else:
-        chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
+        chunk_seqlen_end = tl.load(chunk_offsets_ptr + pid_c + 1)
     b_ptr += chunk_seqlen_start * stride_b_seqlen + (pid_h // nheads_ngroups_ratio) * stride_b_head
     x_ptr += chunk_seqlen_start * stride_x_seqlen + pid_h * stride_x_head
     dt_ptr += pid_c * stride_dt_chunk + pid_h * stride_dt_head
@@ -301,9 +299,10 @@ def _chunk_cumsum_fwd(
     if dt_bias is not None:
         assert dt_bias.shape == (nheads,)
     if chunk_starts is not None:
-        cu_chunk_seqlens = chunk_starts
+        chunk_offsets = chunk_starts
         nchunks = chunk_starts.shape[0]
     else:
+        chunk_offsets = cu_chunk_seqlens
         nchunks = cu_chunk_seqlens.shape[0] - 1
     dt_out = torch.empty(nheads, nchunks, chunk_size, device=dt.device, dtype=torch.float32)
     dA_cumsum = torch.empty(nheads, nchunks, chunk_size, device=dt.device, dtype=torch.float32)
@@ -315,7 +314,7 @@ def _chunk_cumsum_fwd(
             dt_bias_ptr=dt_bias,
             dt_out_ptr=dt_out,
             dA_cumsum_ptr=dA_cumsum,
-            cu_chunk_seqlens_ptr=cu_chunk_seqlens,
+            chunk_offsets_ptr=chunk_offsets,
             seqlen=seqlen,
             nheads=nheads,
             chunk_size=chunk_size,
@@ -355,7 +354,9 @@ def _chunk_state_fwd(
         "chunk_flags and chunk_starts must be provided together"
     )
     if has_chunk_flags:
-        cu_chunk_seqlens = chunk_starts
+        chunk_offsets = chunk_starts
+    else:
+        chunk_offsets = cu_chunk_seqlens
     seqlen, nheads, headdim = x.shape
     _, nchunks, chunk_size = dt.shape
     _, ngroups, dstate = B.shape
@@ -384,7 +385,7 @@ def _chunk_state_fwd(
             states_ptr=states,
             dt_ptr=dt,
             dA_cumsum_ptr=dA_cumsum,
-            cu_chunk_seqlens_ptr=cu_chunk_seqlens,
+            chunk_offsets_ptr=chunk_offsets,
             chunk_flags_ptr=chunk_flags,
             hdim=headdim,
             dstate=dstate,

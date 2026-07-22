@@ -212,9 +212,7 @@ def mamba_chunk_scan_decode_rows(
         dt_limit=dt_limit,
         chunk_starts=chunk_starts,
     )
-    # Non-crossing chunks leave uninitialized rows in `states`. That's fine:
-    # state passing restarts from initial_states at every chunk, so garbage
-    # never propagates, and only flagged chunks' outputs are read.
+    # Only boundary-crossing chunks produce a state; state passing masks the rest.
     states = _chunk_state_fwd(
         B,
         x,

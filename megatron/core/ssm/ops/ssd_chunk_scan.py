@@ -88,7 +88,7 @@ def _chunk_scan_fwd_kernel(
     states_ptr,
     D_ptr,
     initstates_ptr,
-    cu_chunk_seqlens_ptr,
+    chunk_offsets_ptr,
     target_rows_ptr,
     # Matrix dimensions
     chunk_size: tl.constexpr,
@@ -148,18 +148,16 @@ def _chunk_scan_fwd_kernel(
     pid_m = tl.program_id(axis=0) // num_pid_n
     pid_n = tl.program_id(axis=0) % num_pid_n
     if HAS_TARGET_ROWS:
-        # Only row target_rows[pid_c] of this chunk's output is
-        # consumed, so skip every M-block that doesn't contain it. The
-        # surviving block runs the same instructions as the ungated kernel.
+        # Keep the tile containing the only output row consumed.
         if pid_m != tl.load(target_rows_ptr + pid_c) // BLOCK_SIZE_M:
             return
     cb_ptr += pid_c * stride_cb_chunk + (pid_h // nheads_ngroups_ratio) * stride_cb_head
-    chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)
+    chunk_seqlen_start = tl.load(chunk_offsets_ptr + pid_c)
     if HAS_TARGET_ROWS:
-        # Target rows use fixed-length windows at caller-given buffer offsets.
+        # Fixed windows need only a start offset.
         chunk_seqlen_end = chunk_seqlen_start + chunk_size
     else:
-        chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
+        chunk_seqlen_end = tl.load(chunk_offsets_ptr + pid_c + 1)
     x_ptr += chunk_seqlen_start * stride_x_seqlen + pid_h * stride_x_head
     dt_ptr += pid_c * stride_dt_chunk + pid_h * stride_dt_head
     dA_cumsum_ptr += pid_c * stride_dA_cs_chunk + pid_h * stride_dA_cs_head
@@ -172,12 +170,7 @@ def _chunk_scan_fwd_kernel(
     seq_idx_ptr += pid_c * stride_seq_idx_chunk
     seq_idx = tl.load(seq_idx_ptr)
     if HAS_TARGET_ROWS:
-        # Every target-row chunk is its own sequence and seq_idx carries
-        # the slot id into initial_states (which may be the engine's state
-        # cache). Reading initial_states unconditionally means padding entries
-        # with duplicate slot ids can never pick up another chunk's carried
-        # state, and the (dummy) carried-states pointer is never typed into
-        # the program.
+        # Each fixed window starts from its indexed cached state.
         seq_idx_prev = -1
         prev_states_ptr = (
             initstates_ptr + seq_idx * stride_init_states_batch + pid_h * stride_init_states_head
@@ -383,7 +376,9 @@ def _chunk_scan_fwd(
         "target_rows and chunk_starts must be provided together"
     )
     if has_target_rows:
-        cu_chunk_seqlens = chunk_starts
+        chunk_offsets = chunk_starts
+    else:
+        chunk_offsets = cu_chunk_seqlens
 
     seqlen, nheads, headdim = x.shape
     _, nchunks, chunk_size = dt.shape
@@ -430,7 +425,7 @@ def _chunk_scan_fwd(
         states_ptr=states,
         D_ptr=D,
         initstates_ptr=initial_states,
-        cu_chunk_seqlens_ptr=cu_chunk_seqlens,
+        chunk_offsets_ptr=chunk_offsets,
         target_rows_ptr=target_rows,
         chunk_size=chunk_size,
         hdim=headdim,

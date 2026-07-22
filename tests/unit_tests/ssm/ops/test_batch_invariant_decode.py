@@ -15,7 +15,7 @@ try:
     from megatron.core.ssm.ops.ssd_combined import mamba_chunk_scan_combined_varlen
 
     HAVE_BATCH_INVARIANT_DECODE = True
-except (ImportError, Exception):
+except ImportError:
     HAVE_BATCH_INVARIANT_DECODE = False
 
 
