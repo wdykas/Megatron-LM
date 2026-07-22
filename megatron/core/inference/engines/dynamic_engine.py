@@ -1672,6 +1672,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # This avoids the edge case where max_seqlen_q=1 which results in a bug
                     # with the Flash Attention kernel.
                     # See https://github.com/Dao-AILab/flash-attention/issues/1537
+                    # Batch-invariant Mamba handles this in its chunk-length helper.
                     if (
                         not batch_invariant_mamba_prefill
                         and remaining_len - scheduled_prefill_length == 1
