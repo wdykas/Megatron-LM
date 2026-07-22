@@ -691,8 +691,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
         if self.batch_invariant_mode and self.is_hybrid_model and self.enable_chunked_prefill:
-            # Non-final prefills must advance by a complete Mamba chunk. A smaller
-            # per-step token budget would leave the request unable to make progress.
+            # Batch-invariant scheduling processes non-final prefills in whole Mamba
+            # chunks, so the per-step token budget must fit at least one full chunk.
             assert self.max_tokens >= self.mamba_chunk_size, (
                 "batch-invariant Mamba chunked prefill requires max_tokens >= "
                 f"mamba_chunk_size ({self.mamba_chunk_size})."
