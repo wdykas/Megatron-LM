@@ -1,13 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""Numerical correctness tests for the batch-invariant SSM decode kernel.
-
-`batch_invariant_decode_buffered_scan` claims that its single-token output is bitwise
-identical to running `mamba_chunk_scan_combined` over the full
-(prefill + decode_token) sequence — that's what makes batch-invariant RL
-rollout log-probs match the training-side recompute. These tests verify
-that claim directly on plain tensors, across the configurations the
-batch-invariant decode path needs to handle.
-"""
+"""Tests for batch-invariant Mamba decode."""
 
 import unittest
 

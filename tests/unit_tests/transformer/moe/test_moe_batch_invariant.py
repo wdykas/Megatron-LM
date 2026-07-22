@@ -1,14 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Batch-invariant MoE grouped-GEMM tests.
-
-These tests exercise the DeepGEMM-backed batch-invariant grouped GEMM path that
-makes TEGroupedMLP (training) and InferenceGroupedMLP (inference) produce
-bitwise-identical outputs for the same inputs — the contract needed for RL
-rollout==train log-prob parity on MoE models.
-
-Skipped unless DeepGEMM with bf16 grouped bindings is installed; see
-`uv pip install -e .[batch_invariant]`.
-"""
+"""Tests for batch-invariant MoE grouped GEMM."""
 import pytest
 import torch
 import torch.nn.functional as F

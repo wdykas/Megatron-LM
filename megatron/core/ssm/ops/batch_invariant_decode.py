@@ -1,17 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""Batch-invariant Mamba decode.
-
-Single-token decode that is bitwise identical to a full-sequence chunked
-scan (what the training recompute runs). Each slot keeps a buffer of the
-inputs since its last chunk boundary; every decode step re-runs the chunked
-scan over buffer + new token, so the token lands at the same intra-chunk
-position the full scan would give it.
-
-The scan goes through mamba_chunk_scan_decode_rows, which gates the kernels
-down to the one output row per slot (and, on boundary crossings, the chunk
-state) that a decode step actually uses. Everything is fixed-shape with no
-host syncs, so the whole step is CUDA-graph capturable.
-"""
+"""Batch-invariant Mamba decode using buffered chunk replay."""
 
 from dataclasses import dataclass
 

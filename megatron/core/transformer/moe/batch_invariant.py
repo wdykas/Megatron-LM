@@ -1,5 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Batch-invariant helpers for training MoE permutation/unpermutation."""
+"""Batch-invariant MoE permutation helpers."""
 
 from typing import Optional
 

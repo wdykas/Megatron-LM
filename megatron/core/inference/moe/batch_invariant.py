@@ -1,5 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Batch-invariant helpers for inference fused MoE."""
+"""Batch-invariant inference MoE helpers."""
 
 from typing import Optional
 from unittest.mock import MagicMock
