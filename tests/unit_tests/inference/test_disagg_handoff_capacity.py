@@ -42,6 +42,7 @@ class _KvAllocator:
     def __init__(self):
         self.next_block = 10
         self.releases = []
+        self.registered_parent_hashes = []
         self.block_ref_counts = torch.zeros(256, dtype=torch.int32)
         self.kv_hash_to_block_id = {}
 
@@ -56,8 +57,9 @@ class _KvAllocator:
         self.block_ref_counts[blocks] -= 1
         self.releases.append(blocks.tolist())
 
-    def register_kv_block_hashes(self, block_ids, block_hashes):
+    def register_kv_block_hashes(self, block_ids, block_hashes, parent_hashes=None):
         self.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
+        self.registered_parent_hashes.extend(parent_hashes or [])
 
     def update_timestamps(self, block_ids):
         return None
@@ -230,6 +232,7 @@ def test_nixl_handoff_reuses_decode_cached_prefix(handoff_loop):
     assert pending.hashes_to_register == 1
     engine._finalize_kv_handoff_import(pending)
     assert engine.precomputed_hashes[5] == hashes
+    assert engine.context.kv_block_allocator.registered_parent_hashes == [hashes[1]]
 
 
 def test_nixl_handoff_trims_pipeline_stage_block_lists(handoff_loop):

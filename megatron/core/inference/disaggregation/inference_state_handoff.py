@@ -44,8 +44,10 @@ if TYPE_CHECKING:
     from megatron.core.inference.sampling_params import SamplingParams
 
 _MAMBA_STATE_KINDS = ("conv", "ssm")
-# Handoffs retain only the farthest executable recurrent checkpoint selected
-# by _executable_mamba_position.
+# One recurrent checkpoint summarizes all preceding tokens, so a handoff needs
+# only the farthest executable position selected by _executable_mamba_position.
+# Earlier positions could seed reuse for future requests that diverge sooner,
+# but would add transfer traffic and durable slot pressure for the current one.
 _MAX_MAMBA_HANDOFF_SLOTS = 1
 
 
@@ -904,7 +906,15 @@ class InferenceStateHandoffMixin:
             raise RuntimeError(f"Duplicate decode handoff request ID {pending.request_id}")
 
         if n > 0:
-            allocator.register_kv_block_hashes(local_blocks[start:end], pending.hashes[start:end])
+            # The imported suffix extends any retained local prefix. Preserve
+            # that predecessor link in the allocator's parent-aware LRU forest.
+            parent_hashes = [
+                pending.hashes[block_idx - 1] if block_idx > 0 else 0
+                for block_idx in range(start, end)
+            ]
+            allocator.register_kv_block_hashes(
+                local_blocks[start:end], pending.hashes[start:end], parent_hashes=parent_hashes
+            )
 
         if pending.mamba is not None:
             self._complete_mamba_handoff_import(pending.request_id, pending.mamba, pending.hashes)

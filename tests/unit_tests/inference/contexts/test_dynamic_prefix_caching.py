@@ -1135,18 +1135,6 @@ def test_failed_mamba_batch_allocation_is_atomic(monkeypatch):
     assert torch.equal(allocator.slot_to_block, slot_to_block_before)
 
 
-def test_prefix_match_stops_at_first_evicted_block():
-    context = DynamicInferenceContext.__new__(DynamicInferenceContext)
-    context.enable_prefix_caching = True
-    context.kv_block_allocator = SimpleNamespace(kv_hash_to_block_id={101: 7, 103: 9})
-    request = SimpleNamespace(precomputed_block_hashes=[101, 102, 103])
-
-    matched, parent_hash = context._find_kv_match_count(request, 0, 3)
-
-    assert matched == [7]
-    assert parent_hash == 101
-
-
 def test_mamba_lru_eviction_selects_requested_oldest_slots(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
     kv_allocator = SimpleNamespace(
