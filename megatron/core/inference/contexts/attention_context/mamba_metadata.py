@@ -151,9 +151,10 @@ class MambaMetadata:
         self.reset_varlen_metadata()
 
         # Re-initialize the free slot pool
-        self.mamba_state_free_slots = torch.arange(
-            self.max_requests, dtype=torch.int32, device='cpu'
-        )
+        # Preserve the original non-inference tensor. This reset runs under
+        # inference_mode in normal engine teardown; replacing the tensor there
+        # makes later free-slot writes fail outside inference_mode.
+        torch.arange(self.max_requests, out=self.mamba_state_free_slots)
         self.mamba_state_free_slot_count = self.max_requests
 
     def reset_varlen_metadata(self) -> None:

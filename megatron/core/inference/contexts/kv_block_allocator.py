@@ -279,7 +279,11 @@ class KVBlockAllocator:
         # Without resetting the block bag, context request memory will clash and
         # requests will point to each other's memory blocks, resulting in faulty
         # generations.
-        self.block_bag = torch.arange(self.total_count, dtype=torch.int32, device='cpu')
+        # Refill the original tensor rather than replacing it. reset() is called
+        # from inference_mode in the engine; a tensor created there becomes an
+        # inference tensor and rejects later in-place allocator updates outside
+        # inference_mode.
+        torch.arange(self.total_count, out=self.block_bag)
 
         self.total_avail = self.total_count - 1
 
@@ -479,53 +483,77 @@ class KVBlockAllocator:
         Returns:
             True if enough blocks were evicted, False otherwise.
         """
-        # Find all cached blocks (ref_count == 0, hash != -1)
+        # Find all cached blocks (ref_count == 0, hash != -1). The tensor scan is
+        # O(cache size), but keep the much more expensive Python work proportional
+        # to the requested eviction count rather than materializing the entire
+        # forest as Python lists and dictionaries.
         cached_mask = (self.block_ref_counts == 0) & (self.block_hashes != -1)
-        cached_block_ids = torch.nonzero(cached_mask, as_tuple=True)[0]
-
-        num_cached = cached_block_ids.numel()
+        num_cached = int(cached_mask.sum())
         if num_cached < num_blocks_needed:
             return False  # Not enough cached blocks to evict
         if num_blocks_needed <= 0:
             return True
 
-        ts = self.block_timestamps[cached_block_ids].tolist()
-        bid = cached_block_ids.tolist()
-        parent_global = self.block_parent_id[cached_block_ids].tolist()
-        child_count = self.block_child_count[cached_block_ids].tolist()
-
-        # Map a cached block's global id to its local index so the peel can find a
-        # parent's slot to decrement. Parents that are not cached (root, or a
-        # parent still in use) are absent and are simply treated as peel roots.
-        global_to_local = {bid[i]: i for i in range(num_cached)}
-        parent_local = [global_to_local.get(p, -1) for p in parent_global]
+        leaf_ids = torch.nonzero(
+            cached_mask & (self.block_child_count == 0), as_tuple=True
+        )[0]
+        # At most K initial leaves can be selected in K eviction steps. Keeping
+        # only the K oldest is exact: every omitted initial leaf is newer than
+        # every retained one, while newly exposed parents are inserted below and
+        # compete by their own timestamp.
+        initial_count = min(num_blocks_needed, leaf_ids.numel())
+        if initial_count > 0:
+            leaf_timestamps = self.block_timestamps[leaf_ids]
+            if initial_count == leaf_ids.numel():
+                initial_leaf_ids = leaf_ids.tolist()
+            else:
+                # Preserve the existing deterministic (timestamp, block_id)
+                # ordering at the kth-timestamp boundary.
+                cutoff = torch.kthvalue(leaf_timestamps, initial_count).values
+                older_ids = leaf_ids[leaf_timestamps < cutoff]
+                tied_ids = leaf_ids[leaf_timestamps == cutoff]
+                tied_needed = initial_count - older_ids.numel()
+                selected_tied_ids = torch.topk(
+                    tied_ids, k=tied_needed, largest=False, sorted=False
+                ).values
+                initial_leaf_ids = torch.cat((older_ids, selected_tied_ids)).tolist()
+        else:
+            initial_leaf_ids = []
 
         # Min-heap of currently-evictable leaves keyed by (own timestamp, block
         # id). Block ids are unique, so the tie-break is total and deterministic.
-        heap = [(ts[i], bid[i], i) for i in range(num_cached) if child_count[i] == 0]
+        heap = [
+            (int(self.block_timestamps[block_id]), block_id)
+            for block_id in initial_leaf_ids
+        ]
         heapq.heapify(heap)
 
-        evicted_local = []
-        while heap and len(evicted_local) < num_blocks_needed:
-            _, _, i = heapq.heappop(heap)
-            evicted_local.append(i)
-            p = parent_local[i]
-            if p >= 0:
-                child_count[p] -= 1
-                if child_count[p] == 0:
-                    heapq.heappush(heap, (ts[p], bid[p], p))
+        evicted_ids = []
+        removed_child_counts = {}
+        while heap and len(evicted_ids) < num_blocks_needed:
+            _, block_id = heapq.heappop(heap)
+            evicted_ids.append(block_id)
+            parent_id = int(self.block_parent_id[block_id])
+            if parent_id >= 0:
+                removed_count = removed_child_counts.get(parent_id, 0) + 1
+                removed_child_counts[parent_id] = removed_count
+                remaining_children = int(self.block_child_count[parent_id]) - removed_count
+                if remaining_children == 0 and bool(cached_mask[parent_id]):
+                    heapq.heappush(
+                        heap, (int(self.block_timestamps[parent_id]), parent_id)
+                    )
 
         # A forest is always fully peelable, so the heap always exposes enough
         # leaves to collect num_blocks_needed (guaranteed by the num_cached >=
         # num_blocks_needed check above). Falling short means the parent graph is
         # cyclic — only possible under a hash collision, which we treat as a bug.
-        assert len(evicted_local) == num_blocks_needed, (
-            f"leaf peel evicted {len(evicted_local)} of {num_blocks_needed} "
+        assert len(evicted_ids) == num_blocks_needed, (
+            f"leaf peel evicted {len(evicted_ids)} of {num_blocks_needed} "
             f"requested from {num_cached} cached blocks; parent graph is not a "
             f"forest (likely a block-hash collision)"
         )
 
-        blocks_to_evict = cached_block_ids[torch.tensor(evicted_local, dtype=torch.int64)]
+        blocks_to_evict = torch.tensor(evicted_ids, dtype=torch.int64)
         self._deregister_blocks(blocks_to_evict)
 
         return True

@@ -819,6 +819,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 scratch_bytes = scratch_slots * mamba_bytes_per_req
                 durable_slots = (prefix_cache_bytes - scratch_bytes) // mamba_bytes_per_req
                 durable_slots = max(durable_slots, 0)
+                durable_slots = min(
+                    durable_slots, self.kv_block_allocator.total_count - 1
+                )
                 log_lines += [
                     f"  Mamba prefix cache:",
                     f"    budget:                {get_mem_size_str(prefix_cache_bytes)}",
@@ -1733,6 +1736,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 f"to at least {(scratch_bytes + per_slot_bytes) / 1024**3:.4g} GB, or "
                 f"reduce max_tokens."
             )
+        # A durable Mamba snapshot is keyed by a usable KV block, so slots beyond
+        # the KV allocator's non-dummy block count can never be addressed.
+        max_slots = min(max_slots, self.kv_block_allocator.total_count - 1)
 
         self.mamba_slot_allocator = MambaSlotAllocator(
             context=self,
@@ -3019,20 +3025,24 @@ class DynamicInferenceContext(BaseInferenceContext):
         if start_block >= end_block:
             return [], 0
 
-        hashes = req.precomputed_block_hashes[start_block:end_block]
+        precomputed_hashes = req.precomputed_block_hashes
         kv_hash_to_block = self.kv_block_allocator.kv_hash_to_block_id
 
-        # Find longest KV prefix by iterating block hashes from end.
-        # Parent-chained hashes guarantee: if hash at position N exists,
-        # all hashes 0..N also exist. So first match from end = longest prefix.
-        for i in range(len(hashes) - 1, -1, -1):
-            if hashes[i] in kv_hash_to_block:
-                num_matched = i + 1
-                matched_blocks = [kv_hash_to_block[hashes[j]] for j in range(num_matched)]
-                parent_hash = hashes[num_matched - 1]
-                return matched_blocks, parent_hash
-
-        return [], 0
+        # Walk forward and stop at the first miss. Besides matching this method's
+        # contract, this is O(matched-prefix length) for misses and degrades
+        # safely if cache bookkeeping is ever temporarily discontinuous.
+        matched_blocks = []
+        parent_hash = 0
+        # Index the original list instead of slicing it: a slice copies every
+        # candidate hash and makes even a first-block cold miss O(prompt blocks).
+        for block_idx in range(start_block, end_block):
+            block_hash = precomputed_hashes[block_idx]
+            block_id = kv_hash_to_block.get(block_hash)
+            if block_id is None:
+                break
+            matched_blocks.append(block_id)
+            parent_hash = block_hash
+        return matched_blocks, parent_hash
 
     def add_request(
         self, req: DynamicInferenceRequest, prefill_chunk_length: Optional[int] = None
