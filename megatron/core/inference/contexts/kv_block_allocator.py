@@ -147,6 +147,26 @@ class KVBlockAllocator:
         """Compute number of paused blocks available."""
         return self.paused_count - self.get_paused_used()
 
+    def get_allocatable_block_count(self, potential_matched_count: int = 0) -> int:
+        """Return the number of blocks that an allocation can consume.
+
+        LRU prefix caching can allocate from both the raw free pool and registered
+        cached blocks whose reference count is zero. ``potential_matched_count``
+        excludes currently-evictable matches that the caller is about to pin.
+        """
+        if potential_matched_count < 0:
+            raise ValueError("potential_matched_count must be non-negative")
+        if (
+            not self.enable_prefix_caching
+            or self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO
+        ):
+            return self.total_avail
+
+        evictable_count = max(
+            0, int(self.get_evictable_block_count()) - potential_matched_count
+        )
+        return self.total_avail + evictable_count
+
     def is_memory_available(self, num_blocks: int, potential_matched_count: int = 0) -> bool:
         """Check if memory blocks are available.
 
@@ -168,13 +188,12 @@ class KVBlockAllocator:
         # Fast path: avoid expensive evictable count computation when free pool suffices
         if self.total_avail >= num_blocks:
             return True
-        if not self.enable_prefix_caching:
-            return False
-        if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO:
-            return False  # RZ: no cached blocks to evict
-        # Also count evictable cached blocks, excluding those the caller will pin.
-        evictable_count = int(self.get_evictable_block_count()) - potential_matched_count
-        return (self.total_avail + evictable_count) >= num_blocks
+        return (
+            self.get_allocatable_block_count(
+                potential_matched_count=potential_matched_count
+            )
+            >= num_blocks
+        )
 
     def allocate_memory_blocks(self, num_blocks: int) -> Optional[Tensor]:
         """Allocate memory blocks if available, else return None.
