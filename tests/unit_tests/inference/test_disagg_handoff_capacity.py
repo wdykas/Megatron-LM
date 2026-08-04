@@ -9,11 +9,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+msgpack = pytest.importorskip("msgpack")
+
 from megatron.core.inference.contexts.mamba_slot_allocator import MambaSlotCapacityError
 from megatron.core.inference.disaggregation.inference_state_handoff import (
     InferenceStateHandoffMixin,
 )
 from megatron.core.inference.disaggregation.pending_handoff_imports import PendingKvImport
+from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import compute_block_hashes_batched
 from megatron.core.inference.sampling_params import SamplingParams
 
@@ -70,18 +73,27 @@ class _MambaAllocator:
         self.available = available
         self.next_slot = 20
         self.invalidated = []
+        self.hash_to_block_id = {}
+        self.block_to_slot = {}
 
     def allocate_slots_batch(self, block_ids):
-        required = len(set(block_ids))
+        missing_blocks = list(
+            dict.fromkeys(bid for bid in block_ids if bid not in self.block_to_slot)
+        )
+        required = len(missing_blocks)
         if required > self.available:
             raise MambaSlotCapacityError(required=required, available=self.available)
         slots = list(range(self.next_slot, self.next_slot + required))
+        self.block_to_slot.update(zip(missing_blocks, slots))
         self.next_slot += required
         self.available -= required
-        return slots
+        return [self.block_to_slot[block_id] for block_id in block_ids]
 
     def invalidate_block(self, block_id):
         self.invalidated.append(block_id)
+
+    def register_block_hashes_batch(self, block_ids, hashes):
+        self.hash_to_block_id.update(zip(hashes, block_ids))
 
 
 class _SchedulerHarness:
@@ -134,8 +146,8 @@ def _meta(request_id, positions):
         "request_id": request_id,
         "mamba": {
             "positions": positions,
-            "conv": {"request_id": request_id},
-            "ssm": {"request_id": request_id},
+            "conv": {"request_id": request_id, "block_ids": list(range(len(positions)))},
+            "ssm": {"request_id": request_id, "block_ids": list(range(len(positions)))},
         },
     }
 
@@ -235,6 +247,56 @@ def test_nixl_handoff_reuses_decode_cached_prefix(handoff_loop):
     assert engine.context.kv_block_allocator.registered_parent_hashes == [hashes[1]]
 
 
+def test_overlapping_handoff_waits_for_pending_prefix(handoff_loop):
+    engine = _HandoffHarness(handoff_loop, available=0)
+    engine.context.mamba_slot_allocator = None
+    engine._mamba_transfer_agents = {}
+    prompt = [4] * 8
+    sampling_params = SamplingParams(num_tokens_to_generate=2)
+
+    engine.add_request_with_kv_handoff(5, prompt, sampling_params, {"request_id": 5}, [100, 101])
+    blocks_after_first = engine.context.kv_block_allocator.next_block
+    engine.add_request_with_kv_handoff(6, prompt, sampling_params, {"request_id": 6}, [200, 201])
+
+    assert engine.context.kv_block_allocator.next_block == blocks_after_first
+    assert len(engine._kv_transfer_agent.calls) == 1
+    assert engine.pending_kv_import_count == 2
+
+    first = engine._pending_kv_imports.popleft()
+    first_blocks = list(first.local_blocks)
+    engine._finalize_kv_handoff_import(first)
+    _drain_loop(handoff_loop)
+    assert engine._drain_deferred_kv_handoffs() == 1
+    _drain_loop(handoff_loop)
+
+    second = engine._pending_kv_imports.popleft()
+    assert second.local_blocks == first_blocks
+    assert second.hashes_to_register == 0
+    assert engine.context.kv_block_allocator.next_block == blocks_after_first
+    assert engine._kv_transfer_agent.calls[-1] == ({"request_id": 6}, [], [])
+
+
+def test_overlapping_hybrid_handoff_reuses_completed_mamba_state(handoff_loop):
+    engine = _HandoffHarness(handoff_loop, available=1)
+    prompt = [5] * 8
+    sampling_params = SamplingParams(num_tokens_to_generate=2)
+
+    engine.add_request_with_kv_handoff(7, prompt, sampling_params, _meta(7, [1]), [100, 101])
+    engine.add_request_with_kv_handoff(8, prompt, sampling_params, _meta(8, [1]), [200, 201])
+    first = engine._pending_kv_imports.popleft()
+    first_slot = first.mamba.local_slots[0]
+    engine._finalize_kv_handoff_import(first)
+    _drain_loop(handoff_loop)
+    assert engine._drain_deferred_kv_handoffs() == 1
+    _drain_loop(handoff_loop)
+
+    second = engine._pending_kv_imports.popleft()
+    assert second.mamba.local_slots == [first_slot]
+    assert engine.context.mamba_slot_allocator.next_slot == first_slot + 1
+    assert len(engine._mamba_transfer_agents["conv"].calls) == 2
+    assert len(engine._mamba_transfer_agents["ssm"].calls) == 2
+
+
 def test_nixl_handoff_trims_pipeline_stage_block_lists(handoff_loop):
     engine = _HandoffHarness(handoff_loop, available=0)
     engine.context.mamba_slot_allocator = None
@@ -281,6 +343,43 @@ def test_nccl_handoff_does_not_filter_source_push(handoff_loop):
     _drain_loop(handoff_loop)
 
     assert engine._kv_transfer_agent.calls == [({"request_id": 9}, [100, 101], [10, 11])]
+
+
+def test_native_nccl_handoff_reports_cached_transfer_prefix(handoff_loop):
+    engine = _HandoffHarness(handoff_loop, available=0)
+    engine.context.mamba_slot_allocator = None
+    engine._mamba_transfer_agents = {}
+    engine._kv_transfer_agent.is_push = True
+    engine._disagg_config = SimpleNamespace()
+    engine.is_mp_coordinator = True
+    messages = []
+    engine.socket_for_receiving_requests = SimpleNamespace(
+        send=lambda payload: messages.append(msgpack.unpackb(payload, raw=False))
+    )
+
+    def begin_pull_after_transfer_plan(peer_meta, src_block_ids, dst_block_ids):
+        assert messages == [[Headers.KV_TRANSFER_READY.value, 10, {"cached_prefix_blocks": 1}]]
+        engine._kv_transfer_agent.calls.append(
+            (peer_meta, list(src_block_ids), list(dst_block_ids))
+        )
+        return _PendingHandle()
+
+    engine._kv_transfer_agent.begin_pull_blocks = begin_pull_after_transfer_plan
+    prompt = [6] * 8
+    hashes = compute_block_hashes_batched(
+        torch.tensor(prompt), engine.context.block_size_tokens, include_partial=True
+    )
+    cached = engine.context.kv_block_allocator.allocate_memory_blocks(1)
+    engine.context.kv_block_allocator.release_memory_blocks(cached)
+    engine.context.kv_block_allocator.kv_hash_to_block_id[hashes[0]] = int(cached[0])
+
+    engine.add_request_with_kv_handoff(
+        10, prompt, SamplingParams(num_tokens_to_generate=2), {"request_id": 10}, [100, 101]
+    )
+    _drain_loop(handoff_loop)
+
+    assert engine._kv_transfer_agent.calls == [({"request_id": 10}, [101], [11])]
+    assert messages == [[Headers.KV_TRANSFER_READY.value, 10, {"cached_prefix_blocks": 1}]]
 
 
 def test_capacity_queue_is_fifo(handoff_loop):

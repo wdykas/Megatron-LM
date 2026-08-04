@@ -38,6 +38,22 @@ def test_push_handoff_reuses_mamba_slots_advertised_during_capture():
     assert engine._pending_kv_pushes == [(7, [kv_handle, mamba_handle])]
 
 
+def test_push_handoff_sends_only_decode_requested_kv_suffix():
+    engine = DisaggDynamicInferenceEngine.__new__(DisaggDynamicInferenceEngine)
+    engine._initialize_disaggregation_state()
+    engine._kv_transfer_agent = mock.Mock()
+    engine._kv_transfer_agent.begin_push_blocks.return_value = mock.Mock()
+    engine._mamba_transfer_agents = {}
+    engine._pinned_handoff_blocks[8] = [20, 21, 22]
+    decode_metas = [{"global_rank": 2}]
+
+    engine.push_handoff_kv(8, decode_metas, {"cached_prefix_blocks": 2})
+
+    engine._kv_transfer_agent.begin_push_blocks.assert_called_once_with(
+        {"tp_metas": decode_metas}, [22]
+    )
+
+
 def test_capture_handoff_keeps_request_mamba_metadata_independent():
     """A later TP=1 handoff must not replace an earlier request's Mamba positions."""
     engine = DisaggDynamicInferenceEngine.__new__(DisaggDynamicInferenceEngine)

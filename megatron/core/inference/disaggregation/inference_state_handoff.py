@@ -28,6 +28,7 @@ from megatron.core.inference.disaggregation.pending_handoff_imports import (
     DeferredKvHandoff,
     PendingKvImport,
     PendingMambaImport,
+    PendingPrefixReservations,
 )
 from megatron.core.inference.disaggregation.transfer_backends.base import (
     construct_kv_transfer_backend_class,
@@ -147,6 +148,7 @@ class InferenceStateHandoffMixin:
         self._mamba_peer_metas = {}
         self._deferred_kv_handoffs = deque()
         self._pending_kv_imports = deque()
+        self._pending_prefix_reservations = PendingPrefixReservations()
         self._handoff_import_owners: Dict[int, list[int]] = {}
         self._handoff_import_listeners = []
         self._pending_kv_pushes: list = []
@@ -156,7 +158,11 @@ class InferenceStateHandoffMixin:
     def pending_kv_import_count(self) -> int:
         """Number of decode requests waiting for capacity or transfer completion."""
 
-        return len(self._deferred_kv_handoffs) + len(self._pending_kv_imports)
+        return (
+            len(self._deferred_kv_handoffs)
+            + len(self._pending_kv_imports)
+            + self._pending_prefix_reservations.waiter_count
+        )
 
     def _reset_pending_kv_imports(self) -> None:
         """Drain and release pending imports before an engine reset."""
@@ -168,6 +174,12 @@ class InferenceStateHandoffMixin:
             if not deferred.future.done():
                 deferred.future.cancel()
 
+        if not hasattr(self, "_pending_prefix_reservations"):
+            self._pending_prefix_reservations = PendingPrefixReservations()
+        for waiter in self._pending_prefix_reservations.drain_waiters():
+            if not waiter.future.done():
+                waiter.future.cancel()
+
         if not hasattr(self, "_pending_kv_imports"):
             self._pending_kv_imports = deque()
         unsafe = deque()
@@ -175,6 +187,7 @@ class InferenceStateHandoffMixin:
             pending = self._pending_kv_imports.popleft()
             if self._wait_for_transfer_handles(*self._pending_transfer_handles(pending)):
                 self._release_pending_kv_import(pending)
+                self._release_prefix_reservation(pending.request_id, requeue_waiters=False)
                 if not pending.future.done():
                     pending.future.cancel()
             else:
@@ -188,6 +201,14 @@ class InferenceStateHandoffMixin:
             self._handoff_import_owners = {}
         for request_id in list(self._handoff_import_owners):
             self._release_handoff_import_owner(request_id)
+
+    def _release_prefix_reservation(self, request_id: int, *, requeue_waiters: bool = True) -> int:
+        """Release an in-flight prefix and optionally retry its waiters."""
+
+        waiters = self._pending_prefix_reservations.release(request_id)
+        if requeue_waiters:
+            self._deferred_kv_handoffs.extendleft(reversed(waiters))
+        return len(waiters)
 
     def _release_handoff_import_owner(self, request_id: int) -> bool:
         """Release blocks retained until a decode request enters the context."""
@@ -409,7 +430,9 @@ class InferenceStateHandoffMixin:
             gathered = [entry]
         self._instance_transfer_meta = gathered
 
-    def push_handoff_kv(self, request_id: int, decode_metas: list) -> None:
+    def push_handoff_kv(
+        self, request_id: int, decode_metas: list, transfer_plan: Optional[dict] = None
+    ) -> None:
         """Push a pinned hand-off's KV (and Mamba snapshots) to the decode
         instance described by `decode_metas` (two-sided transports only).
 
@@ -422,8 +445,15 @@ class InferenceStateHandoffMixin:
                 "SEND_KV for request %d with no pinned hand-off blocks; skipping", request_id
             )
             return
+        transfer_plan = transfer_plan or {}
+        prefix_count = int(transfer_plan.get("cached_prefix_blocks", 0))
+        if prefix_count < 0 or prefix_count > len(block_ids):
+            raise ValueError(
+                f"SEND_KV cached prefix {prefix_count} is outside {len(block_ids)} blocks"
+            )
+        transfer_blocks = block_ids[prefix_count:]
         kv_peer = {"tp_metas": list(decode_metas)}
-        handles = [self._kv_transfer_agent.begin_push_blocks(kv_peer, block_ids)]
+        handles = [self._kv_transfer_agent.begin_push_blocks(kv_peer, transfer_blocks)]
         if self._mamba_transfer_agents:
             # Reuse the exact slots advertised in the handoff metadata. The
             # allocator can acquire more cached Mamba states between metadata
@@ -444,7 +474,7 @@ class InferenceStateHandoffMixin:
         logging.debug(
             "DISAGG_PREFILL_PUSH request_id=%d blocks=%d mamba=%d",
             request_id,
-            len(block_ids),
+            len(transfer_blocks),
             len(handles) - 1,
         )
 
@@ -727,8 +757,24 @@ class InferenceStateHandoffMixin:
         allocator = self.context.kv_block_allocator
         num_blocks = handoff.num_blocks
         cached_blocks = []
-        if not getattr(self._kv_transfer_agent, "is_push", False):
-            cached_blocks = self._retain_cached_handoff_prefix(handoff.hashes, num_blocks)
+        reuse_prefix = self._can_reuse_handoff_prefix()
+        if reuse_prefix:
+            cached_blocks = self._find_cached_handoff_prefix(handoff.hashes, num_blocks)
+            missing_hashes = handoff.hashes[
+                len(cached_blocks) : min(num_blocks, len(handoff.hashes))
+            ]
+            boundary_hash = missing_hashes[0] if missing_hashes else None
+            pending_owner = self._pending_prefix_reservations.find_owner(boundary_hash)
+            if pending_owner is not None:
+                self._pending_prefix_reservations.wait(pending_owner, handoff)
+                logging.debug(
+                    "DISAGG_DECODE_PREFIX_WAIT request_id=%d owner_request_id=%d blocks=%d",
+                    handoff.request_id,
+                    pending_owner,
+                    len(missing_hashes),
+                )
+                return True, None
+            self._retain_handoff_blocks(cached_blocks)
 
         num_blocks_to_import = num_blocks - len(cached_blocks)
         local_blocks_tensor = allocator.allocate_memory_blocks(num_blocks_to_import)
@@ -769,6 +815,20 @@ class InferenceStateHandoffMixin:
                 allocator.release_memory_blocks(owned_blocks_tensor)
                 return False, capacity_error
 
+            if reuse_prefix:
+                boundary_index = len(cached_blocks)
+                boundary_hash = (
+                    handoff.hashes[boundary_index]
+                    if boundary_index < min(num_blocks, len(handoff.hashes))
+                    else None
+                )
+                self._pending_prefix_reservations.reserve(handoff.request_id, boundary_hash)
+            # NCCL receive submission can wait for matching sends. Publish the
+            # negotiated suffix before entering the transport so the sender
+            # can post its half of the rendezvous.
+            self._notify_push_transfer_plan(
+                handoff.request_id, cached_prefix_blocks=len(cached_blocks)
+            )
             handle = self._kv_transfer_agent.begin_pull_blocks(
                 transfer_meta, transfer_src_blocks, imported_blocks
             )
@@ -781,6 +841,7 @@ class InferenceStateHandoffMixin:
                 handles.extend(mamba_import.handles.values())
             safe_to_release &= self._wait_for_transfer_handles(*handles)
             if safe_to_release:
+                self._release_prefix_reservation(handoff.request_id)
                 allocator.release_memory_blocks(owned_blocks_tensor)
                 if mamba_import is not None:
                     msa = self.context.mamba_slot_allocator
@@ -820,8 +881,15 @@ class InferenceStateHandoffMixin:
         self._loop.call_soon_threadsafe(self._loop.create_task, self._notify_cond_for_new_request())
         return True, None
 
-    def _retain_cached_handoff_prefix(self, hashes: list[int], num_blocks: int) -> list[int]:
-        """Retain the contiguous handoff prefix already cached on decode."""
+    def _can_reuse_handoff_prefix(self) -> bool:
+        """Return whether this handoff can negotiate a reduced transfer."""
+
+        if not getattr(self._kv_transfer_agent, "is_push", False):
+            return True
+        return getattr(self, "_disagg_config", None) is not None
+
+    def _find_cached_handoff_prefix(self, hashes: list[int], num_blocks: int) -> list[int]:
+        """Find the contiguous handoff prefix already ready on decode."""
 
         allocator = self.context.kv_block_allocator
         cached_blocks = []
@@ -830,12 +898,31 @@ class InferenceStateHandoffMixin:
             if block_id is None:
                 break
             cached_blocks.append(int(block_id))
+        return cached_blocks
 
-        if cached_blocks:
-            block_tensor = torch.tensor(cached_blocks, dtype=torch.int32, device="cpu")
+    def _retain_handoff_blocks(self, block_ids: list[int]) -> None:
+        """Retain ready blocks while a handoff enters the decode scheduler."""
+
+        if block_ids:
+            block_tensor = torch.tensor(block_ids, dtype=torch.int32, device="cpu")
+            allocator = self.context.kv_block_allocator
             allocator.block_ref_counts[block_tensor] += 1
             allocator.update_timestamps(block_tensor)
-        return cached_blocks
+
+    def _notify_push_transfer_plan(self, request_id: int, *, cached_prefix_blocks: int) -> None:
+        """Tell the native coordinator which receive operations decode will post."""
+
+        if not getattr(self._kv_transfer_agent, "is_push", False):
+            return
+        if getattr(self, "_disagg_config", None) is None or not self.is_mp_coordinator:
+            return
+        assert HAVE_MSGPACK, "the coordinator-native disagg mode requires msgpack"
+        transfer_plan = {"cached_prefix_blocks": int(cached_prefix_blocks)}
+        self.socket_for_receiving_requests.send(
+            msgpack.packb(
+                [Headers.KV_TRANSFER_READY.value, request_id, transfer_plan], use_bin_type=True
+            )
+        )
 
     def _agree_mamba_handoff_capacity(
         self, mamba_meta: Optional[dict], local_error: Optional[MambaSlotCapacityError]
@@ -918,6 +1005,8 @@ class InferenceStateHandoffMixin:
 
         if pending.mamba is not None:
             self._complete_mamba_handoff_import(pending.request_id, pending.mamba, pending.hashes)
+
+        self._release_prefix_reservation(pending.request_id)
 
         logging.debug(
             "DISAGG_DECODE_IMPORT request_id=%d prompt_tokens=%d "
@@ -1052,6 +1141,7 @@ class InferenceStateHandoffMixin:
                 )
                 if safe_to_release:
                     self._release_pending_kv_import(pending)
+                    self._release_prefix_reservation(pending.request_id)
                 else:
                     remaining.append(pending)
                     logging.error(
@@ -1097,7 +1187,7 @@ class InferenceStateHandoffMixin:
             raise ValueError(
                 f"Mamba handoff positions are outside the imported KV blocks: {positions}"
             )
-        target_blocks = [int(local_blocks[p]) for p in positions]
+        target_blocks = [int(local_blocks[position]) for position in positions]
         local_slots = msa.allocate_slots_batch(target_blocks)
         return PendingMambaImport(
             handles={}, local_slots=local_slots, target_blocks=target_blocks, positions=positions

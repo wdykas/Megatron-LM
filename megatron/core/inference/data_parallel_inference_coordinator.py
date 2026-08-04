@@ -216,6 +216,7 @@ class DataParallelInferenceCoordinator:
         # restore registration blobs omitted from per-request prefill replies.
         self._engine_metas: dict = {}  # identity -> instance per-rank transfer metas
         self._disagg_mamba_flow = DisaggMambaFlowControl()
+        self._disagg_push_started: set = set()
 
         self.request_id_to_client_id = {}
         self.request_id_to_client_request_id = {}
@@ -418,19 +419,30 @@ class DataParallelInferenceCoordinator:
             )
 
     def _send_decode_handoff(self, decode_id, request_id: int, payload: bytes) -> bool:
-        """Submit one capacity-reserved handoff and start push sends if needed."""
+        """Submit one capacity-reserved handoff to decode."""
 
         if not self._send_to_engine(decode_id, payload):
             # Engine removal drops the request and releases its reservation.
             return False
-        prefill_id = self._disagg_prefill_of.get(request_id)
-        if prefill_id is not None and self._engine_transport.get(prefill_id) == "nccl":
-            # Two-sided transport: only post sends after decode capacity is
-            # reserved and its SUBMIT_REQUEST_WITH_KV has been delivered.
-            self._disagg_send(
-                prefill_id, Headers.SEND_KV, request_id, self._engine_metas[decode_id]
-            )
         return True
+
+    def _handle_kv_transfer_ready(self, decode_id, request_id: int, transfer_plan: dict) -> None:
+        """Start a push transfer after decode has selected the matching receives."""
+
+        prefill_id = self._disagg_prefill_of.get(request_id)
+        if prefill_id is None or request_id in self._disagg_push_started:
+            return
+        if self._engine_transport.get(prefill_id) != "nccl":
+            logging.warning(
+                "Coordinator: ignoring transfer-ready for non-push request %d", request_id
+            )
+            return
+        decode_metas = self._engine_metas.get(decode_id)
+        if decode_metas is None:
+            self._drop_disagg_request(request_id, "decode transfer metadata is unavailable")
+            return
+        self._disagg_push_started.add(request_id)
+        self._disagg_send(prefill_id, Headers.SEND_KV, request_id, decode_metas, transfer_plan)
 
     def _drain_decode_submit_queue(self, decode_id) -> None:
         """Admit queued handoffs in FIFO order as durable slots become free."""
@@ -526,6 +538,7 @@ class DataParallelInferenceCoordinator:
         pinned blocks and the flow-control slot, submitting the next queued
         request for that prefill if any. A missing mapping (late or duplicate
         ack, already-dropped request) is a no-op."""
+        self._disagg_push_started.discard(request_id)
         prefill_id = self._disagg_prefill_of.pop(request_id, None)
         if prefill_id is None:
             return
@@ -909,6 +922,14 @@ class DataParallelInferenceCoordinator:
                 # release the prefill's pinned blocks and a flow-control slot.
                 assert self.disaggregated, "KV_READ_DONE on a non-disaggregated coordinator"
                 self._handle_kv_read_done(int(deserialized_payload[1]))
+
+            elif header == Headers.KV_TRANSFER_READY:
+                # NCCL sends start after decode reserves its destinations and
+                # reports the exact subset for which it will post receives.
+                assert self.disaggregated, "KV_TRANSFER_READY on a non-disaggregated coordinator"
+                self._handle_kv_transfer_ready(
+                    sender_identity, int(deserialized_payload[1]), deserialized_payload[2]
+                )
 
             elif header == Headers.SUBMIT_REQUEST_WITH_KV:
                 # Decode-side handoff import, routed like SUBMIT_REQUEST.

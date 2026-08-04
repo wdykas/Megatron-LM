@@ -50,6 +50,7 @@ def _coord(max_outstanding=32, mamba_capacity=None):
             meta["mamba_slot_capacity"] = mamba_capacity
             meta["mamba_handoff_max_slots"] = 1
     c._engine_metas = {b"p0": [prefill_meta], b"d0": [decode_meta]}
+    c._disagg_push_started = set()
     c._disagg.register(b"p0", "prefill")
     c._disagg.register(b"d0", "decode")
     c._disagg_mamba_flow.register_engine(b"p0", "prefill", c._engine_metas[b"p0"])
@@ -184,7 +185,7 @@ def test_coordinator_hydrates_compact_nixl_handoff_from_prefill_registration():
     assert message[4]["block_ids"] == [4, 5]
 
 
-def test_push_prefill_reply_also_emits_send_kv():
+def test_push_prefill_waits_for_decode_transfer_plan():
     c = _coord()
     c._engine_transport[b"p0"] = "nccl"
     c._route_submit_disagg(5, [1, 2, 3], {})
@@ -192,10 +193,15 @@ def test_push_prefill_reply_also_emits_send_kv():
     c._handle_prefill_done(5, {"request_id": 5, "disaggregated_params": HANDOFF})
     headers = [(ident, Headers(m[0])) for ident, m in c.sent]
     assert (b"d0", Headers.SUBMIT_REQUEST_WITH_KV) in headers
-    # Two-sided transport: the prefill is told where to send, with the decode
-    # instance's transfer metas.
+    assert not [m for _, m in c.sent if Headers(m[0]) == Headers.SEND_KV]
+
+    transfer_plan = {"cached_prefix_blocks": 1, "mamba_positions": []}
+    c._handle_kv_transfer_ready(b"d0", 5, transfer_plan)
     send = [m for ident, m in c.sent if Headers(m[0]) == Headers.SEND_KV]
-    assert send and send[0][1] == 5 and send[0][2] == [{"global_rank": 2}]
+    assert send == [[Headers.SEND_KV.value, 5, [{"global_rank": 2}], transfer_plan]]
+
+    c._handle_kv_transfer_ready(b"d0", 5, transfer_plan)
+    assert len([m for _, m in c.sent if Headers(m[0]) == Headers.SEND_KV]) == 1
 
 
 def test_prefill_reply_without_handoff_drops_request():
@@ -282,10 +288,12 @@ def test_nccl_send_waits_for_decode_mamba_capacity():
     c.sent.clear()
     c._handle_prefill_done(5, {"request_id": 5, "disaggregated_params": handoff})
     c._handle_prefill_done(6, {"request_id": 6, "disaggregated_params": handoff})
+    c._handle_kv_transfer_ready(b"d0", 5, {})
     sends = [message for _, message in c.sent if Headers(message[0]) == Headers.SEND_KV]
     assert [message[1] for message in sends] == [5]
 
     c._release_decode_slot_reservation(5)
+    c._handle_kv_transfer_ready(b"d0", 6, {})
 
     sends = [message for _, message in c.sent if Headers(message[0]) == Headers.SEND_KV]
     assert [message[1] for message in sends] == [5, 6]

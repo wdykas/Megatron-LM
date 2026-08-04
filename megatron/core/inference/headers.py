@@ -28,6 +28,7 @@ class Headers(Enum):
     REGISTER_ROLE = auto()  # Engine announces its disagg role (prefill/decode).
     KV_READ_DONE = auto()  # Decode finished importing a hand-off's KV.
     SEND_KV = auto()  # Push transport: tell the prefill to send a hand-off's KV.
+    KV_TRANSFER_READY = auto()  # Decode reserved destinations and selected the transfer subset.
 
 
 class UnknownHeaderError(Exception):

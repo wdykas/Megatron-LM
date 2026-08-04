@@ -339,7 +339,9 @@ class DynamicInferenceEngine(AbstractEngine):
         """Raising stub; the hand-off engine composition overrides it."""
         self._raise_kv_handoff_not_enabled("KV transfer setup")
 
-    def push_handoff_kv(self, request_id: int, decode_metas: list) -> None:
+    def push_handoff_kv(
+        self, request_id: int, decode_metas: list, transfer_plan: Optional[dict] = None
+    ) -> None:
         """Raising stub; the hand-off engine composition overrides it."""
         self._raise_kv_handoff_not_enabled("SEND_KV")
 
@@ -2521,7 +2523,8 @@ class DynamicInferenceEngine(AbstractEngine):
             elif header == Headers.SEND_KV:
                 # Push transport: send a pinned hand-off's KV to the decode
                 # instance the coordinator picked.
-                self.push_handoff_kv(int(data[1]), data[2])
+                transfer_plan = data[3] if len(data) > 3 else None
+                self.push_handoff_kv(int(data[1]), data[2], transfer_plan)
             elif header == Headers.ABORT_REQUEST:
                 request_id = int(data[1])
                 entry = self.requests.get(request_id)
