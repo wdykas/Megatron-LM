@@ -430,6 +430,35 @@ def test_peer_capacity_miss_rolls_back_before_any_transfer(handoff_loop, monkeyp
     assert engine.context.kv_block_allocator.releases == [[10, 11]]
 
 
+def test_peer_poll_failure_fails_this_rank(handoff_loop, monkeypatch):
+    engine = _HandoffHarness(handoff_loop, available=0)
+    engine.context.mamba_slot_allocator = None
+    engine._mamba_transfer_agents = {}
+    block_id = int(engine.context.kv_block_allocator.allocate_memory_blocks(1)[0])
+    pending = _pending_import(engine, 4, block_id, 104)
+    pending.handle = _PendingHandle()
+    engine._pending_kv_imports.append(pending)
+    engine.pg_collection.mp = object()
+    torch_tensor = torch.tensor
+
+    def make_cpu_tensor(data, *args, device=None, **kwargs):
+        return torch_tensor(data, *args, device="cpu", **kwargs)
+
+    def report_peer_failure(flags, op, group):
+        flags.copy_(torch_tensor([-1], dtype=flags.dtype))
+
+    monkeypatch.setattr(torch, "tensor", make_cpu_tensor)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(torch.distributed, "all_reduce", report_peer_failure)
+
+    with pytest.raises(RuntimeError, match="failed on a model-parallel peer"):
+        engine._poll_pending_kv_imports()
+
+    assert isinstance(pending.future.exception(), RuntimeError)
+    assert engine.context.kv_block_allocator.releases == [[block_id]]
+
+
 def test_reset_cancels_capacity_queued_handoffs(handoff_loop):
     engine = _HandoffHarness(handoff_loop, available=0)
     future = engine.add_request_with_kv_handoff(

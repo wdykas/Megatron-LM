@@ -5,6 +5,8 @@
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 from megatron.core.inference.disaggregation.config import DisaggregationConfig
 from megatron.core.inference.disaggregation.engine import DisaggDynamicInferenceEngine
 
@@ -113,6 +115,45 @@ def test_capture_handoff_compacts_only_native_nixl_metadata():
     assert "agent_metadata_b64" not in native_request.disaggregated_params["kv_meta"]
 
 
+@pytest.mark.parametrize(
+    ("remote_request_id", "remote_blocks", "message"),
+    [(8, [20], "request_ids"), (7, [], "block_counts")],
+)
+def test_capture_handoff_rejects_inconsistent_pipeline_metadata(
+    remote_request_id, remote_blocks, message
+):
+    engine = DisaggDynamicInferenceEngine.__new__(DisaggDynamicInferenceEngine)
+    engine._initialize_disaggregation_state()
+    pp_group = object()
+    engine.pg_collection = SimpleNamespace(tp=None, pp=pp_group)
+    engine._kv_peer_metas = {"global_rank": 0}
+    engine._release_pinned_handoff_blocks = mock.Mock(return_value=1)
+    request = SimpleNamespace(request_id=7, prompt_tokens=[0] * 4, disaggregated_params=None)
+
+    def gather_inconsistent_metadata(output, local_entry, group):
+        assert group is pp_group
+        output[:] = [
+            local_entry,
+            {
+                "request_id": remote_request_id,
+                "kv_meta": {"global_rank": 1},
+                "block_ids": remote_blocks,
+                "mamba_meta": None,
+            },
+        ]
+
+    pg_size = "megatron.core.inference.disaggregation.inference_state_handoff.get_pg_size"
+    with (
+        mock.patch(pg_size, side_effect=lambda group: 2 if group is pp_group else 1),
+        mock.patch("torch.distributed.is_initialized", return_value=True),
+        mock.patch("torch.distributed.all_gather_object", side_effect=gather_inconsistent_metadata),
+        pytest.raises(RuntimeError, match=message),
+    ):
+        engine._capture_handoff_meta(request, [10])
+
+    engine._release_pinned_handoff_blocks.assert_called_once_with([10])
+
+
 def test_capture_handoff_uses_mamba_positions_common_to_tp_and_pp():
     """Only checkpoints present on every source model shard are transferable."""
     engine = DisaggDynamicInferenceEngine.__new__(DisaggDynamicInferenceEngine)
@@ -152,6 +193,7 @@ def test_capture_handoff_uses_mamba_positions_common_to_tp_and_pp():
         output[:] = [
             local_entry,
             {
+                "request_id": 8,
                 "kv_meta": [{"global_rank": 2}, {"global_rank": 3}],
                 "block_ids": [10, 11, 12],
                 "mamba_meta": remote_stage,
