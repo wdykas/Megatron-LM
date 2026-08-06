@@ -1,12 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""State records for KV-cache imports awaiting completion."""
+"""State records for KV-cache and SSM-state imports awaiting completion."""
 
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any, List
+from typing import Any, List, Optional
 
 from megatron.core.inference.sampling_params import SamplingParams
 
@@ -26,6 +26,16 @@ class DeferredKvHandoff:
 
 
 @dataclass(kw_only=True)
+class PendingSSMImport:
+    """SSM state transfers attached to a pending KV-cache import."""
+
+    handles: dict[str, Any]
+    local_slots: List[int]
+    target_blocks: List[int]
+    positions: List[int]
+
+
+@dataclass(kw_only=True)
 class PendingKvImport:
     """Decode request waiting for an asynchronous KV-cache import."""
 
@@ -37,6 +47,7 @@ class PendingKvImport:
     cached_prefix_block_count: int
     handle: Any
     future: asyncio.Future
+    ssm: Optional[PendingSSMImport] = None
     resume_tokens: List[int] = field(default_factory=list)
     continuation_blocks: List[int] = field(default_factory=list)
     local_error: Exception | None = None  # Exact local error, if this rank failed.

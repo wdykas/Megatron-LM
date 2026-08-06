@@ -1452,7 +1452,7 @@ def test_mamba_lru_eviction_selects_only_requested_oldest_slots(monkeypatch):
 @pytest.mark.parametrize("max_slots", [0, 1])
 def test_optional_mamba_checkpoint_commit_uses_available_capacity(monkeypatch, max_slots):
     allocator = _make_cpu_mamba_slot_allocator(monkeypatch, total_blocks=3, max_slots=max_slots)
-    allocator._collect_commit_data = lambda: ([1], [0], [2], [0], [101, 102])
+    allocator._collect_commit_data = lambda: ([1], [0], [2], [0], [False], [101, 102])
     copy_calls = []
     store_calls = []
     register_calls = []
@@ -1470,6 +1470,41 @@ def test_optional_mamba_checkpoint_commit_uses_available_capacity(monkeypatch, m
     assert store_calls == ([([], [])] if max_slots else [])
     assert register_calls == ([([1], [101])] if max_slots else [])
     assert clear_calls == [True]
+
+
+def test_required_handoff_state_takes_priority_over_optional_checkpoints(monkeypatch):
+    allocator = _make_cpu_mamba_slot_allocator(monkeypatch, total_blocks=3, max_slots=1)
+    allocator._collect_commit_data = lambda: ([1], [0], [2], [0], [True], [101, -1])
+    copy_calls = []
+    store_calls = []
+    register_calls = []
+    clear_calls = []
+    allocator._copy_intermediate_to_cache = lambda *args: copy_calls.append(args)
+    allocator.store_from_live_batch = lambda *args: store_calls.append(args)
+    allocator.register_block_hashes_batch = lambda *args: register_calls.append(args)
+    allocator._clear_intermediate_state = lambda: clear_calls.append(True)
+
+    allocator.commit_intermediate_states()
+
+    assert allocator.block_to_slot.tolist() == [-1, -1, 0]
+    assert copy_calls == []
+    assert store_calls == [([0], [0])]
+    assert register_calls == [([2], [-1])]
+    assert clear_calls == [True]
+
+
+def test_exact_handoff_states_use_available_capacity_without_failing_batch(monkeypatch):
+    allocator = _make_cpu_mamba_slot_allocator(monkeypatch, total_blocks=3, max_slots=1)
+    allocator._collect_commit_data = lambda: ([], [], [1, 2], [0, 1], [True, True], [-1, -1])
+    store_calls = []
+    allocator.store_from_live_batch = lambda *args: store_calls.append(args)
+    allocator.register_block_hashes_batch = lambda *_: None
+    allocator._clear_intermediate_state = lambda: None
+
+    allocator.commit_intermediate_states()
+
+    assert allocator.block_to_slot.tolist() == [-1, 0, -1]
+    assert store_calls == [([0], [0])]
 
 
 class TestMambaSlotAllocator(PrefixCachingTestBase):
