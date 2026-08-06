@@ -221,6 +221,7 @@ class RequestEntry:
 # pylint: disable=line-too-long
 @experimental_api
 class DynamicInferenceEngine(AbstractEngine):
+    _disagg_config = None
     """The dynamic inference engine.
 
     This engine allows requests of varying length to be dynamically added and
@@ -301,6 +302,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Throw a cudagraph-admission warning if deferred for > max_sequence_length steps.
         # The floor value of 100 avoids warnings in test configs where max_sequence_length < 100.
         self._cg_admission_warn_after = max(100, self.context.max_sequence_length)
+        self._disagg_config = None
         self._initialize_disaggregation_state()
         # Initialize engine.
         self.reset()
@@ -341,6 +343,10 @@ class DynamicInferenceEngine(AbstractEngine):
         # Create cuda graphs.
         self.create_cuda_graphs()
 
+    def add_kv_event_listener(self, listener) -> None:
+        """Register a prefix-cache lifecycle listener on the context."""
+        self.context.add_kv_event_listener(listener)
+
     def _initialize_disaggregation_state(self) -> None:
         """Hook overridden by the KV-handoff engine composition."""
 
@@ -365,6 +371,9 @@ class DynamicInferenceEngine(AbstractEngine):
     def _record_handoff_completion_notification(self, request_id: int, failed: bool) -> None:
         """Hook overridden by the KV-handoff engine composition."""
         self._raise_kv_handoff_not_enabled("KV handoff completion notification")
+
+    def _notify_kv_read_done(self, request_id: int) -> None:
+        """Hook for a native decode engine to release source-side handoff pins."""
 
     def _prepare_handoff_metadata_batch(
         self, requests_and_blocks: list[tuple], decode_tokens_by_request: Dict[int, list[int]]
@@ -733,8 +742,14 @@ class DynamicInferenceEngine(AbstractEngine):
 
         local_ip = hostname or socket.gethostname()
 
+        disagg_config = self._disagg_config
+
         # Spawn a DP coordinator process and get the connection info.
-        if launch_inference_coordinator and self.is_dp_coordinator:
+        if disagg_config is not None:
+            spawn_coordinator = disagg_config["spawn_coordinator"] and self.is_mp_coordinator
+        else:
+            spawn_coordinator = launch_inference_coordinator and self.is_dp_coordinator
+        if spawn_coordinator:
             spawn_context = multiprocessing.get_context('spawn')
             deterministic_mode = torch.are_deterministic_algorithms_enabled()
             dp_pipe, dp_process_pipe = spawn_context.Pipe()
@@ -744,7 +759,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 kwargs={
                     "pipe_connection": dp_process_pipe,
                     "ready_event": coordinator_ready_event,
-                    "data_parallel_size": get_pg_size(self.pg_collection.dp),
+                    # Disaggregated engines register dynamically with their role.
+                    "data_parallel_size": (
+                        0 if disagg_config is not None else get_pg_size(self.pg_collection.dp)
+                    ),
                     "tokenizer": self.controller.tokenizer,
                     "max_requests": self.context.max_requests,
                     "inference_coordinator_port": inference_coordinator_port,
@@ -755,6 +773,12 @@ class DynamicInferenceEngine(AbstractEngine):
                     "prefix_caching_routing_alpha": self.context.prefix_caching_routing_alpha,
                     "schedule_output_path": coordinator_schedule_output_path,
                     "hostname": hostname,
+                    "disaggregated": disagg_config is not None,
+                    "disagg_router": (
+                        disagg_config["disagg_router"]
+                        if disagg_config is not None
+                        else "round_robin"
+                    ),
                 },
             )
             self.inference_coordinator_process.start()
@@ -775,6 +799,13 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             dp_addr = None
 
+        if disagg_config is not None and launch_inference_coordinator:
+            # Shards have disjoint process groups; use the world group once to
+            # distribute the one shared coordinator address.
+            bcast = [dp_addr]
+            torch.distributed.broadcast_object_list(bcast, src=0)
+            [dp_addr] = bcast
+
         # Find available ports for MP and bind to them.
         if self.is_mp_coordinator:
             mp_req_sock = self.zmq_context.socket(zmq.PUB)
@@ -792,7 +823,7 @@ class DynamicInferenceEngine(AbstractEngine):
         torch.distributed.broadcast_object_list(bcast, src=mp_src, group=mp_group)
         [mp_req_addr] = bcast
 
-        identity = f'mp-coord-{dp_rank}'
+        identity = disagg_config["identity"] if disagg_config is not None else f'mp-coord-{dp_rank}'
         if self.is_mp_coordinator:
             # 1. Create dealer sockets where tp_rank = 0 and pp_rank = 0
             #    These will receive requests from an InferenceCoordinator.
@@ -801,8 +832,21 @@ class DynamicInferenceEngine(AbstractEngine):
             self.socket_for_receiving_requests.setsockopt(zmq.IDENTITY, identity.encode('utf-8'))
             self.socket_for_receiving_requests.connect(dp_addr)
 
-            # send empty string. this is used to register with the coordinator.
-            self.socket_for_receiving_requests.send(b"")
+            if disagg_config is not None:
+                self.socket_for_receiving_requests.send(
+                    msgpack.packb(
+                        [
+                            Headers.REGISTER_ROLE.value,
+                            disagg_config["role"],
+                            disagg_config["kv_transport_backend"],
+                            self._instance_transfer_meta,
+                        ],
+                        use_bin_type=True,
+                    )
+                )
+            else:
+                # Empty registration is the aggregated coordinator protocol.
+                self.socket_for_receiving_requests.send(b"")
 
             # 2. Create a publisher socket. This is used to publish or broadcast
             #    requests within the model parallel group
@@ -843,7 +887,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.zmq_context, process_group=None, hostname=hostname
             )
 
-        if launch_inference_coordinator and self.is_dp_coordinator:
+        if spawn_coordinator:
             await await_process_call(
                 coordinator_ready_event.wait, self.inference_coordinator_process
             )
@@ -927,6 +971,7 @@ class DynamicInferenceEngine(AbstractEngine):
             return
 
         InferenceMode.unset_active()
+        self.context.notify_kv_cache_cleared()
 
         # Deallocate context tensors.
         with self.__class__.suspend_resume_ctx(
@@ -2188,6 +2233,9 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             raise EngineSuspendedError(self.context.step_count)
 
+        # Registrations become externally visible only after their forward pass succeeds.
+        self.context.discard_pending_kv_stored_events()
+
         mode = self.context.config.async_sched_mode
         if mode == AsyncScheduleMode.LEGACY:
             self.schedule_waiting_requests()
@@ -2242,6 +2290,7 @@ class DynamicInferenceEngine(AbstractEngine):
         controller_result: DynamicBatchControllerStepResult = (
             await self.controller.async_generate_output_tokens_dynamic_batch(**controller_kwargs)
         )
+        self.context.publish_pending_kv_stored_events()
         self.decode_only = controller_result.decode_only
         pre_step_context_state["decode_only"] = self.decode_only
         result = controller_result.output

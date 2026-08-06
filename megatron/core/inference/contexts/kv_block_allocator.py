@@ -41,6 +41,7 @@ class KVBlockAllocator:
         self.enable_prefix_caching = enable_prefix_caching
         self.prefix_caching_eviction_policy = prefix_caching_eviction_policy
         self.on_blocks_deregistered: Optional[Callable] = None
+        self._blocks_deregistered_observers: list[Callable] = []
 
         # Handoff blocks remain pinned until decode finishes pulling them.
         # Pinning at request finish only happens on engines with KV transfer
@@ -305,6 +306,10 @@ class KVBlockAllocator:
     # Prefix caching methods
     # =========================================================================
 
+    def add_blocks_deregistered_observer(self, observer: Callable) -> None:
+        """Register a callback invoked when cached blocks are deregistered."""
+        self._blocks_deregistered_observers.append(observer)
+
     def register_kv_block_hashes(
         self,
         block_ids: list[int],
@@ -437,6 +442,8 @@ class KVBlockAllocator:
         # Mamba needs every physical block/hash pair for ownership-safe slot cleanup.
         if self.on_blocks_deregistered is not None:
             self.on_blocks_deregistered(block_ids_list, candidate_hashes)
+        for observer in tuple(self._blocks_deregistered_observers):
+            observer(block_ids_list, candidate_hashes)
 
         # Reset block state (batched tensor ops)
         if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:

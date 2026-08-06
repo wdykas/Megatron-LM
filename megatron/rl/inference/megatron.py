@@ -15,10 +15,12 @@ except ImportError:
     use_http2 = False
 
 from megatron.core.inference.config import KVCacheManagementMode
+from megatron.core.inference.disaggregation.engine import DisaggDynamicInferenceEngine
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.utils import log_single_rank
+from megatron.rl.inference.disagg import configure_disagg_engine, is_disagg_rollout
 from megatron.training.global_vars import get_args, get_tokenizer
 
 from ..inference.inference_interface import (
@@ -108,7 +110,17 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         args.return_log_probs = True
         args.skip_prompt_log_probs = True
 
-        inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(model=model)
+        if is_disagg_rollout(args):
+            # Disaggregated rollouts: `model` is this rank's prefill/decode
+            # shard model, kept fresh by the per-pool refit. Tag its role and
+            # spawn the shared 2-hop coordinator; the colocated path is
+            # unchanged.
+            inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(
+                model=model, engine_class=DisaggDynamicInferenceEngine
+            )
+            configure_disagg_engine(inference_engine)
+        else:
+            inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(model=model)
         dp_addr = await inference_engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=41521, launch_inference_coordinator=True,
         )
