@@ -53,7 +53,7 @@ class ParameterMetadata:
     # interleaves these blocks rather than doing a simple contiguous concat.
     partition_sizes: list[int] | None = None
 
-    # GTP always shards dim 0 after any TP-local layout has been formed.
+    # GTP shards dim 0 after any TP-local layout has been formed.
     is_gtp: bool = False
     # Ordered global ranks that own contiguous dim-0 shards. The list position
     # determines each owner's GTP rank and therefore its shard offset.
@@ -95,7 +95,7 @@ class ParameterMetadata:
 
 @dataclass
 class ShardingDescriptor:
-    """Legacy sharding descriptor kept for import compatibility."""
+    """Descriptor for a sharded dimension for a parameter."""
 
     name: str  # "tp" | "ep" | custom label
     dim: int
@@ -103,6 +103,40 @@ class ShardingDescriptor:
     dst_stride: int
     src_dim_ranks: list[int]
     dst_dim_ranks: list[int]
+
+
+@dataclass(frozen=True)
+class TensorReshardSpec:
+    """Backend-neutral description of one native mesh reshard.
+
+    The generic executor continues to consume ``send_ops``/``recv_ops``.  A
+    backend with a native reshard primitive can instead consume these specs
+    before the plan is lowered into point-to-point slices. Most parameters
+    produce one full-tensor spec. Packed parameters whose components are
+    independently TP-sharded produce one spec per contiguous component.
+    """
+
+    resolved_name: str
+    src_ranks: tuple[int, ...]
+    dst_ranks: tuple[int, ...]
+    global_shape: tuple[int, ...]
+    src_local_shape: tuple[int, ...]
+    dst_local_shape: tuple[int, ...]
+    dtype: torch.dtype
+    src_shard_dim: int | None
+    dst_shard_dim: int | None
+    # Raw module paths are rank-local when PP renumbers layers.  Only the
+    # member on the corresponding side has a name here.
+    src_param_name: str | None = None
+    dst_param_name: str | None = None
+    src_param_shape: tuple[int, ...] | None = None
+    dst_param_shape: tuple[int, ...] | None = None
+    # None selects the complete local parameter. Component specs select the
+    # corresponding contiguous logical tensor from the packed parameter.
+    src_slice: tuple[slice, ...] | None = None
+    dst_slice: tuple[slice, ...] | None = None
+    part_index: int = 0
+    part_count: int = 1
 
 
 @dataclass
@@ -116,6 +150,11 @@ class ReshardPlan:
     # Populated by _harmonize_buffer_dtypes on first call; reused thereafter to
     # skip the all_gather_object + named_modules() walks on the hot path.
     buffer_dtypes: Optional[dict[str, torch.dtype]] = None
+    # Whole-tensor descriptions for transports with a native mesh-reshard
+    # primitive. None means this plan cannot be represented by that path; the
+    # accompanying error explains why.
+    tensor_reshard_specs: list[TensorReshardSpec] | None = None
+    tensor_reshard_error: str | None = None
 
     def __str__(self):
         return f"ReshardPlan(sends={len(self.send_ops)}, recvs={len(self.recv_ops)})"
@@ -477,7 +516,7 @@ def _filter_by_ep_local_rank(
         filter ensures dst EP local 0 uses src EP local 0 (same global experts).
       - Different size (EP=8→EP=16): dst EP local 8 has no corresponding src
         EP local → skip filter; expert reassignment is handled by resolved_name
-        matching, and the shard planner handles any TP dimension changes.
+        matching, and the LCM/TP planner handles any TP dimension changes.
     """
     dst_ep_group = dst_metadata.expert_parallel_group_ranks
     if dst_ep_group is None:
@@ -558,9 +597,9 @@ def select_src_metadata_balanced(
 ) -> ParameterMetadata:
     """Choose a representative source `ParameterMetadata` for a destination rank.
 
-    The selected metadata identifies one complete source replica. Selection
-    prefers a local copy when ``dst_rank`` itself owns a source replica, then
-    round-robins across source DP groups to balance load.
+    The selected metadata supplies topology (TP/EP/DP group ranks) to the LCM
+    planner.  Selection prefers a local copy when ``dst_rank`` itself owns a
+    source replica, then round-robins across source DP groups to balance load.
     A local copy is essentially free (``tensor.copy_()`` on same GPU), while
     any remote transfer incurs significant overhead even within the same node.
     """
