@@ -167,12 +167,19 @@ class FlashInferSampling(Sampling):
             top_p = gpu_view.top_p[token_to_request_index]
 
         temperature = temperature.clamp(min=MIN_SAMPLING_TEMPERATURE)
-        probs = torch.softmax(logits / temperature.unsqueeze(1), dim=-1)
+        scaled = logits / temperature.unsqueeze(1)
 
-        # Sentinel values disable filtering:
+        # Batch-level no-op check.
+        no_top_k_batch, no_top_p_batch = context.active_sampling_filter_flags()
+        if no_top_k_batch and no_top_p_batch:
+            return torch.log_softmax(scaled, dim=-1)
+
+        # Sentinel / no-op values disable filtering:
         # top_k=vocab_size keeps all tokens, top_p=1.0 keeps the full probability mass.
-        top_k_safe = top_k.masked_fill(top_k == 0, self._vocab_size)
-        top_p_safe = top_p.masked_fill(top_p == 0.0, 1.0)
+        no_top_k = is_no_op_top_k(top_k) | (top_k >= self._vocab_size)
+        no_top_p = is_no_op_top_p(top_p)
+        top_k_safe = top_k.masked_fill(no_top_k, self._vocab_size)
+        top_p_safe = top_p.masked_fill(no_top_p, 1.0)
 
         # Rows that filter nothing must bypass the renorm kernels, mirroring the
         # `no_top_k and no_top_p` branch of `sample_kernel`, which samples the full
@@ -187,17 +194,13 @@ class FlashInferSampling(Sampling):
         # token's renormalized probability is 0 -> log(0) = -inf. The -inf then
         # leaves the server as JSON null (orjson serializes non-finite floats as
         # null) and fails downstream validation.
-        no_k = top_k_safe >= self._vocab_size
-        no_p = top_p_safe >= 1.0
-        unfiltered = no_k & no_p
-        if bool(unfiltered.all()):
-            return torch.log(probs)
-
+        probs = torch.softmax(scaled, dim=-1)
         # Renormalize to the kept set (top-k first, then top-p) to match
         renormed = flashinfer.sampling.top_k_renorm_probs(probs, top_k_safe)
         renormed = flashinfer.sampling.top_p_renorm_probs(renormed, top_p_safe)
-        if bool(unfiltered.any()):
-            # Mixed batch: restore the unfiltered rows to their un-renormalized
-            # distribution so only rows that genuinely filter are renormalized.
-            renormed = torch.where(unfiltered.unsqueeze(1), probs, renormed)
-        return torch.log(renormed)
+        # Unfiltered rows of a mixed batch bypass the renorm rounding entirely.
+        return torch.where(
+            (no_top_k & no_top_p).unsqueeze(1),
+            torch.log_softmax(scaled, dim=-1),
+            torch.log(renormed),
+        )
