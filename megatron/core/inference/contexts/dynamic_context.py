@@ -3396,12 +3396,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_block_idx[
             self.active_token_count : self.active_token_count + effective_prefill_chunk_length
         ] = self.request_to_kv_block_ids[current_id][token_offset_range // self.block_size_tokens]
-        if num_matched_blocks > 0:
+        if num_matched_blocks > 0 or req.num_matched_prefix_blocks > 0:
             # The blocks matched in this chunk sit after the blocks the request already
             # owns. Include the inherited partial block when that existing prefix was
             # itself hash-matched in an earlier chunk; it is still shared and must not
-            # be rewritten. If there is a gap, the existing blocks were computed by
-            # this request and only this chunk's new matches are protected.
+            # be rewritten, even if this chunk finds no new matches. If there is a gap,
+            # the existing blocks were computed by this request and only this chunk's
+            # new matches are protected.
             matched_start_token = (
                 0
                 if req.num_matched_prefix_blocks >= already_allocated_blocks
