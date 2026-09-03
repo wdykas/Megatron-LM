@@ -3388,25 +3388,31 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.active_token_count : self.active_token_count + effective_prefill_chunk_length
         ] = self.request_to_kv_block_ids[current_id][token_offset_range // self.block_size_tokens]
         if num_matched_blocks > 0:
-            # The matched blocks occupy block indices
-            # [already_allocated_blocks, already_allocated_blocks + num_matched),
-            # i.e. token positions [matched_start_token, matched_end_token). This
-            # chunk's token positions are `effective_kv_offset + i`, so the tokens
-            # to redirect form the contiguous range [lo, hi) below.
-            #
-            # `lo` is only non-zero when `finished_chunk_token_count` is not
-            # block-aligned: `prefix_skip_tokens` is 0 there, so the chunk starts
-            # inside the request's own partial block from the previous chunk, whose
-            # KV nothing else holds and must not be discarded.
-            matched_start_token = already_allocated_blocks * self.block_size_tokens
+            # The blocks matched in this chunk sit after the blocks the request already
+            # owns. Include the inherited partial block when that existing prefix was
+            # itself hash-matched in an earlier chunk; it is still shared and must not
+            # be rewritten. If there is a gap, the existing blocks were computed by
+            # this request and only this chunk's new matches are protected.
+            matched_start_token = (
+                0
+                if req.num_matched_prefix_blocks >= already_allocated_blocks
+                else already_allocated_blocks * self.block_size_tokens
+            )
             matched_end_token = (
                 already_allocated_blocks + num_matched_blocks
             ) * self.block_size_tokens
-            lo = max(0, matched_start_token - effective_kv_offset)
-            hi = min(effective_prefill_chunk_length, matched_end_token - effective_kv_offset)
-            if hi > lo:
+
+            chunk_start_token = effective_kv_offset
+            chunk_end_token = effective_kv_offset + effective_prefill_chunk_length
+            overlap_start_token = max(matched_start_token, chunk_start_token)
+            overlap_end_token = min(matched_end_token, chunk_end_token)
+            if overlap_end_token > overlap_start_token:
+                redirect_start = (
+                    self.active_token_count + overlap_start_token - chunk_start_token
+                )
+                redirect_end = self.active_token_count + overlap_end_token - chunk_start_token
                 self.token_to_block_idx[
-                    self.active_token_count + lo : self.active_token_count + hi
+                    redirect_start:redirect_end
                 ] = self.kv_block_allocator.dummy_block_idx
         self.token_to_local_position_within_kv_block[
             self.active_token_count : self.active_token_count + effective_prefill_chunk_length
@@ -3490,6 +3496,11 @@ class DynamicInferenceContext(BaseInferenceContext):
                 matched_block_ids,
                 overall_required_blocks,
             )
+
+        # Preserve a contiguous leading run of hash-matched blocks across chunks.
+        # A gap means intervening blocks belong exclusively to this request.
+        if num_matched_blocks > 0 and req.num_matched_prefix_blocks >= already_allocated_blocks:
+            req.num_matched_prefix_blocks = already_allocated_blocks + num_matched_blocks
 
         self.active_token_count += effective_prefill_chunk_length
         self.lifetime_prefill_token_count += effective_prefill_chunk_length

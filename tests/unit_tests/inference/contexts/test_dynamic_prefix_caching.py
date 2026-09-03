@@ -1295,6 +1295,41 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert offsets == [bs]
 
 
+class TestMatchedBlockWriteRedirectAcrossChunks(PrefixCachingTestBase):
+
+    @staticmethod
+    def _add_chunk(ctx, req, chunk_length):
+        start = ctx.active_token_count
+        ctx.add_request(req, prefill_chunk_length=chunk_length)
+        end = ctx.active_token_count
+        req.remaining_prompt_tokens = req.remaining_prompt_tokens[chunk_length:]
+        req.finished_chunk_token_count += chunk_length
+        # update_requests() does this for a continuing chunked-prefill request.
+        ctx.total_request_count -= 1
+        return start, end
+
+    @pytest.mark.internal
+    def test_unaligned_continuation_does_not_rewrite_inherited_matched_block(self):
+        """A continuation must protect a partial block matched by its previous chunk."""
+        ctx = self._ctx()
+        block_size = ctx.block_size_tokens
+        dummy = ctx.kv_block_allocator.dummy_block_idx
+        prompt = self._prompt(block_size * 4)
+
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        req = self._req(ctx, prompt.clone(), request_id=2)
+
+        first_chunk_length = block_size + 8
+        start, end = self._add_chunk(ctx, req, first_chunk_length)
+        assert req.num_matched_prefix_blocks == 2
+        assert ctx.token_to_block_idx[start:end].tolist() == [dummy] * (end - start)
+
+        second_chunk_length = block_size * 4 - first_chunk_length
+        start, end = self._add_chunk(ctx, req, second_chunk_length)
+        assert req.num_matched_prefix_blocks == 4
+        assert ctx.token_to_block_idx[start:end].tolist() == [dummy] * (end - start)
+
+
 class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
 
     def _setup_mixed_batch(self, model_type):

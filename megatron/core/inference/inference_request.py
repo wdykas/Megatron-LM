@@ -401,6 +401,10 @@ class DynamicInferenceRequest(InferenceRequest):
     block_size_tokens: Optional[int] = None  # Block size for hash computation
     enable_prefix_caching: bool = False  # Whether prefix caching is enabled
     num_cached_tokens: int = 0  # Tokens served from prefix cache (set by context on first match)
+    # Length of the leading run of blocks obtained by hash match rather than computation.
+    # The context carries this across prefill chunks so a continuation does not rewrite
+    # an inherited partial block that is shared with another request.
+    num_matched_prefix_blocks: int = 0
     # Scopes this request's block hashes to a weight generation. Set once, at
     # construction, from the engine's weight epoch; a request keeps its salt for
     # life, so a request that spans a refit republishes under its original salt
