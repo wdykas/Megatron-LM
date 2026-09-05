@@ -105,7 +105,10 @@ class TorchSampling(Sampling):
         filtered = TorchSampling.filter_logits(
             last_token_logits, temperature, top_k, top_p, vocab_size=vocab_size
         )
-        probabilities = filtered.softmax(dim=-1)
+        # Accumulate the normalization in FP32. Inference logits commonly arrive
+        # as BF16, whose rounded probabilities can change categorical samples and
+        # make otherwise equivalent generation backends diverge token by token.
+        probabilities = filtered.softmax(dim=-1, dtype=torch.float32)
         sampled = torch.multinomial(probabilities, num_samples=1, generator=generator).view(-1)
 
         if vocab_size:
