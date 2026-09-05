@@ -133,9 +133,8 @@ def _fused_moe_kernel(
     """Fused MoE grouped GEMM with indirect token addressing.
 
     Body mirrors vLLM's `fused_moe_kernel` verbatim except for the
-    `FUSE_SQUARED_RELU` branch (Megatron applies relu+square in fp32 on
-    the accumulator before the bf16 cast — strictly more accurate than
-    upstream's separate post-FC1 activation kernel).
+    `FUSE_SQUARED_RELU` branch, which preserves the bf16 FC1 output
+    rounding boundary of the unfused Megatron training path.
 
     Grid is sized host-side from `num_tokens_hint` (the typical-case token
     count), not the worst-case buffer length, so launch overhead at decode
@@ -199,9 +198,11 @@ def _fused_moe_kernel(
                 a_ptrs += BLOCK_SIZE_K * stride_ak
                 b_ptrs += BLOCK_SIZE_K * stride_bk
 
-            # Megatron-only: squared-relu fused on the fp32 accumulator before
-            # the bf16 cast.  Upstream runs relu+square as a separate bf16 kernel.
+            # Match the unfused training path: materialize the FC1 result in
+            # bf16 before applying squared ReLU, then evaluate the activation
+            # in fp32 before the existing bf16 output cast below.
             if FUSE_SQUARED_RELU:
+                accumulator = accumulator.to(tl.bfloat16).to(tl.float32)
                 accumulator = tl.maximum(accumulator, 0.0)
                 accumulator *= accumulator
 
@@ -230,9 +231,10 @@ class VllmFusedMoeBuffers:
 
     Allocated once at engine init (from DynamicInferenceContext) so the hot
     path performs no allocations inside CUDA graph capture, and every MoE
-    layer's graph shares this single buffer set. Without this, the intermediates are allocated inside each layer's
-    capture and recycled by the shared graph mempool's free-list reuse — same net
-    memory, but addresses then depend on allocator policy rather than being fixed.
+    layer's graph shares this single buffer set. Without this, the intermediates
+    are allocated inside each layer's capture and recycled by the shared graph
+    mempool's free-list reuse — same net memory, but addresses then depend on
+    allocator policy rather than being fixed.
 
     Sharing one set across all layers/graphs is safe because graph replays are
     serialized on one stream and each buffer is fully rewritten (gated by the
@@ -484,7 +486,7 @@ def _invoke_fused_moe_kernel(
 
     Body matches upstream vLLM `fused_moe_kernel` (1 CTA per (pid_m, pid_n)
     tile, raw pointer arithmetic with `% N` on the N axis), apart from the
-    optional fused squared-relu activation in fp32.
+    optional fused squared-relu activation after bf16 FC1 rounding.
 
     `grid_size` is sized host-side from `num_tokens_hint` so launch overhead
     at decode is small.  When the actual padded length exceeds the hinted

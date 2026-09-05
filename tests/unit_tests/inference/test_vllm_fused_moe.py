@@ -54,7 +54,7 @@ def _ref_sequential_moe(
             lid = eid - local_expert_start
             if 0 <= lid < num_local_experts:
                 h = hidden_states[t].float()
-                fc1_out = h @ fc1_weight[lid].float().T
+                fc1_out = (h @ fc1_weight[lid].float().T).to(torch.bfloat16).float()
                 activated = torch.clamp(fc1_out, min=0.0) ** 2
                 fc2_out = activated @ fc2_weight[lid].float().T
                 acc += probs[t, k].item() * fc2_out
@@ -495,6 +495,41 @@ class TestVllmFusedMoe:
         assert result.shape == (max_tokens, hidden_size)
         assert result.dtype == torch.float32
         torch.testing.assert_close(result, expected, atol=5e-2, rtol=5e-2)
+
+    def test_squared_relu_rounds_fc1_to_bf16_before_activation(self):
+        """Squared ReLU preserves the BF16 FC1 output boundary used in training."""
+        from megatron.core.inference.moe.fused_moe import ActivationType
+        from megatron.core.inference.moe.vllm_fused_moe import vllm_fused_moe
+
+        value = 0.10009765625
+        hidden = torch.full((1, 2), value, device="cuda", dtype=torch.bfloat16)
+        probs = torch.ones((1, 1), device="cuda", dtype=torch.float32)
+        routing_map = torch.zeros((1, 1), device="cuda", dtype=torch.int64)
+        fc1_weight = torch.full((1, 1, 2), value, device="cuda", dtype=torch.bfloat16)
+        fc2_weight = torch.tensor([[[1.0], [0.0]]], device="cuda", dtype=torch.bfloat16)
+
+        result = vllm_fused_moe(
+            hidden,
+            probs,
+            fc1_weight,
+            fc2_weight,
+            ActivationType.SQUARED_RELU,
+            1,
+            0,
+            _vt(1),
+            routing_map,
+        )
+
+        fc1_accumulator = hidden.float() @ fc1_weight[0].float().T
+        rounded_fc1 = fc1_accumulator.to(torch.bfloat16).float()
+        expected_activation = rounded_fc1.clamp_min(0).square().to(torch.bfloat16)
+        unrounded_activation = fc1_accumulator.clamp_min(0).square().to(torch.bfloat16)
+        assert not torch.equal(expected_activation, unrounded_activation)
+
+        expected = (
+            (expected_activation.float() @ fc2_weight[0].float().T).to(torch.bfloat16).float()
+        )
+        torch.testing.assert_close(result, expected, atol=0, rtol=0)
 
     @pytest.mark.parametrize(
         "max_tokens,hidden_size,ffn_hidden,topk,num_experts",
