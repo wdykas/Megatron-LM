@@ -6,7 +6,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.resharding.model_view import _as_refit_model, _RefitComponent, _RefitModelView
+from megatron.core.resharding.model_adapters import _as_refit_model, _refit_components
+from megatron.core.resharding.model_view import _RefitComponent, _RefitModelView
 from megatron.core.resharding.planner import (
     _extract_module_metadata,
     _find_source_metadata,
@@ -273,3 +274,58 @@ def test_cached_adapter_does_not_keep_original_model_alive():
     del model
     gc.collect()
     assert reference() is None
+
+
+def test_cached_layout_does_not_keep_component_alive_or_match_replacement():
+    import gc
+    import weakref
+
+    module = torch.nn.Linear(2, 2)
+    view = _RefitModelView({'language': _RefitComponent(module, groups())})
+    reference = weakref.ref(module)
+    layout = _get_parallel_config(view)
+    cached = {layout: object()}
+    assert _get_parallel_config(view) in cached
+
+    del module, view
+    gc.collect()
+    assert reference() is None
+    assert layout in cached
+
+    replacement = _RefitModelView({'language': _RefitComponent(torch.nn.Linear(2, 2), groups())})
+    assert _get_parallel_config(replacement) not in cached
+
+
+def test_registered_adapter_uses_generic_validation_and_cache():
+    class Composite(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = torch.nn.Linear(2, 2)
+
+    @_refit_components.register(Composite)
+    def components(model):
+        return {'vision_model': _RefitComponent(model.encoder, groups())}
+
+    model = Composite()
+    view = _as_refit_model(model)
+    assert _as_refit_model(model) is view
+    assert get_refit_tensor_dict(view)['vision_model.weight'] is model.encoder.weight
+    clear_plan_cache()
+    assert _as_refit_model(model) is not view
+
+    incomplete = Composite()
+    incomplete.register_buffer('unmapped', torch.ones(1))
+    with pytest.raises(ValueError, match='Composite refit adapter does not cover all'):
+        _as_refit_model(incomplete)
+
+
+def test_registered_adapter_cannot_retain_its_cache_key():
+    class RootComponent(torch.nn.Module):
+        pass
+
+    @_refit_components.register(RootComponent)
+    def components(model):
+        return {'language_model': _RefitComponent(model, groups())}
+
+    with pytest.raises(ValueError, match='child modules, not the original model'):
+        _as_refit_model(RootComponent())

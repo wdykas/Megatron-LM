@@ -29,7 +29,8 @@ from .copy_services.nccl_copy_service import NCCLCopyService
 from .copy_services.nccl_m2n_copy_service import NCCLM2NCopyService
 from .copy_services.nixl_copy_service import NixlCopyService
 from .copy_services.nvshmem_copy_service import NVSHMEMCopyService
-from .model_view import _as_refit_model, _clear_model_view_cache, _RefitModelView
+from .model_adapters import _as_refit_model, _clear_model_view_cache
+from .model_view import _RefitModelView
 from .transforms import MXFP8ReshardTransform, ReshardTransform
 from .utils import invalidate_refit_tensor_cache, named_persistent_buffers
 

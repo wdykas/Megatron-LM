@@ -3,7 +3,7 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from weakref import WeakKeyDictionary
+from weakref import ref
 
 import torch
 import torch.distributed as dist
@@ -54,7 +54,6 @@ class _RefitModelView(torch.nn.Module):
 
     def __init__(self, components: Mapping[str, _RefitComponent]) -> None:
         super().__init__()
-        modules = {}
         specifications = []
         tensor_owners = {}
         for name, component in sorted(components.items()):
@@ -97,12 +96,9 @@ class _RefitModelView(torch.nn.Module):
                 owner = tensor_owners.setdefault(id(tensor), name)
                 if owner != name:
                     raise ValueError(f"Components {owner!r} and {name!r} share a tensor")
-            modules[name] = module
-            specifications.append((name, _RefitComponent(module, pg, num_experts)))
-        # Match the destination's native module paths. Registering references
-        # does not rename or copy tensors in the original model.
-        for name, module in modules.items():
+            # Match native destination paths without copying the original tensors.
             self.add_module(name, module)
+            specifications.append((name, _RefitComponent(module, pg, num_experts)))
         self._specifications = tuple(specifications)
 
     def local_components(self) -> tuple[tuple[str, _RefitComponent], ...]:
@@ -114,7 +110,9 @@ class _RefitModelView(torch.nn.Module):
         return tuple(
             (
                 name,
-                component.module,
+                # Preserve identity without keeping model tensors alive in the plan cache.
+                # Unlike id(module), a dead weak reference cannot alias a new model.
+                ref(component.module),
                 component.num_experts,
                 tuple(
                     (axis, tuple(dist.get_process_group_ranks(pg)))
@@ -124,75 +122,3 @@ class _RefitModelView(torch.nn.Module):
             )
             for name, component in self._specifications
         )
-
-
-_model_view_cache: WeakKeyDictionary[torch.nn.Module, _RefitModelView] = WeakKeyDictionary()
-
-
-def _clear_model_view_cache() -> None:
-    _model_view_cache.clear()
-
-
-def _as_refit_model(model: torch.nn.Module) -> torch.nn.Module:
-    """Adapt MIMO's component meshes to the existing LLaVA tensor namespace.
-
-    Ordinary models retain their existing refit path. The supported MIMO layout
-    has a language module and one CLIP vision encoder with an input projector.
-    Cache views separately from the model; clear_plan_cache invalidates both.
-    """
-    from megatron.core.models.mimo import MimoModel
-    from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
-    from megatron.core.models.vision.clip_vit_model import CLIPViTModel
-    from megatron.core.models.vision.multimodal_projector import MultimodalProjector
-
-    if not isinstance(model, MimoModel):
-        return model
-    cached = _model_view_cache.get(model)
-    if cached is not None:
-        return cached
-    if set(model.mimo_config.modality_submodules_spec) != {'images'}:
-        raise ValueError(
-            "MIMO refit supports one 'images' modality with CLIP and an input projector"
-        )
-    components = {}
-    if model.language_model is not None:
-        language = unwrap_model(model.language_model)
-        components['language_model'] = _RefitComponent(language, language.pg_collection)
-    for tower in model.modality_submodules.values():
-        tower = unwrap_model(tower)
-        if (
-            not isinstance(tower, VisionModalitySubmodules)
-            or len(tower.encoders) != 1
-            or len(tower.input_projections) != 1
-            or tower.decoders
-            or tower.output_projections
-        ):
-            raise ValueError(
-                "MIMO refit requires one vision encoder and one input projector, without decoders"
-            )
-        vision = unwrap_model(next(iter(tower.encoders.values())))
-        projector = unwrap_model(tower.input_projections[0])
-        if not isinstance(vision, CLIPViTModel) or not isinstance(projector, MultimodalProjector):
-            raise ValueError("MIMO refit requires CLIPViTModel and MultimodalProjector components")
-        pg = tower.pg_collection
-        if (
-            pg is None
-            or pg.tp is None
-            or tuple(dist.get_process_group_ranks(projector.tp_group))
-            != tuple(dist.get_process_group_ranks(pg.tp))
-        ):
-            raise ValueError(
-                "MIMO refit projector TP group must match its modality's process groups"
-            )
-        components['vision_model'] = _RefitComponent(vision, vision.pg_collection)
-        components['vision_projection'] = _RefitComponent(projector, pg)
-    view = _RefitModelView(components)
-    # Detect uncovered root/tower state instead of silently omitting it.
-    if {id(t) for _, t in named_refit_tensors(model)} != {
-        id(t) for _, t in named_refit_tensors(view)
-    }:
-        raise ValueError(
-            "MIMO refit adapter does not cover all model parameters and persistent buffers"
-        )
-    _model_view_cache[model] = view
-    return view

@@ -100,13 +100,21 @@ original tensors; model storage and the inference forward path are unchanged.
 The existing rank-offset arguments still apply when the refit group joins
 independent training and inference worlds.
 
+Component discovery uses an internal type-based adapter registry. Each adapter
+returns named modules and their process groups; tensor validation, caching, and
+planning are shared. Models without an adapter retain their existing refit path.
+The MIMO adapter owns the mapping to LLaVA names, so other model families can
+add mappings without changing the public prepare/swap API or planner.
+
 The automatic adapter supports the MIMO `images` modality with one
 `CLIPViTModel` encoder and one `MultimodalProjector` input projection, without
-modality decoders or output projections. Unknown structures and uncovered
-parameters/persistent buffers raise an error. Source and destination must have
-equivalent architectures and input preprocessing; matching tensor names alone
-does not establish model equivalence. Initial validation covers BF16 and FP16 dense
-models; quantized MIMO components are rejected. Other modality/model adapters
+modality decoders or output projections. Vision pipeline partitioning is not
+supported: the adapter requires a local encoder and projector together.
+Unknown structures and uncovered parameters/persistent buffers raise an error.
+Source and destination must have equivalent architectures and input
+preprocessing; matching tensor names alone does not establish model equivalence.
+Initial validation covers BF16 and FP16 dense models; quantized MIMO components
+are rejected. Other modality/model adapters
 and quantized multimodal inference are outside this validation.
 
 Views are cached between optimizer steps; update existing tensor values in place.
@@ -115,37 +123,10 @@ on **all** refit ranks, and prepare again. Replacing tensors or submodules on an
 existing model is not automatically tracked by refit's tensor caches. Existing
 single-model callers retain their path.
 
-Run the synthetic four-GPU correctness test from the repository root:
-
-```bash
-uv run python -m torch.distributed.run --standalone --nproc_per_node=4 \
-  examples/rl/mimo_refit_smoke.py --output /tmp/mimo-refit-results.json
-```
-
-It performs MIMO forward/backward and optimizer steps, refits before and after
-training, reconstructs source TP shards independently to check every target
-weight and persistent buffer exactly, compares image-conditioned logits, and
-runs LLaVA prefill plus a cached decode step. It uses explicit activation and
-gradient exchange in one distributed world, rather than a NeMo-RL/Ray training
-scheduler or a pretrained checkpoint.
-
-Run the full matrix, with per-case logs and JSON results:
-
-```bash
-uv run python examples/rl/run_mimo_refit_matrix.py --output-dir /tmp/mimo-refit-matrix
-```
-
-The matrix covers language and vision TP2-to-TP1, TP1-to-TP2 inference, idle
-ranks, tied embeddings (including tied-to-untied refit), MLP/affine projectors,
-GQA, deeper bias-free models, BF16/FP16, NCCL/Gloo, precision/list wrappers,
-batch size two, cache rebuilding, and 64 KiB execution batches. Each case
-checks an initial refit and at least two optimizer/refit cycles. Use `--cases`
-to select individual cases, or pass the corresponding options to the smoke test.
-
-The TP2 affine-projector case uses no bias: the current projector forward adds
-its local bias after gathering the output, which is incompatible with a sharded
-bias at TP2. A separate TP1 affine case covers bias. This is a model-forward
-limitation, independent of refit.
+TP2 affine projectors currently require bias to be disabled: the projector
+forward adds its local bias after gathering the output, which is incompatible
+with a sharded bias at TP2. This is a model-forward limitation, independent
+of refit.
 
 ## Copy Service Backends
 
