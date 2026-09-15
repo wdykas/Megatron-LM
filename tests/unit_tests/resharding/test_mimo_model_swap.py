@@ -22,6 +22,7 @@ from megatron.core.resharding.refit import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.mlp import MLPSubmodules
+from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -93,7 +94,9 @@ def _models(language_tp, vision_tp, language_grid, image_grid, language_pg, imag
             .cuda()
             .bfloat16()
         )
-        target.vision_model.register_buffer('refit_counter', torch.zeros(1, device='cuda'))
+        target.vision_model.register_buffer(
+            'refit_counter', torch.zeros(1, device='cuda', dtype=torch.bfloat16)
+        )
         return None, target, {}
     if rank >= language_tp + vision_tp:
         return None, None, {}
@@ -200,9 +203,10 @@ def _assert_refit(components, target):
         )
 
 
+@pytest.mark.parametrize('wrapped', [False, True])
 @pytest.mark.parametrize('language_tp,vision_tp', [(2, 1), (1, 2)])
 @pytest.mark.parametrize('backend', ['nccl', 'gloo'])
-def test_mimo_to_llava_repeated_refit(language_tp, vision_tp, backend):
+def test_mimo_to_llava_repeated_refit(language_tp, vision_tp, backend, wrapped):
     Utils.initialize_model_parallel()
     if dist.get_world_size() < 4:
         Utils.destroy_model_parallel()
@@ -218,6 +222,16 @@ def test_mimo_to_llava_repeated_refit(language_tp, vision_tp, backend):
         source, target, components = _models(
             language_tp, vision_tp, language_grid, image_grid, language_pg, image_pg, target_pg
         )
+        if wrapped and source is not None:
+            if source.language_model is not None:
+                source.language_model = Float16Module(_config(language_tp), source.language_model)
+            for name, tower in list(source.modality_submodules.items()):
+                source.modality_submodules[name] = Float16Module(_config(vision_tp), tower)
+            # Mimic training's FP32 persistent state after precision wrapping.
+            if 'vision_model' in components:
+                components['vision_model'].refit_counter = components[
+                    'vision_model'
+                ].refit_counter.float()
         prepare_swap_model_weights(source, target)
         for update in range(2):
             if update:

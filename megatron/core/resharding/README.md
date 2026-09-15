@@ -91,37 +91,32 @@ prepare_swap_model_weights(train_model, inference_model, group=refit_group)
 swap_model_weights(train_model, inference_model, "nccl", group=refit_group)
 ```
 
-Internally, MIMO's local language, vision and projector modules are exposed under
-the existing LLaVA paths (`language_model`, `vision_model`, `vision_projection`).
-The planner reads each component's own process groups, allowing, for example,
-TP2 language training on two GPUs, TP1 vision/projector training on a third,
-and a standard TP1 LLaVA inference model on a fourth. The executor uses the
-original tensors; model storage and the inference forward path are unchanged.
-The existing rank-offset arguments still apply when the refit group joins
-independent training and inference worlds.
+The planner iterates the original model's parameters and persistent buffers.
+For models without one root process-group collection, it walks the module tree
+and uses each tensor's nearest owning collection. Containers inherit ownership;
+a child's collection replaces it. Ordinary models retain their existing path.
+This allows, for example, TP2 language training on two GPUs, TP1 vision/projector
+training on a third, and standard TP1 LLaVA inference on a fourth.
 
-Component discovery uses an internal type-based adapter registry. Each adapter
-returns named modules and their process groups; tensor validation, caching, and
-planning are shared. Models without an adapter retain their existing refit path.
-The MIMO adapter owns the mapping to LLaVA names, so other model families can
-add mappings without changing the public prepare/swap API or planner.
+A small name-alias table matches MIMO's language, image encoder, and input
+projector paths to LLaVA's `language_model`, `vision_model`, and `vision_projection`.
+Only matching names are translated. The executor uses original tensor paths,
+including wrapper levels, and buffer dtypes are matched by transfer ID. There
+are no temporary model views or adapter registry. The existing rank-offset
+arguments still apply when the refit group joins independent worlds.
 
-The automatic adapter supports the MIMO `images` modality with one
-`CLIPViTModel` encoder and one `MultimodalProjector` input projection, without
-modality decoders or output projections. Vision pipeline partitioning is not
-supported: the adapter requires a local encoder and projector together.
-Unknown structures and uncovered parameters/persistent buffers raise an error.
-Source and destination must have equivalent architectures and input
-preprocessing; matching tensor names alone does not establish model equivalence.
-Initial validation covers BF16 and FP16 dense models; quantized MIMO components
-are rejected. Other modality/model adapters
-and quantized multimodal inference are outside this validation.
+Validation covers dense BF16/FP16 MIMO training with one CLIP image encoder and
+one input projector, paired with equivalent LLaVA inference. Other modalities,
+vision pipeline partitioning, and multimodal MoE are not GPU-validated here.
+Quantized composite models are rejected. Missing ownership, unmapped names, and
+ambiguous destination names raise errors. Matching names and shapes do not
+establish equivalent architectures or input preprocessing; callers must ensure
+those agree.
 
-Views are cached between optimizer steps; update existing tensor values in place.
-For a new component layout, construct new model objects, call `clear_plan_cache()`
-on **all** refit ranks, and prepare again. Replacing tensors or submodules on an
-existing model is not automatically tracked by refit's tensor caches. Existing
-single-model callers retain their path.
+Plans are cached between optimizer steps; update tensor values in place.
+For a new layout, construct new model objects, call `clear_plan_cache()` on
+**all** refit ranks, and prepare again. Replacing tensors or submodules on an
+existing model is not automatically tracked by refit's tensor caches.
 
 TP2 affine projectors currently require bias to be disabled: the projector
 forward adds its local bias after gathering the output, which is incompatible

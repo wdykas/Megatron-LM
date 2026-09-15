@@ -10,6 +10,7 @@ High-level refit/reshard orchestration:
 
 from dataclasses import dataclass
 from typing import Any, Literal, NamedTuple, Optional, Union
+from weakref import ref
 
 import torch
 
@@ -29,8 +30,6 @@ from .copy_services.nccl_copy_service import NCCLCopyService
 from .copy_services.nccl_m2n_copy_service import NCCLM2NCopyService
 from .copy_services.nixl_copy_service import NixlCopyService
 from .copy_services.nvshmem_copy_service import NVSHMEMCopyService
-from .model_adapters import _as_refit_model, _clear_model_view_cache
-from .model_view import _RefitModelView
 from .transforms import MXFP8ReshardTransform, ReshardTransform
 from .utils import invalidate_refit_tensor_cache, named_persistent_buffers
 
@@ -85,8 +84,11 @@ def _get_parallel_config(core) -> _ParallelConfig | tuple | None:
     """
     if core is None:
         return None
-    if isinstance(core, _RefitModelView):
-        return core.layout_key()
+    if getattr(core, 'pg_collection', None) is None:
+        # Composite models have multiple meshes. A weak identity distinguishes
+        # their plans without retaining tensors or adding a second metadata cache.
+        # Rebuilding a layout requires new models and collective cache clearing.
+        return (ref(core),)
     cached = getattr(core, '_refit_parallel_config', None)
     if cached is not None:
         return cached
@@ -200,7 +202,6 @@ def clear_plan_cache():
     """
     global _plan_cache
     _plan_cache.clear()
-    _clear_model_view_cache()
 
 
 def clear_all_caches():
@@ -226,26 +227,19 @@ def _unwrap_model_cores(src_model, target_model):
 
     if src_model is not None:
         src_lm = src_model[0] if isinstance(src_model, (list, tuple)) else src_model
-        src_core = _as_refit_model(unwrap_model(src_lm))
-        if not isinstance(src_core, _RefitModelView):
-            num_experts = src_core.config.num_moe_experts
-            if not hasattr(src_core, "pg_collection") or src_core.pg_collection is None:
-                raise RuntimeError("Source model missing pg_collection required for reshard")
-            # Preserve the legacy single-model fallback; views require explicit groups.
-            if getattr(src_core.pg_collection, "dp", None) is None:
-                src_core.pg_collection.dp = parallel_state.get_data_parallel_group(
-                    with_gtp_remat=False
-                )
+        src_core = unwrap_model(src_lm)
+        num_experts = getattr(getattr(src_core, 'config', None), 'num_moe_experts', None)
+        pg = getattr(src_core, 'pg_collection', None)
+        # Preserve the legacy single-model fallback. Composite models discover
+        # explicit ownership per tensor when the planner builds metadata.
+        if pg is not None and getattr(pg, 'dp', None) is None:
+            pg.dp = parallel_state.get_data_parallel_group(with_gtp_remat=False)
 
     if target_model is not None:
         tgt_lm = target_model[0] if isinstance(target_model, (list, tuple)) else target_model
-        tgt_core = _as_refit_model(unwrap_model(tgt_lm))
-        if num_experts is None and not isinstance(tgt_core, _RefitModelView):
-            num_experts = tgt_core.config.num_moe_experts
-        if not isinstance(tgt_core, _RefitModelView) and (
-            not hasattr(tgt_core, "pg_collection") or tgt_core.pg_collection is None
-        ):
-            raise RuntimeError("Target model missing pg_collection required for reshard")
+        tgt_core = unwrap_model(tgt_lm)
+        if num_experts is None:
+            num_experts = getattr(getattr(tgt_core, 'config', None), 'num_moe_experts', None)
 
     return src_core, tgt_core, num_experts
 
@@ -510,28 +504,37 @@ def _harmonize_buffer_dtypes(plan, src_core, tgt_core, group=None):
     sending fp32 bytes into a bf16 receive buffer corrupts the data — so dst's
     buffer must match src's dtype before the transfer.
 
-    The canonical dtype map is collected once via ``all_gather_object`` and
-    cached on the plan.  Subsequent refits reuse the cached map and only do
-    the per-buffer dtype check / replacement (no collective).
+    Source dtypes are collected once via ``all_gather_object``, matched by
+    transfer ID, and cached under local destination buffer names on the plan.
+    Subsequent refits reuse the cached map and only do the per-buffer dtype
+    check / replacement (no collective).
     """
     if plan.buffer_dtypes is None:
-        local_src_dtypes: dict[str, torch.dtype] = {}
+        source_buffers = {}
         if src_core is not None:
-            for full_name, _sub, _buf_name, buf in named_persistent_buffers(src_core):
-                local_src_dtypes[full_name] = buf.dtype
-
+            source_buffers = {
+                name: buf.dtype for name, _, _, buf in named_persistent_buffers(src_core)
+            }
+        # Transfer IDs already pair source and destination tensors, even when
+        # their storage names or local pipeline indices differ.
+        local_src_dtypes = {
+            op.task_id: source_buffers[op.param_name]
+            for op in plan.send_ops
+            if op.param_name in source_buffers
+        }
         world_size = group.size() if group is not None else torch.distributed.get_world_size()
         gathered: list = [None] * world_size
         torch.distributed.all_gather_object(gathered, local_src_dtypes, group=group)
-
-        canonical: dict[str, torch.dtype] = {}
-        for d in gathered:
-            if not d:
+        transfer_dtypes = {task_id: dtype for part in gathered for task_id, dtype in part.items()}
+        destination_dtypes = {}
+        for op in plan.recv_ops:
+            if op.task_id not in transfer_dtypes:
                 continue
-            for name, dtype in d.items():
-                # Replicated buffers agree across ranks; first writer wins.
-                canonical.setdefault(name, dtype)
-        plan.buffer_dtypes = canonical
+            dtype = transfer_dtypes[op.task_id]
+            previous = destination_dtypes.setdefault(op.param_name, dtype)
+            if previous != dtype:
+                raise ValueError(f"Source shards disagree on buffer dtype for {op.param_name}")
+        plan.buffer_dtypes = destination_dtypes
 
     if tgt_core is None:
         return

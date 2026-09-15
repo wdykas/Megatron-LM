@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
-from .model_view import _RefitModelView
+from .model_metadata import _match_refit_name, _named_owned_tensors, _refit_name_aliases
 from .shard_planner import plan_sharded_transfer
 from .utils import (
     ParameterMetadata,
@@ -702,7 +702,7 @@ def _build_tensor_reshard_specs(
 
 
 def _extract_module_metadata(
-    module, owner_rank, num_experts, rank_offset, rank_list_cache, *, pg_collection=None
+    module, owner_rank, num_experts, rank_offset, rank_list_cache
 ) -> list[ParameterMetadata]:
     """Metadata for a module's params and persistent buffers, or [] if None.
 
@@ -711,26 +711,28 @@ def _extract_module_metadata(
     """
     if module is None:
         return []
-    if isinstance(module, _RefitModelView):
-        metadata = []
-        for name, component in module.local_components():
-            prefix = f"{name}."
-            local_metadata = _extract_module_metadata(
-                component.module,
-                owner_rank,
-                component.num_experts,
-                rank_offset,
-                rank_list_cache,
-                pg_collection=component.pg_collection,
-            )
-            for entry in local_metadata:
-                entry.name = prefix + entry.name
-                entry.resolved_name = prefix + entry.resolved_name
-            metadata.extend(local_metadata)
-        return metadata
-    pg = pg_collection if pg_collection is not None else getattr(module, "pg_collection", None)
+    pg = getattr(module, "pg_collection", None)
     if pg is None:
-        raise ValueError("Module must have pg_collection")
+        aliases = _refit_name_aliases(module)
+        metadata = []
+        resolved_names = set()
+        for name, logical_name, tensor, groups, experts in _named_owned_tensors(module):
+            entry = extract_param_metadata(
+                tensor,
+                logical_name,
+                owner_rank,
+                groups,
+                num_experts=experts,
+                rank_offset=rank_offset,
+                _rank_list_cache=rank_list_cache,
+            )
+            entry.name = name  # The executor always addresses the original model.
+            entry.resolved_name = _match_refit_name(entry.resolved_name, aliases)
+            if entry.resolved_name in resolved_names:
+                raise ValueError(f"Duplicate refit name {entry.resolved_name!r}")
+            resolved_names.add(entry.resolved_name)
+            metadata.append(entry)
+        return metadata
     layer_prefix_map = _build_layer_module_prefix_map(module)
     return [
         extract_param_metadata(
