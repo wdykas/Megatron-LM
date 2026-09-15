@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
+from .model_view import _RefitModelView
 from .shard_planner import plan_sharded_transfer
 from .utils import (
     ParameterMetadata,
@@ -41,7 +42,9 @@ def _find_source_metadata(
     """Find source metadata, including the tied-output embedding alias."""
     src_meta_list = src_param_metadata.get(resolved_name)
     if not src_meta_list and resolved_name.endswith("output_layer.weight"):
-        for embedding_name in ("embedding.word_embeddings.weight", "word_embeddings.weight"):
+        prefix = resolved_name.removesuffix("output_layer.weight")
+        for suffix in ("embedding.word_embeddings.weight", "word_embeddings.weight"):
+            embedding_name = prefix + suffix
             src_meta_list = src_param_metadata.get(embedding_name)
             if src_meta_list:
                 break
@@ -699,7 +702,7 @@ def _build_tensor_reshard_specs(
 
 
 def _extract_module_metadata(
-    module, owner_rank, num_experts, rank_offset, rank_list_cache
+    module, owner_rank, num_experts, rank_offset, rank_list_cache, *, pg_collection=None
 ) -> list[ParameterMetadata]:
     """Metadata for a module's params and persistent buffers, or [] if None.
 
@@ -708,7 +711,24 @@ def _extract_module_metadata(
     """
     if module is None:
         return []
-    pg = getattr(module, "pg_collection", None)
+    if isinstance(module, _RefitModelView):
+        metadata = []
+        for name, component in module.local_components():
+            prefix = f"{name}."
+            local_metadata = _extract_module_metadata(
+                component.module,
+                owner_rank,
+                component.num_experts,
+                rank_offset,
+                rank_list_cache,
+                pg_collection=component.pg_collection,
+            )
+            for entry in local_metadata:
+                entry.name = prefix + entry.name
+                entry.resolved_name = prefix + entry.resolved_name
+            metadata.extend(local_metadata)
+        return metadata
+    pg = pg_collection if pg_collection is not None else getattr(module, "pg_collection", None)
     if pg is None:
         raise ValueError("Module must have pg_collection")
     layer_prefix_map = _build_layer_module_prefix_map(module)

@@ -29,6 +29,7 @@ from .copy_services.nccl_copy_service import NCCLCopyService
 from .copy_services.nccl_m2n_copy_service import NCCLM2NCopyService
 from .copy_services.nixl_copy_service import NixlCopyService
 from .copy_services.nvshmem_copy_service import NVSHMEMCopyService
+from .model_view import _as_refit_model, _clear_model_view_cache, _RefitModelView
 from .transforms import MXFP8ReshardTransform, ReshardTransform
 from .utils import invalidate_refit_tensor_cache, named_persistent_buffers
 
@@ -55,8 +56,8 @@ class _PlanCacheKey:
     """
 
     rank: int
-    src_config: Optional[_ParallelConfig]
-    dst_config: Optional[_ParallelConfig]
+    src_config: _ParallelConfig | tuple | None
+    dst_config: _ParallelConfig | tuple | None
     num_experts: Optional[int]
     # Adding inference nodes leaves the configs and offsets unchanged, so without
     # world_size the stale pre-growth plan would be reused.
@@ -74,7 +75,7 @@ class _PlanCacheKey:
     execution_batch_bytes: int | None = None
 
 
-def _get_parallel_config(core) -> Optional[_ParallelConfig]:
+def _get_parallel_config(core) -> _ParallelConfig | tuple | None:
     """Extract TP/PP/EP/DP/expert-TP/GTP-remat sizes, memoized on the core.
 
     Process-group sizes don't change after init, so the result is cached on the
@@ -83,6 +84,8 @@ def _get_parallel_config(core) -> Optional[_ParallelConfig]:
     """
     if core is None:
         return None
+    if isinstance(core, _RefitModelView):
+        return core.layout_key()
     cached = getattr(core, '_refit_parallel_config', None)
     if cached is not None:
         return cached
@@ -196,6 +199,7 @@ def clear_plan_cache():
     """
     global _plan_cache
     _plan_cache.clear()
+    _clear_model_view_cache()
 
 
 def clear_all_caches():
@@ -221,20 +225,25 @@ def _unwrap_model_cores(src_model, target_model):
 
     if src_model is not None:
         src_lm = src_model[0] if isinstance(src_model, (list, tuple)) else src_model
-        num_experts = src_lm.config.num_moe_experts
-        src_core = unwrap_model(src_lm)
-        if not hasattr(src_core, "pg_collection") or src_core.pg_collection is None:
-            raise RuntimeError("Source model missing pg_collection required for reshard")
-        # Fill missing DP group on the source using Megatron's parallel state if not provided
-        if getattr(src_core.pg_collection, "dp", None) is None:
-            src_core.pg_collection.dp = parallel_state.get_data_parallel_group(with_gtp_remat=False)
+        src_core = _as_refit_model(unwrap_model(src_lm))
+        if not isinstance(src_core, _RefitModelView):
+            num_experts = src_core.config.num_moe_experts
+            if not hasattr(src_core, "pg_collection") or src_core.pg_collection is None:
+                raise RuntimeError("Source model missing pg_collection required for reshard")
+            # Preserve the legacy single-model fallback; views require explicit groups.
+            if getattr(src_core.pg_collection, "dp", None) is None:
+                src_core.pg_collection.dp = parallel_state.get_data_parallel_group(
+                    with_gtp_remat=False
+                )
 
     if target_model is not None:
         tgt_lm = target_model[0] if isinstance(target_model, (list, tuple)) else target_model
-        if num_experts is None:
-            num_experts = tgt_lm.config.num_moe_experts
-        tgt_core = unwrap_model(tgt_lm)
-        if not hasattr(tgt_core, "pg_collection") or tgt_core.pg_collection is None:
+        tgt_core = _as_refit_model(unwrap_model(tgt_lm))
+        if num_experts is None and not isinstance(tgt_core, _RefitModelView):
+            num_experts = tgt_core.config.num_moe_experts
+        if not isinstance(tgt_core, _RefitModelView) and (
+            not hasattr(tgt_core, "pg_collection") or tgt_core.pg_collection is None
+        ):
             raise RuntimeError("Target model missing pg_collection required for reshard")
 
     return src_core, tgt_core, num_experts
