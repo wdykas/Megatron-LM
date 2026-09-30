@@ -910,11 +910,21 @@ try:
         tools_requested = bool(tools) and tool_choice != "none"
         messages = req.get("messages")
         chat_template_kwargs = _sanitize_chat_template_kwargs(req.get("chat_template_kwargs"))
+        vllm_swe_parser = current_app.config.get("vllm_swe_parser")
+        if vllm_swe_parser is not None and req.get("stream", False):
+            return Response("The vLLM SWE parser supports non-streaming requests only", status=400)
+        parse_vllm_swe = None
         # --- 1. Parse Messages ---
         if not messages:
             return Response("Missing 'messages' field", status=400)
         if not isinstance(messages, list):
             return Response("'messages' must be a list", status=400)
+        if vllm_swe_parser is not None:
+            try:
+                parse_vllm_swe = vllm_swe_parser(req, chat_template_kwargs)
+            except ValueError as error:
+                return Response(str(error), status=400)
+
         prompt_config = current_app.config['multimodal_prompt_config']
         # Extract structured media before template sanitization. Remote image
         # fetches block, so keep this work off the event loop.
@@ -1475,7 +1485,9 @@ try:
             metadata = {}
             message_text = text_output
 
-            if parsers:
+            if parse_vllm_swe is not None:
+                message_text, metadata = parse_vllm_swe(message_text)
+            elif parsers:
                 message_text, metadata = apply_parsers(
                     message_text,
                     tools,
@@ -1495,7 +1507,10 @@ try:
             # - Named tool choice or "required": content is empty string
             # - Otherwise: content is the parsed message text
             is_named_tool_choice = isinstance(tool_choice, dict) and "function" in tool_choice
-            if normalized_tool_calls and (is_named_tool_choice or tool_choice == "required"):
+            if parse_vllm_swe is not None:
+                # None is significant to agent clients; retain the parser result.
+                content = message_text
+            elif normalized_tool_calls and (is_named_tool_choice or tool_choice == "required"):
                 content = ""
             else:
                 content = message_text if message_text is not None else ""

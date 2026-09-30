@@ -65,6 +65,7 @@ async def _run_text_gen_server(
     eval_mode: bool = False,
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
+    vllm_swe_reasoning_parser_plugin: Optional[str] = None,
 ):
     """
     Initializes and runs the async web server. Automatically starts and
@@ -107,6 +108,12 @@ async def _run_text_gen_server(
         app.config['client'] = inference_client
         app.config['tokenizer'] = tokenizer
         app.config['parsers'] = parsers
+        if vllm_swe_reasoning_parser_plugin is not None:
+            from .vllm_swe_parser import load_vllm_swe_parser
+
+            app.config['vllm_swe_parser'] = load_vllm_swe_parser(
+                tokenizer, vllm_swe_reasoning_parser_plugin
+            )
         app.config['verbose'] = verbose
         app.config['chat_template'] = chat_template
         app.config['multimodal_prompt_config'] = (
@@ -182,6 +189,7 @@ def _server_process_worker(
     eval_mode: bool = False,
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
+    vllm_swe_reasoning_parser_plugin: Optional[str] = None,
 ):
     """Synchronous worker function that sets up a new event loop for the separate process."""
     loop = asyncio.new_event_loop()
@@ -204,6 +212,7 @@ def _server_process_worker(
                 eval_mode,
                 block_size_tokens,
                 prefix_caching_coordinator_policy,
+                vllm_swe_reasoning_parser_plugin,
             )
         )
     except KeyboardInterrupt:
@@ -267,6 +276,7 @@ def start_text_gen_server(
     eval_mode: bool = False,
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
+    vllm_swe_reasoning_parser_plugin: Optional[str] = None,
 ) -> Optional[str]:
     """Start the text generation server.
 
@@ -283,6 +293,9 @@ def start_text_gen_server(
     spreading requests over the result is the caller's business.
 
     Args:
+        vllm_swe_reasoning_parser_plugin: Optional path to a vLLM plugin registering
+            nano_v3. Selects non-streaming Nano/Qwen3 parsing instead of native
+            parsers; requires a compatible vLLM installation in each frontend.
         server_port: Port to listen on. Overridden by ``sock`` when given; 0
             asks the OS to choose a free one.
         sock: A socket the caller already bound, used only to fix the port.
@@ -295,6 +308,9 @@ def start_text_gen_server(
         The base URL this rank serves on, or None if the server was already
         running.
     """
+    if vllm_swe_reasoning_parser_plugin is not None and parsers:
+        raise ValueError("Select either native parsers or the vLLM SWE parser")
+
     global _SERVER_PROCESSES
 
     if _SERVER_PROCESSES:
@@ -332,6 +348,7 @@ def start_text_gen_server(
                 eval_mode,
                 block_size_tokens,
                 prefix_caching_coordinator_policy,
+                vllm_swe_reasoning_parser_plugin,
             ),
             daemon=True,
         )
