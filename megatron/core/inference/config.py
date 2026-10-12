@@ -659,13 +659,16 @@ class InferenceConfig:
     """Where speculative tokens come from when `num_speculative_tokens > 0`.
 
     - ``"mtp"``: the model's multi-token-prediction head drafts them (requires MTP layers).
-    - ``"lookup"``: exact lookup ("n-gram") speculation. Each step, a CPU proposer matches the
-      longest suffix (`lookup_ngram_max` down to `lookup_ngram_min` tokens) of every request's
-      tokens against the request's own prompt + generated tokens and its optional
-      `SamplingParams.lookup_references`, and proposes up to `num_speculative_tokens` tokens that
-      followed the match. Proposals go through the same verify step as MTP drafts, which is exact
+    - ``"lookup"``: exact lookup ("n-gram") speculation, available to requests that opt in
+      (`SamplingParams.lookup_speculation`, or non-empty `SamplingParams.lookup_references`).
+      Each step, a CPU proposer matches the longest suffix (`lookup_ngram_max` down to
+      `lookup_ngram_min` tokens) of an opted-in request's tokens against its own prompt +
+      generated tokens and its references, and proposes up to `num_speculative_tokens` tokens
+      that followed the match. Other requests never get proposals and commit one token per
+      step, exactly as without speculation (they still occupy `num_speculative_tokens + 1`
+      verify rows; the batch layout is uniform). Proposals go through the same verify step as MTP drafts, which is exact
       for any deterministic proposal, so outputs follow the target distribution. Needs no draft
-      model. Currently requires ``async_sched_mode=AsyncScheduleMode.LEGACY``.
+      model.
     """
 
     lookup_ngram_max: int = 4

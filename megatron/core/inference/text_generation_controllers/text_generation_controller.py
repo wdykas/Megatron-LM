@@ -319,6 +319,8 @@ class TextGenerationController(MTPControllerMixin):
 
         self._lookup_proposer = None
         self._lookup_request_source = None
+        # Requests that did not opt into lookup speculation (see `set_lookup_request_source`).
+        self._lookup_opted_out = set()
         if self._lookup_enabled:
             self._lookup_proposer = LookupProposer(
                 self.num_speculative_tokens,
@@ -333,9 +335,11 @@ class TextGenerationController(MTPControllerMixin):
         """Set how lookup speculation reads a request's committed tokens and references.
 
         Requests are indexed lazily, the first time they finish a step. The engine registers a
-        callback with signature `callback(request_id) -> (context_tokens, references)`, where
-        `context_tokens` is the request's prompt followed by every token committed before the
-        current step, and `references` is its `SamplingParams.lookup_references` (or None).
+        callback with signature `callback(request_id) -> Optional[(context_tokens, references)]`,
+        where `context_tokens` is the request's prompt followed by every token committed before
+        the current step, and `references` is its `SamplingParams.lookup_references` (or None).
+        The callback returns None for a request that has not opted into lookup speculation;
+        such a request never gets proposals and so commits exactly one token per step.
 
         Args:
             callback: Function returning a request's committed tokens and references.
@@ -1782,17 +1786,29 @@ class TextGenerationController(MTPControllerMixin):
         # prefill: on admission, and again after eviction or a recompute rebuilt its context.
         prefill_rows = context.request_in_prefill_status_tensor[active_slice].tolist()
 
+        opted_out = self._lookup_opted_out
         committed: List[Optional[List[int]]] = []
         for row, request_id in enumerate(request_ids):
             if row == chunked_row:
                 committed.append(None)
                 continue
-            if prefill_rows[row] == 1 or not proposer.has_request(request_id):
+            if prefill_rows[row] == 1 or not (
+                proposer.has_request(request_id) or request_id in opted_out
+            ):
                 assert (
                     self._lookup_request_source is not None
                 ), "Lookup speculation needs `set_lookup_request_source` to index new requests."
-                context_tokens, references = self._lookup_request_source(request_id)
-                proposer.add_request(request_id, context_tokens, references)
+                source = self._lookup_request_source(request_id)
+                if source is None:
+                    # Not opted in: never proposes, so it commits exactly one token per step.
+                    proposer.remove_request(request_id)
+                    opted_out.add(request_id)
+                else:
+                    opted_out.discard(request_id)
+                    proposer.add_request(request_id, *source)
+            if request_id in opted_out:
+                committed.append(None)
+                continue
             tokens = [token for token in accepted_rows[row] if token != -1]
             tokens.append(sampled[row])
             committed.append(tokens)
@@ -1803,6 +1819,7 @@ class TextGenerationController(MTPControllerMixin):
         if self._lookup_proposer is not None:
             for request_id in request_ids:
                 self._lookup_proposer.remove_request(request_id)
+                self._lookup_opted_out.discard(request_id)
 
     def _apply_stop_word_finished_ids(
         self, active_request_ids: Tensor, active_request_mask: Tensor

@@ -77,6 +77,11 @@ class SamplingParams:
     # change how many tokens a step commits, never which tokens are generated. Ignored by other
     # speculative methods.
     lookup_references: Optional[List[List[int]]] = None
+    # Opt into lookup speculative decoding. None (default): on iff `lookup_references` is
+    # non-empty. True: on, using the request's own context (and references, if any). False: off.
+    # A request that is not opted in decodes exactly as without speculation: one committed
+    # token per step, with no lookup in its own context.
+    lookup_speculation: Optional[bool] = None
 
     def __post_init__(self):
         """Validate parameters and maintain backward compatibility.
@@ -96,6 +101,12 @@ class SamplingParams:
         self._normalize_filters()
         self._sync_prompt_logprobs_fields()
         self._validate_streaming_interval()
+
+    def lookup_enabled(self) -> bool:
+        """Whether this request opted into lookup speculative decoding."""
+        if self.lookup_speculation is not None:
+            return bool(self.lookup_speculation)
+        return bool(self.lookup_references)
 
     def _validate_lookup_references(self):
         if self.lookup_references is None:

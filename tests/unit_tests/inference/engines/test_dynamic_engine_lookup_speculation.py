@@ -272,6 +272,8 @@ class TestDynamicEngineLookupSpeculation:
 
         def build(references=None):
             requests = _make_requests(prompts, num_tokens, references, **sampling_kwargs)
+            for request in requests:
+                request.sampling_params.lookup_speculation = True
             if sampling == "seeded":
                 for request in requests:
                     request.sampling_params.seed = 1000 + request.request_id
@@ -321,6 +323,7 @@ class TestDynamicEngineLookupSpeculation:
             )
             for request in requests:
                 request.sampling_params.seed = 77 + request.request_id
+                request.sampling_params.lookup_speculation = True
             return requests
 
         expected, _ = _run(plain, build())
@@ -367,7 +370,9 @@ class TestDynamicEngineLookupSpeculation:
         prompts = [[0, 1, 2, 3], list(range(modulus)) + [5, 6], [7, 8, 9], [1, 2], [4, 5, 6]]
 
         def build():
-            requests = _make_requests(prompts, 37, top_k=1, termination_id=-1)
+            requests = _make_requests(
+                prompts, 37, top_k=1, termination_id=-1, lookup_speculation=True
+            )
             requests[0].sampling_params.num_tokens_to_generate = 23  # not a multiple of k + 1
             requests[1].sampling_params.termination_id = 4  # EOS inside a speculative block
             requests[2].sampling_params.stop_token_ids = [3]
@@ -403,12 +408,54 @@ class TestDynamicEngineLookupSpeculation:
         _install_table_logits(plain, table)
         _install_table_logits(lookup, table)
         prompts = _random_prompts(3, 256, 256, seed=3)
-        expected, _ = _run(plain, _make_requests(prompts, 400, top_k=1, termination_id=-1))
-        actual, _ = _run(lookup, _make_requests(prompts, 400, top_k=1, termination_id=-1))
+        expected, _ = _run(
+            plain, _make_requests(prompts, 400, top_k=1, termination_id=-1, lookup_speculation=True)
+        )
+        actual, _ = _run(
+            lookup,
+            _make_requests(prompts, 400, top_k=1, termination_id=-1, lookup_speculation=True),
+        )
         assert lookup.evicted_request_count > 0
         for i in range(len(prompts)):
             assert actual[i].generated_tokens == expected[i].generated_tokens, i
         assert _tokens_per_step(actual, range(len(prompts))) > 3.0
+
+    @torch.inference_mode()
+    def test_only_opted_in_requests_speculate(self):
+        """Mixed batch: opted-in requests commit several tokens per step, the rest exactly one.
+
+        Every request's own context is perfectly predictable (a cycle), so a request that
+        speculated would commit several tokens per step; requests that did not opt in must not.
+        """
+        k, max_len = 4, 160
+        model = _build_model(max_len)
+        plain, lookup = self._plain_and_lookup(model, k, max_len)
+        table = _cycle_table(modulus=7)
+        _install_table_logits(plain, table)
+        _install_table_logits(lookup, table)
+        prompts = [list(range(7)) * 2 + [i] for i in range(6)]
+        num_tokens = 40
+
+        def build():
+            requests = _make_requests(prompts, num_tokens, top_k=1, termination_id=-1)
+            requests[0].sampling_params.lookup_speculation = True  # explicit flag
+            requests[1].sampling_params.lookup_references = [[1, 2, 3, 4, 5]]  # references
+            requests[2].sampling_params.lookup_references = [[1, 2, 3]]
+            requests[2].sampling_params.lookup_speculation = False  # explicit opt-out wins
+            # Requests 3..5: no references, no flag -> not opted in.
+            return requests
+
+        expected, _ = _run(plain, build())
+        actual, _ = _run(lookup, build())
+        for i in range(len(prompts)):
+            assert actual[i].generated_tokens == expected[i].generated_tokens, i
+        for i in (0, 1):
+            assert max(actual[i].acceptance_step_lengths) == k + 1, i
+            assert _tokens_per_step(actual, [i]) > 3.0, i
+        for i in (2, 3, 4, 5):
+            assert actual[i].acceptance_step_lengths == [1] * num_tokens, i
+        assert lookup.controller._lookup_proposer.num_requests == 0
+        assert not lookup.controller._lookup_opted_out
 
     def test_config_validation(self):
         InferenceConfig(num_speculative_tokens=2, speculative_method="lookup")
@@ -426,6 +473,13 @@ class TestDynamicEngineLookupSpeculation:
             SamplingParams(lookup_references=[[1, -2]])
         with pytest.raises(ValueError, match="lookup_references"):
             SamplingParams(lookup_references=[1, 2])
+        assert not SamplingParams().lookup_enabled()
+        assert not SamplingParams(lookup_references=[]).lookup_enabled()
+        assert SamplingParams(lookup_references=[[1]]).lookup_enabled()
+        assert SamplingParams(lookup_speculation=True).lookup_enabled()
+        assert not SamplingParams(
+            lookup_references=[[1]], lookup_speculation=False
+        ).lookup_enabled()
         params = SamplingParams(lookup_references=[(1, 2), [3]])
         assert params.lookup_references == [[1, 2], [3]]
         assert SamplingParams.deserialize(params.serialize()).lookup_references == [[1, 2], [3]]

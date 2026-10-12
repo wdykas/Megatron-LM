@@ -1850,17 +1850,20 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def _lookup_request_source(
         self, request_id: int
-    ) -> Tuple[List[int], Optional[List[List[int]]]]:
+    ) -> Optional[Tuple[List[int], Optional[List[List[int]]]]]:
         """Committed tokens and lookup references of a request, for lookup speculation.
 
         Args:
             request_id (int): Request id.
 
         Returns:
-            The request's prompt followed by its generated tokens, and its
-            `SamplingParams.lookup_references`.
+            None if the request has not opted into lookup speculation (see
+            `SamplingParams.lookup_speculation`); otherwise its prompt followed by its
+            generated tokens, and its `SamplingParams.lookup_references`.
         """
         request = self.get_request(request_id)
+        if not request.sampling_params.lookup_enabled():
+            return None
         context_tokens = request.prompt_tokens.tolist() + list(request.generated_tokens)
         return context_tokens, request.sampling_params.lookup_references
 
