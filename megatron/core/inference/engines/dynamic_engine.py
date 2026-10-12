@@ -1036,10 +1036,19 @@ class DynamicInferenceEngine(AbstractEngine):
             mtp_warmup_depths = range(controller.num_mtp_depths) if mtp_pass_depth else [None]
             mtp_seen_batch_sizes = set()
 
-        tbar = enumerate(context.cuda_graph_batch_dimensions_list)
+        # One pass per speculative width the context lays forwards out with (a single width
+        # unless lookup speculation may skip verification, see `speculative_widths`).
+        capture_plan = [
+            (width, dims)
+            for width in context.speculative_widths
+            for dims in context._cuda_graph_dims_by_width[width][0]
+        ]
+        tbar = enumerate(capture_plan)
         if HAVE_TQDM:
-            tbar = tqdm(tbar, total=len(context.cuda_graph_batch_dimensions_list))
-        for tbar_idx, cuda_graph_batch_dimension in tbar:
+            tbar = tqdm(tbar, total=len(capture_plan))
+        for tbar_idx, (capture_width, cuda_graph_batch_dimension) in tbar:
+            if capture_width != context.num_speculative_tokens:
+                controller.set_speculative_width(capture_width)
             input_ids, position_ids, _ = self.controller._dynamic_step_context_init(
                 construct_graph_dimensions=cuda_graph_batch_dimension
             )
@@ -1048,9 +1057,7 @@ class DynamicInferenceEngine(AbstractEngine):
             if HAVE_TQDM:
                 tbar.set_description(tbar_str)
             else:
-                logger.info(
-                    f"{tbar_idx}/{len(context.cuda_graph_batch_dimensions_list)}. {tbar_str}"
-                )
+                logger.info(f"{tbar_idx}/{len(capture_plan)}. {tbar_str}")
 
             # Enable routing recording during warmup if routing replay is enabled.
             # This ensures the record_indices copy operation is captured in the CUDA graph.
@@ -1130,7 +1137,7 @@ class DynamicInferenceEngine(AbstractEngine):
             logger.info(
                 "  [graph %d/%d] %s | pool reserved=%s (Δiter=%s) " "pool allocated=%s (Δiter=%s)",
                 tbar_idx + 1,
-                len(context.cuda_graph_batch_dimensions_list),
+                len(capture_plan),
                 cuda_graph_batch_dimension,
                 format_mem_bytes(pool_reserved),
                 format_mem_bytes(pool_reserved - prev_pool_reserved),
@@ -1138,6 +1145,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 format_mem_bytes(pool_alloc - prev_pool_alloc),
             )
             prev_pool_reserved, prev_pool_alloc = pool_reserved, pool_alloc
+
+        if context.num_speculative_tokens != context.max_speculative_tokens:
+            controller.set_speculative_width(context.max_speculative_tokens)
 
         if mtp_warmup_enabled and mtp_seen_batch_sizes:
             logger.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_seen_batch_sizes))
@@ -2004,7 +2014,7 @@ class DynamicInferenceEngine(AbstractEngine):
             max_stored_tokens += (
                 request.sampling_params.num_tokens_to_generate
                 - 1
-                + self.context.num_speculative_tokens
+                + getattr(self.context, "max_speculative_tokens", self.context.num_speculative_tokens)
             )
         request_block_count = math.ceil(max_stored_tokens / self.context.block_size_tokens)
         usable_blocks = self.context.kv_block_allocator.pool_size - 1
@@ -2770,6 +2780,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     not is_prefill
                     and len(request.generated_tokens) > 0
                     and self.num_speculative_tokens > 0
+                    # A lookup step laid out without draft slots (adaptive width) proposed none.
+                    and len(accepted_tokens_list) > 0
                 ):
                     actual_proposed = max(0, self.num_speculative_tokens - num_stop_word_trim)
                     self._spec_tokens_proposed_per_pos[:actual_proposed] += 1

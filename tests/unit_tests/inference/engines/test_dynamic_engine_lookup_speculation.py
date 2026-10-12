@@ -100,6 +100,7 @@ def _build_engine(
     materialize_only_last_token_logits: bool = True,
     async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY,
     num_cuda_graphs: Optional[int] = None,
+    lookup_adaptive_verify_width: bool = True,
 ) -> DynamicInferenceEngine:
     context = DynamicInferenceContext(
         model_config=model.config,
@@ -119,6 +120,7 @@ def _build_engine(
             sampling_backend="torch",
             async_sched_mode=async_sched_mode,
             num_cuda_graphs=num_cuda_graphs,
+            lookup_adaptive_verify_width=lookup_adaptive_verify_width,
             use_cuda_graphs_for_non_decode_steps=False,
             max_requests=16 if num_cuda_graphs else None,
         ),
@@ -529,6 +531,83 @@ class TestDynamicEngineLookupSpeculation:
         assert _tokens_per_step(actual, range(0, len(prompts), 2)) > 3.0
         for i in range(1, len(prompts), 2):
             assert actual[i].acceptance_step_lengths == [1] * num_tokens, i
+
+    @torch.inference_mode()
+    @pytest.mark.parametrize("cuda_graphs", [False, True])
+    @pytest.mark.parametrize("adaptive", [True, False])
+    def test_adaptive_verify_width(self, cuda_graphs, adaptive):
+        """Decode steps without any proposal run at width 1; steps with one run at K + 1.
+
+        Phase 1: only plain requests -> every decode forward has one token per request.
+        Phase 2: an opted-in request joins with a reference -> K + 1 tokens per request while
+        it has proposals, back to one token per request after it finishes. Outputs equal
+        plain decoding throughout, and with `lookup_adaptive_verify_width=False` every decode
+        forward keeps K + 1 tokens per request.
+        """
+        k, max_len = 4, 160
+        prompts = _random_prompts(5, 6, 16, seed=21)
+        num_tokens = [48, 48, 48, 48, 12]
+
+        def build(references=None):
+            requests = _make_requests(prompts, num_tokens, references, termination_id=-1)
+            for request in requests:
+                request.sampling_params.seed = 300 + request.request_id
+            return requests
+
+        def run(num_speculative_tokens, references=None):
+            model = _build_model(max_len, cuda_graphs=cuda_graphs)
+            engine = _build_engine(
+                model,
+                num_speculative_tokens=num_speculative_tokens,
+                max_sequence_length=max_len,
+                async_sched_mode=self.sched_mode,
+                num_cuda_graphs=-1 if cuda_graphs else None,
+                lookup_adaptive_verify_width=adaptive,
+            )
+            context = engine.context
+            widths = []
+            original = engine.controller._dynamic_step_forward_logits
+
+            def recording_forward(*args, **kwargs):
+                if context.is_decode_only():
+                    per_request = context.active_token_count // context.num_decode_requests
+                    widths.append((per_request, context.using_cuda_graph_this_step()))
+                return original(*args, **kwargs)
+
+            engine.controller._dynamic_step_forward_logits = recording_forward
+            requests = build(references)
+            # Phase 1: the plain requests alone for a few steps.
+            for request in requests[:4]:
+                engine._add_request(request)
+            for _ in range(6):
+                engine.step_modern()
+            phase_one = list(widths)
+            finished, _ = _run(engine, requests[4:])
+            # `_run` only returns requests that finished during its own steps.
+            finished.update(
+                {r.request_id: r for r in requests[:4] if r.request_id not in finished}
+            )
+            delete_cuda_graphs()
+            return finished, widths, phase_one
+
+        expected, _, _ = run(0)
+        references = [None] * 4 + [[prompts[4] + expected[4].generated_tokens]]
+        actual, widths, phase_one = run(k, references)
+        for i in range(len(prompts)):
+            assert actual[i].generated_tokens == expected[i].generated_tokens, i
+        for i in range(4):
+            assert actual[i].acceptance_step_lengths == [1] * num_tokens[i], i
+        assert max(actual[4].acceptance_step_lengths) == k + 1
+        per_request = [w for w, _ in widths]
+        if adaptive:
+            assert phase_one and all(w == 1 for w, _ in phase_one)
+            assert k + 1 in per_request
+            # After the opted-in request finishes, decoding returns to one token per request.
+            assert per_request[-1] == 1
+        else:
+            assert set(per_request) == {k + 1}
+        if cuda_graphs:
+            assert all(graphed for _, graphed in widths)
 
     def test_config_validation(self):
         InferenceConfig(num_speculative_tokens=2, speculative_method="lookup")

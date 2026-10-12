@@ -437,6 +437,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         self.batch_invariant_mode = model_config.batch_invariant_mode
         self.num_speculative_tokens = inference_config.num_speculative_tokens
+        # `num_speculative_tokens` is the draft width of the forward being laid out or verified.
+        # It is fixed for MTP. With lookup speculation and an adaptive verify width it switches
+        # between `max_speculative_tokens` and 0 (see `set_speculative_width`); buffers and
+        # capacity limits are always sized for the maximum.
+        self.max_speculative_tokens = self.num_speculative_tokens
         assert self.num_speculative_tokens < inference_config.block_size_tokens, (
             f"num_speculative_tokens ({self.num_speculative_tokens}) must be < "
             f"block_size_tokens ({inference_config.block_size_tokens})"
@@ -832,21 +837,36 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             else min(max(inference_config.cuda_graph_max_tokens, decode_bound), self.max_tokens)
         )
 
-        # CUDA graph config list.
-        self.cuda_graph_batch_dimensions_list, self.cuda_graph_token_counts = (
-            CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
-                tp_size=tp_size,
-                num_cuda_graphs=inference_config.num_cuda_graphs,
-                cuda_graph_max_tokens=cuda_graph_max_tokens,
-                cuda_graph_mixed_prefill_request_count=inference_config.cuda_graph_mixed_prefill_count,
-                max_requests=self.max_requests,
-                max_tokens=self.max_tokens,
-                max_sequence_length=self.max_sequence_length,
-                use_cuda_graphs_for_non_decode_steps=self.use_cuda_graphs_for_non_decode_steps,
-                num_speculative_tokens=self.num_speculative_tokens,
-                sizing_distribution=inference_config.cuda_graph_sizing_distribution,
+        # Speculative widths this context lays forwards out with: just the configured one,
+        # plus 0 when lookup speculation may skip verification on steps without proposals.
+        self.speculative_widths = [self.max_speculative_tokens]
+        if (
+            self.max_speculative_tokens > 0
+            and getattr(inference_config, "speculative_method", "mtp") == "lookup"
+            and getattr(inference_config, "lookup_adaptive_verify_width", False)
+            and not self.is_hybrid_model
+            and get_pg_size(self.expert_model_parallel_group) == 1
+        ):
+            self.speculative_widths.append(0)
+
+        # CUDA graph config lists, one per speculative width: a graph captured at one width
+        # has a different token layout and must never be replayed at another.
+        self._cuda_graph_dims_by_width = {}
+        for width in self.speculative_widths:
+            self._cuda_graph_dims_by_width[width] = (
+                CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
+                    tp_size=tp_size,
+                    num_cuda_graphs=inference_config.num_cuda_graphs,
+                    cuda_graph_max_tokens=cuda_graph_max_tokens,
+                    cuda_graph_mixed_prefill_request_count=inference_config.cuda_graph_mixed_prefill_count,
+                    max_requests=self.max_requests,
+                    max_tokens=self.max_tokens,
+                    max_sequence_length=self.max_sequence_length,
+                    use_cuda_graphs_for_non_decode_steps=self.use_cuda_graphs_for_non_decode_steps,
+                    num_speculative_tokens=width,
+                    sizing_distribution=inference_config.cuda_graph_sizing_distribution,
+                )
             )
-        )
 
         # Allocate per-step dispatcher buffers upfront so update_metadata never
         # triggers an allocation inside a captured CUDA graph.
@@ -1204,7 +1224,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             pin_memory=True,
         )
         self._async_sched_token_offsets = torch.arange(
-            self.num_speculative_tokens + 1, device='cpu'
+            self.max_speculative_tokens + 1, device='cpu'
         )
 
         # Track request metadata. Backed by pinned CPU memory: bookkeeping is
@@ -2329,6 +2349,37 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.total_request_count = end_request_idx
         if count_as_prefill:
             self.num_prefill_requests += num_new_requests
+
+    @property
+    def cuda_graph_batch_dimensions_list(self) -> List[InferenceBatchDimensions]:
+        """CUDA graph batch dimensions for the current speculative width."""
+        return self._cuda_graph_dims_by_width[self.num_speculative_tokens][0]
+
+    @cuda_graph_batch_dimensions_list.setter
+    def cuda_graph_batch_dimensions_list(self, value: List[InferenceBatchDimensions]) -> None:
+        self._cuda_graph_dims_by_width[self.num_speculative_tokens] = (
+            value,
+            self._cuda_graph_dims_by_width[self.num_speculative_tokens][1],
+        )
+
+    @property
+    def cuda_graph_token_counts(self):
+        """CUDA graph token counts for the current speculative width."""
+        return self._cuda_graph_dims_by_width[self.num_speculative_tokens][1]
+
+    def set_speculative_width(self, width: int) -> None:
+        """Set the draft width of the next forward this context lays out.
+
+        Called between verifying one forward and laying out the next (before
+        `update_requests` / `prepare_requests`), so every request of a forward shares one width.
+
+        Args:
+            width (int): One of `speculative_widths`.
+        """
+        assert width in self.speculative_widths, (
+            f"speculative width {width} is not one of {self.speculative_widths}"
+        )
+        self.num_speculative_tokens = width
 
     def add_dummy_requests_for_cudagraph_capture(
         self, graph_dimensions: InferenceBatchDimensions
@@ -3952,7 +4003,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
             # Constrain resumptions by the maximum allowed active requests and tokens
             max_allowed_active = min(
-                self.max_requests, self.max_tokens // (self.num_speculative_tokens + 1)
+                self.max_requests, self.max_tokens // (self.max_speculative_tokens + 1)
             )
             allowed_to_resume = max(0, max_allowed_active - active_request_count)
             candidate_count = min(self.paused_request_count, allowed_to_resume)
@@ -4038,7 +4089,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             return None
 
         max_allowed_active = min(
-            self.max_requests, self.max_tokens // (self.num_speculative_tokens + 1)
+            self.max_requests, self.max_tokens // (self.max_speculative_tokens + 1)
         )
         allowed_to_resume = max(0, max_allowed_active - active_request_count)
 
@@ -4202,7 +4253,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         active_slice = slice(0, active_request_count)
         tokens_per_request = self.num_speculative_tokens + 1
         last_block_offsets = self.request_last_kv_block_offset[active_slice]
-        token_offsets = self._async_sched_token_offsets
+        token_offsets = self._async_sched_token_offsets[:tokens_per_request]
         if self.enable_mtp_kv_cache:
             if not self.can_prepare_requests():
                 raise RuntimeError("Async scheduling cannot pause requests to allocate new blocks.")
@@ -4588,7 +4639,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 ] = 0  # chunked prefill should not be paused
             else:
                 max_allowed_active = min(
-                    self.max_requests, self.max_tokens // (self.num_speculative_tokens + 1)
+                    self.max_requests, self.max_tokens // (self.max_speculative_tokens + 1)
                 )
                 if active_request_count > max_allowed_active:
                     # Force-pause excess requests in a decode-only batch

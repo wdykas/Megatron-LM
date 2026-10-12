@@ -244,6 +244,7 @@ class TextGenerationController(MTPControllerMixin):
         self.tokenizer = tokenizer
         self.extra_eos_token_id_set = self._build_extra_eos_token_id_set(tokenizer)
         self.num_speculative_tokens = inference_config.num_speculative_tokens
+        self.max_speculative_tokens = self.num_speculative_tokens
         self.speculative_method = getattr(inference_config, "speculative_method", "mtp")
         # Lookup speculation: proposals come from a CPU n-gram index instead of an MTP head.
         self._lookup_enabled = (
@@ -321,6 +322,8 @@ class TextGenerationController(MTPControllerMixin):
         self._lookup_request_source = None
         # Requests that did not opt into lookup speculation (see `set_lookup_request_source`).
         self._lookup_opted_out = set()
+        # Draft width chosen for the next forward from the latest proposals.
+        self._lookup_next_width = self.num_speculative_tokens
         if self._lookup_enabled:
             self._lookup_proposer = LookupProposer(
                 self.num_speculative_tokens,
@@ -330,6 +333,15 @@ class TextGenerationController(MTPControllerMixin):
 
         if self.inference_wrapped_model.inference_context.is_dynamic_batching():
             self._init_dynamic_sampling_tensors()
+
+    def set_speculative_width(self, width: int) -> None:
+        """Set the draft width of the next forward (see `DynamicInferenceContext`).
+
+        Args:
+            width (int): One of the context's `speculative_widths`.
+        """
+        self.inference_wrapped_model.inference_context.set_speculative_width(width)
+        self.num_speculative_tokens = width
 
     def set_lookup_request_source(self, callback: Callable) -> None:
         """Set how lookup speculation reads a request's committed tokens and references.
@@ -1771,9 +1783,13 @@ class TextGenerationController(MTPControllerMixin):
         active_slice = slice(context.paused_request_count, context.total_request_count)
         request_ids = context.request_ids[active_slice].tolist()
         # Accepted proposals precede the sampled token; rejected slots hold -1.
-        if accepted_tokens_cpu is None:
-            accepted_tokens_cpu = self._accepted_tokens_per_request[:active_request_count]
-        accepted_rows = accepted_tokens_cpu[:active_request_count].tolist()
+        if self.num_speculative_tokens == 0:
+            # The verified forward had no draft slots (adaptive width): nothing was accepted.
+            accepted_rows = [()] * active_request_count
+        else:
+            if accepted_tokens_cpu is None:
+                accepted_tokens_cpu = self._accepted_tokens_per_request[:active_request_count]
+            accepted_rows = accepted_tokens_cpu[:active_request_count].tolist()
         sampled = sampled_tokens_cpu.tolist()
 
         # A partial chunked-prefill row samples a placeholder; it commits nothing this step.
@@ -1812,7 +1828,14 @@ class TextGenerationController(MTPControllerMixin):
             tokens = [token for token in accepted_rows[row] if token != -1]
             tokens.append(sampled[row])
             committed.append(tokens)
-        return proposer.step(request_ids, committed, pad_token=LOOKUP_PAD_TOKEN)
+        proposals = proposer.step(request_ids, committed, pad_token=LOOKUP_PAD_TOKEN)
+        # Adaptive width: lay the next forward out without draft slots if nothing was proposed.
+        context_widths = context.speculative_widths
+        if 0 in context_widths and bool((proposals[0] == LOOKUP_PAD_TOKEN).all()):
+            self._lookup_next_width = 0
+        else:
+            self._lookup_next_width = self.max_speculative_tokens
+        return proposals
 
     def lookup_release_requests(self, request_ids: List[int]) -> None:
         """Drop the lookup index of finished requests (no-op without lookup speculation)."""
@@ -1986,6 +2009,9 @@ class TextGenerationController(MTPControllerMixin):
         # which would corrupt the reused buffer.
         new_sample_copy = sampled_tokens_cpu.clone()
         range_pop()
+
+        if self._lookup_enabled and self._lookup_next_width != self.num_speculative_tokens:
+            self.set_speculative_width(self._lookup_next_width)
 
         range_push("update_requests")
         update_result = context.update_requests(
@@ -2363,6 +2389,12 @@ class TextGenerationController(MTPControllerMixin):
         blocks_to_release, remove_mask = self._rewind_kv_cache(accepted_counts_cpu)
         context = self.inference_wrapped_model.inference_context
         context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
+
+    def _draft_rows_for_next_forward(self, drafts: Optional[Tensor]) -> Optional[Tensor]:
+        """Slice `[K, n]` draft tokens to the next forward's draft width (None at width 0)."""
+        if drafts is None or self.num_speculative_tokens == 0:
+            return None
+        return drafts[: self.num_speculative_tokens]
 
     def _run_async_sched_lookup_propose(self, sample_result: _AsyncScheduleSampleResult) -> None:
         """Build lookup proposals for the successor forward from this step's samples.
@@ -2954,13 +2986,15 @@ class TextGenerationController(MTPControllerMixin):
                 if self.num_speculative_tokens > 0:
                     sample_result = self._run_async_sched_sample_mtp()
                     self._run_async_sched_mtp_rewind(sample_result)
-                    if self._lookup_enabled:
-                        self._run_async_sched_lookup_propose(sample_result)
                 else:
                     sample_result = self._run_async_sched_sample()
+                if self._lookup_enabled:
+                    self._run_async_sched_lookup_propose(sample_result)
 
                 log_probs_gpu_result = self._run_async_sched_log_probs(sample_result)
                 log_probs_transfer = self._copy_async_sched_log_probs_to_cpu(log_probs_gpu_result)
+                if self._lookup_enabled and self._lookup_next_width != self.num_speculative_tokens:
+                    self.set_speculative_width(self._lookup_next_width)
 
                 self._synchronize_async_sched_event(sample_result.sample_cpu_ready_event)
 
@@ -3126,13 +3160,19 @@ class TextGenerationController(MTPControllerMixin):
             # Sample/MTP
             # -------------------------------------------------------------------------
             # Verify pending drafts, sample replacements, and rewind rejected KV state.
-            sample_result = self._run_async_sched_sample_mtp()
-            self._run_async_sched_mtp_rewind(sample_result)
+            if self.num_speculative_tokens > 0:
+                sample_result = self._run_async_sched_sample_mtp()
+                self._run_async_sched_mtp_rewind(sample_result)
+            else:
+                # Lookup with adaptive width: the pending forward had no draft slots.
+                sample_result = self._run_async_sched_sample()
             if self._lookup_enabled:
                 self._run_async_sched_lookup_propose(sample_result)
             resolved_sequence_lengths = context.get_active_sequence_lengths() + 1
             log_probs_gpu_result = self._run_async_sched_log_probs(sample_result)
             log_probs_transfer = self._copy_async_sched_log_probs_to_cpu(log_probs_gpu_result)
+            if self._lookup_enabled and self._lookup_next_width != self.num_speculative_tokens:
+                self.set_speculative_width(self._lookup_next_width)
 
             # -------------------------------------------------------------------------
             # Prepare
@@ -3149,7 +3189,8 @@ class TextGenerationController(MTPControllerMixin):
 
             # Populate the next forward with the sampled base and draft tokens.
             context.copy_async_sched_sample_to_forward(
-                sample_result.sampled_tokens_gpu, sample_result.sampled_mtp_tokens_gpu
+                sample_result.sampled_tokens_gpu,
+                self._draft_rows_for_next_forward(sample_result.sampled_mtp_tokens_gpu),
             )
 
             # -------------------------------------------------------------------------
@@ -3175,10 +3216,11 @@ class TextGenerationController(MTPControllerMixin):
 
             # Commit CPU input IDs in the resolved survivor order.
             survivor_idxs = resolve_result.survivor_idxs
+            next_drafts_cpu = self._draft_rows_for_next_forward(
+                sample_result.sampled_mtp_tokens_cpu_view
+            )
             sampled_mtp_tokens_cpu = (
-                sample_result.sampled_mtp_tokens_cpu_view[:, survivor_idxs]
-                if sample_result.sampled_mtp_tokens_cpu_view is not None
-                else None
+                next_drafts_cpu[:, survivor_idxs] if next_drafts_cpu is not None else None
             )
             context.commit_sampled_tokens(
                 resolve_result.sampled_tokens_cpu[survivor_idxs], sampled_mtp_tokens_cpu
@@ -3225,6 +3267,10 @@ class TextGenerationController(MTPControllerMixin):
             return DynamicBatchControllerStepResult(
                 decode_only=DecodeOnly(consumed=None, launched=None)
             )
+
+        # Draft width of this step's forward. Bookkeeping may switch the width for the next
+        # forward (lookup adaptive width), so read it once here.
+        verified_width = self.num_speculative_tokens
 
         with torch.inference_mode():
             input_ids, position_ids, _ = self._dynamic_step_context_init()
@@ -3363,14 +3409,14 @@ class TextGenerationController(MTPControllerMixin):
                 "accepted_tokens": (
                     # Clone needed: .fill_(-1) below would corrupt the returned value.
                     self._accepted_tokens_per_request.clone()
-                    if self.num_speculative_tokens > 0 and num_decode_requests > 0
+                    if verified_width > 0 and num_decode_requests > 0
                     else None
                 ),
                 "log_probs": log_probs,
                 "top_n_logprobs": top_n_logprobs,
                 "cuda_graph_request_count": cuda_graph_request_count,
             }
-            if self.num_speculative_tokens > 0:
+            if verified_width > 0:
                 self._accepted_tokens_per_request.fill_(-1)
                 self._accepted_token_counts_per_request.fill_(0)
             ret.update(request_bookkeeping)
@@ -3423,7 +3469,7 @@ class TextGenerationController(MTPControllerMixin):
             return await self._run_async_sched_step_no_overlap(
                 schedule_waiting_requests=schedule_waiting_requests
             )
-        if self.num_speculative_tokens > 0:
+        if self.num_speculative_tokens > 0 or self._lookup_enabled:
             return await self._run_async_sched_step_overlap_mtp()
         return await self._run_async_sched_step_overlap()
 

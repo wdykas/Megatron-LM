@@ -677,6 +677,14 @@ class InferenceConfig:
     lookup_ngram_min: int = 1
     """Shortest suffix length matched by `speculative_method="lookup"`."""
 
+    lookup_adaptive_verify_width: bool = True
+    """Let lookup speculation skip verification on steps where no active request has a
+    proposal. Such a step is laid out and run as plain decoding (one token per request,
+    with its own CUDA graphs) instead of `num_speculative_tokens + 1` tokens per request. The
+    width is per step, not per request: while any active request has a proposal, every
+    decode request occupies `num_speculative_tokens + 1` rows. Ignored for hybrid models and
+    expert parallelism (fixed width)."""
+
     enable_prefix_caching: bool = False
     """Whether to enable prefix caching for KV cache block sharing."""
 
