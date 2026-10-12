@@ -31,6 +31,7 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version
 from tests.unit_tests.inference.engines.test_dynamic_engine import reset_rounder, set_rounder
@@ -47,7 +48,9 @@ pytestmark = [
 ]
 
 
-def _build_model(max_sequence_length: int) -> GPTModel:
+def _build_model(
+    max_sequence_length: int, cuda_graphs: bool = False, tensor_model_parallel_size: int = 1
+) -> GPTModel:
     clear_nvte_env_vars()
     torch.manual_seed(SEED)
     model_parallel_cuda_manual_seed(
@@ -59,12 +62,16 @@ def _build_model(max_sequence_length: int) -> GPTModel:
         hidden_size=64,
         num_attention_heads=4,
         use_cpu_initialization=True,
-        cuda_graph_impl="none",
+        cuda_graph_impl="local" if cuda_graphs else "none",
+        inference_cuda_graph_scope=(
+            InferenceCudaGraphScope.block if cuda_graphs else InferenceCudaGraphScope.none
+        ),
         inference_rng_tracker=True,
         pipeline_dtype=torch.bfloat16,
         add_bias_linear=True,
         inference_sampling_seed=SEED,
         flash_attention_version=2,
+        tensor_model_parallel_size=tensor_model_parallel_size,
     )
     model = GPTModel(
         config=config,
@@ -92,6 +99,7 @@ def _build_engine(
     block_size_tokens: int = 256,
     materialize_only_last_token_logits: bool = True,
     async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY,
+    num_cuda_graphs: Optional[int] = None,
 ) -> DynamicInferenceEngine:
     context = DynamicInferenceContext(
         model_config=model.config,
@@ -110,6 +118,9 @@ def _build_engine(
             lookup_ngram_min=1,
             sampling_backend="torch",
             async_sched_mode=async_sched_mode,
+            num_cuda_graphs=num_cuda_graphs,
+            use_cuda_graphs_for_non_decode_steps=False,
+            max_requests=16 if num_cuda_graphs else None,
         ),
     )
     wrapper = GPTInferenceWrapper(model, context)
@@ -457,6 +468,68 @@ class TestDynamicEngineLookupSpeculation:
         assert lookup.controller._lookup_proposer.num_requests == 0
         assert not lookup.controller._lookup_opted_out
 
+    @torch.inference_mode()
+    def test_cuda_graphs(self):
+        """Block-scope CUDA graphs: decode steps replay graphs captured at K + 1 tokens/request.
+
+        A mixed batch (opted-in and plain requests) on the real model, seeded sampling: outputs
+        equal a plain engine that also runs with CUDA graphs, and decode steps use graphs.
+        """
+        k, max_len, num_tokens = 4, 128, 40
+        prompts = _random_prompts(7, 6, 20, seed=5)
+
+        def build(references=None):
+            requests = _make_requests(prompts, num_tokens, references, termination_id=-1)
+            for request in requests:
+                request.sampling_params.seed = 500 + request.request_id
+            return requests
+
+        def run(num_speculative_tokens, references=None):
+            model = _build_model(max_len, cuda_graphs=True)
+            engine = _build_engine(
+                model,
+                num_speculative_tokens=num_speculative_tokens,
+                max_sequence_length=max_len,
+                async_sched_mode=self.sched_mode,
+                num_cuda_graphs=-1,
+            )
+            context = engine.context
+            graphed = {"decode": 0, "decode_graphed": 0}
+            original = engine.controller._dynamic_step_forward_logits
+
+            def counting_forward(*args, **kwargs):
+                if context.is_decode_only():
+                    graphed["decode"] += 1
+                    graphed["decode_graphed"] += int(context.using_cuda_graph_this_step())
+                return original(*args, **kwargs)
+
+            engine.controller._dynamic_step_forward_logits = counting_forward
+            graph_dims = {
+                (d.token_count, d.decode_req_count)
+                for d in context.cuda_graph_batch_dimensions_list
+                if d.prefill_req_count == 0
+            }
+            finished, _ = _run(engine, build(references))
+            delete_cuda_graphs()
+            return finished, graphed, graph_dims
+
+        expected, plain_graphed, _ = run(0)
+        references = [
+            [prompts[i] + expected[i].generated_tokens] if i % 2 == 0 else None
+            for i in range(len(prompts))
+        ]
+        actual, lookup_graphed, graph_dims = run(k, references)
+        # Decode graphs are captured with K + 1 tokens per request.
+        assert all(tokens == reqs * (k + 1) for tokens, reqs in graph_dims)
+        assert lookup_graphed["decode"] > 0
+        assert lookup_graphed["decode_graphed"] == lookup_graphed["decode"]
+        assert plain_graphed["decode_graphed"] == plain_graphed["decode"] > 0
+        for i in range(len(prompts)):
+            assert actual[i].generated_tokens == expected[i].generated_tokens, i
+        assert _tokens_per_step(actual, range(0, len(prompts), 2)) > 3.0
+        for i in range(1, len(prompts), 2):
+            assert actual[i].acceptance_step_lengths == [1] * num_tokens, i
+
     def test_config_validation(self):
         InferenceConfig(num_speculative_tokens=2, speculative_method="lookup")
         with pytest.raises(ValueError, match="lookup_ngram_min"):
@@ -483,3 +556,61 @@ class TestDynamicEngineLookupSpeculation:
         params = SamplingParams(lookup_references=[(1, 2), [3]])
         assert params.lookup_references == [[1, 2], [3]]
         assert SamplingParams.deserialize(params.serialize()).lookup_references == [[1, 2], [3]]
+
+
+@pytest.mark.skipif(Utils.world_size != 2, reason="needs exactly 2 ranks (torchrun)")
+class TestDynamicEngineLookupSpeculationTP2:
+    """Tensor-parallel smoke test: every TP rank proposes identically and outputs match."""
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=2, pipeline_model_parallel_size=1
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        delete_cuda_graphs()
+        reset_rounder()
+        Utils.destroy_model_parallel()
+
+    @torch.inference_mode()
+    @pytest.mark.parametrize("sched_mode", [AsyncScheduleMode.LEGACY, AsyncScheduleMode.ASYNC])
+    def test_tp2_matches_plain(self, sched_mode):
+        set_rounder(4)
+        k, max_len, num_tokens = 4, 128, 32
+        prompts = _random_prompts(6, 6, 20, seed=11)
+
+        def build(references=None):
+            requests = _make_requests(prompts, num_tokens, references, termination_id=-1)
+            for request in requests:
+                request.sampling_params.seed = 900 + request.request_id
+            return requests
+
+        def run(num_speculative_tokens, references=None):
+            model = _build_model(max_len, tensor_model_parallel_size=2)
+            engine = _build_engine(
+                model,
+                num_speculative_tokens=num_speculative_tokens,
+                max_sequence_length=max_len,
+                async_sched_mode=sched_mode,
+            )
+            finished, _ = _run(engine, build(references))
+            return finished
+
+        expected = run(0)
+        references = [
+            [prompts[i] + expected[i].generated_tokens] if i % 2 == 0 else None
+            for i in range(len(prompts))
+        ]
+        actual = run(k, references)
+        for i in range(len(prompts)):
+            assert actual[i].generated_tokens == expected[i].generated_tokens, i
+        assert _tokens_per_step(actual, range(0, len(prompts), 2)) > 3.0
+        # Both ranks committed the same tokens (and so made the same proposals).
+        tokens = torch.tensor(
+            [t for i in range(len(prompts)) for t in actual[i].generated_tokens], device="cuda"
+        )
+        gathered = [torch.empty_like(tokens) for _ in range(2)]
+        torch.distributed.all_gather(gathered, tokens)
+        assert torch.equal(gathered[0], gathered[1])
