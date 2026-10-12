@@ -71,6 +71,13 @@ class SamplingParams:
     # Optional request-local RNG; independent of dynamic batch position.
     seed: Optional[int] = None
 
+    # Reference token sequences for lookup speculative decoding
+    # (`InferenceConfig.speculative_method="lookup"`). The request's own prompt and generated
+    # tokens are always searched; these sequences are searched after it, in order. They only
+    # change how many tokens a step commits, never which tokens are generated. Ignored by other
+    # speculative methods.
+    lookup_references: Optional[List[List[int]]] = None
+
     def __post_init__(self):
         """Validate parameters and maintain backward compatibility.
 
@@ -85,9 +92,28 @@ class SamplingParams:
                 raise ValueError("stop_token_ids must be a list of nonnegative integers")
             self.stop_token_ids = sorted(set(self.stop_token_ids))
         self._validate_seed()
+        self._validate_lookup_references()
         self._normalize_filters()
         self._sync_prompt_logprobs_fields()
         self._validate_streaming_interval()
+
+    def _validate_lookup_references(self):
+        if self.lookup_references is None:
+            return
+        error = ValueError("lookup_references must be a list of lists of nonnegative integers")
+        if not isinstance(self.lookup_references, (list, tuple)):
+            raise error
+        references = []
+        for reference in self.lookup_references:
+            if not isinstance(reference, (list, tuple)):
+                raise error
+            # `type(...) is int` rejects bools; the C-level `min` keeps long references cheap.
+            if not all(type(token) is int for token in reference) or (
+                reference and min(reference) < 0
+            ):
+                raise error
+            references.append(list(reference))
+        self.lookup_references = references
 
     def _validate_seed(self):
         if self.seed is not None and (type(self.seed) is not int or not 0 <= self.seed < 2**63):
@@ -141,6 +167,7 @@ class SamplingParams:
 
         # Synchronize fields after setting attributes
         self._validate_seed()
+        self._validate_lookup_references()
         self._normalize_filters()
         self._sync_prompt_logprobs_fields()
         self._validate_streaming_interval()

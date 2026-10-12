@@ -512,10 +512,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
         assert self.num_speculative_tokens >= 0, "Number of speculative tokens must be non-negative"
 
-        if self.num_speculative_tokens > 0:
-            assert (
-                model_config.mtp_use_repeated_layer
-                or self.num_speculative_tokens <= model_config.mtp_num_layers
+        self.speculative_method = getattr(inference_config, "speculative_method", "mtp")
+        if self.num_speculative_tokens > 0 and self.speculative_method == "mtp":
+            assert model_config.mtp_use_repeated_layer or self.num_speculative_tokens <= (
+                model_config.mtp_num_layers or 0
             ), f"Number of speculative tokens {self.num_speculative_tokens} must be less than or equal to number of MTP layers {model_config.mtp_num_layers}"
         self.track_paused_request_events = inference_config.track_paused_request_events
         self.track_generated_token_events = inference_config.track_generated_token_events
@@ -558,6 +558,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self.controller.set_stop_word_finished_ids_callback(
             self._get_and_clear_stop_word_finished_ids
         )
+        # Lookup speculation indexes each request's committed tokens and references.
+        if hasattr(self.controller, "set_lookup_request_source"):
+            self.controller.set_lookup_request_source(self._lookup_request_source)
 
         # Configure wandb to use separate step counter for inference metrics (only once)
         if self.logging_step_interval > 0 and self.metrics_writer is not None:
@@ -1844,6 +1847,22 @@ class DynamicInferenceEngine(AbstractEngine):
             (DynamicInferenceRequest) The most recent request in the record.
         """
         return self.requests[request_id].record[-1]
+
+    def _lookup_request_source(
+        self, request_id: int
+    ) -> Tuple[List[int], Optional[List[List[int]]]]:
+        """Committed tokens and lookup references of a request, for lookup speculation.
+
+        Args:
+            request_id (int): Request id.
+
+        Returns:
+            The request's prompt followed by its generated tokens, and its
+            `SamplingParams.lookup_references`.
+        """
+        request = self.get_request(request_id)
+        context_tokens = request.prompt_tokens.tolist() + list(request.generated_tokens)
+        return context_tokens, request.sampling_params.lookup_references
 
     def _validate_async_sched_support_for_config(self) -> None:
         """Validate config-level restrictions for async scheduling.

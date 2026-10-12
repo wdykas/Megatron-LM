@@ -29,6 +29,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
     AbstractModelInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_controllers.lookup_proposer import LookupProposer
 from megatron.core.inference.text_generation_controllers.mtp_controller_mixin import (
     MTPControllerMixin,
 )
@@ -72,6 +73,9 @@ from megatron.core.inference.text_generation_controllers.mtp_utils_triton import
     prepare_next_forward_pass,
     verify_speculative_tokens,
 )
+
+# Pad value for positions without a lookup proposal. Never sampled, so never accepted.
+LOOKUP_PAD_TOKEN = -1
 
 
 @dataclass
@@ -227,6 +231,12 @@ class TextGenerationController(MTPControllerMixin):
     # it) for batched `torch.isin`. Empty => the model declares a single eos.
     extra_eos_token_id_set: frozenset = frozenset()
 
+    # Lookup speculative decoding (`InferenceConfig.speculative_method="lookup"`); set in
+    # `__init__`. Class-level defaults keep partially constructed controllers on the MTP path.
+    _lookup_enabled: bool = False
+    _lookup_proposer: Optional[LookupProposer] = None
+    _lookup_request_source: Optional[Callable] = None
+
     def __init__(self, inference_wrapped_model: AbstractModelInferenceWrapper, tokenizer):
         self.inference_wrapped_model = inference_wrapped_model
         self.model_config = self.inference_wrapped_model.model.config
@@ -234,6 +244,11 @@ class TextGenerationController(MTPControllerMixin):
         self.tokenizer = tokenizer
         self.extra_eos_token_id_set = self._build_extra_eos_token_id_set(tokenizer)
         self.num_speculative_tokens = inference_config.num_speculative_tokens
+        self.speculative_method = getattr(inference_config, "speculative_method", "mtp")
+        # Lookup speculation: proposals come from a CPU n-gram index instead of an MTP head.
+        self._lookup_enabled = (
+            self.num_speculative_tokens > 0 and self.speculative_method == "lookup"
+        )
 
         pg_collection = inference_config.pg_collection
         if pg_collection is not None:
@@ -279,7 +294,7 @@ class TextGenerationController(MTPControllerMixin):
             seed += torch.distributed.get_rank(group=self.dp_group)
         self.sampling_rng.manual_seed(seed)
 
-        if not self.num_speculative_tokens:
+        if not self.num_speculative_tokens or self._lookup_enabled:
             self.num_mtp_depths = 0
         else:
             assert (
@@ -302,8 +317,30 @@ class TextGenerationController(MTPControllerMixin):
                 "CUDA graphs with expert parallelism"
             )
 
+        self._lookup_proposer = None
+        self._lookup_request_source = None
+        if self._lookup_enabled:
+            self._lookup_proposer = LookupProposer(
+                self.num_speculative_tokens,
+                ngram_max=inference_config.lookup_ngram_max,
+                ngram_min=inference_config.lookup_ngram_min,
+            )
+
         if self.inference_wrapped_model.inference_context.is_dynamic_batching():
             self._init_dynamic_sampling_tensors()
+
+    def set_lookup_request_source(self, callback: Callable) -> None:
+        """Set how lookup speculation reads a request's committed tokens and references.
+
+        Requests are indexed lazily, the first time they finish a step. The engine registers a
+        callback with signature `callback(request_id) -> (context_tokens, references)`, where
+        `context_tokens` is the request's prompt followed by every token committed before the
+        current step, and `references` is its `SamplingParams.lookup_references` (or None).
+
+        Args:
+            callback: Function returning a request's committed tokens and references.
+        """
+        self._lookup_request_source = callback
 
     def set_stop_word_finished_ids_callback(self, callback):
         """Set a callback to get request IDs that should be marked as finished due to stop words.
@@ -1665,11 +1702,87 @@ class TextGenerationController(MTPControllerMixin):
                 sampled_mtp_tokens_cpu is None when speculative decoding is off.
         """
         sampled_tokens_cpu = self._sampled_tokens_cuda[:active_request_count].cpu()
-        if self.num_speculative_tokens > 0:
+        if self._lookup_enabled:
+            sampled_mtp_tokens_cpu = self._lookup_propose(active_request_count, sampled_tokens_cpu)
+        elif self.num_speculative_tokens > 0:
             sampled_mtp_tokens_cpu = self._sampled_mtp_tokens_cuda[:, :active_request_count].cpu()
         else:
             sampled_mtp_tokens_cpu = None
         return sampled_tokens_cpu, sampled_mtp_tokens_cpu
+
+    def _split_lookup_padding(self, input_ids: Tensor) -> Tensor:
+        """Separate the lookup pad sentinel from the tokens the model consumes.
+
+        A request whose proposal is shorter than `num_speculative_tokens` is padded with
+        `LOOKUP_PAD_TOKEN` (-1) so every decode request keeps the fixed `K + 1`-token layout
+        that the batch dimensions and CUDA graphs assume. The sentinel must never reach the
+        embedding, and it must never be accepted. This returns a copy that keeps the sentinel,
+        used only for verification (a sampled token is never -1, so padded positions are always
+        rejected), and replaces it in place with token 0 in the forward's input.
+
+        Args:
+            input_ids (Tensor): `[1, T]` forward input ids (a view of the GPU bookkeeping).
+
+        Returns:
+            Tensor: The unmodified input ids, for verification.
+        """
+        verify_input_ids = input_ids.clone()
+        input_ids.clamp_(min=0)
+        return verify_input_ids
+
+    def _lookup_propose(self, active_request_count: int, sampled_tokens_cpu: Tensor) -> Tensor:
+        """Commit this step's tokens to the lookup index and propose the next step's tokens.
+
+        Runs on the CPU after the step's samples reach it, before `update_requests` lays out
+        the next forward's input ids, so the proposals ride in the same slots as MTP drafts.
+
+        Args:
+            active_request_count (int): Number of active requests.
+            sampled_tokens_cpu (Tensor): Sampled token per active request, on the CPU.
+
+        Returns:
+            Tensor: `[num_speculative_tokens, active_request_count]` int64 CPU proposals,
+                padded with `LOOKUP_PAD_TOKEN`.
+        """
+        context = self.inference_wrapped_model.inference_context
+        proposer = self._lookup_proposer
+        active_slice = slice(context.paused_request_count, context.total_request_count)
+        request_ids = context.request_ids[active_slice].tolist()
+        # Accepted proposals precede the sampled token; rejected slots hold -1.
+        accepted_rows = self._accepted_tokens_per_request[:active_request_count].tolist()
+        sampled = sampled_tokens_cpu.tolist()
+
+        # A partial chunked-prefill row samples a placeholder; it commits nothing this step.
+        chunked_row = -1
+        if context.chunked_prefill_request_id != -1:
+            chunked_row = context.get_index_of_chunked_prefill_request(safe=True)
+            chunked_row -= context.paused_request_count
+
+        # A request is (re)indexed from the engine's record at the step that finishes its
+        # prefill: on admission, and again after eviction or a recompute rebuilt its context.
+        prefill_rows = context.request_in_prefill_status_tensor[active_slice].tolist()
+
+        committed: List[Optional[List[int]]] = []
+        for row, request_id in enumerate(request_ids):
+            if row == chunked_row:
+                committed.append(None)
+                continue
+            if prefill_rows[row] == 1 or not proposer.has_request(request_id):
+                assert (
+                    self._lookup_request_source is not None
+                ), "Lookup speculation needs `set_lookup_request_source` to index new requests."
+                context_tokens, references = self._lookup_request_source(request_id)
+                proposer.add_request(request_id, context_tokens, references)
+            tokens = [token for token in accepted_rows[row] if token != -1]
+            tokens.append(sampled[row])
+            committed.append(tokens)
+        return proposer.step(request_ids, committed, pad_token=LOOKUP_PAD_TOKEN)
+
+    def lookup_release_requests(self, request_ids: List[int]) -> None:
+        """Drop the lookup index of finished requests (no-op without lookup speculation)."""
+        if self._lookup_proposer is not None:
+            for request_id in request_ids:
+                self._lookup_proposer.remove_request(request_id)
 
     def _apply_stop_word_finished_ids(
         self, active_request_ids: Tensor, active_request_mask: Tensor
@@ -1808,6 +1921,8 @@ class TextGenerationController(MTPControllerMixin):
             # routing and handoff bookkeeping consistent with that decision.
             finished_idxs = finished_idxs[finished_idxs != chunked_prefill_idx]
         finished_request_ids = context.request_ids[finished_idxs]
+        if self._lookup_enabled:
+            self.lookup_release_requests(finished_request_ids.tolist())
 
         # Save block IDs for finished requests before update_requests releases them.
         # Needed for per-block routing reconstruction in the engine.
@@ -3023,6 +3138,9 @@ class TextGenerationController(MTPControllerMixin):
         with torch.inference_mode():
             input_ids, position_ids, _ = self._dynamic_step_context_init()
             is_decode_only = context.is_decode_only()
+            verify_input_ids = (
+                self._split_lookup_padding(input_ids) if self._lookup_enabled else input_ids
+            )
 
             cuda_graph_request_count = (
                 context.padded_active_request_count
@@ -3080,7 +3198,7 @@ class TextGenerationController(MTPControllerMixin):
             if self.num_speculative_tokens > 0:
                 # Phase 1: Verify speculative tokens using base logits only.
                 nvtx_range_push("mtp-spec-decoding/verify")
-                self._dynamic_step_sample_logits_and_verify_tokens(input_ids)
+                self._dynamic_step_sample_logits_and_verify_tokens(verify_input_ids)
                 nvtx_range_pop("mtp-spec-decoding/verify")
                 # Phase 2: Rewind KV cache for rejected tokens.
                 nvtx_range_push("mtp-spec-decoding/rewind-kv-cache")
@@ -3089,16 +3207,19 @@ class TextGenerationController(MTPControllerMixin):
                 # main KV offsets, so rejected drafts are naturally overwritten next step.
                 nvtx_range_pop("mtp-spec-decoding/rewind-kv-cache")
 
-                # Disable MoE padding for MTP computation, unless CUDA graphs
-                # are active (the graphs were captured with padding enabled).
-                if self.model_config.moe_pad_experts_for_cuda_graph_inference:
-                    if not context.using_cuda_graph_this_step():
-                        set_decode_expert_padding(self._unwrapped_model, False)
+                # Phase 3: Compute MTP serially with correct (verified) inputs. Lookup
+                # proposals are instead computed on the CPU during bookkeeping, from the
+                # tokens this step commits.
+                if not self._lookup_enabled:
+                    # Disable MoE padding for MTP computation, unless CUDA graphs
+                    # are active (the graphs were captured with padding enabled).
+                    if self.model_config.moe_pad_experts_for_cuda_graph_inference:
+                        if not context.using_cuda_graph_this_step():
+                            set_decode_expert_padding(self._unwrapped_model, False)
 
-                # Phase 3: Compute MTP serially with correct (verified) inputs.
-                nvtx_range_push("mtp-spec-decoding/serial-mtp")
-                self._compute_serial_mtp_and_sample()
-                nvtx_range_pop("mtp-spec-decoding/serial-mtp")
+                    nvtx_range_push("mtp-spec-decoding/serial-mtp")
+                    self._compute_serial_mtp_and_sample()
+                    nvtx_range_pop("mtp-spec-decoding/serial-mtp")
 
                 # Phase 4: Release freed blocks. Deferred from Phase 2 so the
                 # data-dependent boolean-mask sync overlaps with MTP GPU work.

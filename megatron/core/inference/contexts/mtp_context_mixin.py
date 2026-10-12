@@ -108,6 +108,7 @@ class MTPContextMixin:
         # address. Sized to max_tokens; only [:actual_tokens] is valid each step.
         if (
             self.num_speculative_tokens > 0
+            and getattr(self.config, "speculative_method", "mtp") == "mtp"
             and self.inference_cuda_graph_scope == InferenceCudaGraphScope.block
         ):
             self.mtp_decoder_hidden_states = torch.empty(

@@ -655,6 +655,25 @@ class InferenceConfig:
     num_speculative_tokens: int = 0
     """The number of speculative tokens to generate for decode steps."""
 
+    speculative_method: Literal['mtp', 'lookup'] = 'mtp'
+    """Where speculative tokens come from when `num_speculative_tokens > 0`.
+
+    - ``"mtp"``: the model's multi-token-prediction head drafts them (requires MTP layers).
+    - ``"lookup"``: exact lookup ("n-gram") speculation. Each step, a CPU proposer matches the
+      longest suffix (`lookup_ngram_max` down to `lookup_ngram_min` tokens) of every request's
+      tokens against the request's own prompt + generated tokens and its optional
+      `SamplingParams.lookup_references`, and proposes up to `num_speculative_tokens` tokens that
+      followed the match. Proposals go through the same verify step as MTP drafts, which is exact
+      for any deterministic proposal, so outputs follow the target distribution. Needs no draft
+      model. Currently requires ``async_sched_mode=AsyncScheduleMode.LEGACY``.
+    """
+
+    lookup_ngram_max: int = 4
+    """Longest suffix length matched by `speculative_method="lookup"`."""
+
+    lookup_ngram_min: int = 1
+    """Shortest suffix length matched by `speculative_method="lookup"`."""
+
     enable_prefix_caching: bool = False
     """Whether to enable prefix caching for KV cache block sharing."""
 
@@ -855,6 +874,30 @@ class InferenceConfig:
                 f"Unsupported logprobs_mode {self.logprobs_mode!r}. "
                 "Supported modes: raw_logprobs, processed_logprobs."
             )
+
+        if self.speculative_method not in ("mtp", "lookup"):
+            raise ValueError(
+                f"Unsupported speculative_method {self.speculative_method!r}. "
+                "Supported methods: mtp, lookup."
+            )
+        if self.speculative_method == "lookup":
+            if not 1 <= self.lookup_ngram_min <= self.lookup_ngram_max:
+                raise ValueError(
+                    "lookup speculation requires 1 <= lookup_ngram_min <= lookup_ngram_max, got "
+                    f"lookup_ngram_min={self.lookup_ngram_min}, "
+                    f"lookup_ngram_max={self.lookup_ngram_max}."
+                )
+            if (
+                self.num_speculative_tokens > 0
+                and self.async_sched_mode != AsyncScheduleMode.LEGACY
+            ):
+                # Lookup proposals are computed on the CPU from the tokens committed by the
+                # previous step; the async scheduler launches the next forward before those are
+                # on the CPU. Wiring the proposer into async scheduling is not built yet.
+                raise ValueError(
+                    "speculative_method='lookup' currently requires "
+                    "async_sched_mode=AsyncScheduleMode.LEGACY."
+                )
 
         # The speculative log-probs path does not yet apply processed-logprobs.
         if self.logprobs_mode == "processed_logprobs" and self.num_speculative_tokens > 0:
