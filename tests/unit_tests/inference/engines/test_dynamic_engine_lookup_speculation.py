@@ -91,6 +91,7 @@ def _build_engine(
     paused_buffer_size_gb: Optional[float] = None,
     block_size_tokens: int = 256,
     materialize_only_last_token_logits: bool = True,
+    async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY,
 ) -> DynamicInferenceEngine:
     context = DynamicInferenceContext(
         model_config=model.config,
@@ -108,7 +109,7 @@ def _build_engine(
             lookup_ngram_max=4,
             lookup_ngram_min=1,
             sampling_backend="torch",
-            async_sched_mode=AsyncScheduleMode.LEGACY,
+            async_sched_mode=async_sched_mode,
         ),
     )
     wrapper = GPTInferenceWrapper(model, context)
@@ -217,6 +218,12 @@ def _tokens_per_step(requests: Dict[int, DynamicInferenceRequest], request_ids) 
 
 class TestDynamicEngineLookupSpeculation:
 
+    @pytest.fixture(autouse=True, params=[AsyncScheduleMode.LEGACY, AsyncScheduleMode.ASYNC])
+    def async_sched_mode(self, request):
+        """Run every test under legacy and async (overlapped) scheduling."""
+        self.sched_mode = request.param
+        return request.param
+
     @classmethod
     def setup_class(cls):
         Utils.initialize_model_parallel(
@@ -233,6 +240,7 @@ class TestDynamicEngineLookupSpeculation:
         set_rounder(4)
 
     def _plain_and_lookup(self, model, k, max_sequence_length, **engine_kwargs):
+        engine_kwargs.setdefault("async_sched_mode", self.sched_mode)
         # Each engine gets its own copy of the same weights: a model module is bound to one
         # inference context (and the logit overrides below wrap one engine's context).
         twin = _build_model(max_sequence_length)
@@ -402,9 +410,8 @@ class TestDynamicEngineLookupSpeculation:
             assert actual[i].generated_tokens == expected[i].generated_tokens, i
         assert _tokens_per_step(actual, range(len(prompts))) > 3.0
 
-    def test_config_rejects_async_scheduling_and_bad_ngrams(self):
-        with pytest.raises(ValueError, match="LEGACY"):
-            InferenceConfig(num_speculative_tokens=2, speculative_method="lookup")
+    def test_config_validation(self):
+        InferenceConfig(num_speculative_tokens=2, speculative_method="lookup")
         with pytest.raises(ValueError, match="lookup_ngram_min"):
             InferenceConfig(
                 num_speculative_tokens=2,

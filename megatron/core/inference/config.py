@@ -887,17 +887,6 @@ class InferenceConfig:
                     f"lookup_ngram_min={self.lookup_ngram_min}, "
                     f"lookup_ngram_max={self.lookup_ngram_max}."
                 )
-            if (
-                self.num_speculative_tokens > 0
-                and self.async_sched_mode != AsyncScheduleMode.LEGACY
-            ):
-                # Lookup proposals are computed on the CPU from the tokens committed by the
-                # previous step; the async scheduler launches the next forward before those are
-                # on the CPU. Wiring the proposer into async scheduling is not built yet.
-                raise ValueError(
-                    "speculative_method='lookup' currently requires "
-                    "async_sched_mode=AsyncScheduleMode.LEGACY."
-                )
 
         # The speculative log-probs path does not yet apply processed-logprobs.
         if self.logprobs_mode == "processed_logprobs" and self.num_speculative_tokens > 0:

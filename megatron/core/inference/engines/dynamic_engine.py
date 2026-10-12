@@ -1876,7 +1876,10 @@ class DynamicInferenceEngine(AbstractEngine):
             raise AssertionError(f"Unexpected async scheduling mode: {mode}")
 
         model_config = self.controller.inference_wrapped_model.model.config
-        if self.num_speculative_tokens > self.controller.num_mtp_depths:
+        if (
+            self.speculative_method == "mtp"
+            and self.num_speculative_tokens > self.controller.num_mtp_depths
+        ):
             raise ValueError("Async scheduling requires one MTP depth per speculative token.")
         if model_config.moe_enable_routing_replay:
             raise ValueError("Async scheduling does not support routing replay.")

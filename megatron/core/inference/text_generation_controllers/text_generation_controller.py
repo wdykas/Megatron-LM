@@ -417,6 +417,15 @@ class TextGenerationController(MTPControllerMixin):
 
         self._init_mtp_sampling_tensors()
 
+        # Lookup speculation: the forward's input ids with pad sentinels kept, for verification.
+        # Fixed address and indexed by forward input row, so async scheduling can verify a
+        # pending forward after its logits were compacted (via `token_row_indices`).
+        self._lookup_verify_input_ids = (
+            torch.empty(context.max_tokens, dtype=torch.int64, device=device)
+            if self._lookup_enabled
+            else None
+        )
+
     def _build_extra_eos_token_id_set(self, tokenizer) -> frozenset:
         """Build the model-level EOS token-id set used for termination.
 
@@ -1726,11 +1735,18 @@ class TextGenerationController(MTPControllerMixin):
         Returns:
             Tensor: The unmodified input ids, for verification.
         """
-        verify_input_ids = input_ids.clone()
+        token_count = input_ids.shape[-1]
+        verify_input_ids = self._lookup_verify_input_ids[:token_count]
+        verify_input_ids.copy_(input_ids.view(-1))
         input_ids.clamp_(min=0)
-        return verify_input_ids
+        return verify_input_ids.unsqueeze(0)
 
-    def _lookup_propose(self, active_request_count: int, sampled_tokens_cpu: Tensor) -> Tensor:
+    def _lookup_propose(
+        self,
+        active_request_count: int,
+        sampled_tokens_cpu: Tensor,
+        accepted_tokens_cpu: Optional[Tensor] = None,
+    ) -> Tensor:
         """Commit this step's tokens to the lookup index and propose the next step's tokens.
 
         Runs on the CPU after the step's samples reach it, before `update_requests` lays out
@@ -1739,6 +1755,8 @@ class TextGenerationController(MTPControllerMixin):
         Args:
             active_request_count (int): Number of active requests.
             sampled_tokens_cpu (Tensor): Sampled token per active request, on the CPU.
+            accepted_tokens_cpu (Optional[Tensor]): `[active_request_count, K]` accepted
+                proposals (-1 where rejected), on the CPU. Read from the GPU when omitted.
 
         Returns:
             Tensor: `[num_speculative_tokens, active_request_count]` int64 CPU proposals,
@@ -1749,7 +1767,9 @@ class TextGenerationController(MTPControllerMixin):
         active_slice = slice(context.paused_request_count, context.total_request_count)
         request_ids = context.request_ids[active_slice].tolist()
         # Accepted proposals precede the sampled token; rejected slots hold -1.
-        accepted_rows = self._accepted_tokens_per_request[:active_request_count].tolist()
+        if accepted_tokens_cpu is None:
+            accepted_tokens_cpu = self._accepted_tokens_per_request[:active_request_count]
+        accepted_rows = accepted_tokens_cpu[:active_request_count].tolist()
         sampled = sampled_tokens_cpu.tolist()
 
         # A partial chunked-prefill row samples a placeholder; it commits nothing this step.
@@ -2250,7 +2270,15 @@ class TextGenerationController(MTPControllerMixin):
             raise RuntimeError("Pending async MTP logits are missing token-row indices.")
 
         range_push("sampling")
-        pending_input_ids = context.gpu_view.token_to_input_ids.unsqueeze(0)
+        # Verification writes accepted tokens and counts for decode rows only. Reset the
+        # buffers so prefill rows read "nothing accepted" rather than the values a previous
+        # occupant of the row left behind (the legacy step resets them after each use).
+        self._accepted_tokens_per_request.fill_(-1)
+        self._accepted_token_counts_per_request.fill_(0)
+        if self._lookup_enabled:
+            pending_input_ids = self._lookup_verify_input_ids.unsqueeze(0)
+        else:
+            pending_input_ids = context.gpu_view.token_to_input_ids.unsqueeze(0)
         self._dynamic_step_sample_logits_and_verify_tokens(
             pending_input_ids, token_row_indices=token_row_indices
         )
@@ -2263,16 +2291,21 @@ class TextGenerationController(MTPControllerMixin):
             self._copy_async_sched_accepted_counts_to_cpu(accepted_counts_gpu)
         )
 
-        base_position = (context.gpu_view.token_to_pos_ids[self._last_accepted_seq_indices] + 1).to(
-            torch.int64
-        )
-        self._compute_serial_mtp_and_sample(base_position=base_position)
+        if self._lookup_enabled:
+            # Lookup proposals are built on the CPU from these samples, right before the
+            # successor forward is launched (`_run_async_sched_lookup_propose`).
+            sampled_mtp_tokens_gpu = None
+        else:
+            base_position = (
+                context.gpu_view.token_to_pos_ids[self._last_accepted_seq_indices] + 1
+            ).to(torch.int64)
+            self._compute_serial_mtp_and_sample(base_position=base_position)
+            sampled_mtp_tokens_gpu = self._sampled_mtp_tokens_cuda[:, :active_request_count]
         self._replace_partial_prefill_sample_with_prompt_token()
         sampled_tokens_gpu = self._sampled_tokens_cuda[:active_request_count]
-        sampled_mtp_tokens_gpu = self._sampled_mtp_tokens_cuda[:, :active_request_count]
         accepted_tokens_gpu = (
             self._accepted_tokens_per_request[:active_request_count]
-            if context.num_decode_requests > 0
+            if context.num_decode_requests > 0 or self._lookup_enabled
             else None
         )
         if sampled_tokens_gpu.is_cuda:
@@ -2313,6 +2346,34 @@ class TextGenerationController(MTPControllerMixin):
         blocks_to_release, remove_mask = self._rewind_kv_cache(accepted_counts_cpu)
         context = self.inference_wrapped_model.inference_context
         context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
+
+    def _run_async_sched_lookup_propose(self, sample_result: _AsyncScheduleSampleResult) -> None:
+        """Build lookup proposals for the successor forward from this step's samples.
+
+        Async scheduling launches forward N+1 before step N is resolved. Its proposals must
+        extend the tokens step N commits, so the host waits for step N's samples, commits them
+        to the lookup index, and only then fills the successor's draft slots. Proposals are made
+        in the pre-resolve row order of forward N+1; rows of requests that resolve as finished
+        are discarded with the rest of their speculative work by the logits compaction. This
+        trades the sample-to-launch overlap for exact proposals; resolution and bookkeeping of
+        step N still overlap with forward N+1.
+
+        Args:
+            sample_result (_AsyncScheduleSampleResult): Verified samples; updated in place with
+                the proposals (CPU and GPU) in the draft-token fields.
+        """
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        self._synchronize_async_sched_event(sample_result.sample_cpu_ready_event)
+        proposals_cpu = self._lookup_propose(
+            active_request_count,
+            sample_result.sampled_tokens_cpu_view,
+            sample_result.accepted_tokens_cpu_view,
+        )
+        sample_result.sampled_mtp_tokens_cpu_view = proposals_cpu
+        sample_result.sampled_mtp_tokens_gpu = proposals_cpu.to(
+            sample_result.sampled_tokens_gpu.device, non_blocking=True
+        )
 
     def _run_async_sched_log_probs(
         self, sample_result: _AsyncScheduleSampleResult
@@ -2620,6 +2681,10 @@ class TextGenerationController(MTPControllerMixin):
             context.padded_active_request_count if context.using_cuda_graph_this_step() else None
         )
 
+        # Lookup proposals carry -1 pads: keep them for verification, feed the model token 0.
+        if self._lookup_enabled:
+            self._split_lookup_padding(input_ids_gpu_view)
+
         # Forward.
         range_push("forward_pass")
         self._dynamic_step_forward_logits(input_ids_gpu_view, position_ids_gpu_view)
@@ -2707,6 +2772,8 @@ class TextGenerationController(MTPControllerMixin):
         range_pop()
 
         assert torch.equal(finished_request_ids, resolved_finished_request_ids)
+        if self._lookup_enabled:
+            self.lookup_release_requests(finished_request_ids.tolist())
 
         # Enqueue compaction behind the successor forward on the current CUDA stream.
         self._compact_async_sched_logits(survivor_idxs)
@@ -2756,6 +2823,9 @@ class TextGenerationController(MTPControllerMixin):
                 finished_idxs, sampled_tokens_cpu, sample_result.sampled_mtp_tokens_cpu_view
             )
         )
+
+        if self._lookup_enabled:
+            self.lookup_release_requests(finished_request_ids.tolist())
 
         mutable_sampled_tokens_cpu = sampled_tokens_cpu.clone()
         mutable_sampled_mtp_tokens_cpu = (
@@ -2867,6 +2937,8 @@ class TextGenerationController(MTPControllerMixin):
                 if self.num_speculative_tokens > 0:
                     sample_result = self._run_async_sched_sample_mtp()
                     self._run_async_sched_mtp_rewind(sample_result)
+                    if self._lookup_enabled:
+                        self._run_async_sched_lookup_propose(sample_result)
                 else:
                     sample_result = self._run_async_sched_sample()
 
@@ -3039,6 +3111,8 @@ class TextGenerationController(MTPControllerMixin):
             # Verify pending drafts, sample replacements, and rewind rejected KV state.
             sample_result = self._run_async_sched_sample_mtp()
             self._run_async_sched_mtp_rewind(sample_result)
+            if self._lookup_enabled:
+                self._run_async_sched_lookup_propose(sample_result)
             resolved_sequence_lengths = context.get_active_sequence_lengths() + 1
             log_probs_gpu_result = self._run_async_sched_log_probs(sample_result)
             log_probs_transfer = self._copy_async_sched_log_probs_to_cpu(log_probs_gpu_result)
