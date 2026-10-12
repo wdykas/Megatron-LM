@@ -260,15 +260,38 @@ class TorchSampling(Sampling):
         )
         row_seeds = None
         positions = None
+        token_to_request_index_cpu = None
         if any(seed >= 0 for seed in seeds):
-            if token_to_request_index is not None or context.config.num_speculative_tokens:
-                raise ValueError("Request-local seeds do not yet support speculative decoding")
-            positions = (
+            speculative = (
+                token_to_request_index is not None or context.config.num_speculative_tokens
+            )
+            if speculative and getattr(context.config, "speculative_method", "mtp") != "lookup":
+                raise ValueError("Request-local seeds do not yet support MTP speculative decoding")
+            request_positions = (
                 context.get_active_sequence_lengths()
                 if sequence_lengths is None
                 else sequence_lengths
-            ).tolist()
-            row_seeds = [seed if seed >= 0 else None for seed in seeds]
+            )
+            if token_to_request_index is None:
+                positions = request_positions.tolist()
+                row_seeds = [seed if seed >= 0 else None for seed in seeds]
+            else:
+                # Speculative verify rows: each request owns a contiguous run of rows whose last
+                # row predicts the token at the request's current sequence length, so row j of a
+                # run of r rows predicts position `length - (r - 1 - j)`. Keying the noise by that
+                # absolute position draws exactly the variates that one-token-per-step decoding
+                # would use at the same position, so accepted proposals and the token sampled after
+                # them match non-speculative seeded decoding token for token.
+                token_to_request_index_cpu = token_to_request_index.cpu()
+                counts = torch.bincount(token_to_request_index_cpu, minlength=active_request_count)
+                ends = torch.cumsum(counts, 0)[token_to_request_index_cpu]
+                rows_after = ends - 1 - torch.arange(token_to_request_index_cpu.numel())
+                positions = (
+                    request_positions.cpu()[token_to_request_index_cpu] - rows_after
+                ).tolist()
+                row_seeds = [
+                    seeds[i] if seeds[i] >= 0 else None for i in token_to_request_index_cpu.tolist()
+                ]
 
         bucket_map: dict = defaultdict(list)
         temp = md["temperature"][:active_request_count].tolist()
@@ -292,8 +315,15 @@ class TorchSampling(Sampling):
         for idx_tensor, (indices, temp, top_k, top_p) in zip(bucket_index_tensors, buckets):
             if token_to_request_index is None:
                 row_indices = idx_tensor
+                seed_rows = indices
             else:
                 row_indices = torch.where(torch.isin(token_to_request_index, idx_tensor))[0]
+                seed_rows = None
+                if token_to_request_index_cpu is not None:
+                    # Same rows as `row_indices`, in the same (ascending) order.
+                    seed_rows = torch.where(
+                        torch.isin(token_to_request_index_cpu, torch.tensor(indices))
+                    )[0].tolist()
             token_list.append(
                 TorchSampling.sample_from_logits(
                     logits[row_indices, :],
@@ -302,8 +332,8 @@ class TorchSampling(Sampling):
                     top_p,
                     generator=self._rng,
                     vocab_size=self._vocab_size,
-                    row_seeds=None if row_seeds is None else [row_seeds[i] for i in indices],
-                    row_positions=None if positions is None else [positions[i] for i in indices],
+                    row_seeds=None if row_seeds is None else [row_seeds[i] for i in seed_rows],
+                    row_positions=None if positions is None else [positions[i] for i in seed_rows],
                 )
             )
             indices_list.append(row_indices)

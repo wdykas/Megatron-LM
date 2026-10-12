@@ -1921,8 +1921,11 @@ class DynamicInferenceEngine(AbstractEngine):
         if request.sampling_params.seed is not None:
             if self.context.config.sampling_backend != "torch":
                 seed_error = "Request-local seeds require sampling_backend='torch'"
-            elif self.context.config.num_speculative_tokens:
-                seed_error = "Request-local seeds do not yet support speculative decoding"
+            elif (
+                self.context.config.num_speculative_tokens
+                and getattr(self.context.config, "speculative_method", "mtp") != "lookup"
+            ):
+                seed_error = "Request-local seeds do not yet support MTP speculative decoding"
             elif "seed" not in self.context.request_metadata:
                 seed_error = "Request-local seeds require seed in request metadata"
         if seed_error is not None:
