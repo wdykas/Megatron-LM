@@ -269,7 +269,7 @@ def _permute_tokens_kernel(
     valid_pairs = valid_tokens * topk
     if pid >= valid_pairs:
         return
-    for pair in tl.range(pid, max_pairs, NUM_BLOCKS):
+    for pair in tl.range(pid, tl.minimum(valid_pairs, max_pairs), NUM_BLOCKS):
         tok = pair // topk
         if tok < valid_tokens:
             k = pair % topk
@@ -310,7 +310,7 @@ def _zero_permutation_padding_kernel(
     n_used = tl.load(n_used_ptr)
     if pid >= n_used:
         return
-    for row in tl.range(pid, max_rows, NUM_BLOCKS):
+    for row in tl.range(pid, tl.minimum(n_used, max_rows), NUM_BLOCKS):
         if row < n_used:
             if tl.load(permutation_map_ptr + row) < 0:
                 for h in tl.range(0, hidden_dim, BLOCK_H):
@@ -626,7 +626,7 @@ def _permute_quantize_mxfp8_kernel(
     if pid >= valid_pairs:
         return
 
-    for pair in tl.range(pid, max_pairs, NUM_BLOCKS):
+    for pair in tl.range(pid, tl.minimum(valid_pairs, max_pairs), NUM_BLOCKS):
         tok = pair // topk
         if tok < valid_tokens:
             k = pair % topk
