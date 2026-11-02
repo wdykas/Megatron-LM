@@ -52,8 +52,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         pin_cpu_grads: bool = True,
         pin_cpu_params: bool = True,
         overlap_cpu_optimizer_d2h_h2d: bool = True,
+        _defer_sub_optimizer_init: bool = False,
         **kwargs,
-    ):
+    ) -> None:
         super(HybridDeviceOptimizer, self).__init__(
             params,
             defaults={
@@ -77,8 +78,13 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.param_update_in_fp32 = param_update_in_fp32
         self.sub_optimizer_kwargs = kwargs
 
-        self._init_sub_optimizers()
-        self._register_load_state_dict_hooks()
+        # DistributedOptimizer replaces this temporary optimizer after sharding.
+        # Allocating full-parameter CPU copies here would leave a large pinned
+        # allocation cache even after the temporary optimizer is discarded.
+        # Keep this internal flag out of defaults so the replacement initializes.
+        if not _defer_sub_optimizer_init:
+            self._init_sub_optimizers()
+            self._register_load_state_dict_hooks()
 
     def _set_sub_optimizer_grads(self):
         if self.param_update_in_fp32:
@@ -324,6 +330,21 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     new_state[orig_param]["master_param"] = param
         self.state = new_state
 
+        # FusedAdam advances a group-level step. Publish it back to HDO so a
+        # restored counter is not copied over the newer value on every step.
+        # CPU Adam keeps its counters in per-parameter state instead.
+        if self.gpu_optimizer is not None:
+            steps = {
+                self.inner_param_to_orig_param[group["params"][0]]: group["step"]
+                for group in self.gpu_optimizer.param_groups
+                if "step" in group
+            }
+            for group in self.param_groups:
+                for param in group["params"]:
+                    if param in steps:
+                        group["step"] = steps[param]
+                        break
+
     def _sync_hdo_state_to_sub_optimizers(self):
         for optimizer in self.sub_optimizers:
             new_state = defaultdict(dict)
@@ -374,11 +395,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         if not self.param_update_in_fp32:
             return
         for param, v in self.state.items():
-            # Native FP32 params do not need a separate master parameter and are
-            # intentionally absent from param_to_fp32_param.
-            fp32_param = self.param_to_fp32_param.get(param)
-            if fp32_param is not None:
-                fp32_param.data.copy_(v["master_param"])
+            # Native FP32 parameters can also have an offloaded CPU copy.
+            # Restore the actual inner parameter, including those copies.
+            self.param_to_inner_param[param].data.copy_(v["master_param"])
 
     @torch.no_grad()
     def update_fp32_param_by_new_param(self):
@@ -441,12 +460,16 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     for i, param in enumerate(group["params"]):
                         group["params"][i] = self.fp32_param_to_orig_param.get(param, param)
 
-            # 2. After loading state_dict, the parameters may change, and we need to
-            # reinitialize the sub-optimizers to regenerate the new parameters and
-            # cpu copy pairs.
-            self._init_sub_optimizers()
+            # Optimizer.load_state_dict preserves the current parameter objects.
+            # Reuse their CPU copies and FP32 masters; rebuilding them here doubles
+            # master-parameter storage while the loaded state is still live.
             self._sync_hdo_param_groups_to_sub_optimizers()
             self._sync_hdo_state_to_sub_optimizers()
+            if not self.param_update_in_fp32:
+                # These copies are not stored as master_param in the optimizer
+                # checkpoint. Refresh them from the separately restored model.
+                for param, cpu_copy in self.gpu_params_map_cpu_copy.items():
+                    cpu_copy.data.copy_(param)
 
         self.register_load_state_dict_post_hook(post_load_state_dict_hook)
 

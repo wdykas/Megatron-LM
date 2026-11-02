@@ -1933,3 +1933,54 @@ def test_float16_optimizer_rejects_unmatchable_main_params():
     new_optimizer = _float16_optimizer(_decay_layer_params(fp32_decay=True))
     with pytest.raises(RuntimeError, match="Cannot match the 9 saved main params"):
         new_optimizer.load_state_dict(state_dict)
+
+
+def test_distributed_cpu_offload_initializes_only_parameter_shards(monkeypatch):
+    """Do not allocate an offloaded full-model copy before distributed sharding."""
+    from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+
+    world = int(os.getenv("WORLD_SIZE", "1"))
+    rank = int(os.getenv("RANK", "0"))
+    _init_distributed(world, rank)
+    Utils.initialize_model_parallel()
+    try:
+        module = torch.nn.Linear(1024, 1024, bias=False, dtype=torch.bfloat16, device="cuda")
+        module.weight.data.fill_(1.0)
+        model = DistributedDataParallel(
+            TransformerConfig(num_attention_heads=1, num_layers=1),
+            DistributedDataParallelConfig(use_distributed_optimizer=True),
+            module,
+        )
+        allocated_numels = []
+        original_init = HybridDeviceOptimizer._init_sub_optimizers
+
+        def record_init(optimizer):
+            allocated_numels.append(
+                sum(param.numel() for group in optimizer.param_groups for param in group["params"])
+            )
+            return original_init(optimizer)
+
+        monkeypatch.setattr(HybridDeviceOptimizer, "_init_sub_optimizers", record_init)
+        optimizer = get_megatron_optimizer(
+            OptimizerConfig(
+                optimizer="adam",
+                lr=0.01,
+                bf16=True,
+                use_distributed_optimizer=True,
+                optimizer_cpu_offload=True,
+                optimizer_offload_fraction=1.0,
+                overlap_cpu_optimizer_d2h_h2d=False,
+                clip_grad=0.0,
+            ),
+            [model],
+        )
+        assert allocated_numels == [module.weight.numel() // world]
+        optimizer.zero_grad()
+        model.zero_grad_buffer()
+        module.weight.main_grad.fill_(rank + 1)
+        model.finish_grad_sync()
+        success, _, _ = optimizer.step()
+        assert success
+        assert not torch.equal(module.weight, torch.ones_like(module.weight))
+    finally:
+        Utils.destroy_model_parallel()

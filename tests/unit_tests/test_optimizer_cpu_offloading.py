@@ -414,3 +414,34 @@ def test_distributed_optimizer_with_cpu_offload_and_fp32_marked_param():
         assert update_successful
     finally:
         Utils.destroy_model_parallel()
+
+
+def test_deferred_initialization_does_not_propagate_to_replacement(monkeypatch):
+    """The temporary distributed-optimizer placeholder owns no pinned copies."""
+    parameter = torch.nn.Parameter(torch.ones(1024, dtype=torch.bfloat16, device="cuda"))
+    calls = []
+    original_init = HybridDeviceOptimizer._init_sub_optimizers
+
+    def record_init(optimizer):
+        calls.append(optimizer)
+        return original_init(optimizer)
+
+    monkeypatch.setattr(HybridDeviceOptimizer, "_init_sub_optimizers", record_init)
+    temporary = HybridDeviceOptimizer(
+        [parameter],
+        offload_fraction=1.0,
+        cpu_optimizer_cls=torch.optim.AdamW,
+        gpu_optimizer_cls=GPUAdam,
+        param_update_in_fp32=True,
+        overlap_cpu_optimizer_d2h_h2d=False,
+        _defer_sub_optimizer_init=True,
+        lr=0.01,
+    )
+    assert calls == []
+    assert "_defer_sub_optimizer_init" not in temporary.defaults
+    shard = torch.nn.Parameter(parameter[:512].float())
+    replacement = HybridDeviceOptimizer([shard], **temporary.defaults)
+    assert calls == [replacement]
+    shard.grad = torch.ones_like(shard)
+    replacement.step()
+    assert not torch.equal(shard, torch.ones_like(shard))
