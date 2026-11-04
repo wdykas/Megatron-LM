@@ -8,6 +8,7 @@ import logging
 import torch
 
 from megatron.core.tensor_parallel.random import get_all_rng_states
+from megatron.core.transformer.cuda_graphs import capture_constants
 
 logger = logging.getLogger(__name__)
 
@@ -223,11 +224,14 @@ class FullCudaGraphWrapper:
                 FullCudaGraphWrapper.cuda_graph[training_str].register_generator_state(state)
             torch.cuda.synchronize()
             capture_stream = get_shared_capture_stream()
-            with torch.cuda.graph(
-                FullCudaGraphWrapper.cuda_graph[training_str],
-                stream=capture_stream,
-                pool=get_graph_pool(self.use_single_mempool),
-                capture_error_mode="thread_local",
+            with (
+                capture_constants(FullCudaGraphWrapper.cuda_graph[training_str]),
+                torch.cuda.graph(
+                    FullCudaGraphWrapper.cuda_graph[training_str],
+                    stream=capture_stream,
+                    pool=get_graph_pool(self.use_single_mempool),
+                    capture_error_mode="thread_local",
+                ),
             ):
                 FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(
                     *args, **kwargs
@@ -252,6 +256,9 @@ class FullCudaGraphWrapper:
 
     def reset_cuda_graph(self, stage=None):
         """Reset CUDA graph."""
+        captured = any(graph is not None for graph in FullCudaGraphWrapper.cuda_graph.values())
+        if captured:
+            torch.cuda.synchronize()
         if stage is None or stage == 'training':
             if FullCudaGraphWrapper.cuda_graph['training'] is not None:
                 del FullCudaGraphWrapper.cuda_graph['training']
