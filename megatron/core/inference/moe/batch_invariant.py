@@ -472,7 +472,8 @@ def _ordered_reduce_scatter_v_kernel(
     buffer_ptrs = buffer_ptrs_dev.to(tl.pointer_type(tl.uint64))
 
     for token_offset in range(pid, local_tokens, tl.num_programs(axis=0)):
-        global_token = rank_token_offset + token_offset
+        tok64 = token_offset.to(tl.int64)  # int64 row offsets (token x hidden past 2^31 elements)
+        global_token = rank_token_offset + tok64
 
         for channel_offset in range(0, HIDDEN_SIZE, BLOCK_SIZE):
             offsets = channel_offset + tid
@@ -487,7 +488,7 @@ def _ordered_reduce_scatter_v_kernel(
                 )
                 acc += values
 
-            tl.store(local_ptr + token_offset * HIDDEN_SIZE + offsets, acc, mask=mask)
+            tl.store(local_ptr + tok64 * HIDDEN_SIZE + offsets, acc, mask=mask)
 
 
 def ordered_reduce_scatter_v(

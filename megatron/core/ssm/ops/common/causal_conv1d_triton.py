@@ -66,10 +66,12 @@ def causal_conv1d_update_kernel(
     mask = channel_offsets < dim
 
     # State batch coordinate mapping
+    # int64 slot offsets: slot x conv_state_b_stride passes 2^31 elements on large state pools (an int32 product wraps
+    # to a wrong slot). The token-row offsets (x / out) stay int32: they are bounded by the step's tokens.
     if HAS_STATE_INDICES:
-        state_batch_coord = tl.load(conv_state_indices_ptr + batch_id)
+        state_batch_coord = tl.load(conv_state_indices_ptr + batch_id).to(tl.int64)
     else:
-        state_batch_coord = batch_id
+        state_batch_coord = batch_id.to(tl.int64)
 
     # Base Pointers
     conv_state_ptrs = (
