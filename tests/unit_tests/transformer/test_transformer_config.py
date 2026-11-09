@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from megatron.core.activations import squared_relu
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 
@@ -145,6 +146,60 @@ def test_batch_invariant_backend_rejects_unknown_value_at_construction():
             batch_invariant_mode=True,
             batch_invariant_backend="te-native",
         )
+
+
+def _make_batch_invariant_moe_config(**overrides):
+    kwargs = dict(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=4,
+        moe_router_topk=2,
+        moe_token_dispatcher_type="alltoall",
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        attention_backend=AttnBackend.flash,
+        flash_attention_version=3,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        batch_invariant_mode=True,
+    )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
+
+
+_BI_MXFP8_TRAINING = dict(
+    fp8="e4m3",
+    fp8_recipe="mxfp8",
+    fp8_param=True,
+    moe_grouped_gemm=True,
+    gated_linear_unit=True,
+    activation_func=torch.nn.functional.silu,
+)
+
+
+@pytest.mark.parametrize("overrides", [{}, _BI_MXFP8_TRAINING])
+def test_batch_invariant_moe_accepts_dropless_routing(overrides):
+    cfg = _make_batch_invariant_moe_config(**overrides)
+    assert cfg.moe_expert_capacity_factor is None
+    assert not cfg.moe_router_padding_for_quantization
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"moe_expert_capacity_factor": 1.0},
+        # Router padding needs fp8 / fp4; MXFP8 is the quantized recipe batch-invariant MoE allows.
+        {"moe_router_padding_for_quantization": True, **_BI_MXFP8_TRAINING},
+        {"moe_router_padding_for_fp8": True, **_BI_MXFP8_TRAINING},
+    ],
+)
+def test_batch_invariant_moe_rejects_dynamic_num_out_tokens_at_construction(overrides):
+    # Token dropping and router padding make the alltoall dispatcher's num_out_tokens a
+    # device tensor, which batch-invariant unpermute cannot use; reject at construction
+    # instead of failing at the first MoE forward.
+    with pytest.raises(AssertionError, match="Unset moe_expert_capacity_factor"):
+        _make_batch_invariant_moe_config(**overrides)
 
 
 def test_mhc_fused_backend_defaults_to_auto():

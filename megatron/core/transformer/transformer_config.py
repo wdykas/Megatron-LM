@@ -5012,6 +5012,16 @@ class TransformerConfig(ModelParallelConfig):
                     "Batch-invariant MoE supports dynamic dropless routing only. "
                     "Disable MoE capacity/expert padding."
                 )
+                # Token dropping and router padding make the permuted row count a device
+                # tensor; batch-invariant unpermute needs the static num_tokens x top-k
+                # layout (batch_invariant.build_inverse_permutation_map).
+                assert not (
+                    self.moe_expert_capacity_factor is not None
+                    or self.moe_router_padding_for_quantization
+                ), (
+                    "Batch-invariant MoE supports dynamic dropless routing only. "
+                    "Unset moe_expert_capacity_factor and moe_router_padding_for_quantization."
+                )
 
         # Scheduler-value, max-seqlen, and variable_seq_lengths handling live in
         # ModelParallelConfig.__post_init__ next to the field definitions; only the
