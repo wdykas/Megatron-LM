@@ -4893,11 +4893,12 @@ class TransformerConfig(ModelParallelConfig):
                     and not self.fp4
                 )
                 # DeepGEMM is used by the "deepgemm"/"triton" backends, and by
-                # the torch inference path for BF16 experts. MXFP8 experts use
-                # torch scaled_grouped_mm directly and do not need DeepGEMM.
+                # BF16 Torch inference unless te_native uses TE's device-metadata GEMM.
+                # MXFP8 experts use torch scaled_grouped_mm directly.
                 needs_deepgemm = self.batch_invariant_backend in ("deepgemm", "triton") or (
                     self.transformer_impl == "inference_optimized"
                     and self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH
+                    and self.batch_invariant_backend != "te_native"
                     and not mxfp8_params_enabled
                 )
                 assert not needs_deepgemm or HAVE_DEEPGEMM_BF16, (

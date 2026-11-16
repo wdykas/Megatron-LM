@@ -1490,7 +1490,14 @@ def _deepgemm_m_alignment() -> int:
 
 
 def grouped_gemm_batch_invariant_alignment() -> int:
-    """Return the M alignment required by the DeepGEMM grouped-GEMM backend."""
+    """Return the active inference grouped-GEMM backend's expert row alignment."""
+    if get_batch_invariant_backend() == "te_native":
+        # The extension imports this module, so resolve its alignment after initialization.
+        from megatron.core.extensions.transformer_engine import (
+            TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
+        )
+
+        return TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT
     _require_deepgemm_bf16("get_m_alignment_for_contiguous_layout")
     return _deepgemm_m_alignment()
 
@@ -1660,8 +1667,55 @@ def grouped_gemm_batch_invariant(
     a: torch.Tensor, b: torch.Tensor, *, offs: torch.Tensor, m_total: int
 ) -> torch.Tensor:
     """Run the graph-safe grouped GEMM over pre-aligned inference expert blocks."""
+    if get_batch_invariant_backend() == "te_native":
+        return _te_native_grouped_gemm(a, b, offs=offs, m_total=m_total)
     m_indices = _offs_to_m_indices(offs, m_total).contiguous()
     return _bf16_grouped_gemm_aligned_contiguous(a.contiguous(), b.contiguous(), m_indices)
+
+
+def _te_native_grouped_gemm(
+    a: torch.Tensor, b: torch.Tensor, *, offs: torch.Tensor, m_total: int
+) -> torch.Tensor:
+    """Use TE's device-metadata grouped GEMM for aligned inference expert blocks."""
+    # TE is optional for the other backends and imports MCore during initialization.
+    from transformer_engine.pytorch.cpp_extensions.gemm import (
+        general_grouped_gemm_for_grouped_tensor,
+    )
+    from transformer_engine.pytorch.tensor.storage.grouped_tensor_storage import (
+        GroupedTensorStorage,
+    )
+
+    assert a.dtype == b.dtype == torch.bfloat16
+    assert a.is_contiguous() and b.is_contiguous()
+    assert a.shape == (m_total, b.shape[2])
+    assert offs.numel() == b.shape[0]
+    experts, out_features, in_features = b.shape
+    output = torch.zeros((m_total, out_features), dtype=a.dtype, device=a.device)
+    if m_total == 0:
+        return output
+    ends = offs.to(dtype=torch.int64)
+    starts = torch.cat((ends.new_zeros(1), ends[:-1]))
+    counts = ends - starts
+    grouped_input = GroupedTensorStorage(
+        shape=(m_total, in_features),
+        dtype=a.dtype,
+        num_tensors=experts,
+        data=a.reshape(-1),
+        first_dims=counts,
+        tensor_offsets=starts * in_features,
+    )
+    grouped_output = GroupedTensorStorage(
+        shape=(m_total, out_features),
+        dtype=a.dtype,
+        num_tensors=experts,
+        data=output.reshape(-1),
+        first_dims=counts,
+        tensor_offsets=starts * out_features,
+    )
+    general_grouped_gemm_for_grouped_tensor(
+        list(b.unbind(0)), grouped_input, grouped_output, layout="TN"
+    )
+    return output
 
 
 def _te_rmsnorm_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
