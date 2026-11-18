@@ -911,7 +911,9 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
 
         if labels is None:
             # [s b h] => [b s h]
-            return logits.transpose(0, 1).contiguous()
+            logits = logits.transpose(0, 1)
+            # Training losses accept this view; avoid a second full-vocabulary allocation.
+            return logits if self.training and not in_inference_mode else logits.contiguous()
 
         loss = self.compute_language_model_loss(labels, logits)
 
