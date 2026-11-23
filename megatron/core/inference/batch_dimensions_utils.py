@@ -454,6 +454,7 @@ class CUDAGraphBatchDimensionBuilder:
         num_speculative_tokens: int = 0,
         sizing_distribution: "CudaGraphSizingDistribution" = None,
         extra_prefill_token_counts: Sequence[int] = (),
+        prefill_only: bool = False,
     ) -> Tuple[List[InferenceBatchDimensions], Optional[List[int]]]:
         """
         Generate CUDA graph batch dimensions.
@@ -498,6 +499,7 @@ class CUDAGraphBatchDimensionBuilder:
                 (64- and TP-aligned): the batch-invariant hybrid prefill budget below
                 ``max_tokens``. Batch-invariant mode only. Counts at or above
                 ``cuda_graph_max_tokens`` are ignored.
+            prefill_only: Size mixed graph outputs for a dedicated prefill engine.
 
         Returns:
             Tuple containing:
@@ -699,6 +701,9 @@ class CUDAGraphBatchDimensionBuilder:
                     p_values.append(max_requests)
                 prefill_only_floor = 1
 
+            compact_prefill = (
+                prefill_only and num_speculative_tokens == 0 and not _batch_invariant_mode_enabled()
+            )
             # Create prefill and mixed dimensions with full token counts
             for size in cuda_graph_prefill_token_counts:
                 assert size % tp_size == 0
@@ -710,6 +715,12 @@ class CUDAGraphBatchDimensionBuilder:
                             max_requests - prefill_req_count,
                         ),
                     )
+                    if compact_prefill and decode_req_count > 1:
+                        # Each padded request retains a vocabulary-sized last-token output.
+                        # Keep one decode slot for a dummy request. Short sequence limits
+                        # may require additional slots to construct legal capture prompts.
+                        min_decode = max(1, size - prefill_req_count * (max_sequence_length - 1))
+                        decode_req_count = min(decode_req_count, min_decode)
                     # Skip token_count == 1 with prefill_req == 1: the gather kernel asserts
                     # on index >= 1 against a 1-element tensor at capture time. Larger
                     # `(size, size, 0)` shapes (each prefill = 1 token, total batch >= 2) are

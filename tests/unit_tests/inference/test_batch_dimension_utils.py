@@ -178,6 +178,45 @@ class TestCUDAGraphTokenCountAlignment:
         assert None not in selected, "Decode-only step at the request limit found no graph"
 
 
+@pytest.mark.parametrize("max_sequence_length", [3, 8192])
+def test_dedicated_prefill_graph_coverage(max_sequence_length):
+    make = CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list
+    args = dict(
+        tp_size=1,
+        num_cuda_graphs=-1,
+        cuda_graph_max_tokens=32,
+        cuda_graph_mixed_prefill_request_count=4,
+        max_requests=32,
+        max_tokens=32,
+        max_sequence_length=max_sequence_length,
+        use_cuda_graphs_for_non_decode_steps=True,
+        sizing_distribution=CudaGraphSizingDistribution.EXPONENTIAL,
+    )
+    original, _ = make(**args)
+    prefill, _ = make(**args, prefill_only=True)
+    assert sum(g.req_count for g in prefill) < sum(g.req_count for g in original)
+    assert [g for g in prefill if g.prefill_req_count == 0] == [
+        g for g in original if g.prefill_req_count == 0
+    ]
+    for tokens in range(1, 33):
+        for decode in (0, 1):
+            for prompts in range(tokens - decode + 1):
+                real = BD(tokens, prompts, decode)
+                before, after = (
+                    CUDAGraphBatchDimensionBuilder.match_graph_config(
+                        real, menu, strict=True, match_ep_token_counts=False
+                    )
+                    for menu in (original, prefill)
+                )
+                assert (after is None) == (before is None)
+                if before is not None:
+                    assert (after.token_count, after.prefill_req_count) == (
+                        before.token_count,
+                        before.prefill_req_count,
+                    )
+                    assert after.req_count <= before.req_count
+
+
 class TestGenerateCUDAGraphEdgeCases:
     """Single-process tests for graph generation edge cases."""
 
